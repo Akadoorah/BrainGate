@@ -55,6 +55,15 @@ function snapshot(providerId: ProviderId, values: { auth?: "subscription" | "api
   };
 }
 
+function registryWithClaude(): ModelRegistry {
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null },
+    { available: true, quotaState: "healthy", quotaPressure: 0.2, observedAt: "2026-09-07T00:00:00Z" },
+  );
+  return registry;
+}
+
 const model: ModelRef = { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription" };
 const payload: ShadowRolePayload = { schemaVersion: 1, role: "primary", phase: "initial", task: "private task body", findings: [], context: { secretContext: "private context body" }, responseContract: { kind: "work", output: "string" } };
 
@@ -115,7 +124,7 @@ class FakeExecutor implements ShadowProcessExecutor {
 
 test("shadow invoker sends Claude payload through stdin while argv remains generic", async () => {
   const { repo, project } = setupProject();
-  const fake = new FakeExecutor((plan) => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "safe answer" }) }));
+  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "safe answer" }) }));
   const invoker = new SubscriptionShadowAgentInvoker({ project, cwd: repo, snapshots: [snapshot("anthropic")], context: { relevant: "context" }, executor: fake });
   const request: AgentRequest = { role: "primary", model, phase: "initial", task: "private task body", findings: [] };
   const result = await invoker.invoke(request);
@@ -141,19 +150,20 @@ test("node executor blocks cwd escapes, scrubs API env overrides and redacts cap
   await assert.rejects(() => executor.run({ project, plan: { ...plan, cwd: root } }), /outside the registered project/);
 });
 
-test("dogfood dry-run performs full preflight with zero executor calls and zero usage", async () => {
+test("dogfood dry-run performs full T0 preflight with zero executor calls and zero usage", async () => {
   const { repo, project } = setupProject();
   const ledger = new TaskLedger(project);
-  const registry = new ModelRegistry();
-  registry.register({ providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaPressure: 0.2, observedAt: "2026-09-07T00:00:00Z" });
-  const router = new CapabilityRouter(registry);
+  const router = new CapabilityRouter(registryWithClaude());
   const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "unused" }) }));
-  const classification = classifyTask({ text: "Where is the auth session stored?", mode: "ask" });
+  const taskText = "Where is the theme config?";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
   const budget = budgetFor(classification, { writeRequested: false });
+  assert.equal(classification.complexity, "T0");
+  assert.equal(classification.risk, "low");
   try {
     const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic")], executor: fake }).run({
-      title: "Inspect auth session", task: "Where is the auth session stored?", cwd: repo, classification, budget, requiredContextTokens: 500,
-      context: { files: ["src/auth.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
+      title: "Inspect theme config", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: { files: ["src/theme.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
     });
     assert.equal(result.dryRun, true);
     assert.equal(fake.calls.length, 0);
@@ -163,24 +173,48 @@ test("dogfood dry-run performs full preflight with zero executor calls and zero 
   } finally { ledger.close(); }
 });
 
-test("real T0 shadow run uses bounded workflow and records measured call plus unknown tokens", async () => {
+test("real T0 shadow run uses one bounded provider call and records unknown token usage honestly", async () => {
   const { repo, project } = setupProject();
   const ledger = new TaskLedger(project);
-  const registry = new ModelRegistry();
-  registry.register({ providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaPressure: 0.2, observedAt: "2026-09-07T00:00:00Z" });
-  const router = new CapabilityRouter(registry);
-  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "session is in Redis" }) }));
-  const classification = classifyTask({ text: "Where is the auth session stored?", mode: "ask" });
+  const router = new CapabilityRouter(registryWithClaude());
+  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "theme config is in src/theme.ts" }) }));
+  const taskText = "Where is the theme config?";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
   const budget = budgetFor(classification, { writeRequested: false });
+  assert.equal(classification.complexity, "T0");
+  assert.equal(classification.risk, "low");
   try {
     const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic")], executor: fake }).run({
-      title: "Inspect auth session", task: "Where is the auth session stored?", cwd: repo, classification, budget, requiredContextTokens: 500,
-      context: { files: ["src/auth.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+      title: "Inspect theme config", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: { files: ["src/theme.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
     });
     assert.equal(fake.calls.length, 1);
     assert.equal(result.workflow?.budget.providerCalls, 1);
     assert.equal(result.taskReceipt.task.state, "completed");
     assert.ok(result.taskReceipt.usage.some((usage) => usage.metric === "provider_call" && usage.evidence === "measured" && usage.value === 1));
     assert.ok(result.taskReceipt.usage.some((usage) => usage.metric === "provider_tokens" && usage.evidence === "unknown" && usage.value === null));
+  } finally { ledger.close(); }
+});
+
+test("high-risk auth shadow preflight fails closed without an independent reviewer and spends zero calls", async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const router = new CapabilityRouter(registryWithClaude());
+  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "must not run" }) }));
+  const taskText = "Where is the auth session stored?";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  assert.equal(classification.risk, "high");
+  assert.equal(classification.complexity, "T3");
+  try {
+    await assert.rejects(
+      () => new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic")], executor: fake }).run({
+        title: "Inspect auth session", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+        context: { files: ["src/auth.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
+      }),
+      /No eligible model for role reviewer/,
+    );
+    assert.equal(fake.calls.length, 0);
+    assert.equal(ledger.listTasks().length, 0);
   } finally { ledger.close(); }
 });
