@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, writeFileSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { BrainGateInvariantError } from "@braingate/core";
@@ -24,7 +24,7 @@ test("read guard blocks sensitive files and symlink escapes", () => {
   const guard = new SecretGuard();
   assert.match(guard.assertReadablePath(root, "src/safe.ts"), /safe\.ts$/);
   assert.throws(() => guard.assertReadablePath(root, ".env"), (e: unknown) => e instanceof BrainGateInvariantError && e.code === "SECRET_PATH_BLOCKED");
-  if (require("node:fs").existsSync(join(root, "src", "escape"))) {
+  if (existsSync(join(root, "src", "escape"))) {
     assert.throws(() => guard.assertReadablePath(root, "src/escape"), (e: unknown) => e instanceof BrainGateInvariantError && e.code === "SECRET_PATH_ESCAPE");
   }
 });
