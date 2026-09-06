@@ -47,6 +47,31 @@ test("missing binary returns unavailable and does not try follow-up probes", asy
   assert.equal(runner.calls.length, 1);
 });
 
+test("Claude auth status proves subscription OAuth without a model call", async () => {
+  const runner = new FakeRunner([
+    ["claude --version", { stdout: "2.1.248 (Claude Code)\n" }],
+    ["claude --help", { stdout: "claude -p --model MODEL --output-format json mcp\n" }],
+    ["claude auth status", { stdout: '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty","subscriptionType":"max"}\n' }],
+  ]);
+  const snapshot = await new ProviderDiscovery(runner).discover("anthropic");
+  assert.equal(snapshot.authState.value, "authenticated");
+  assert.equal(snapshot.authMode.value, "subscription");
+  assert.equal(snapshot.authState.evidence, "native");
+  assert.deepEqual(runner.calls.map(formatProbeCommand), ["claude --version", "claude --help", "claude auth status"]);
+  assert.ok(runner.calls.every((command) => !command.args.includes("-p") && !command.args.includes("--prompt")));
+});
+
+test("Claude console/API authentication is never mislabeled as subscription", async () => {
+  const runner = new FakeRunner([
+    ["claude --version", { stdout: "2.1.248\n" }],
+    ["claude --help", { stdout: "claude -p --model MODEL --output-format json\n" }],
+    ["claude auth status", { stdout: '{"loggedIn":true,"authMethod":"console","subscriptionType":null}\n' }],
+  ]);
+  const snapshot = await new ProviderDiscovery(runner).discover("anthropic");
+  assert.equal(snapshot.authState.value, "authenticated");
+  assert.equal(snapshot.authMode.value, "api");
+});
+
 test("Antigravity model discovery preserves provider-owned model slugs without prompting", async () => {
   const runner = new FakeRunner([
     ["agy --version", { stdout: "agy 2.8.0\n" }],
@@ -84,10 +109,10 @@ test("model metadata timeout stays unknown rather than guessing auth or models",
   assert.match(snapshot.warnings.join(" "), /unknown|did not complete/i);
 });
 
-test("providers without verified zero-prompt model/status commands report unknown instead of making a model call", async () => {
+test("providers without verified zero-prompt auth/status commands report unknown instead of making a model call", async () => {
   const runner = new FakeRunner([
     ["copilot version", { stdout: "GitHub Copilot CLI 0.9.0\n" }],
-    ["copilot help", { stdout: "Options: -p --prompt --model --stream; Commands: mcp\n" }],
+    ["copilot help", { stdout: "Options: -p --prompt --model --output-format json --stream; Commands: mcp\n" }],
   ]);
   const snapshot = await new ProviderDiscovery(runner).discover("github-copilot");
 

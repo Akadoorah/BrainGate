@@ -1,0 +1,24 @@
+{
+  "name": "@braingate/shadow",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "scripts": {
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@braingate/core": "workspace:*",
+    "@braingate/observability": "workspace:*",
+    "@braingate/providers": "workspace:*",
+    "@braingate/router": "workspace:*",
+    "@braingate/security": "workspace:*",
+    "@braingate/workflows": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.7",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
