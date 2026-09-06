@@ -169,7 +169,13 @@ export class ContextBuilder {
         skipped.push({ id: item.id, source: item.source, reason: "budget" });
         return false;
       }
-      const maxChars = remainingTokens * 2;
+
+      // The task may use the full remaining budget. Every other item is capped at
+      // half the total pack budget so one giant file cannot crowd out all other evidence.
+      const perItemTokenCap = item.kind === "task"
+        ? remainingTokens
+        : Math.min(remainingTokens, Math.max(32, Math.floor(input.maxTokens / 2)));
+      const maxChars = perItemTokenCap * 2;
       const bounded = truncateForBudget(item.content, maxChars);
       const estimatedTokens = conservativeTokenEstimate(bounded.content);
       if (estimatedTokens > remainingTokens || bounded.content.length === 0) {
