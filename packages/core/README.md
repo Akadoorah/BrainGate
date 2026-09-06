@@ -1,3 +1,3 @@
 # @braingate/core
 
-Deterministic BrainGate primitives. Milestone 1 implements explicit project identity/isolation and an append-only SQLite task ledger. Provider-specific execution must not be added to this package.
+Deterministic BrainGate primitives. The core owns project isolation, the task ledger, provider-free task classification, and hard execution budgets. Provider-specific execution must not be added to this package.
