@@ -29,6 +29,11 @@ function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string)
   return snapshot;
 }
 
+function attestationFor(attestations: readonly SubscriptionAttestation[], providerId: string): Readonly<{ attestation?: SubscriptionAttestation }> {
+  const attestation = attestations.find((item) => item.providerId === providerId);
+  return attestation === undefined ? Object.freeze({}) : Object.freeze({ attestation });
+}
+
 export interface ShadowDogfoodResult {
   readonly dryRun: boolean;
   readonly taskId: string;
@@ -86,7 +91,7 @@ export class ShadowDogfoodRunner {
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
-    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd: input.cwd, payload: preflightPayload("primary", input.task, input.context), attestation: this.#attestations.find((item) => item.providerId === primaryRef.providerId) });
+    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd: input.cwd, payload: preflightPayload("primary", input.task, input.context), ...attestationFor(this.#attestations, primaryRef.providerId) });
 
     const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && (input.optionalReview ?? false));
     if (needsReview) {
@@ -96,7 +101,7 @@ export class ShadowDogfoodRunner {
       const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence });
       routes.push(reviewerRoute);
       const reviewerRef = modelRef(reviewerRoute);
-      planShadowInvocation({ snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId), model: reviewerRef, cwd: input.cwd, payload: preflightPayload("reviewer", input.task, input.context), attestation: this.#attestations.find((item) => item.providerId === reviewerRef.providerId) });
+      planShadowInvocation({ snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId), model: reviewerRef, cwd: input.cwd, payload: preflightPayload("reviewer", input.task, input.context), ...attestationFor(this.#attestations, reviewerRef.providerId) });
     }
 
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
