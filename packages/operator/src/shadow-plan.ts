@@ -1,0 +1,125 @@
+import type { ExecutionBudget, RegisteredProject, TaskClassification } from "@braingate/core";
+import type { ProviderSnapshot } from "@braingate/providers";
+import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
+import {
+  assertShadowProjectCwd,
+  planShadowInvocation,
+  previewShadowInvocation,
+  shadowProviderStatus,
+  type ShadowInvocationPreview,
+  type ShadowRolePayload,
+  type SubscriptionAttestation,
+} from "@braingate/shadow";
+
+export interface PlannedShadowRole {
+  readonly role: "primary" | "reviewer";
+  readonly model: ModelRef;
+  readonly route: RouteResult;
+  readonly invocation: ShadowInvocationPreview;
+}
+
+export interface ShadowTaskPlan {
+  readonly classification: TaskClassification;
+  readonly budget: ExecutionBudget;
+  readonly requiredContextTokens: number;
+  readonly cwd: string;
+  readonly roles: readonly PlannedShadowRole[];
+}
+
+function modelRef(route: RouteResult): ModelRef {
+  const definition = route.selected.model.definition;
+  return Object.freeze({ providerId: definition.providerId, modelId: definition.modelId, quotaPool: definition.quotaPool });
+}
+
+function payload(role: "primary" | "reviewer", task: string, context: unknown): ShadowRolePayload {
+  return Object.freeze({
+    schemaVersion: 1,
+    role,
+    phase: "preflight",
+    task,
+    findings: Object.freeze([]),
+    context,
+    responseContract: Object.freeze(role === "primary"
+      ? { kind: "work", output: "string" }
+      : { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" }),
+  });
+}
+
+function attestationFor(attestations: readonly SubscriptionAttestation[], providerId: string): Readonly<{ attestation?: SubscriptionAttestation }> {
+  const value = attestations.find((item) => item.providerId === providerId);
+  return value === undefined ? Object.freeze({}) : Object.freeze({ attestation: value });
+}
+
+function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
+  const value = snapshots.find((candidate) => candidate.providerId === providerId);
+  if (value === undefined) throw new Error(`Missing provider snapshot for routed provider ${providerId}.`);
+  return value;
+}
+
+export function buildShadowTaskPlan(input: {
+  readonly project: RegisteredProject;
+  readonly cwd: string;
+  readonly router: CapabilityRouter;
+  readonly providers: readonly ProviderSnapshot[];
+  readonly attestations?: readonly SubscriptionAttestation[];
+  readonly task: string;
+  readonly context: unknown;
+  readonly classification: TaskClassification;
+  readonly budget: ExecutionBudget;
+  readonly requiredContextTokens: number;
+  readonly optionalReview?: boolean;
+}): ShadowTaskPlan {
+  const cwd = assertShadowProjectCwd(input.project, input.cwd);
+  const attestations = input.attestations ?? [];
+  const excludedProviders = input.providers.filter((snapshot) => !shadowProviderStatus(snapshot.providerId).enabled).map((snapshot) => snapshot.providerId);
+  const primaryRoute = input.router.route({
+    role: "coder",
+    classification: input.classification,
+    budget: input.budget,
+    requiredContextTokens: input.requiredContextTokens,
+    writeRequired: false,
+    excludeProviders: excludedProviders,
+  });
+  const primaryModel = modelRef(primaryRoute);
+  const primaryInvocation = planShadowInvocation({
+    snapshot: snapshotFor(input.providers, primaryModel.providerId),
+    model: primaryModel,
+    cwd,
+    payload: payload("primary", input.task, input.context),
+    ...attestationFor(attestations, primaryModel.providerId),
+  });
+  const roles: PlannedShadowRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, invocation: previewShadowInvocation(primaryInvocation) })];
+
+  const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && (input.optionalReview ?? false));
+  if (needsReview) {
+    const independence = input.classification.risk === "high" || input.classification.risk === "critical"
+      ? { mode: "required" as const, models: [primaryModel] }
+      : { mode: "preferred" as const, models: [primaryModel] };
+    const reviewerRoute = input.router.route({
+      role: "reviewer",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
+      writeRequired: false,
+      independence,
+      excludeProviders: excludedProviders,
+    });
+    const reviewerModel = modelRef(reviewerRoute);
+    const reviewerInvocation = planShadowInvocation({
+      snapshot: snapshotFor(input.providers, reviewerModel.providerId),
+      model: reviewerModel,
+      cwd,
+      payload: payload("reviewer", input.task, input.context),
+      ...attestationFor(attestations, reviewerModel.providerId),
+    });
+    roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, invocation: previewShadowInvocation(reviewerInvocation) }));
+  }
+
+  return Object.freeze({
+    classification: input.classification,
+    budget: input.budget,
+    requiredContextTokens: input.requiredContextTokens,
+    cwd,
+    roles: Object.freeze(roles),
+  });
+}

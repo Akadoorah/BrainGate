@@ -11,7 +11,8 @@ import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
 import { WorkflowEngine, type WorkflowReceipt } from "@braingate/workflows";
 import { SubscriptionShadowAgentInvoker } from "./invoker.js";
-import { planShadowInvocation } from "./profiles.js";
+import { planShadowInvocation, shadowProviderStatus } from "./profiles.js";
+import { assertShadowProjectCwd } from "./process-executor.js";
 import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 function modelRef(route: RouteResult): ModelRef {
@@ -86,22 +87,24 @@ export class ShadowDogfoodRunner {
   }): Promise<ShadowDogfoodResult> {
     if (input.task.trim().length === 0) throw new BrainGateInvariantError("SHADOW_TASK_INVALID", "Shadow task must be non-empty.");
     if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("SHADOW_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
+    const cwd = assertShadowProjectCwd(this.#project, input.cwd);
+    const excludedProviders = this.#snapshots.filter((snapshot) => !shadowProviderStatus(snapshot.providerId).enabled).map((snapshot) => snapshot.providerId);
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false });
+    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: excludedProviders });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
-    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd: input.cwd, payload: preflightPayload("primary", input.task, input.context), ...attestationFor(this.#attestations, primaryRef.providerId) });
+    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd, payload: preflightPayload("primary", input.task, input.context), ...attestationFor(this.#attestations, primaryRef.providerId) });
 
     const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && (input.optionalReview ?? false));
     if (needsReview) {
       const independence = input.classification.risk === "high" || input.classification.risk === "critical"
         ? { mode: "required" as const, models: [primaryRef] }
         : { mode: "preferred" as const, models: [primaryRef] };
-      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence });
+      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: excludedProviders });
       routes.push(reviewerRoute);
       const reviewerRef = modelRef(reviewerRoute);
-      planShadowInvocation({ snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId), model: reviewerRef, cwd: input.cwd, payload: preflightPayload("reviewer", input.task, input.context), ...attestationFor(this.#attestations, reviewerRef.providerId) });
+      planShadowInvocation({ snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId), model: reviewerRef, cwd, payload: preflightPayload("reviewer", input.task, input.context), ...attestationFor(this.#attestations, reviewerRef.providerId) });
     }
 
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
@@ -129,7 +132,7 @@ export class ShadowDogfoodRunner {
     try {
       const invoker = new SubscriptionShadowAgentInvoker({
         project: this.#project,
-        cwd: input.cwd,
+        cwd,
         snapshots: this.#snapshots,
         attestations: this.#attestations,
         context: input.context,
