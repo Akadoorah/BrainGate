@@ -3,6 +3,8 @@ import type {
   ProbeCommand,
   ProbeResult,
   ProbeRunner,
+  ProviderAuthMode,
+  ProviderAuthState,
   ProviderCapabilities,
   ProviderId,
   ProviderSnapshot,
@@ -16,6 +18,7 @@ interface ProviderSpec {
   readonly versionArgs: readonly string[];
   readonly helpArgs: readonly string[];
   readonly modelArgs: readonly string[] | null;
+  readonly authArgs: readonly string[] | null;
   readonly headlessPatterns: readonly RegExp[];
   readonly structuredPatterns: readonly RegExp[];
   readonly modelPatterns: readonly RegExp[];
@@ -30,6 +33,7 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     versionArgs: ["--version"],
     helpArgs: ["--help"],
     modelArgs: null,
+    authArgs: ["auth", "status"],
     headlessPatterns: [/--print\b/i, /\s-p[ ,]/i],
     structuredPatterns: [/output[- ]format/i, /json/i],
     modelPatterns: [/--model\b/i],
@@ -42,6 +46,7 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     versionArgs: ["--version"],
     helpArgs: ["--help"],
     modelArgs: null,
+    authArgs: null,
     headlessPatterns: [/\bexec\b/i, /non[- ]interactive/i],
     structuredPatterns: [/json/i],
     modelPatterns: [/--model\b/i, /\s-m[ ,]/i],
@@ -54,6 +59,7 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     versionArgs: ["--version"],
     helpArgs: ["--help"],
     modelArgs: ["models"],
+    authArgs: null,
     headlessPatterns: [/--prompt\b/i, /--print\b/i, /\s-p[ ,]/i],
     structuredPatterns: [/json/i, /stream/i],
     modelPatterns: [/--model\b/i],
@@ -66,6 +72,7 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     versionArgs: ["version"],
     helpArgs: ["--help"],
     modelArgs: ["models"],
+    authArgs: null,
     headlessPatterns: [/\s-p[ ,]/i, /headless/i],
     structuredPatterns: [/output[- ]format/i, /json/i],
     modelPatterns: [/--model\b/i, /\s-m[ ,]/i],
@@ -78,8 +85,9 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     versionArgs: ["version"],
     helpArgs: ["help"],
     modelArgs: null,
+    authArgs: null,
     headlessPatterns: [/--prompt\b/i, /\s-p[ ,]/i, /programmatic/i],
-    structuredPatterns: [/json/i, /stream/i],
+    structuredPatterns: [/output[- ]format/i, /json/i, /stream/i],
     modelPatterns: [/--model\b/i],
     mcpPatterns: [/\bmcp\b/i],
   },
@@ -136,6 +144,33 @@ function mergedRemoved(...results: readonly (ProbeResult | null)[]): readonly st
   return Object.freeze(
     [...new Set(results.flatMap((result) => result?.removedBillingOverrides ?? []))].sort(),
   );
+}
+
+function parseClaudeAuth(result: ProbeResult): {
+  readonly state: ProviderAuthState;
+  readonly mode: ProviderAuthMode;
+  readonly evidence: Observation<ProviderAuthState>["evidence"];
+} {
+  if (!result.spawned || result.timedOut) return { state: "unknown", mode: "unknown", evidence: "unknown" };
+  try {
+    const parsed = JSON.parse(result.stdout.trim()) as Record<string, unknown>;
+    const loggedIn = parsed.loggedIn;
+    if (loggedIn === false) return { state: "unauthenticated", mode: "unknown", evidence: "native" };
+    if (loggedIn !== true) return { state: "unknown", mode: "unknown", evidence: "unknown" };
+
+    const authMethod = typeof parsed.authMethod === "string" ? parsed.authMethod.toLowerCase() : "";
+    const subscriptionType = typeof parsed.subscriptionType === "string" ? parsed.subscriptionType.trim() : "";
+    if (subscriptionType.length > 0 && !authMethod.includes("console") && !authMethod.includes("api")) {
+      return { state: "authenticated", mode: "subscription", evidence: "native" };
+    }
+    if (authMethod.includes("console") || authMethod.includes("api")) {
+      return { state: "authenticated", mode: "api", evidence: "native" };
+    }
+    return { state: "authenticated", mode: "unknown", evidence: "native" };
+  } catch {
+    if (result.exitCode === 1) return { state: "unauthenticated", mode: "unknown", evidence: "native" };
+    return { state: "unknown", mode: "unknown", evidence: "unknown" };
+  }
 }
 
 export class ProviderDiscovery {
@@ -207,6 +242,24 @@ export class ProviderDiscovery {
       warnings.push("No verified zero-prompt model-list command is configured for this provider.");
     }
 
+    let authResult: ProbeResult | null = null;
+    let authState: Observation<ProviderAuthState>;
+    let authMode: Observation<ProviderAuthMode>;
+    if (spec.authArgs !== null) {
+      const authCommand: ProbeCommand = { binary: spec.binary, args: spec.authArgs, timeoutMs: 5_000 };
+      authResult = await this.#runner.run(authCommand);
+      const source = formatProbeCommand(authCommand);
+      const parsed = spec.providerId === "anthropic"
+        ? parseClaudeAuth(authResult)
+        : { state: "unknown" as const, mode: "unknown" as const, evidence: "unknown" as const };
+      authState = observation(parsed.state, parsed.evidence, source, authResult.observedAt);
+      authMode = observation(parsed.mode, parsed.evidence, source, authResult.observedAt);
+      if (parsed.state === "unknown") warnings.push("Authentication metadata probe could not be interpreted safely.");
+    } else {
+      authState = observation("unknown", "unknown", null, helpResult.observedAt);
+      authMode = observation("unknown", "unknown", null, helpResult.observedAt);
+    }
+
     const version = versionResult.exitCode === 0 && !versionResult.timedOut ? firstUsefulLine(versionResult) : null;
     if (version === null) warnings.push("CLI version could not be parsed from the local version command.");
 
@@ -217,9 +270,13 @@ export class ProviderDiscovery {
       mcp: capabilityFromHelp(helpResult, spec.mcpPatterns),
     };
 
-    warnings.push(
-      "Authentication and quota remain unknown unless a provider exposes them through a verified zero-prompt command; BrainGate does not open an interactive session merely to probe status.",
-    );
+    if (spec.authArgs === null) {
+      warnings.push(
+        "Authentication and quota remain unknown unless a provider exposes them through a verified zero-prompt command; BrainGate does not open an interactive session merely to probe status.",
+      );
+    } else {
+      warnings.push("Quota remains unknown unless a provider exposes it through a verified zero-prompt command; BrainGate does not make a model call to probe quota.");
+    }
 
     return {
       providerId: spec.providerId,
@@ -227,8 +284,8 @@ export class ProviderDiscovery {
       binary: spec.binary,
       available: observation(true, "native", versionSource, versionResult.observedAt),
       version: observation(version, version === null ? "unknown" : "native", versionSource, versionResult.observedAt),
-      authState: observation("unknown", "unknown", null, helpResult.observedAt),
-      authMode: observation("unknown", "unknown", null, helpResult.observedAt),
+      authState,
+      authMode,
       models,
       capabilities: observation(
         capabilities,
@@ -237,7 +294,7 @@ export class ProviderDiscovery {
         helpResult.observedAt,
       ),
       usage: observation(null, "unknown", null, helpResult.observedAt),
-      removedBillingOverrides: mergedRemoved(versionResult, helpResult, modelResult),
+      removedBillingOverrides: mergedRemoved(versionResult, helpResult, modelResult, authResult),
       warnings: Object.freeze(warnings),
     };
   }
