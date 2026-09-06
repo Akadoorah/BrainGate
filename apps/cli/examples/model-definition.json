@@ -1,0 +1,17 @@
+{
+  "providerId": "provider-id",
+  "modelId": "provider-model-id",
+  "quotaPool": "subscription-quota-pool",
+  "capabilities": {
+    "scout": 70,
+    "planner": 80,
+    "coder": 85,
+    "reviewer": 80,
+    "judge": 75
+  },
+  "speed": "balanced",
+  "contextCapacity": 100000,
+  "writeCapable": false,
+  "reasoning": 80,
+  "underlyingFamily": null
+}
