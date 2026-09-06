@@ -14,7 +14,7 @@ Complexity/risk classifier, escalation/de-escalation, Budget Governor, loop caps
 
 ## Milestone 3 — Provider discovery
 
-Official CLI adapters for Claude Code, Codex, Antigravity, and Grok Build; login/model discovery and normalized telemetry. No code-writing automation yet.
+Official CLI adapters for Claude Code, Codex, Antigravity, Grok Build, and optional GitHub Copilot CLI; install/version/model discovery and normalized telemetry. Discovery is zero-prompt and never intentionally consumes model tokens or AI credits. No code-writing automation yet.
 
 ## Milestone 4 — Context and memory
 
