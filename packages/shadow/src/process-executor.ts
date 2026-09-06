@@ -11,7 +11,7 @@ function inside(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
-function projectCwd(project: RegisteredProject, cwdInput: string): string {
+export function assertShadowProjectCwd(project: RegisteredProject, cwdInput: string): string {
   let cwd: string;
   try { cwd = realpathSync.native(resolve(cwdInput)); }
   catch { throw new BrainGateInvariantError("SHADOW_CWD_INVALID", "Shadow working directory does not exist or cannot be resolved."); }
@@ -33,7 +33,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
   }): Promise<ShadowProcessResult> {
-    const cwd = projectCwd(input.project, input.plan.cwd);
+    const cwd = assertShadowProjectCwd(input.project, input.plan.cwd);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 10 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
     let tempRoot: string | null = null;

@@ -1,0 +1,29 @@
+{
+  "name": "@braingate/cli",
+  "version": "0.0.0-private",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "braingate": "./bin/braingate.mjs"
+  },
+  "scripts": {
+    "start": "tsx src/main.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "dependencies": {
+    "@braingate/context": "workspace:*",
+    "@braingate/core": "workspace:*",
+    "@braingate/dashboard": "workspace:*",
+    "@braingate/observability": "workspace:*",
+    "@braingate/operator": "workspace:*",
+    "@braingate/providers": "workspace:*",
+    "@braingate/router": "workspace:*",
+    "@braingate/shadow": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.7",
+    "tsx": "^4.23.13",
+    "typescript": "^5.9.3"
+  }
+}
