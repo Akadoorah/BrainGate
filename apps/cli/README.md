@@ -1,5 +1,5 @@
 # BrainGate CLI
 
-Planned local entry point for `braingate init`, `ask`, `run`, `review`, `status`, and `doctor`.
+Local operator entry point for project validation, provider discovery, model catalog management, shadow planning/execution, status, and the loopback dashboard.
 
-Implementation begins after core project/task contracts are established.
+Safe commands are zero-model-call by default. Any token-consuming shadow execution requires an explicit `--execute` flag.
