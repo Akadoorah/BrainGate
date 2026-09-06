@@ -160,7 +160,10 @@ test("memory tables reject direct mutation and obvious secrets", () => {
     assert.throws(() => db.prepare("UPDATE memory_records SET body = 'tampered'").run(), /immutable/);
     assert.throws(() => db.prepare("DELETE FROM memory_reviews").run(), /append-only/);
     assert.throws(() => db.prepare("DELETE FROM memory_proposals").run(), /append-only/);
-    assert.equal(db.prepare("SELECT body FROM memory_records WHERE record_id = ?").get(record.recordId)?.body, "Safe canonical fact.");
+    const persisted = db.prepare("SELECT body FROM memory_records WHERE record_id = ?").get(record.recordId) as
+      | { body: string }
+      | undefined;
+    assert.equal(persisted?.body, "Safe canonical fact.");
   } finally {
     db.close();
   }
