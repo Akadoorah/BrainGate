@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { budgetFor, classifyTask } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import { ModelCatalog, hydrateModelRegistry, resolveOperatorState } from "./index.js";
@@ -73,8 +74,9 @@ test("runtime hydration preserves unknown quota and blocks unavailable/exhausted
 
   const unavailable = hydrateModelRegistry({ entries: catalog.load(), providers: [provider(false)], quota: [], observedAt: "2026-09-07T00:00:00.000Z" });
   const router = new CapabilityRouter(unavailable.registry);
-  const classification = { complexity: "T0" as const, risk: "low" as const, confidence: 1, mode: "ask" as const, signals: [] as string[] };
-  assert.throws(() => router.route({ role: "coder", classification, budget: { maxAgents: 1, maxProviderCalls: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 1000, reviewerPolicy: "none", councilPolicy: "off", requiresHumanApproval: false }, requiredContextTokens: 100, writeRequired: false }), /No eligible model/);
+  const classification = classifyTask({ text: "Where is the theme config?", mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  assert.throws(() => router.route({ role: "coder", classification, budget, requiredContextTokens: 100, writeRequired: false }), /No eligible model/);
 
   const exhausted = hydrateModelRegistry({ entries: catalog.load(), providers: [provider(true)], quota: [{ sequence: 1, provider: "anthropic", quotaPool: "claude-subscription", metric: "remaining", window: null, value: 0, unit: "requests", resetAt: null, status: "exhausted", evidence: "native", source: "status", observedAt: "2026-09-07T00:00:00.000Z" }], observedAt: "2026-09-07T00:00:00.000Z" });
   assert.equal(exhausted.runtimes[0]?.quotaState, "exhausted");
