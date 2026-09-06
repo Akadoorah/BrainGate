@@ -65,7 +65,8 @@ export class SafeCommandRunner {
 
     const cwd = resolve(input.command.cwd);
     if (!inside(root, cwd)) throw new BrainGateInvariantError("COMMAND_CWD_DENIED", "Command cwd escapes its execution root.");
-    const environment = this.#secretGuard.buildEnvironment(input.env ?? process.env, { allowedAdditionalKeys: input.allowedEnvKeys });
+    const environmentOptions = input.allowedEnvKeys === undefined ? {} : { allowedAdditionalKeys: input.allowedEnvKeys };
+    const environment = this.#secretGuard.buildEnvironment(input.env ?? process.env, environmentOptions);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 60_000, 100), 15 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 512 * 1024, 1024), 8 * 1024 * 1024);
 
