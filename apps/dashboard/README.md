@@ -1,5 +1,10 @@
-# BrainGate Dashboard
+# BrainGate local dashboard
 
-Planned local dashboard for task briefs, live execution, receipts, audit history, and provider usage/quota telemetry.
+A dependency-light, local-only dashboard renderer/server for BrainGate observability snapshots.
 
-The dashboard is not part of Milestone 0 implementation.
+- Default host: `127.0.0.1`
+- Non-loopback binds are rejected.
+- Rendering never launches provider CLI probes.
+- Unknown quota stays visibly unknown; provenance is always shown.
+
+The app intentionally accepts an already-built `DashboardSnapshot`; collection and provider probing remain outside the rendering path.
