@@ -107,12 +107,13 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       context: this.#context,
       responseContract: responseContract(request.role),
     });
+    const attestation = this.#attestations.get(request.model.providerId);
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
       cwd: this.#cwd,
       payload,
-      attestation: this.#attestations.get(request.model.providerId),
+      ...(attestation === undefined ? {} : { attestation }),
     });
     const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
     this.#event("shadow.provider.started", safeMeta);
