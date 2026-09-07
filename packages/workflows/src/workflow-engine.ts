@@ -1,5 +1,5 @@
 import { BrainGateInvariantError, BudgetTracker } from "@braingate/core";
-import { CapabilityRouter, type ModelRef, type RouteCandidate } from "@braingate/router";
+import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteCandidate } from "@braingate/router";
 import type { AgentInvoker, AgentRequest, AgentResponse, ReviewIndependence, WorkflowEvent, WorkflowInput, WorkflowOutcome, WorkflowReceipt } from "./types.js";
 
 const MAX_FINDINGS = 8;
@@ -57,6 +57,10 @@ function assertResponse(role: AgentRequest["role"], response: AgentResponse): vo
   if (role === "primary" && response.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Primary agent must return work output.");
   if (role === "reviewer" && response.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer must return a review verdict.");
   if (role === "judge" && response.kind !== "judge") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Judge must return a judge verdict.");
+}
+
+function isNoEligibleModel(error: unknown): boolean {
+  return error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL";
 }
 
 export class WorkflowEngine {
@@ -119,19 +123,34 @@ export class WorkflowEngine {
     if (!needsReview) return this.#receipt(input, "completed_without_review", primary, null, null, events, tracker, finalOutput);
 
     const primaryRef = modelRef(primary);
-    const reviewerIndependence = input.classification.risk === "critical"
-      ? { mode: "required" as const, level: "cross-provider" as const, models: [primaryRef] }
-      : { mode: "preferred" as const, level: "cross-provider" as const, models: [primaryRef] };
     const reviewerExcluded = input.excludeProviders?.reviewer;
-    const reviewer = this.#router.route({
+    const routeReviewer = (independence: IndependenceConstraint): RouteCandidate => this.#router.route({
       role: "reviewer",
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
       writeRequired: false,
-      independence: reviewerIndependence,
+      independence,
       ...(reviewerExcluded === undefined ? {} : { excludeProviders: reviewerExcluded }),
     }).selected;
+
+    let reviewer: RouteCandidate;
+    if (input.classification.risk === "critical") {
+      reviewer = routeReviewer({ mode: "required", level: "cross-provider", models: [primaryRef] });
+    } else {
+      try {
+        reviewer = routeReviewer({ mode: "required", level: "cross-provider", models: [primaryRef] });
+      } catch (error) {
+        if (!isNoEligibleModel(error)) throw error;
+        try {
+          reviewer = routeReviewer({ mode: "required", level: "different-model", models: [primaryRef] });
+        } catch (differentModelError) {
+          if (!isNoEligibleModel(differentModelError)) throw differentModelError;
+          reviewer = routeReviewer({ mode: "preferred", level: "fresh-session", models: [primaryRef] });
+        }
+      }
+    }
+
     const independence = reviewIndependence(primary, reviewer, input);
     emit("review.independence", "reviewer", modelRef(reviewer), `${independence.level};shared-quota=${independence.sharedQuotaPool};human-approval=${independence.humanApprovalRequired}`);
 
