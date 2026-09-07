@@ -127,6 +127,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       phase: request.phase,
       task: request.task,
       findings: Object.freeze([...request.findings]),
+      candidateOutput: request.candidateOutput === null ? null : boundedText(request.candidateOutput),
       context: this.#context,
       responseContract: responseContract(request.role),
     });
