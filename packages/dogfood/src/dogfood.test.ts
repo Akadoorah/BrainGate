@@ -6,7 +6,7 @@ import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
 import { ProjectRegistry, TaskLedger, type RegisteredProject, type TaskClassification, type TaskComplexity, type TaskRisk } from "@braingate/core";
-import { applyDogfoodPrior, DogfoodStore, initializeDogfoodProject } from "./index.js";
+import { applyDogfoodPrior, DogfoodStore, emptyDogfoodPrior, initializeDogfoodProject } from "./index.js";
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -88,6 +88,25 @@ test("dogfood telemetry is physically project scoped and append-only", () => {
       assert.throws(() => db.prepare("DELETE FROM dogfood_runs").run(), /append-only/);
     } finally { db.close(); }
   } finally { storeA.close(); storeB.close(); }
+});
+
+test("persistence rejects de-escalated effective classifications and mismatched prior modes", () => {
+  const f = registered("persistence-guard"); const store = new DogfoodStore(f.project);
+  try {
+    const predicted = classification("T2", "medium");
+    const taskReceipt = receipt(f.project, "T2", "medium");
+    const base = {
+      receipt: taskReceipt,
+      mode: "ask" as const,
+      predicted,
+      roles: [{ role: "primary" as const, providerId: "anthropic", modelId: "test-model" }],
+      outcome: "success" as const,
+    };
+    assert.throws(() => store.recordRun({ ...base, effective: classification("T1", "medium") }), /effective complexity cannot be lower/);
+    assert.throws(() => store.recordRun({ ...base, effective: classification("T2", "low") }), /effective risk cannot be lower/);
+    assert.throws(() => store.recordRun({ ...base, effective: predicted, prior: emptyDogfoodPrior("write") }), /prior mode must match/);
+    assert.equal(store.report().runs, 0);
+  } finally { store.close(); }
 });
 
 test("adaptive prior needs three feedback samples and can only escalate", () => {
