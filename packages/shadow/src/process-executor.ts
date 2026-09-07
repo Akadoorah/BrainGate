@@ -37,6 +37,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 10 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
+    const baseEnv = input.env ?? process.env;
     let tempRoot: string | null = null;
     let spawnCwd = sourceCwd;
     let args = [...input.plan.args];
@@ -46,7 +47,21 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
       if (input.plan.workspaceMode === "staged-clean") {
         tempRoot = mkdtempSync(join(tmpdir(), "braingate-shadow-stage-"));
         spawnCwd = join(tempRoot, "workspace");
+        const isolatedHome = join(tempRoot, "home");
         mkdirSync(spawnCwd, { mode: 0o700 });
+        mkdirSync(isolatedHome, { mode: 0o700 });
+
+        if (input.plan.providerId === "openai") {
+          const originalCodexHome = baseEnv.CODEX_HOME ?? (baseEnv.HOME === undefined ? null : join(baseEnv.HOME, ".codex"));
+          if (originalCodexHome === null) {
+            throw new BrainGateInvariantError("SHADOW_CODEX_HOME_UNKNOWN", "Codex authentication home cannot be located without CODEX_HOME or HOME.");
+          }
+          // Keep only the auth/config root location. BrainGate never reads or copies provider auth files.
+          // HOME moves to an empty temp directory so ~/.agents/skills and unrelated user files are not discoverable.
+          overrides.CODEX_HOME = originalCodexHome;
+          overrides.HOME = isolatedHome;
+        }
+
         args = args.map((argument) => argument.replaceAll(CODEX_STAGE_TOKEN, spawnCwd));
         if (args.some((argument) => argument.includes(CODEX_STAGE_TOKEN))) {
           throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Staged shadow invocation contains an unresolved workspace token.");
@@ -69,7 +84,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         args = args.map((argument) => argument === input.plan.attachmentToken ? attachmentPath : argument);
       }
 
-      const environment = this.#secretGuard.buildEnvironment(input.env ?? process.env, {
+      const environment = this.#secretGuard.buildEnvironment(baseEnv, {
         allowedAdditionalKeys: input.plan.allowedEnvKeys,
         overrides,
       });
@@ -81,26 +96,12 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         let overflow = false;
         let spawned = false;
         let settled = false;
-        const child = spawn(input.plan.executable, args, {
-          cwd: spawnCwd,
-          env: environment.env,
-          shell: false,
-          stdio: ["pipe", "pipe", "pipe"],
-          windowsHide: true,
-        });
+        const child = spawn(input.plan.executable, args, { cwd: spawnCwd, env: environment.env, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
         const finish = (exitCode: number | null) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          resolveResult(Object.freeze({
-            spawned,
-            exitCode: overflow ? null : exitCode,
-            stdout: redactSecrets(stdout),
-            stderr: redactSecrets(stderr),
-            timedOut: timedOut || overflow,
-            durationMs: Date.now() - started,
-            removedEnvironmentKeys: environment.removed,
-          }));
+          resolveResult(Object.freeze({ spawned, exitCode: overflow ? null : exitCode, stdout: redactSecrets(stdout), stderr: redactSecrets(stderr), timedOut: timedOut || overflow, durationMs: Date.now() - started, removedEnvironmentKeys: environment.removed }));
         };
         const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
         const append = (target: "stdout" | "stderr", chunk: Buffer) => {
@@ -114,8 +115,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
         child.on("error", (error) => { stderr += `\n${error.message}`; finish(null); });
         child.on("close", (exitCode) => finish(exitCode));
-        if (input.plan.stdin !== null) child.stdin?.end(input.plan.stdin);
-        else child.stdin?.end();
+        if (input.plan.stdin !== null) child.stdin?.end(input.plan.stdin); else child.stdin?.end();
       });
     } finally {
       if (tempRoot !== null) rmSync(tempRoot, { recursive: true, force: true });
