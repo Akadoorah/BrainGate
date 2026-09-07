@@ -52,7 +52,12 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         mkdirSync(isolatedHome, { mode: 0o700 });
 
         if (input.plan.providerId === "openai") {
-          const originalCodexHome = baseEnv.CODEX_HOME ?? (baseEnv.HOME === undefined ? null : join(baseEnv.HOME, ".codex"));
+          // The caller may intentionally pass a minimal child environment. Resolve only the
+          // location of the existing auth home from the request first, then BrainGate's host
+          // environment. No auth file is read or copied, and the child environment is still
+          // rebuilt through SecretGuard below.
+          const hostHome = baseEnv.HOME ?? process.env.HOME;
+          const originalCodexHome = baseEnv.CODEX_HOME ?? process.env.CODEX_HOME ?? (hostHome === undefined ? null : join(hostHome, ".codex"));
           if (originalCodexHome === null) {
             throw new BrainGateInvariantError("SHADOW_CODEX_HOME_UNKNOWN", "Codex authentication home cannot be located without CODEX_HOME or HOME.");
           }
