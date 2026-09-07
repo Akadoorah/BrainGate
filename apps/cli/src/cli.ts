@@ -454,13 +454,14 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           diff: result.diff,
           verification: result.verification,
           review: result.review,
+          readyForApproval: result.readyForApproval,
           approvalRequired: result.approvalRequired,
           mergePerformed: result.mergePerformed,
           usage: result.taskReceipt?.usage ?? [],
         };
         const reviewText = result.review === null ? "review=disabled" : `review=${result.review.providerId}/${result.review.modelId}:${result.review.verdict}`;
-        emit(json, data, `Task ${result.taskId} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\n${reviewText}\nNo merge performed. Human approval required.`, stdout);
-        return Object.freeze({ exitCode: 0, data });
+        emit(json, data, `Task ${result.taskId} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\n${reviewText}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
+        return Object.freeze({ exitCode: result.readyForApproval ? 0 : 1, data });
       } finally { ledger.close(); }
     }
 
