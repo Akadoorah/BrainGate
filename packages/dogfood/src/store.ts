@@ -7,7 +7,6 @@ import {
   type RegisteredProject,
   type TaskClassification,
   type TaskReceipt,
-  type TaskRisk,
 } from "@braingate/core";
 import { deriveDogfoodPrior, emptyDogfoodPrior, parseTaskComplexity, parseTaskRisk, type PriorSample } from "./prior.js";
 import type {
@@ -26,6 +25,8 @@ import type {
 const OUTCOMES = new Set<DogfoodOutcome>(["success", "partial", "blocked", "failed"]);
 const REVIEW_VERDICTS = new Set<Exclude<DogfoodReviewerVerdict, null>>(["approve", "request_changes", "disagree"]);
 const MODES = new Set<DogfoodMode>(["ask", "write"]);
+const COMPLEXITY_ORDER = ["T0", "T1", "T2", "T3", "T4"] as const;
+const RISK_ORDER = ["low", "medium", "high", "critical"] as const;
 
 interface RunRow {
   sequence: number;
@@ -72,6 +73,15 @@ function parseReviewerVerdict(value: unknown): DogfoodReviewerVerdict {
   if (value === null || value === undefined) return null;
   if (typeof value !== "string" || !REVIEW_VERDICTS.has(value as Exclude<DogfoodReviewerVerdict, null>)) throw new BrainGateInvariantError("DOGFOOD_REVIEW_INVALID", "Reviewer verdict must be approve, request_changes, disagree, or null.");
   return value as Exclude<DogfoodReviewerVerdict, null>;
+}
+
+function assertNoDeescalation(predicted: TaskClassification, effective: TaskClassification): void {
+  if (COMPLEXITY_ORDER.indexOf(effective.complexity) < COMPLEXITY_ORDER.indexOf(predicted.complexity)) {
+    throw new BrainGateInvariantError("DOGFOOD_DEESCALATION_FORBIDDEN", "Dogfood effective complexity cannot be lower than the classifier prediction.");
+  }
+  if (RISK_ORDER.indexOf(effective.risk) < RISK_ORDER.indexOf(predicted.risk)) {
+    throw new BrainGateInvariantError("DOGFOOD_DEESCALATION_FORBIDDEN", "Dogfood effective risk cannot be lower than the classifier prediction.");
+  }
 }
 
 function mapUsage(receipt: TaskReceipt): readonly DogfoodUsage[] {
@@ -160,10 +170,12 @@ export class DogfoodStore {
   }): DogfoodRunRecord {
     if (input.receipt.task.projectId !== this.#project.projectId) throw new BrainGateInvariantError("DOGFOOD_PROJECT_MISMATCH", "Task receipt belongs to another project.");
     const mode = parseMode(input.mode);
+    assertNoDeescalation(input.predicted, input.effective);
     const roles = validateRoles(input.roles);
     const outcome = parseOutcome(input.outcome);
     const verdict = parseReviewerVerdict(input.reviewerVerdict ?? null);
     const prior = input.prior ?? emptyDogfoodPrior(mode);
+    if (prior.mode !== mode) throw new BrainGateInvariantError("DOGFOOD_PRIOR_MODE_MISMATCH", "Dogfood prior mode must match the recorded run mode.");
     const usage = mapUsage(input.receipt);
     this.#db.prepare(`
       INSERT INTO dogfood_runs (
