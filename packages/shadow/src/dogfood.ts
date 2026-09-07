@@ -36,8 +36,12 @@ function attestationFor(attestations: readonly SubscriptionAttestation[], provid
   return attestation === undefined ? Object.freeze({}) : Object.freeze({ attestation });
 }
 
-function exclusionsFor(snapshots: readonly ProviderSnapshot[], role: WorkflowRole): readonly string[] {
-  return Object.freeze(snapshots.filter((snapshot) => !shadowProviderRoleStatus(snapshot.providerId, role).enabled).map((snapshot) => snapshot.providerId));
+function exclusionsFor(snapshots: readonly ProviderSnapshot[], role: WorkflowRole, codexIsolation?: CodexIsolationAttestation): readonly string[] {
+  return Object.freeze(snapshots.filter((snapshot) => {
+    if (!shadowProviderRoleStatus(snapshot.providerId, role).enabled) return true;
+    if (snapshot.providerId === "openai" && role === "reviewer" && codexIsolation === undefined) return true;
+    return false;
+  }).map((snapshot) => snapshot.providerId));
 }
 
 export interface ShadowDogfoodResult {
@@ -96,9 +100,9 @@ export class ShadowDogfoodRunner {
     if (input.task.trim().length === 0) throw new BrainGateInvariantError("SHADOW_TASK_INVALID", "Shadow task must be non-empty.");
     if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("SHADOW_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
     const cwd = assertShadowProjectCwd(this.#project, input.cwd);
-    const primaryExcluded = exclusionsFor(this.#snapshots, "primary");
-    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer");
-    const judgeExcluded = exclusionsFor(this.#snapshots, "judge");
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", this.#codexIsolation);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", this.#codexIsolation);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", this.#codexIsolation);
 
     const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded });
     const routes: RouteResult[] = [primaryRoute];
