@@ -42,6 +42,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     let spawnCwd = sourceCwd;
     let args = [...input.plan.args];
     const overrides: Record<string, string> = { ...input.plan.envOverrides };
+    const internalAllowedEnv = new Set(input.plan.allowedEnvKeys);
 
     try {
       if (input.plan.workspaceMode === "staged-clean") {
@@ -61,8 +62,9 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           if (originalCodexHome === null) {
             throw new BrainGateInvariantError("SHADOW_CODEX_HOME_UNKNOWN", "Codex authentication home cannot be located without CODEX_HOME or HOME.");
           }
-          // Keep only the auth/config root location. BrainGate never reads or copies provider auth files.
-          // HOME moves to an empty temp directory so ~/.agents/skills and unrelated user files are not discoverable.
+          // CODEX_HOME is an executor-owned requirement for this hardened path, not a caller-granted
+          // arbitrary environment capability. HOME itself is already in SecretGuard's base safe set.
+          internalAllowedEnv.add("CODEX_HOME");
           overrides.CODEX_HOME = originalCodexHome;
           overrides.HOME = isolatedHome;
         }
@@ -90,7 +92,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
       }
 
       const environment = this.#secretGuard.buildEnvironment(baseEnv, {
-        allowedAdditionalKeys: input.plan.allowedEnvKeys,
+        allowedAdditionalKeys: [...internalAllowedEnv],
         overrides,
       });
       const started = Date.now();
