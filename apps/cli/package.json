@@ -15,6 +15,7 @@
     "@braingate/context": "workspace:*",
     "@braingate/core": "workspace:*",
     "@braingate/dashboard": "workspace:*",
+    "@braingate/dogfood": "workspace:*",
     "@braingate/observability": "workspace:*",
     "@braingate/operator": "workspace:*",
     "@braingate/providers": "workspace:*",
