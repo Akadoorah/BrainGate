@@ -1,4 +1,5 @@
-import { routeCapabilityFloor, type ModelDefinition, type ModelRole, type SpeedClass, type TaskComplexity } from "@braingate/router";
+import type { TaskComplexity } from "@braingate/core";
+import { routeCapabilityFloor, type ModelDefinition, type ModelRole, type SpeedClass } from "@braingate/router";
 import type { ModelCatalogEntry } from "./model-catalog.js";
 
 export interface ProviderModelProfile {
