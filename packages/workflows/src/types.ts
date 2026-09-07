@@ -11,6 +11,8 @@ export interface AgentRequest {
   readonly phase: string;
   readonly task: string;
   readonly findings: readonly string[];
+  /** Current candidate output when the role is reviewing/judging/repairing a stateless prior result. */
+  readonly candidateOutput?: string | null;
 }
 
 export type AgentResponse =
@@ -56,4 +58,5 @@ export interface WorkflowInput {
   readonly requiredContextTokens: number;
   readonly writeRequired: boolean;
   readonly optionalReview: boolean;
+  readonly excludeProviders?: Readonly<Partial<Record<WorkflowRole, readonly string[]>>>;
 }

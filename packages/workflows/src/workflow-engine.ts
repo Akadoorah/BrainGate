@@ -5,6 +5,7 @@ import type { AgentInvoker, AgentRequest, AgentResponse, WorkflowEvent, Workflow
 const MAX_FINDINGS = 8;
 const MAX_FINDING_CHARS = 1_000;
 const MAX_FINDINGS_TOTAL = 4_000;
+const MAX_CANDIDATE_OUTPUT_CHARS = 100_000;
 
 function modelRef(candidate: RouteCandidate): ModelRef {
   const definition = candidate.model.definition;
@@ -23,6 +24,17 @@ function boundFindings(values: readonly string[]): readonly string[] {
     total += normalized.length;
   }
   return Object.freeze(result);
+}
+
+function boundCandidateOutput(value: string | null): string | null {
+  if (value === null) return null;
+  return value.slice(0, MAX_CANDIDATE_OUTPUT_CHARS);
+}
+
+function candidateContextTokens(value: string | null): number {
+  if (value === null) return 0;
+  // Deliberately conservative: roughly two Unicode code points per token.
+  return Math.ceil(Array.from(value).length / 2);
 }
 
 function assertResponse(role: AgentRequest["role"], response: AgentResponse): void {
@@ -48,17 +60,33 @@ export class WorkflowEngine {
       events.push(Object.freeze({ sequence: ++sequence, kind, role, model, detail }));
     };
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: input.writeRequired });
+    const primaryExcluded = input.excludeProviders?.primary;
+    const primaryRoute = this.#router.route({
+      role: "coder",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
+      writeRequired: input.writeRequired,
+      ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
+    });
     const primary = primaryRoute.selected;
     let finalOutput = "";
 
-    const invoke = async (role: AgentRequest["role"], candidate: RouteCandidate, phase: string, findings: readonly string[], reviewerLike: boolean): Promise<AgentResponse> => {
-      tracker.reserveProviderCall({ reviewer: reviewerLike, contextTokens: input.requiredContextTokens });
+    const invoke = async (
+      role: AgentRequest["role"],
+      candidate: RouteCandidate,
+      phase: string,
+      findings: readonly string[],
+      candidateOutput: string | null,
+      reviewerLike: boolean,
+    ): Promise<AgentResponse> => {
+      const boundedCandidate = boundCandidateOutput(candidateOutput);
+      tracker.reserveProviderCall({ reviewer: reviewerLike, contextTokens: input.requiredContextTokens + candidateContextTokens(boundedCandidate) });
       const release = tracker.beginAgent();
       const ref = modelRef(candidate);
       emit("agent.started", role, ref, phase);
       try {
-        const response = await this.#invoker.invoke({ role, model: ref, phase, task: input.task, findings });
+        const response = await this.#invoker.invoke({ role, model: ref, phase, task: input.task, findings, candidateOutput: boundedCandidate });
         assertResponse(role, response);
         emit("agent.completed", role, ref, phase);
         return response;
@@ -67,7 +95,7 @@ export class WorkflowEngine {
       }
     };
 
-    const initial = await invoke("primary", primary, "initial", [], false);
+    const initial = await invoke("primary", primary, "initial", [], null, false);
     if (initial.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Primary response was not work.");
     finalOutput = initial.output;
 
@@ -78,8 +106,17 @@ export class WorkflowEngine {
     const reviewerIndependence = input.classification.risk === "high" || input.classification.risk === "critical"
       ? { mode: "required" as const, models: [primaryRef] }
       : { mode: "preferred" as const, models: [primaryRef] };
-    const reviewer = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence: reviewerIndependence }).selected;
-    let reviewerResponse = await invoke("reviewer", reviewer, "review-1", [], true);
+    const reviewerExcluded = input.excludeProviders?.reviewer;
+    const reviewer = this.#router.route({
+      role: "reviewer",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
+      writeRequired: false,
+      independence: reviewerIndependence,
+      ...(reviewerExcluded === undefined ? {} : { excludeProviders: reviewerExcluded }),
+    }).selected;
+    let reviewerResponse = await invoke("reviewer", reviewer, "review-1", [], finalOutput, true);
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
 
@@ -92,7 +129,7 @@ export class WorkflowEngine {
     if (input.budget.maxRepairRounds < 1) return this.#receipt("blocked_changes_required", primary, reviewer, null, events, tracker, finalOutput);
     tracker.recordRepairRound();
     const findings = boundFindings(reviewerResponse.findings);
-    const repair = await invoke("primary", primary, "repair-1", findings, false);
+    const repair = await invoke("primary", primary, "repair-1", findings, finalOutput, false);
     if (repair.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Repair response was not work.");
     finalOutput = repair.output;
     emit("repair.completed", "primary", primaryRef, `findings:${findings.length}`);
@@ -101,7 +138,7 @@ export class WorkflowEngine {
       return this.#receipt("repaired_needs_review", primary, reviewer, null, events, tracker, finalOutput);
     }
 
-    reviewerResponse = await invoke("reviewer", reviewer, "review-2", [], true);
+    reviewerResponse = await invoke("reviewer", reviewer, "review-2", [], finalOutput, true);
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
     if (reviewerResponse.verdict === "approve") return this.#receipt("approved_after_repair", primary, reviewer, null, events, tracker, finalOutput);
@@ -119,7 +156,7 @@ export class WorkflowEngine {
     events: WorkflowEvent[],
     tracker: BudgetTracker,
     finalOutput: string,
-    invoke: (role: AgentRequest["role"], candidate: RouteCandidate, phase: string, findings: readonly string[], reviewerLike: boolean) => Promise<AgentResponse>,
+    invoke: (role: AgentRequest["role"], candidate: RouteCandidate, phase: string, findings: readonly string[], candidateOutput: string | null, reviewerLike: boolean) => Promise<AgentResponse>,
   ): Promise<WorkflowReceipt> {
     if (input.budget.councilPolicy !== "disagreement-only" || input.budget.maxCouncilRounds < 1) {
       return this.#receipt("blocked_disagreement", primary, reviewer, null, events, tracker, finalOutput);
@@ -128,13 +165,18 @@ export class WorkflowEngine {
       return this.#receipt("blocked_disagreement", primary, reviewer, null, events, tracker, finalOutput);
     }
     tracker.recordCouncilRound();
+    const judgeExcluded = input.excludeProviders?.judge;
     const judge = this.#router.route({
-      role: "judge", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens,
+      role: "judge",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
       writeRequired: false,
       independence: { mode: "preferred", models: [modelRef(primary), modelRef(reviewer)] },
+      ...(judgeExcluded === undefined ? {} : { excludeProviders: judgeExcluded }),
     }).selected;
     const bounded = boundFindings(findings);
-    const response = await invoke("judge", judge, "judge-1", bounded, true);
+    const response = await invoke("judge", judge, "judge-1", bounded, finalOutput, true);
     if (response.kind !== "judge") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Judge response was not judge.");
     events.push(Object.freeze({ sequence: events.length + 1, kind: `judge.${response.verdict}`, role: "judge", model: modelRef(judge), detail: response.rationale.slice(0, 1_000) }));
     return this.#receipt(response.verdict === "approve" ? "approved_by_judge" : "blocked_changes_required", primary, reviewer, judge, events, tracker, finalOutput);

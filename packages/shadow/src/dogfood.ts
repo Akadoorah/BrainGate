@@ -9,9 +9,10 @@ import {
 import { buildTaskBrief, recordTaskBrief, recordWorkflowReceipt } from "@braingate/observability";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
-import { WorkflowEngine, type WorkflowReceipt } from "@braingate/workflows";
+import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole } from "@braingate/workflows";
+import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { SubscriptionShadowAgentInvoker } from "./invoker.js";
-import { planShadowInvocation, shadowProviderStatus } from "./profiles.js";
+import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
@@ -21,7 +22,7 @@ function modelRef(route: RouteResult): ModelRef {
 }
 
 function preflightPayload(role: "primary" | "reviewer", task: string, context: unknown): ShadowRolePayload {
-  return Object.freeze({ schemaVersion: 1, role, phase: "preflight", task, findings: Object.freeze([]), context, responseContract: Object.freeze(role === "primary" ? { kind: "work", output: "string" } : { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" }) });
+  return Object.freeze({ schemaVersion: 1, role, phase: "preflight", task, findings: Object.freeze([]), candidateOutput: null, context, responseContract: Object.freeze(role === "primary" ? { kind: "work", output: "string" } : { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" }) });
 }
 
 function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
@@ -33,6 +34,14 @@ function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string)
 function attestationFor(attestations: readonly SubscriptionAttestation[], providerId: string): Readonly<{ attestation?: SubscriptionAttestation }> {
   const attestation = attestations.find((item) => item.providerId === providerId);
   return attestation === undefined ? Object.freeze({}) : Object.freeze({ attestation });
+}
+
+function exclusionsFor(snapshots: readonly ProviderSnapshot[], role: WorkflowRole, codexIsolation?: CodexIsolationAttestation): readonly string[] {
+  return Object.freeze(snapshots.filter((snapshot) => {
+    if (!shadowProviderRoleStatus(snapshot.providerId, role).enabled) return true;
+    if (snapshot.providerId === "openai" && role === "reviewer" && codexIsolation === undefined) return true;
+    return false;
+  }).map((snapshot) => snapshot.providerId));
 }
 
 export interface ShadowDogfoodResult {
@@ -48,6 +57,7 @@ export class ShadowDogfoodRunner {
   readonly #router: CapabilityRouter;
   readonly #snapshots: readonly ProviderSnapshot[];
   readonly #attestations: readonly SubscriptionAttestation[];
+  readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
 
   constructor(input: {
@@ -56,6 +66,7 @@ export class ShadowDogfoodRunner {
     readonly router: CapabilityRouter;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
+    readonly codexIsolation?: CodexIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
   }) {
     this.#project = input.project;
@@ -63,6 +74,7 @@ export class ShadowDogfoodRunner {
     this.#router = input.router;
     this.#snapshots = input.snapshots;
     this.#attestations = input.attestations ?? [];
+    this.#codexIsolation = input.codexIsolation;
     this.#executor = input.executor;
   }
 
@@ -88,9 +100,11 @@ export class ShadowDogfoodRunner {
     if (input.task.trim().length === 0) throw new BrainGateInvariantError("SHADOW_TASK_INVALID", "Shadow task must be non-empty.");
     if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("SHADOW_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
     const cwd = assertShadowProjectCwd(this.#project, input.cwd);
-    const excludedProviders = this.#snapshots.filter((snapshot) => !shadowProviderStatus(snapshot.providerId).enabled).map((snapshot) => snapshot.providerId);
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", this.#codexIsolation);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", this.#codexIsolation);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", this.#codexIsolation);
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: excludedProviders });
+    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
@@ -101,24 +115,22 @@ export class ShadowDogfoodRunner {
       const independence = input.classification.risk === "high" || input.classification.risk === "critical"
         ? { mode: "required" as const, models: [primaryRef] }
         : { mode: "preferred" as const, models: [primaryRef] };
-      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: excludedProviders });
+      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: reviewerExcluded });
       routes.push(reviewerRoute);
       const reviewerRef = modelRef(reviewerRoute);
-      planShadowInvocation({ snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId), model: reviewerRef, cwd, payload: preflightPayload("reviewer", input.task, input.context), ...attestationFor(this.#attestations, reviewerRef.providerId) });
+      planShadowInvocation({
+        snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId),
+        model: reviewerRef,
+        cwd,
+        payload: preflightPayload("reviewer", input.task, input.context),
+        ...attestationFor(this.#attestations, reviewerRef.providerId),
+        ...(reviewerRef.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
+      });
     }
 
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
     this.#ledger.transition(task.taskId, "planned", { shadow: true, dryRun: input.dryRun ?? false });
-    const brief = buildTaskBrief({
-      project: this.#project,
-      task: this.#ledger.requireTask(task.taskId),
-      classification: input.classification,
-      budget: input.budget,
-      routes,
-      context: input.contextSummary,
-      permissions: { executionProfile: "shadow-read-only", networkAllowed: false },
-      worktree: { enabled: false, taskWorktreeLabel: null },
-    });
+    const brief = buildTaskBrief({ project: this.#project, task: this.#ledger.requireTask(task.taskId), classification: input.classification, budget: input.budget, routes, context: input.contextSummary, permissions: { executionProfile: "shadow-read-only", networkAllowed: false }, worktree: { enabled: false, taskWorktreeLabel: null } });
     recordTaskBrief(this.#ledger, brief);
 
     if (input.dryRun ?? false) {
@@ -130,33 +142,15 @@ export class ShadowDogfoodRunner {
 
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({
-        project: this.#project,
-        cwd,
-        snapshots: this.#snapshots,
-        attestations: this.#attestations,
-        context: input.context,
-        ...(this.#executor === undefined ? {} : { executor: this.#executor }),
-        ledger: this.#ledger,
-        taskId: task.taskId,
-      });
-      const workflow = await new WorkflowEngine(this.#router, invoker).run({
-        task: input.task,
-        classification: input.classification,
-        budget: input.budget,
-        requiredContextTokens: input.requiredContextTokens,
-        writeRequired: false,
-        optionalReview: input.optionalReview ?? false,
-      });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId });
+      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
       recordWorkflowReceipt(this.#ledger, task.taskId, workflow);
       this.#ledger.transition(task.taskId, "completed", { shadow: true, outcome: workflow.outcome });
       return Object.freeze({ dryRun: false, taskId: task.taskId, taskReceipt: this.#ledger.receipt(task.taskId), workflow });
     } catch (error) {
       const current = this.#ledger.requireTask(task.taskId);
-      if (current.state === "running" || current.state === "verifying" || current.state === "planned") {
-        this.#ledger.transition(task.taskId, "failed", { shadow: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
-      }
+      if (current.state === "running" || current.state === "verifying" || current.state === "planned") this.#ledger.transition(task.taskId, "failed", { shadow: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
       throw error;
     }
   }

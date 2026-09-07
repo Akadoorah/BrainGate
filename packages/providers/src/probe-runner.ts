@@ -25,8 +25,10 @@ export const SUBSCRIPTION_BILLING_OVERRIDE_ENV = Object.freeze([
 const SAFE_PROBE_COMMANDS = new Set([
   "claude\0--version",
   "claude\0--help",
+  "claude\0auth\0status",
   "codex\0--version",
   "codex\0--help",
+  "codex\0login\0status",
   "agy\0--version",
   "agy\0--help",
   "agy\0models",
@@ -131,12 +133,8 @@ export class NodeProbeRunner implements ProbeRunner {
 
       child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
       child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
-      child.on("spawn", () => {
-        spawned = true;
-      });
-      child.on("error", (error: NodeJS.ErrnoException) => {
-        errorCode = error.code ?? "SPAWN_ERROR";
-      });
+      child.on("spawn", () => { spawned = true; });
+      child.on("error", (error: NodeJS.ErrnoException) => { errorCode = error.code ?? "SPAWN_ERROR"; });
       child.on("close", (exitCode) => {
         if (settled) return;
         settled = true;

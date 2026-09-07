@@ -36,18 +36,21 @@ test("T0/T1 workflow uses one primary and never creates review or council", asyn
   const receipt = await engine.run(input("where is the logo?", "ask"));
   assert.equal(receipt.outcome, "completed_without_review");
   assert.equal(invoker.calls.length, 1);
+  assert.equal(invoker.calls[0]?.candidateOutput, null);
   assert.equal(receipt.budget.councilRounds, 0);
 });
 
-test("T3 high-risk requires independent reviewer and returns approval", async () => {
+test("T3 high-risk requires independent reviewer and gives it the primary candidate", async () => {
   const invoker = new ScriptedInvoker([{ kind: "work", output: "patch" }, { kind: "review", verdict: "approve", findings: [] }]);
   const engine = new WorkflowEngine(new CapabilityRouter(registry(["anthropic", "openai"])), invoker);
   const receipt = await engine.run(input("fix auth login bug", "write"));
   assert.equal(receipt.outcome, "approved");
   assert.notEqual(receipt.primary.model.definition.providerId, receipt.reviewer?.model.definition.providerId);
+  assert.equal(invoker.calls[0]?.candidateOutput, null);
+  assert.equal(invoker.calls[1]?.candidateOutput, "patch");
 });
 
-test("T3 repair is bounded and ends needing review when reviewer-call budget is exhausted", async () => {
+test("T3 repair is bounded and receives the prior candidate plus reviewer findings", async () => {
   const invoker = new ScriptedInvoker([
     { kind: "work", output: "v1" },
     { kind: "review", verdict: "request_changes", findings: ["Fix race condition", "x".repeat(5_000)] },
@@ -57,11 +60,13 @@ test("T3 repair is bounded and ends needing review when reviewer-call budget is 
   const receipt = await engine.run(input("fix auth race condition", "write"));
   assert.equal(receipt.outcome, "repaired_needs_review");
   assert.equal(receipt.budget.repairRounds, 1);
+  assert.equal(invoker.calls[1]?.candidateOutput, "v1");
+  assert.equal(invoker.calls[2]?.candidateOutput, "v1");
   assert.equal(invoker.calls[2]?.findings.length, 2);
   assert.ok((invoker.calls[2]?.findings[1]?.length ?? 0) <= 1_000);
 });
 
-test("T4 disagreement invokes at most one judge and chooses a third provider when possible", async () => {
+test("T4 disagreement gives judge the current candidate and invokes at most one judge", async () => {
   const invoker = new ScriptedInvoker([
     { kind: "work", output: "architecture" },
     { kind: "review", verdict: "disagree", findings: ["schema tradeoff"] },
@@ -72,6 +77,7 @@ test("T4 disagreement invokes at most one judge and chooses a third provider whe
   assert.equal(receipt.outcome, "approved_by_judge");
   assert.equal(receipt.budget.councilRounds, 1);
   assert.equal(invoker.calls.filter((call) => call.role === "judge").length, 1);
+  assert.equal(invoker.calls.find((call) => call.role === "judge")?.candidateOutput, "architecture");
   const judgeProvider = receipt.judge?.model.definition.providerId;
   assert.ok(judgeProvider !== receipt.primary.model.definition.providerId && judgeProvider !== receipt.reviewer?.model.definition.providerId);
 });

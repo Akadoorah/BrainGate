@@ -26,17 +26,21 @@ export interface ShadowRolePayload {
   readonly phase: string;
   readonly task: string;
   readonly findings: readonly string[];
+  /** Current candidate output for review/judge/repair phases; omitted only by legacy/preflight callers. */
+  readonly candidateOutput?: string | null;
   readonly context: unknown;
   readonly responseContract: Readonly<Record<string, unknown>>;
 }
 
 export type ShadowInputMode = "stdin" | "temp-attachment";
+export type ShadowWorkspaceMode = "project" | "staged-clean";
 
 export interface ShadowInvocationPlan {
   readonly providerId: ProviderId;
   readonly executable: string;
   readonly args: readonly string[];
   readonly cwd: string;
+  readonly workspaceMode: ShadowWorkspaceMode;
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;
@@ -54,6 +58,7 @@ export interface ShadowInvocationPreview {
   readonly executable: string;
   readonly args: readonly string[];
   readonly cwd: string;
+  readonly workspaceMode: ShadowWorkspaceMode;
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;
