@@ -5,7 +5,8 @@ import {
   assertShadowProjectCwd,
   planShadowInvocation,
   previewShadowInvocation,
-  shadowProviderStatus,
+  shadowProviderRoleStatus,
+  type CodexIsolationAttestation,
   type ShadowInvocationPreview,
   type ShadowRolePayload,
   type SubscriptionAttestation,
@@ -56,12 +57,25 @@ function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string)
   return value;
 }
 
+function excludedProviders(input: {
+  readonly providers: readonly ProviderSnapshot[];
+  readonly role: "primary" | "reviewer";
+  readonly codexIsolation?: CodexIsolationAttestation;
+}): readonly string[] {
+  return Object.freeze(input.providers.filter((snapshot) => {
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role).enabled) return true;
+    if (snapshot.providerId === "openai" && input.role === "reviewer" && input.codexIsolation === undefined) return true;
+    return false;
+  }).map((snapshot) => snapshot.providerId));
+}
+
 export function buildShadowTaskPlan(input: {
   readonly project: RegisteredProject;
   readonly cwd: string;
   readonly router: CapabilityRouter;
   readonly providers: readonly ProviderSnapshot[];
   readonly attestations?: readonly SubscriptionAttestation[];
+  readonly codexIsolation?: CodexIsolationAttestation;
   readonly task: string;
   readonly context: unknown;
   readonly classification: TaskClassification;
@@ -71,14 +85,13 @@ export function buildShadowTaskPlan(input: {
 }): ShadowTaskPlan {
   const cwd = assertShadowProjectCwd(input.project, input.cwd);
   const attestations = input.attestations ?? [];
-  const excludedProviders = input.providers.filter((snapshot) => !shadowProviderStatus(snapshot.providerId).enabled).map((snapshot) => snapshot.providerId);
   const primaryRoute = input.router.route({
     role: "coder",
     classification: input.classification,
     budget: input.budget,
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
-    excludeProviders: excludedProviders,
+    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }) }),
   });
   const primaryModel = modelRef(primaryRoute);
   const primaryInvocation = planShadowInvocation({
@@ -102,7 +115,7 @@ export function buildShadowTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence,
-      excludeProviders: excludedProviders,
+      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }) }),
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({
@@ -111,6 +124,7 @@ export function buildShadowTaskPlan(input: {
       cwd,
       payload: payload("reviewer", input.task, input.context),
       ...attestationFor(attestations, reviewerModel.providerId),
+      ...(reviewerModel.providerId === "openai" && input.codexIsolation !== undefined ? { codexIsolation: input.codexIsolation } : {}),
     });
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, invocation: previewShadowInvocation(reviewerInvocation) }));
   }
