@@ -56,4 +56,5 @@ export interface WorkflowInput {
   readonly requiredContextTokens: number;
   readonly writeRequired: boolean;
   readonly optionalReview: boolean;
+  readonly excludeProviders?: Readonly<Partial<Record<WorkflowRole, readonly string[]>>>;
 }
