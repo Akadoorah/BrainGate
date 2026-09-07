@@ -68,7 +68,7 @@ Pre-trial hardening for users with existing project history or only one AI subsc
 - critical tasks remain cross-provider fail-closed, while noncritical T4 same-provider review remains human-approval gated;
 - `braingate models profile` reports T0-T4 model coverage and reviewer independence.
 
-## Next hardening
+## Immediate technical hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.
 - Measure routing/classification error rates and quota pressure on real work.
@@ -76,6 +76,67 @@ Pre-trial hardening for users with existing project history or only one AI subsc
 - Add bounded project test-command policies before widening write scope beyond simple T0-T2 changes.
 - Harden additional provider execution paths only where equivalent isolation can be proven.
 
-## Later
+## Open-source release track
 
-Hardened Antigravity/Grok execution paths, visual/image workers, visual QA, remote control, encrypted sync, teams, plugin/skill marketplace, and enterprise policy features.
+BrainGate Core is intended to become a useful open-source local product rather than a crippled demonstration edition.
+
+Before a public technical preview:
+
+- select and add the final OSS license; Apache-2.0 is the current preferred direction, not yet a granted license;
+- complete third-party code/license/attribution review;
+- perform BrainGate name/trademark clearance;
+- add contribution/governance/community artifacts;
+- publish a vulnerability disclosure policy and supported-platform/provider matrix;
+- create a clean-machine installation/upgrade path;
+- define release/versioning/package publishing;
+- verify that Git history contains no private dogfood data, credentials, exports, or personal information;
+- run platform/provider-policy audits;
+- mechanically preserve the dependency boundary where optional commercial/cloud layers depend on OSS contracts rather than the OSS core depending on proprietary services.
+
+See [`OPEN_SOURCE_AND_COMMERCIAL.md`](OPEN_SOURCE_AND_COMMERCIAL.md) and [`PUBLIC_RELEASE_CHECKLIST.md`](PUBLIC_RELEASE_CHECKLIST.md).
+
+## Commercial product track
+
+Commercial development should start only after the local OSS product proves recurring utility in real dogfood.
+
+### Commercial beta candidates
+
+- BrainGate Cloud account/device layer;
+- secure remote relay and notifications;
+- remote observation and approval/control from another authorized device;
+- encrypted selected-state synchronization after a dedicated security design/review;
+- richer managed compatibility/analytics services;
+- team membership, RBAC, organization policies, and approval workflows;
+- centralized team/fleet observability where provider policies allow it.
+
+### Enterprise candidates
+
+- SSO and organization identity integration;
+- compliance/audit exports;
+- retention/residency controls;
+- enterprise deployment/self-hosted commercial components where justified;
+- managed integrations;
+- support/onboarding/SLAs;
+- advanced fleet and version policy.
+
+### Marketplace/ecosystem candidates
+
+- curated distribution and verification of provider adapters, skills, and integrations;
+- optional commercial discovery/support/revenue-sharing layers while preserving community extension capability in the OSS core.
+
+Commercial features must not require provider credential pooling, token scraping, private endpoints, subscription resale, or usage-limit circumvention. The default model remains bring-your-own independently authorized provider account/subscription.
+
+## Packaging hypotheses
+
+These are validation hypotheses rather than public commitments:
+
+- **Community** — free/open-source local BrainGate.
+- **Pro** — optional individual cloud/sync/remote functionality.
+- **Teams** — collaboration, policy, administration, and shared audit/approval functionality.
+- **Enterprise** — compliance, security policy, deployment, support, and contractual capabilities.
+
+Early research pricing hypotheses remain roughly $12–15/month for Pro, $25–29/user/month for Teams, and $12k–25k+/year for Enterprise depending on scope. Product architecture must not be optimized around these numbers before customer evidence exists.
+
+## Later technical/product directions
+
+Hardened Antigravity/Grok execution paths, visual/image workers, visual QA, remote control, encrypted sync, teams, plugin/skill marketplace, enterprise policy features, and broader platform support.
