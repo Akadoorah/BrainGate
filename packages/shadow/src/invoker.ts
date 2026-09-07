@@ -2,6 +2,7 @@ import { BrainGateInvariantError, type RegisteredProject, type TaskLedger } from
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
+import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
@@ -22,8 +23,27 @@ function boundedFindings(value: unknown): readonly string[] {
   return Object.freeze(value.slice(0, 8).map((item) => boundedText(item, 1_000)).filter((item) => item.trim().length > 0));
 }
 
+export function extractCodexAgentMessage(stdout: string): string {
+  let finalMessage: string | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    if (event.type !== "item.completed") continue;
+    const item = event.item;
+    if (typeof item !== "object" || item === null) continue;
+    const record = item as Record<string, unknown>;
+    if (record.type === "agent_message" && typeof record.text === "string") finalMessage = record.text;
+  }
+  if (finalMessage === null) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Codex JSONL did not contain a completed agent_message.");
+  return finalMessage;
+}
+
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   const trimmed = stdout.trim();
+  if (providerId === "openai") return extractCodexAgentMessage(trimmed);
   if (providerId === "anthropic") {
     try {
       const outer = JSON.parse(trimmed) as Record<string, unknown>;
@@ -69,6 +89,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #cwd: string;
   readonly #snapshots: ReadonlyMap<string, ProviderSnapshot>;
   readonly #attestations: ReadonlyMap<string, SubscriptionAttestation>;
+  readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #context: unknown;
   readonly #executor: ShadowProcessExecutor;
   readonly #ledger: TaskLedger | null;
@@ -79,6 +100,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly cwd: string;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
+    readonly codexIsolation?: CodexIsolationAttestation;
     readonly context: unknown;
     readonly executor?: ShadowProcessExecutor;
     readonly ledger?: TaskLedger;
@@ -88,6 +110,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#cwd = input.cwd;
     this.#snapshots = new Map(input.snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
     this.#attestations = new Map((input.attestations ?? []).map((attestation) => [attestation.providerId, attestation]));
+    this.#codexIsolation = input.codexIsolation;
     this.#context = input.context;
     this.#executor = input.executor ?? new NodeShadowProcessExecutor();
     this.#ledger = input.ledger ?? null;
@@ -114,6 +137,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       cwd: this.#cwd,
       payload,
       ...(attestation === undefined ? {} : { attestation }),
+      ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
     });
     const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
     this.#event("shadow.provider.started", safeMeta);
