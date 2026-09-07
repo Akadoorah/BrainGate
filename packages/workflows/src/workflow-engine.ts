@@ -48,7 +48,14 @@ export class WorkflowEngine {
       events.push(Object.freeze({ sequence: ++sequence, kind, role, model, detail }));
     };
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: input.writeRequired });
+    const primaryRoute = this.#router.route({
+      role: "coder",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
+      writeRequired: input.writeRequired,
+      excludeProviders: input.excludeProviders?.primary,
+    });
     const primary = primaryRoute.selected;
     let finalOutput = "";
 
@@ -78,7 +85,15 @@ export class WorkflowEngine {
     const reviewerIndependence = input.classification.risk === "high" || input.classification.risk === "critical"
       ? { mode: "required" as const, models: [primaryRef] }
       : { mode: "preferred" as const, models: [primaryRef] };
-    const reviewer = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence: reviewerIndependence }).selected;
+    const reviewer = this.#router.route({
+      role: "reviewer",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
+      writeRequired: false,
+      independence: reviewerIndependence,
+      excludeProviders: input.excludeProviders?.reviewer,
+    }).selected;
     let reviewerResponse = await invoke("reviewer", reviewer, "review-1", [], true);
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
@@ -129,9 +144,13 @@ export class WorkflowEngine {
     }
     tracker.recordCouncilRound();
     const judge = this.#router.route({
-      role: "judge", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens,
+      role: "judge",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence: { mode: "preferred", models: [modelRef(primary), modelRef(reviewer)] },
+      excludeProviders: input.excludeProviders?.judge,
     }).selected;
     const bounded = boundFindings(findings);
     const response = await invoke("judge", judge, "judge-1", bounded, true);
