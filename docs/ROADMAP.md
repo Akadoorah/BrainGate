@@ -54,6 +54,20 @@ Local project onboarding, zero-model-call preflight, real `ask`/small-write dogf
 
 The first supported rollout is intentionally manual and local. Model capability definitions remain user-verified, provider sessions remain local, and BrainGate still has no automatic merge/push/deploy surface.
 
+## Milestone 13 — Memory bootstrap and single-provider routing
+
+Pre-trial hardening for users with existing project history or only one AI subscription provider:
+
+- local Markdown/text, normalized JSONL, and compact best-effort ChatGPT conversation-export bootstrap;
+- import preview with no persistence;
+- proposal-only historical memory import with canonical dedupe;
+- explicit evidence/confidence required before canonical promotion;
+- capability-based routing across multiple models from one provider without hard-coded model names;
+- reviewer independence tiers: cross-provider, same-provider/different-model, same-model/fresh-session;
+- shared quota-pool visibility rather than treating models from one subscription as separate providers;
+- critical tasks remain cross-provider fail-closed, while noncritical T4 same-provider review remains human-approval gated;
+- `braingate models profile` reports T0-T4 model coverage and reviewer independence.
+
 ## Next hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.
