@@ -11,6 +11,7 @@ export interface AgentRequest {
   readonly phase: string;
   readonly task: string;
   readonly findings: readonly string[];
+  readonly candidateOutput: string | null;
 }
 
 export type AgentResponse =
