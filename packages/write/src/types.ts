@@ -61,6 +61,8 @@ export interface WriteRunResult {
   readonly diff: string;
   readonly verification: readonly WriteVerificationResult[];
   readonly review: Readonly<{ providerId: string; modelId: string; verdict: string; findings: readonly string[] }> | null;
+  /** True only when verification passed and the configured reviewer approved (or review was explicitly disabled). */
+  readonly readyForApproval: boolean;
   readonly approvalRequired: true;
   readonly mergePerformed: false;
   readonly taskReceipt: TaskReceipt | null;
