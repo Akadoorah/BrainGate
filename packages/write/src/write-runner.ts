@@ -135,7 +135,7 @@ export class WriteDogfoodRunner {
       baseRef: input.baseRef ?? "HEAD",
       review: input.review ?? true,
     });
-    if (input.dryRun ?? false) return Object.freeze({ dryRun: true, taskId: null, worktree: null, changedFiles: Object.freeze([]), diff: "", verification: Object.freeze([]), review: null, approvalRequired: true, mergePerformed: false, taskReceipt: null });
+    if (input.dryRun ?? false) return Object.freeze({ dryRun: true, taskId: null, worktree: null, changedFiles: Object.freeze([]), diff: "", verification: Object.freeze([]), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: null });
 
     const task = this.#ledger.createTask({ title: `Write ${input.classification.complexity} task`, complexity: input.classification.complexity, risk: input.classification.risk });
     this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: true, mergeAvailable: false });
@@ -164,8 +164,8 @@ export class WriteDogfoodRunner {
       const verification: WriteVerificationResult[] = [Object.freeze({ command: "git diff --check", passed: !verifyResult.timedOut && verifyResult.exitCode === 0, exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut })];
       if (!verification[0]!.passed) {
         this.#ledger.appendEvent(task.taskId, "write.verification_failed", { command: "git diff --check", exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut });
-        this.#ledger.transition(task.taskId, "failed", { write: true, reason: "verification" });
-        return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review: null, approvalRequired: true, mergePerformed: false, taskReceipt: this.#ledger.receipt(task.taskId) });
+        this.#ledger.transition(task.taskId, "failed", { write: true, reason: "verification", readyForApproval: false });
+        return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: this.#ledger.receipt(task.taskId) });
       }
 
       this.#ledger.transition(task.taskId, "verifying", { write: true, changedFileCount: guarded.changedFiles.length });
@@ -190,9 +190,10 @@ export class WriteDogfoodRunner {
       }
 
       assertSourceCheckoutClean(handle.repositoryPath);
-      const reviewPassed = review === null || review.verdict === "approve";
-      this.#ledger.transition(task.taskId, "completed", { write: true, reviewPassed, approvalRequired: true, mergePerformed: false, branch: handle.branch });
-      return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review, approvalRequired: true, mergePerformed: false, taskReceipt: this.#ledger.receipt(task.taskId) });
+      const readyForApproval = review === null || review.verdict === "approve";
+      if (readyForApproval) this.#ledger.transition(task.taskId, "completed", { write: true, readyForApproval: true, approvalRequired: true, mergePerformed: false, branch: handle.branch });
+      else this.#ledger.transition(task.taskId, "failed", { write: true, reason: "review", reviewVerdict: review?.verdict ?? "unknown", readyForApproval: false, approvalRequired: true, mergePerformed: false, branch: handle.branch });
+      return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review, readyForApproval, approvalRequired: true, mergePerformed: false, taskReceipt: this.#ledger.receipt(task.taskId) });
     } catch (error) {
       const current = this.#ledger.requireTask(task.taskId);
       if (current.state === "planned" || current.state === "running" || current.state === "verifying") this.#ledger.transition(task.taskId, "failed", { write: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
