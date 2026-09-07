@@ -2,6 +2,7 @@ import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { checkDogfoodExportPath } from "./dogfood-export-path.js";
 import { runMemoryCli } from "./memory-cli.js";
+import { runModelProfileCli } from "./model-profile-cli.js";
 
 const args = process.argv.slice(2);
 const exportPath = checkDogfoodExportPath(args);
@@ -14,6 +15,8 @@ if (!exportPath.safe) {
     ? await runDogfoodCli(args)
     : args[0] === "memory"
       ? await runMemoryCli(args)
-      : await runCli(args);
+      : args[0] === "models" && args[1] === "profile"
+        ? await runModelProfileCli(args)
+        : await runCli(args);
   process.exitCode = result.exitCode;
 }
