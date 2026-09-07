@@ -29,6 +29,7 @@ import {
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
+import { WriteDogfoodRunner, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
 
 export interface CliDependencies {
   readonly cwd?: string;
@@ -36,6 +37,7 @@ export interface CliDependencies {
   readonly discoverAll?: () => Promise<readonly ProviderSnapshot[]>;
   readonly verifyCodexIsolation?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
+  readonly writeExecutor?: WriteProviderExecutor;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   readonly startDashboard?: (
@@ -104,6 +106,10 @@ function taskContext(project: RegisteredProject): Readonly<Record<string, unknow
   return Object.freeze({ projectId: project.projectId, scope: "registered-project-cwd", access: "read-only" });
 }
 
+function writeTaskContext(project: RegisteredProject): Readonly<Record<string, unknown>> {
+  return Object.freeze({ projectId: project.projectId, scope: "task-worktree", access: "small-write", merge: "human-only" });
+}
+
 function contextTokens(task: string): number {
   return Math.max(128, conservativeTokenEstimate(task) + 64);
 }
@@ -146,6 +152,32 @@ function serializedPlan(plan: ReturnType<typeof buildShadowTaskPlan>): Readonly<
     cwd: plan.cwd,
     roles: Object.freeze(plan.roles.map((role) => Object.freeze({ role: role.role, model: role.model, invocation: role.invocation }))),
   });
+}
+
+function serializedWritePlan(plan: ReturnType<typeof buildWriteTaskPlan>): Readonly<Record<string, unknown>> {
+  return Object.freeze({
+    classification: plan.classification,
+    budget: plan.budget,
+    requiredContextTokens: plan.requiredContextTokens,
+    repositoryPath: plan.repositoryPath,
+    baseRef: plan.baseRef,
+    roles: Object.freeze(plan.roles.map((role) => Object.freeze({ role: role.role, model: role.model, workspace: role.workspace }))),
+    providerCallsOnPlan: plan.providerCallsOnPlan,
+    createsWorktree: plan.createsWorktree,
+    mergeAvailable: plan.mergeAvailable,
+  });
+}
+
+function resolveWriteRepository(project: RegisteredProject, cwd: string, requested: string | undefined): string {
+  if (requested === undefined) {
+    if (project.repositories.length !== 1) throw new BrainGateInvariantError("CLI_REPOSITORY_REQUIRED", "Multi-repository projects require an explicit --repo path for write tasks.");
+    return project.repositories[0]!;
+  }
+  let candidate: string;
+  try { candidate = realpathSync.native(resolve(cwd, requested)); }
+  catch { throw new BrainGateInvariantError("CLI_REPOSITORY_INVALID", "--repo does not resolve to an accessible registered repository."); }
+  if (!project.repositories.includes(candidate)) throw new BrainGateInvariantError("CLI_REPOSITORY_INVALID", "--repo is not registered to the selected project.");
+  return candidate;
 }
 
 async function discovery(deps: CliDependencies): Promise<readonly ProviderSnapshot[]> {
@@ -222,8 +254,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     const state = resolveOperatorState(env);
     const command = args.shift();
     if (command === undefined || command === "help" || command === "--help") {
-      data = { commands: ["doctor", "discover", "models", "shadow", "status", "dashboard"] };
-      emit(json, data, "BrainGate commands: doctor, discover, models, shadow, status, dashboard", stdout);
+      data = { commands: ["doctor", "discover", "models", "shadow", "write", "status", "dashboard"] };
+      emit(json, data, "BrainGate commands: doctor, discover, models, shadow, write, status, dashboard", stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
@@ -346,6 +378,91 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       data = { url: started.url, projectId: project.projectId };
       emit(json, data, `BrainGate dashboard: ${started.url}`, stdout);
       return Object.freeze({ exitCode: 0, data });
+    }
+
+    if (command === "write") {
+      const subcommand = args.shift();
+      if (subcommand !== "plan" && subcommand !== "run") throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "write requires plan or run.");
+      const manifest = takeOption(args, "--project", true)!;
+      const task = takeOption(args, "--task", true)!;
+      const requestedRepo = takeOption(args, "--repo");
+      const baseRef = takeOption(args, "--base") ?? "HEAD";
+      const execute = removeFlag(args, "--execute");
+      const review = !removeFlag(args, "--no-review");
+      const attestations = attestation(args);
+      noExtraArgs(args);
+      if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `write run`.");
+
+      const project = projectFromManifest(state, manifest, cwd);
+      const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
+      const snapshots = await discovery(deps);
+      const hydrated = runtimeFor(state, snapshots);
+      const classification = classifyTask({ text: task, mode: "write" });
+      const budget = budgetFor(classification, { writeRequested: true });
+      const requiredContextTokens = contextTokens(task);
+      const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state));
+      const codexIsolation = isolation.attestation ?? undefined;
+      const plan = buildWriteTaskPlan({
+        router: hydrated.router,
+        providers: snapshots,
+        ...(codexIsolation === undefined ? {} : { codexIsolation }),
+        classification,
+        budget,
+        requiredContextTokens,
+        repositoryPath,
+        baseRef,
+        review,
+      });
+      const planData = serializedWritePlan(plan);
+
+      if (subcommand === "plan" || !execute) {
+        data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason }, approvalRequired: true };
+        emit(json, data, `${classification.complexity}/${classification.risk} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
+        return Object.freeze({ exitCode: 0, data });
+      }
+
+      if (!json) stdout(`${classification.complexity}/${classification.risk} · creating isolated worktree · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
+      const ledger = new TaskLedger(project);
+      try {
+        const runner = new WriteDogfoodRunner({
+          project,
+          ledger,
+          router: hydrated.router,
+          providers: snapshots,
+          attestations,
+          ...(codexIsolation === undefined ? {} : { codexIsolation }),
+          ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }),
+          ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }),
+        });
+        const result = await runner.run({
+          task,
+          repositoryPath,
+          baseRef,
+          classification,
+          budget,
+          requiredContextTokens,
+          context: writeTaskContext(project),
+          review,
+          dryRun: false,
+          env,
+        });
+        data = {
+          plan: planData,
+          taskId: result.taskId,
+          worktree: result.worktree,
+          changedFiles: result.changedFiles,
+          diff: result.diff,
+          verification: result.verification,
+          review: result.review,
+          readyForApproval: result.readyForApproval,
+          approvalRequired: result.approvalRequired,
+          mergePerformed: result.mergePerformed,
+          usage: result.taskReceipt?.usage ?? [],
+        };
+        const reviewText = result.review === null ? "review=disabled" : `review=${result.review.providerId}/${result.review.modelId}:${result.review.verdict}`;
+        emit(json, data, `Task ${result.taskId} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\n${reviewText}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
+        return Object.freeze({ exitCode: result.readyForApproval ? 0 : 1, data });
+      } finally { ledger.close(); }
     }
 
     if (command === "shadow") {
