@@ -1,7 +1,7 @@
 import { BrainGateInvariantError, type ExecutionBudget, type RegisteredProject, type TaskClassification, type TaskLedger } from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
+import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
 import { SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { assertClaudeWriteEligible, NodeClaudeWriteExecutor, planClaudeWriteInvocation } from "./claude-write-profile.js";
 import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
@@ -48,6 +48,40 @@ function assertM11Scope(classification: TaskClassification): void {
   }
 }
 
+function isNoEligibleModel(error: unknown): boolean {
+  return error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL";
+}
+
+function routeWriteReviewer(input: {
+  readonly router: CapabilityRouter;
+  readonly classification: TaskClassification;
+  readonly budget: ExecutionBudget;
+  readonly requiredContextTokens: number;
+  readonly primaryModel: ModelRef;
+  readonly excludeProviders: readonly string[];
+}): RouteResult {
+  const route = (independence: IndependenceConstraint): RouteResult => input.router.route({
+    role: "reviewer",
+    classification: input.classification,
+    budget: input.budget,
+    requiredContextTokens: input.requiredContextTokens,
+    writeRequired: false,
+    independence,
+    excludeProviders: input.excludeProviders,
+  });
+  try {
+    return route({ mode: "required", level: "cross-provider", models: [input.primaryModel] });
+  } catch (error) {
+    if (!isNoEligibleModel(error)) throw error;
+    try {
+      return route({ mode: "required", level: "different-model", models: [input.primaryModel] });
+    } catch (differentModelError) {
+      if (!isNoEligibleModel(differentModelError)) throw differentModelError;
+      return route({ mode: "preferred", level: "fresh-session", models: [input.primaryModel] });
+    }
+  }
+}
+
 export function buildWriteTaskPlan(input: {
   readonly router: CapabilityRouter;
   readonly providers: readonly ProviderSnapshot[];
@@ -70,13 +104,12 @@ export function buildWriteTaskPlan(input: {
 
   const wantsReview = input.review ?? true;
   if (wantsReview) {
-    const reviewerRoute = input.router.route({
-      role: "reviewer",
+    const reviewerRoute = routeWriteReviewer({
+      router: input.router,
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
-      writeRequired: false,
-      independence: { mode: "preferred", models: [primaryModel] },
+      primaryModel,
       excludeProviders: reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? []),
     });
     const reviewerModel = modelRef(reviewerRoute);
