@@ -55,6 +55,32 @@ test("required reviewer independence treats Copilot as its own provider and quot
   assert.equal(result.selected.model.definition.providerId, "github-copilot");
 });
 
+test("preferred independence falls back to a different model on the same provider", () => {
+  const registry = new ModelRegistry();
+  registry.register(model("anthropic", "primary", { quotaPool: "anthropic:max", capabilities: { reviewer: 96 }, reasoning: 96 }), runtime("healthy"));
+  registry.register(model("anthropic", "reviewer", { quotaPool: "anthropic:max", capabilities: { reviewer: 88 }, reasoning: 88 }), runtime("healthy"));
+  const classification = classifyTask({ text: "review feature implementation", mode: "review" });
+  const result = new CapabilityRouter(registry).route({
+    role: "reviewer", classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 5_000, writeRequired: false,
+    independence: { mode: "preferred", level: "cross-provider", models: [{ providerId: "anthropic", modelId: "primary", quotaPool: "anthropic:max" }] },
+  });
+  assert.equal(result.selected.model.definition.modelId, "reviewer");
+  assert.ok(result.selected.reasons.includes("same-provider-different-model-penalty"));
+});
+
+test("different-model requirement allows same provider but rejects the exact primary model", () => {
+  const registry = new ModelRegistry();
+  registry.register(model("anthropic", "primary", { quotaPool: "anthropic:max", capabilities: { reviewer: 96 } }), runtime("healthy"));
+  registry.register(model("anthropic", "alternate", { quotaPool: "anthropic:max", capabilities: { reviewer: 86 } }), runtime("healthy"));
+  const classification = classifyTask({ text: "review feature", mode: "review" });
+  const result = new CapabilityRouter(registry).route({
+    role: "reviewer", classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 1_000, writeRequired: false,
+    independence: { mode: "required", level: "different-model", models: [{ providerId: "anthropic", modelId: "primary", quotaPool: "anthropic:max" }] },
+  });
+  assert.equal(result.selected.model.definition.modelId, "alternate");
+  assert.ok(result.rejected.some((entry) => entry.model.modelId === "primary" && entry.reasons.includes("independence-required:different-model")));
+});
+
 test("routing is deterministic for identical inputs", () => {
   const registry = new ModelRegistry();
   registry.register(model("b", "same-b", { capabilities: { coder: 80 }, reasoning: 80 }), runtime("healthy"));
