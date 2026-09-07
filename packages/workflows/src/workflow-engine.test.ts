@@ -25,6 +25,13 @@ function registry(providers: string[]): ModelRegistry {
   return result;
 }
 
+function singleProviderRegistry(): ModelRegistry {
+  const result = new ModelRegistry();
+  result.register(def("anthropic", "fast", { speed: "fast", capabilities: { coder: 82, reviewer: 76, judge: 70 }, reasoning: 74 }), runtime());
+  result.register(def("anthropic", "strong", { speed: "deep", capabilities: { coder: 96, reviewer: 94, judge: 92 }, reasoning: 96 }), runtime());
+  return result;
+}
+
 function input(text: string, mode: "ask" | "write", optionalReview = false) {
   const classification = classifyTask({ text, mode });
   return { task: text, classification, budget: budgetFor(classification, { writeRequested: mode === "write" }), requiredContextTokens: 10_000, writeRequired: mode === "write", optionalReview };
@@ -37,17 +44,32 @@ test("T0/T1 workflow uses one primary and never creates review or council", asyn
   assert.equal(receipt.outcome, "completed_without_review");
   assert.equal(invoker.calls.length, 1);
   assert.equal(invoker.calls[0]?.candidateOutput, null);
+  assert.equal(receipt.reviewIndependence.level, "none");
   assert.equal(receipt.budget.councilRounds, 0);
 });
 
-test("T3 high-risk requires independent reviewer and gives it the primary candidate", async () => {
+test("T3 high-risk prefers cross-provider reviewer and gives it the primary candidate", async () => {
   const invoker = new ScriptedInvoker([{ kind: "work", output: "patch" }, { kind: "review", verdict: "approve", findings: [] }]);
   const engine = new WorkflowEngine(new CapabilityRouter(registry(["anthropic", "openai"])), invoker);
   const receipt = await engine.run(input("fix auth login bug", "write"));
   assert.equal(receipt.outcome, "approved");
   assert.notEqual(receipt.primary.model.definition.providerId, receipt.reviewer?.model.definition.providerId);
+  assert.equal(receipt.reviewIndependence.level, "cross-provider");
   assert.equal(invoker.calls[0]?.candidateOutput, null);
   assert.equal(invoker.calls[1]?.candidateOutput, "patch");
+});
+
+test("T3 high-risk can use a different model from the same provider in a fresh review invocation", async () => {
+  const invoker = new ScriptedInvoker([{ kind: "work", output: "patch" }, { kind: "review", verdict: "approve", findings: [] }]);
+  const engine = new WorkflowEngine(new CapabilityRouter(singleProviderRegistry()), invoker);
+  const receipt = await engine.run(input("fix auth login bug", "write"));
+  assert.equal(receipt.outcome, "approved");
+  assert.equal(receipt.primary.model.definition.providerId, "anthropic");
+  assert.equal(receipt.reviewer?.model.definition.providerId, "anthropic");
+  assert.notEqual(receipt.primary.model.definition.modelId, receipt.reviewer?.model.definition.modelId);
+  assert.equal(receipt.reviewIndependence.level, "same-provider-different-model");
+  assert.equal(receipt.reviewIndependence.sharedQuotaPool, true);
+  assert.equal(invoker.calls.length, 2);
 });
 
 test("T3 repair is bounded and receives the prior candidate plus reviewer findings", async () => {
@@ -82,10 +104,12 @@ test("T4 disagreement gives judge the current candidate and invokes at most one 
   assert.ok(judgeProvider !== receipt.primary.model.definition.providerId && judgeProvider !== receipt.reviewer?.model.definition.providerId);
 });
 
-test("high-risk workflow fails closed when no independent reviewer exists", async () => {
+test("critical workflow still fails closed when cross-provider review is unavailable", async () => {
   const invoker = new ScriptedInvoker([{ kind: "work", output: "patch" }]);
-  const engine = new WorkflowEngine(new CapabilityRouter(registry(["anthropic"])), invoker);
-  await assert.rejects(() => engine.run(input("fix auth login bug", "write")), (e: unknown) => e instanceof BrainGateInvariantError && e.code === "ROUTE_NO_ELIGIBLE_MODEL");
+  const engine = new WorkflowEngine(new CapabilityRouter(singleProviderRegistry()), invoker);
+  const critical = input("delete production payment database migration credentials security", "write");
+  assert.equal(critical.classification.risk, "critical");
+  await assert.rejects(() => engine.run(critical), (e: unknown) => e instanceof BrainGateInvariantError && e.code === "ROUTE_NO_ELIGIBLE_MODEL");
 });
 
 test("T2 optional review remains off unless explicitly requested", async () => {

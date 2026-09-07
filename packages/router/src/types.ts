@@ -3,6 +3,7 @@ import type { ExecutionBudget, TaskClassification } from "@braingate/core";
 export type ModelRole = "scout" | "planner" | "coder" | "reviewer" | "judge" | "visual";
 export type SpeedClass = "fast" | "balanced" | "deep";
 export type QuotaState = "healthy" | "limited" | "unknown" | "exhausted";
+export type IndependenceLevel = "cross-provider" | "different-model" | "fresh-session";
 
 export interface ModelDefinition {
   readonly providerId: string;
@@ -37,6 +38,8 @@ export interface ModelRef {
 export interface IndependenceConstraint {
   readonly models: readonly ModelRef[];
   readonly mode: "required" | "preferred";
+  /** Defaults to cross-provider for backward-compatible strictness. */
+  readonly level?: IndependenceLevel;
 }
 
 export interface RouteRequest {
