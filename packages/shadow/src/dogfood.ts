@@ -9,9 +9,10 @@ import {
 import { buildTaskBrief, recordTaskBrief, recordWorkflowReceipt } from "@braingate/observability";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
-import { WorkflowEngine, type WorkflowReceipt } from "@braingate/workflows";
+import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole } from "@braingate/workflows";
+import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { SubscriptionShadowAgentInvoker } from "./invoker.js";
-import { planShadowInvocation, shadowProviderStatus } from "./profiles.js";
+import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
@@ -35,6 +36,10 @@ function attestationFor(attestations: readonly SubscriptionAttestation[], provid
   return attestation === undefined ? Object.freeze({}) : Object.freeze({ attestation });
 }
 
+function exclusionsFor(snapshots: readonly ProviderSnapshot[], role: WorkflowRole): readonly string[] {
+  return Object.freeze(snapshots.filter((snapshot) => !shadowProviderRoleStatus(snapshot.providerId, role).enabled).map((snapshot) => snapshot.providerId));
+}
+
 export interface ShadowDogfoodResult {
   readonly dryRun: boolean;
   readonly taskId: string;
@@ -48,6 +53,7 @@ export class ShadowDogfoodRunner {
   readonly #router: CapabilityRouter;
   readonly #snapshots: readonly ProviderSnapshot[];
   readonly #attestations: readonly SubscriptionAttestation[];
+  readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
 
   constructor(input: {
@@ -56,6 +62,7 @@ export class ShadowDogfoodRunner {
     readonly router: CapabilityRouter;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
+    readonly codexIsolation?: CodexIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
   }) {
     this.#project = input.project;
@@ -63,6 +70,7 @@ export class ShadowDogfoodRunner {
     this.#router = input.router;
     this.#snapshots = input.snapshots;
     this.#attestations = input.attestations ?? [];
+    this.#codexIsolation = input.codexIsolation;
     this.#executor = input.executor;
   }
 
@@ -88,9 +96,11 @@ export class ShadowDogfoodRunner {
     if (input.task.trim().length === 0) throw new BrainGateInvariantError("SHADOW_TASK_INVALID", "Shadow task must be non-empty.");
     if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("SHADOW_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
     const cwd = assertShadowProjectCwd(this.#project, input.cwd);
-    const excludedProviders = this.#snapshots.filter((snapshot) => !shadowProviderStatus(snapshot.providerId).enabled).map((snapshot) => snapshot.providerId);
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary");
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer");
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge");
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: excludedProviders });
+    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
@@ -101,10 +111,17 @@ export class ShadowDogfoodRunner {
       const independence = input.classification.risk === "high" || input.classification.risk === "critical"
         ? { mode: "required" as const, models: [primaryRef] }
         : { mode: "preferred" as const, models: [primaryRef] };
-      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: excludedProviders });
+      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: reviewerExcluded });
       routes.push(reviewerRoute);
       const reviewerRef = modelRef(reviewerRoute);
-      planShadowInvocation({ snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId), model: reviewerRef, cwd, payload: preflightPayload("reviewer", input.task, input.context), ...attestationFor(this.#attestations, reviewerRef.providerId) });
+      planShadowInvocation({
+        snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId),
+        model: reviewerRef,
+        cwd,
+        payload: preflightPayload("reviewer", input.task, input.context),
+        ...attestationFor(this.#attestations, reviewerRef.providerId),
+        ...(reviewerRef.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
+      });
     }
 
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
@@ -135,6 +152,7 @@ export class ShadowDogfoodRunner {
         cwd,
         snapshots: this.#snapshots,
         attestations: this.#attestations,
+        ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
         context: input.context,
         ...(this.#executor === undefined ? {} : { executor: this.#executor }),
         ledger: this.#ledger,
@@ -147,6 +165,7 @@ export class ShadowDogfoodRunner {
         requiredContextTokens: input.requiredContextTokens,
         writeRequired: false,
         optionalReview: input.optionalReview ?? false,
+        excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded },
       });
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
       recordWorkflowReceipt(this.#ledger, task.taskId, workflow);
