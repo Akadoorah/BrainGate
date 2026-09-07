@@ -26,6 +26,7 @@ export interface ShadowRolePayload {
   readonly phase: string;
   readonly task: string;
   readonly findings: readonly string[];
+  readonly candidateOutput: string | null;
   readonly context: unknown;
   readonly responseContract: Readonly<Record<string, unknown>>;
 }
