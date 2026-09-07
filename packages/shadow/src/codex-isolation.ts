@@ -10,45 +10,49 @@ import { SecretGuard, redactSecrets } from "@braingate/security";
 export const CODEX_REVIEW_PROFILE = "braingate-review";
 export const CODEX_STAGE_TOKEN = "__BRAINGATE_CODEX_STAGE__";
 
-const PROFILE_POLICY = Object.freeze({
-  schemaVersion: 1,
-  filesystem: Object.freeze({ root: "none", minimal: "read", stage: "read" }),
-  network: false,
-  role: "reviewer-only",
-});
-
 export const CODEX_REVIEW_DISABLED_FEATURES = Object.freeze([
-  "shell_tool",
-  "code_mode",
-  "code_mode_host",
-  "code_mode_prewarm",
-  "unified_exec",
-  "unified_exec_tty",
-  "shell_zsh_fork",
-  "exec_permission_approvals",
-  "request_permissions_tool",
-  "web_search_request",
-  "web_search_cached",
-  "standalone_web_search",
-  "memory_tool",
-  "external_agent_memory_import",
-  "chronicle",
-  "network_proxy",
-  "worktrees",
-  "collab",
-  "multi_agent_v2",
+  // Mirrors the isolation-oriented temporary structured request surface in current Codex,
+  // then adds other external/tool surfaces BrainGate does not need for review.
   "apps",
-  "enable_mcp_apps",
+  "code_mode",
+  "code_mode_only",
+  "context_management",
+  "current_time_reminder",
+  "deferred_executor",
+  "enable_fanout",
+  "goals",
+  "hooks",
+  "image_generation",
+  "memories",
+  "multi_agent",
+  "multi_agent_v2",
   "plugins",
-  "executor_capability_discovery",
-  "remote_plugin",
+  "request_permissions_tool",
+  "shell_snapshot",
+  "shell_tool",
+  "standalone_web_search",
+  "token_budget",
+  "tool_suggest",
+  "unified_exec",
+  "view_image",
   "browser_use",
   "browser_use_full_cdp_access",
   "browser_use_external",
   "computer_use",
-  "image_generation",
-  "codex_hooks",
+  "enable_mcp_apps",
+  "network_proxy",
+  "remote_plugin",
+  "worktrees",
 ] as const);
+
+const PROFILE_POLICY = Object.freeze({
+  schemaVersion: 2,
+  filesystem: Object.freeze({ root: "none", minimal: "read", stage: "read" }),
+  network: false,
+  role: "reviewer-only",
+  skills: Object.freeze({ orchestratorEnabled: false, includeInstructions: false, bundledEnabled: false, skipHostDiscoveryRequested: true }),
+  disabledFeatures: CODEX_REVIEW_DISABLED_FEATURES,
+});
 
 export interface CodexIsolationAttestation {
   readonly providerId: "openai";
@@ -96,6 +100,13 @@ export function codexReviewerConfigArgs(stagePath = CODEX_STAGE_TOKEN): readonly
     "-c", `default_permissions=${tomlString(CODEX_REVIEW_PROFILE)}`,
     "-c", `permissions=${codexPermissionInlineTable(stagePath)}`,
     "-c", "web_search=\"disabled\"",
+    // These match the isolation controls used by Codex's own temporary structured request path.
+    "-c", "orchestrator.skills.enabled=false",
+    "-c", "skills.include_instructions=false",
+    "-c", "skills.bundled.enabled=false",
+    "-c", "features.skip_host_skill_discovery=true",
+    "-c", "tools.experimental_request_user_input.enabled=false",
+    "-c", "tools.update_plan.enabled=false",
   ];
   for (const feature of CODEX_REVIEW_DISABLED_FEATURES) args.push("-c", `features.${feature}=false`);
   return Object.freeze(args);
@@ -236,15 +247,7 @@ export class CodexIsolationVerifier {
         throw new BrainGateInvariantError("CODEX_ISOLATION_SELF_TEST_FAILED", "Codex sandbox allowed writing inside the staged read-only workspace.");
       }
 
-      return Object.freeze({
-        providerId: "openai",
-        source: "sandbox-self-test",
-        version,
-        platform,
-        profileHash: codexIsolationProfileHash(),
-        observedAt: now.toISOString(),
-        expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
-      });
+      return Object.freeze({ providerId: "openai", source: "sandbox-self-test", version, platform, profileHash: codexIsolationProfileHash(), observedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString() });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
