@@ -151,7 +151,7 @@ export function planShadowInvocation(input: {
       throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", "Codex is reviewer-only in this BrainGate milestone.");
     }
     if (!validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })) {
-      throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", "Codex reviewer requires a current sandbox self-test attestation for this version/platform/profile.");
+      throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", "Codex reviewer isolation requires a current sandbox self-test attestation for this version/platform/profile.");
     }
     const args = Object.freeze([
       "exec",
