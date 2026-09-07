@@ -18,11 +18,27 @@ function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string)
   return snapshot;
 }
 
-function reviewerExclusions(snapshots: readonly ProviderSnapshot[], codexIsolation?: CodexIsolationAttestation): readonly string[] {
+function validSubscriptionAttestation(attestations: readonly SubscriptionAttestation[], providerId: string, now = new Date()): boolean {
+  const value = attestations.find((entry) => entry.providerId === providerId && entry.mode === "subscription");
+  if (value === undefined) return false;
+  const observed = new Date(value.observedAt);
+  if (Number.isNaN(observed.getTime()) || observed.getTime() > now.getTime() + 60_000 || now.getTime() - observed.getTime() > 30 * 24 * 60 * 60 * 1000) return false;
+  if (value.expiresAt !== undefined && value.expiresAt !== null) {
+    const expires = new Date(value.expiresAt);
+    if (Number.isNaN(expires.getTime()) || expires.getTime() <= now.getTime()) return false;
+  }
+  return true;
+}
+
+function reviewerExclusions(snapshots: readonly ProviderSnapshot[], codexIsolation: CodexIsolationAttestation | undefined, attestations: readonly SubscriptionAttestation[]): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
     if (!shadowProviderRoleStatus(snapshot.providerId, "reviewer").enabled) return true;
-    if (snapshot.providerId === "openai" && codexIsolation === undefined) return true;
-    return false;
+    if (snapshot.providerId === "openai") return snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription" || codexIsolation === undefined;
+    if (snapshot.providerId === "github-copilot") {
+      if (snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription") return false;
+      return !validSubscriptionAttestation(attestations, snapshot.providerId);
+    }
+    return snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription";
   }).map((snapshot) => snapshot.providerId));
 }
 
@@ -35,6 +51,7 @@ function assertM11Scope(classification: TaskClassification): void {
 export function buildWriteTaskPlan(input: {
   readonly router: CapabilityRouter;
   readonly providers: readonly ProviderSnapshot[];
+  readonly attestations?: readonly SubscriptionAttestation[];
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
@@ -60,11 +77,9 @@ export function buildWriteTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence: { mode: "preferred", models: [primaryModel] },
-      excludeProviders: reviewerExclusions(input.providers, input.codexIsolation),
+      excludeProviders: reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? []),
     });
     const reviewerModel = modelRef(reviewerRoute);
-    const reviewerSnapshot = snapshotFor(input.providers, reviewerModel.providerId);
-    if (reviewerSnapshot.authState.value !== "authenticated" && reviewerSnapshot.providerId !== "github-copilot") throw new BrainGateInvariantError("WRITE_REVIEWER_AUTH_REQUIRED", "Write reviewer authentication is not proven.");
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, workspace: reviewerModel.providerId === "openai" ? "staged-review" : "project-read-only" }));
   }
 
@@ -127,6 +142,7 @@ export class WriteDogfoodRunner {
     const plan = buildWriteTaskPlan({
       router: this.#router,
       providers: this.#providers,
+      attestations: this.#attestations,
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
       classification: input.classification,
       budget: input.budget,
@@ -148,9 +164,7 @@ export class WriteDogfoodRunner {
       const primarySnapshot = snapshotFor(this.#providers, primary.model.providerId);
       const invocation = planClaudeWriteInvocation({ snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath, task: input.task, context: input.context });
       const result = await this.#writer.run({ plan: invocation, ...(input.env === undefined ? {} : { env: input.env }) });
-      if (!result.spawned || result.timedOut || result.exitCode !== 0) {
-        throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `Claude write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
-      }
+      if (!result.spawned || result.timedOut || result.exitCode !== 0) throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `Claude write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });
