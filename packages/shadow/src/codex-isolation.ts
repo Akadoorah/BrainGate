@@ -42,7 +42,6 @@ export const CODEX_REVIEW_DISABLED_FEATURES = Object.freeze([
   "enable_mcp_apps",
   "network_proxy",
   "remote_plugin",
-  "worktrees",
 ] as const);
 
 const PROFILE_POLICY = Object.freeze({
