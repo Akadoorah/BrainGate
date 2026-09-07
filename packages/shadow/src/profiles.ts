@@ -1,6 +1,13 @@
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import type { ModelRef } from "@braingate/router";
+import type { WorkflowRole } from "@braingate/workflows";
+import {
+  CODEX_STAGE_TOKEN,
+  codexReviewerConfigArgs,
+  validCodexIsolationAttestation,
+  type CodexIsolationAttestation,
+} from "./codex-isolation.js";
 import type { ShadowInvocationPlan, ShadowInvocationPreview, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -17,7 +24,7 @@ interface ProfileDefinition {
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
   anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null },
   "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null },
-  openai: { providerId: "openai", enabled: false, minimumVersion: null, blockedReason: "Codex CLI read-only mode does not yet enforce project-only readable roots in BrainGate; restricted-root app-server isolation is required." },
+  openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation." },
   xai: { providerId: "xai", enabled: false, minimumVersion: null, blockedReason: "Grok read-only permits broad filesystem reads while strict mode permits CWD writes; hardened clean-config isolation is not yet verified." },
   google: { providerId: "google", enabled: false, minimumVersion: null, blockedReason: "Antigravity strict mode has not yet been verified as a stable per-invocation headless enforcement mechanism." },
 });
@@ -95,6 +102,7 @@ export function planShadowInvocation(input: {
   readonly cwd: string;
   readonly payload: ShadowRolePayload;
   readonly attestation?: SubscriptionAttestation;
+  readonly codexIsolation?: CodexIsolationAttestation;
   readonly maxTurns?: number;
   readonly now?: Date;
 }): ShadowInvocationPlan {
@@ -124,6 +132,7 @@ export function planShadowInvocation(input: {
       executable: input.snapshot.binary,
       args,
       cwd: input.cwd,
+      workspaceMode: "project",
       modelId: input.model.modelId,
       quotaPool: input.model.quotaPool,
       inputMode: "stdin",
@@ -131,6 +140,48 @@ export function planShadowInvocation(input: {
       attachmentContent: null,
       attachmentToken: null,
       allowedEnvKeys: Object.freeze([]),
+      envOverrides: Object.freeze({}),
+      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      minimumVersion: profile.minimumVersion,
+    });
+  }
+
+  if (input.snapshot.providerId === "openai") {
+    if (input.payload.role !== "reviewer") {
+      throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", "Codex is reviewer-only in this BrainGate milestone.");
+    }
+    if (!validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })) {
+      throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", "Codex reviewer requires a current sandbox self-test attestation for this version/platform/profile.");
+    }
+    const args = Object.freeze([
+      "exec",
+      "--ephemeral",
+      "--ignore-user-config",
+      "--ignore-rules",
+      "--strict-config",
+      "--skip-git-repo-check",
+      "--json",
+      "--model", input.model.modelId,
+      "-C", CODEX_STAGE_TOKEN,
+      ...codexReviewerConfigArgs(),
+      "-",
+    ]);
+    if (args.includes("--sandbox") || args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--full-auto")) {
+      throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe or legacy Codex sandbox flags are forbidden for the reviewer profile.");
+    }
+    return Object.freeze({
+      providerId: "openai",
+      executable: input.snapshot.binary,
+      args,
+      cwd: input.cwd,
+      workspaceMode: "staged-clean",
+      modelId: input.model.modelId,
+      quotaPool: input.model.quotaPool,
+      inputMode: "stdin",
+      stdin: body,
+      attachmentContent: null,
+      attachmentToken: null,
+      allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
       envOverrides: Object.freeze({}),
       guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
       minimumVersion: profile.minimumVersion,
@@ -165,6 +216,7 @@ export function planShadowInvocation(input: {
       executable: input.snapshot.binary,
       args,
       cwd: input.cwd,
+      workspaceMode: "project",
       modelId: input.model.modelId,
       quotaPool: input.model.quotaPool,
       inputMode: "temp-attachment",
@@ -187,6 +239,7 @@ export function previewShadowInvocation(plan: ShadowInvocationPlan): ShadowInvoc
     executable: plan.executable,
     args: Object.freeze([...plan.args]),
     cwd: plan.cwd,
+    workspaceMode: plan.workspaceMode,
     modelId: plan.modelId,
     quotaPool: plan.quotaPool,
     inputMode: plan.inputMode,
@@ -198,4 +251,11 @@ export function previewShadowInvocation(plan: ShadowInvocationPlan): ShadowInvoc
 export function shadowProviderStatus(providerId: ProviderId): Readonly<{ enabled: boolean; minimumVersion: string | null; reason: string | null }> {
   const profile = PROFILES[providerId];
   return Object.freeze({ enabled: profile.enabled, minimumVersion: profile.minimumVersion, reason: profile.blockedReason });
+}
+
+export function shadowProviderRoleStatus(providerId: ProviderId, role: WorkflowRole): Readonly<{ enabled: boolean; reason: string | null }> {
+  const profile = PROFILES[providerId];
+  if (!profile.enabled) return Object.freeze({ enabled: false, reason: profile.blockedReason });
+  if (providerId === "openai" && role !== "reviewer") return Object.freeze({ enabled: false, reason: "Codex is reviewer-only in M10." });
+  return Object.freeze({ enabled: true, reason: providerId === "openai" ? "Requires current sandbox self-test attestation." : null });
 }
