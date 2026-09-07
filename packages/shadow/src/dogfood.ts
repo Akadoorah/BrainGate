@@ -22,7 +22,7 @@ function modelRef(route: RouteResult): ModelRef {
 }
 
 function preflightPayload(role: "primary" | "reviewer", task: string, context: unknown): ShadowRolePayload {
-  return Object.freeze({ schemaVersion: 1, role, phase: "preflight", task, findings: Object.freeze([]), context, responseContract: Object.freeze(role === "primary" ? { kind: "work", output: "string" } : { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" }) });
+  return Object.freeze({ schemaVersion: 1, role, phase: "preflight", task, findings: Object.freeze([]), candidateOutput: null, context, responseContract: Object.freeze(role === "primary" ? { kind: "work", output: "string" } : { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" }) });
 }
 
 function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
@@ -130,16 +130,7 @@ export class ShadowDogfoodRunner {
 
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
     this.#ledger.transition(task.taskId, "planned", { shadow: true, dryRun: input.dryRun ?? false });
-    const brief = buildTaskBrief({
-      project: this.#project,
-      task: this.#ledger.requireTask(task.taskId),
-      classification: input.classification,
-      budget: input.budget,
-      routes,
-      context: input.contextSummary,
-      permissions: { executionProfile: "shadow-read-only", networkAllowed: false },
-      worktree: { enabled: false, taskWorktreeLabel: null },
-    });
+    const brief = buildTaskBrief({ project: this.#project, task: this.#ledger.requireTask(task.taskId), classification: input.classification, budget: input.budget, routes, context: input.contextSummary, permissions: { executionProfile: "shadow-read-only", networkAllowed: false }, worktree: { enabled: false, taskWorktreeLabel: null } });
     recordTaskBrief(this.#ledger, brief);
 
     if (input.dryRun ?? false) {
@@ -151,35 +142,15 @@ export class ShadowDogfoodRunner {
 
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({
-        project: this.#project,
-        cwd,
-        snapshots: this.#snapshots,
-        attestations: this.#attestations,
-        ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
-        context: input.context,
-        ...(this.#executor === undefined ? {} : { executor: this.#executor }),
-        ledger: this.#ledger,
-        taskId: task.taskId,
-      });
-      const workflow = await new WorkflowEngine(this.#router, invoker).run({
-        task: input.task,
-        classification: input.classification,
-        budget: input.budget,
-        requiredContextTokens: input.requiredContextTokens,
-        writeRequired: false,
-        optionalReview: input.optionalReview ?? false,
-        excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded },
-      });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId });
+      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
       recordWorkflowReceipt(this.#ledger, task.taskId, workflow);
       this.#ledger.transition(task.taskId, "completed", { shadow: true, outcome: workflow.outcome });
       return Object.freeze({ dryRun: false, taskId: task.taskId, taskReceipt: this.#ledger.receipt(task.taskId), workflow });
     } catch (error) {
       const current = this.#ledger.requireTask(task.taskId);
-      if (current.state === "running" || current.state === "verifying" || current.state === "planned") {
-        this.#ledger.transition(task.taskId, "failed", { shadow: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
-      }
+      if (current.state === "running" || current.state === "verifying" || current.state === "planned") this.#ledger.transition(task.taskId, "failed", { shadow: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
       throw error;
     }
   }
