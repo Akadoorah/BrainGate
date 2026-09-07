@@ -19,7 +19,8 @@
     "@braingate/operator": "workspace:*",
     "@braingate/providers": "workspace:*",
     "@braingate/router": "workspace:*",
-    "@braingate/shadow": "workspace:*"
+    "@braingate/shadow": "workspace:*",
+    "@braingate/write": "workspace:*"
   },
   "devDependencies": {
     "@types/node": "^22.18.7",
