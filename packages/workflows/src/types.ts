@@ -11,7 +11,8 @@ export interface AgentRequest {
   readonly phase: string;
   readonly task: string;
   readonly findings: readonly string[];
-  readonly candidateOutput: string | null;
+  /** Current candidate output when the role is reviewing/judging/repairing a stateless prior result. */
+  readonly candidateOutput?: string | null;
 }
 
 export type AgentResponse =
