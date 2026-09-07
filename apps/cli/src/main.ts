@@ -1,6 +1,7 @@
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { checkDogfoodExportPath } from "./dogfood-export-path.js";
+import { runMemoryCli } from "./memory-cli.js";
 
 const args = process.argv.slice(2);
 const exportPath = checkDogfoodExportPath(args);
@@ -11,6 +12,8 @@ if (!exportPath.safe) {
 } else {
   const result = args[0] === "init" || args[0] === "dogfood"
     ? await runDogfoodCli(args)
-    : await runCli(args);
+    : args[0] === "memory"
+      ? await runMemoryCli(args)
+      : await runCli(args);
   process.exitCode = result.exitCode;
 }
