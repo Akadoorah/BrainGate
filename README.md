@@ -15,6 +15,20 @@ BrainGate is a private pre-alpha project for coordinating official AI coding CLI
 - **Auditable:** every task has a brief, execution ledger, usage evidence, verification, and final receipt.
 - **Secrets are not memory:** credentials are blocked from memory and denied to agents by default.
 
+## Open-source and commercial direction
+
+BrainGate Core is intended to become a genuinely useful open-source local developer tool. The future commercial layer should add value that is naturally cross-device, team-oriented, centrally administered, or enterprise-focused—such as BrainGate Cloud, encrypted sync, remote approvals/control, organization policy, fleet observability, compliance, and managed support—without deliberately crippling local Community functionality.
+
+The current preferred licensing direction is Apache-2.0, but **the repository is not licensed under Apache-2.0 merely because it is the preferred direction**. A final license, third-party attribution audit, contributor policy, trademark/name review, and public-release security/community artifacts must be completed before a public launch.
+
+The default business assumption is bring-your-own independently authorized provider subscriptions/accounts. BrainGate should not rely on reselling model access, credential pooling, token scraping, private provider endpoints, or usage-limit circumvention.
+
+See:
+
+- [`docs/OPEN_SOURCE_AND_COMMERCIAL.md`](docs/OPEN_SOURCE_AND_COMMERCIAL.md) — intended OSS/commercial boundary, business model, pricing hypotheses, architecture seams, and moat thesis.
+- [`docs/PUBLIC_RELEASE_CHECKLIST.md`](docs/PUBLIC_RELEASE_CHECKLIST.md) — concrete prerequisites before making the project public or charging for cloud/team features.
+- [`docs/PRODUCT.md`](docs/PRODUCT.md) — product definition and business principles.
+
 ## Current local operator
 
 The repository includes a local `braingate` CLI with:
@@ -117,4 +131,4 @@ Current writes are intentionally narrow:
 
 Milestones 0–12 establish the deterministic core, project/task isolation, canonical memory, routing, observability, hardened subscription execution, independent Codex review, guarded worktree-only writes, and real-project dogfood telemetry. Milestone 13 adds safe memory bootstrap and graded single-provider routing so the first real project trial can start with useful historical context and still work well with only one AI subscription provider.
 
-See `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/ROADMAP.md`, and `docs/DOGFOOD.md`.
+See `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/ROADMAP.md`, `docs/DOGFOOD.md`, and `docs/PRETRIAL.md`.
