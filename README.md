@@ -22,7 +22,8 @@ The repository includes a local `braingate` CLI with:
 - `braingate init --project-id <id> --name <name>`
 - `braingate discover`
 - `braingate doctor --project <manifest>`
-- `braingate models list|validate|add|remove|import-discovered`
+- `braingate models list|validate|add|remove|import-discovered|profile`
+- `braingate memory preview|import|promote|list`
 - `braingate shadow plan|run ...`
 - `braingate write plan|run ...`
 - `braingate dogfood preflight`
@@ -36,9 +37,38 @@ The repository includes a local `braingate` CLI with:
 
 `plan` and `run` without `--execute` do not make provider model calls. The explicit `--execute` flag is the model-execution gate.
 
-`braingate init` creates a local ignored `.brain/project.json`, so M12 dogfood commands can use the current project without repeatedly passing a manifest path.
+`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path.
 
 See [`docs/DOGFOOD.md`](docs/DOGFOOD.md) for the real-project trial workflow.
+
+## Memory bootstrap
+
+Existing project history can be imported from local Markdown/text, normalized JSONL, or a best-effort ChatGPT-style `conversations.json` export. BrainGate does not scrape provider sessions or authentication state to obtain chat history.
+
+The import boundary is deliberately conservative:
+
+- `memory preview` persists nothing;
+- `memory import` creates project-scoped **proposals only**;
+- imported claims are never canonical automatically;
+- `memory promote` requires explicit evidence and confidence through the existing supervisor path;
+- canonical duplicates are skipped;
+- ChatGPT-style history is compacted into bounded historical observations rather than retaining or injecting entire transcripts.
+
+This keeps Git/code/tests and verified canonical records above old conversational claims in the source-of-truth hierarchy.
+
+## Single-provider mode
+
+BrainGate does not require several vendors. A user with only one provider can configure multiple provider-owned model IDs with capability, speed, context, and quota metadata. Routing remains capability-based rather than hard-coding names such as Haiku, Sonnet, Opus, or GPT variants.
+
+`braingate models profile` reports T0-T4 coverage, speed classes, quota-pool declarations, and the strongest available reviewer independence level.
+
+Reviewer preference order is:
+
+1. cross-provider;
+2. same provider, different model, fresh invocation;
+3. same model, fresh invocation only when no stronger independence is available.
+
+The receipt labels this distinction explicitly. Models from one subscription are not treated as fake independent providers or quota pools. Critical tasks still require cross-provider/separate-authority review; T4 work without it remains human-approval gated.
 
 ## M12 dogfood telemetry
 
@@ -65,7 +95,7 @@ Codex review runs from a fresh staged workspace rather than the real repository.
 
 Current writes are intentionally narrow:
 
-- Claude is the only write-capable primary provider in M11/M12.
+- Claude is the only write-capable primary provider in the current dogfood path;
 - writes occur only inside task-specific BrainGate worktrees;
 - source checkout mutation is treated as an invariant failure;
 - sensitive paths and BrainGate/agent control files are rejected;
@@ -80,10 +110,11 @@ Current writes are intentionally narrow:
 - Known API-key/direct-billing environment variables are removed from subscription child processes.
 - Raw task text is not used as the persisted task title.
 - Provider reasoning/event streams are not persisted as canonical task output.
+- Imported conversation history is proposal input, not automatic canonical memory.
 - Usage is labeled by evidence quality (`native`, `measured`, `estimated`, or `unknown`) rather than invented.
 
 ## Status
 
-Milestones 0–11 establish the deterministic core, project/task isolation, memory, routing, observability, hardened subscription execution, independent Codex review, and guarded worktree-only writes. Milestone 12 adds real-project onboarding, sanitized dogfood telemetry, conservative project-local routing priors, feedback/report/export workflows, and the trial path documented in `docs/DOGFOOD.md`.
+Milestones 0–12 establish the deterministic core, project/task isolation, canonical memory, routing, observability, hardened subscription execution, independent Codex review, guarded worktree-only writes, and real-project dogfood telemetry. Milestone 13 adds safe memory bootstrap and graded single-provider routing so the first real project trial can start with useful historical context and still work well with only one AI subscription provider.
 
 See `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/ROADMAP.md`, and `docs/DOGFOOD.md`.
