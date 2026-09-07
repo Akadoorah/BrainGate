@@ -54,7 +54,7 @@ Local project onboarding, zero-model-call preflight, real `ask`/small-write dogf
 
 The first supported rollout is intentionally manual and local. Model capability definitions remain user-verified, provider sessions remain local, and BrainGate still has no automatic merge/push/deploy surface.
 
-## Milestone 13 — Memory bootstrap and single-provider routing
+## Milestone 13 — Memory bootstrap and single-provider routing ✅
 
 Pre-trial hardening for users with existing project history or only one AI subscription provider:
 
