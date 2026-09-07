@@ -9,18 +9,23 @@ BrainGate operates near valuable source code and authenticated developer tooling
 - Project repositories: isolated security domains.
 - Skills: executable/instruction-bearing capabilities requiring explicit authorization.
 - Memory: untrusted input until validated; canonical memory has a single writer.
+- Dogfood telemetry: sanitized project-local experiment metadata, not a transcript or memory source.
 
 ## Required controls
 
 ### Project isolation
 
-Every project has an immutable explicit `project_id`. Project-scoped memory is stored separately and retrieval APIs require the project identity. Cross-project retrieval is denied by default.
+Every project has an immutable explicit `project_id`. Project-scoped memory and dogfood telemetry are stored separately and APIs require the project identity. Cross-project retrieval is denied by default.
+
+M12 `braingate init` writes `.brain/project.json` only after resolving the Git top-level repository. `.brain/` is added to the repository's local Git exclude file rather than tracked `.gitignore`; conflicting existing project identity is refused rather than overwritten.
 
 ### Filesystem isolation
 
 Write agents operate in task-specific Git worktrees. Review-only agents receive read-only or separately materialized views where feasible. Provider prompts are never the sole enforcement mechanism.
 
 For the Codex reviewer path, BrainGate validates that the source CWD belongs to the registered project, but Codex itself is **not** started from that repository. BrainGate creates a fresh private staged workspace, substitutes that path into the verified permission profile, runs Codex there, and deletes the stage after the call. The real project repository is never granted as a Codex workspace root in this path.
+
+M11/M12 Claude writes use a restricted provider profile inside a task worktree. The source checkout is checked for mutation after the provider call and again after review. Sensitive files, Git/control-plane configuration, and agent instruction files are rejected by the guarded diff boundary. Current M12 write scope is limited to T0-T2 low/medium-risk changes; high/critical-risk or T3/T4 writes fail closed before worktree/provider execution.
 
 ### Codex reviewer self-test
 
@@ -40,7 +45,7 @@ Skills have explicit scope and allowlists. A worker cannot load a skill outside 
 
 ### Secret handling
 
-Default deny patterns include `.env`, `.env.*`, `credentials.*`, private keys, certificates, and configured secret paths. Secrets must never be persisted to task transcripts, canonical memory, logs, or generated fixtures. Test/dummy credentials should be used where possible.
+Default deny patterns include `.env`, `.env.*`, `credentials.*`, private keys, certificates, and configured secret paths. Secrets must never be persisted to task transcripts, canonical memory, logs, dogfood telemetry, or generated fixtures. Test/dummy credentials should be used where possible.
 
 ### Subscription authentication
 
@@ -58,13 +63,23 @@ Execution profiles declare read/write/shell/network permissions. High-risk permi
 
 Workers propose memory updates. A validation layer checks project scope, source evidence, sensitivity, and conflicts before canonical storage. Canonical architectural/business facts do not expire automatically; temporary observations do.
 
+### Dogfood telemetry and adaptation
+
+Each project's M12 experiment data is stored in its own `dogfood.sqlite` under that project's BrainGate storage directory. Database metadata is bound to the explicit `project_id`; run and feedback tables are append-only at the SQLite layer.
+
+Dogfood telemetry may contain task UUIDs, predicted/effective complexity and risk, classifier rule version, provider/model roles, reviewer verdict, outcome, usage evidence, applied prior metadata, and user-supplied outcome labels. It must not persist raw task text, model answers, candidate diffs, review findings, provider reasoning, provider auth material, or secrets.
+
+Regression JSONL exports contain the same sanitized metadata subset and are deterministic. The default export path is under the project's locally ignored `.brain/` directory.
+
+Adaptive priors are project-local and mode-local (`ask` vs `write`). They require a minimum labeled sample count and sustained underprediction before activation. M12 priors may only raise complexity/risk floors; they cannot lower a classifier result or mutate model-catalog scores automatically.
+
 ### Auditability
 
-Task ledgers record classification, routing, provider/model role, permission grants, file activity metadata, verification, retries, usage source quality, and memory changes. Raw provider reasoning/event streams are not canonical task output.
+Task ledgers record classification, routing, provider/model role, permission grants, file activity metadata, verification, retries, usage source quality, and memory changes. Raw provider reasoning/event streams are not canonical task output. Dogfood reports summarize sanitized experiment metadata separately from canonical task/memory state.
 
 ## Threats explicitly in scope
 
-- Cross-project context leakage.
+- Cross-project context or telemetry leakage.
 - Secret exfiltration or accidental logging.
 - Prompt injection through repository content or skills.
 - Agent modifying the wrong checkout.
@@ -73,3 +88,4 @@ Task ledgers record classification, routing, provider/model role, permission gra
 - Misreported quota/token usage.
 - Provider CLI behavior changing unexpectedly.
 - Compromised or malicious third-party skills.
+- Unsafe adaptation caused by a small or noisy dogfood sample.
