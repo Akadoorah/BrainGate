@@ -1,45 +1,256 @@
-# Shadow dogfooding
+# BrainGate real-project dogfood
 
-Milestone 8 connects BrainGate to subscription CLIs only through **read-only shadow profiles**. No provider process receives project write capability.
+This guide is for trying BrainGate locally against one real Git repository before enabling broader automation.
 
-## Rollout gates
+## Safety model for M12
 
-1. `dryRun`: route, auth/version/path checks and Task Brief only. Zero model calls.
-2. T0/T1 shadow: read-only questions/explanations against one registered repository.
-3. T2 shadow: debugging/planning with the same no-write boundary.
-4. Independent shadow review where Budget Governor requires it.
-5. Future worktree writes only after a separate isolation milestone and explicit approval.
+- Provider authentication comes from each provider's official local CLI/session. Do not add API keys to BrainGate for subscription mode.
+- `dogfood preflight`, `dogfood ask plan`, and `dogfood write plan` make **zero provider model calls**.
+- Read-only execution requires an explicit `--execute` on `dogfood ask run`.
+- Write execution requires an explicit `--execute` on `dogfood write run` and writes only to a BrainGate task worktree.
+- M12 has no automatic merge, push, deploy, or production-secret access.
+- High/critical-risk and T3/T4 write tasks remain blocked by the M11 write boundary.
+- Dogfood telemetry is project-local and does not persist raw task text, model answers, candidate diffs, provider reasoning, or secrets.
+- Adaptive routing in M12 can only raise project-local complexity/risk floors. It never silently lowers them or changes model scores.
 
-## Enabled profiles
+## 1. Prepare BrainGate
 
-### Claude Code
+Requirements:
 
-BrainGate requires Claude Code 2.1.248+ and uses restricted print mode. The profile restricts built-in tools to `Read,Glob,Grep`, removes MCP tools, disables slash commands/Chrome/session persistence, pins the routed model and sends the task/context over stdin instead of the process command line.
+- Node.js 22 or later
+- Git
+- pnpm through Corepack
+- the official provider CLIs you intend to use, already signed in to the subscription/account you control
 
-BrainGate never uses `--bare` for subscription shadow runs. Bare mode changes authentication behavior and still exposes Bash/edit tools; restricted mode is the evaluation-harness boundary designed for this use case.
+From the BrainGate repository:
 
-`claude auth status` is a zero-model-call metadata probe. When it proves a logged-in Claude subscription, BrainGate can use that native auth evidence. Direct billing environment overrides are removed before every child process.
+```bash
+corepack enable
+pnpm install
+pnpm typecheck
+pnpm test
+```
 
-### GitHub Copilot CLI
+For the examples below, set a shell variable pointing at BrainGate's launcher. Use an absolute path.
 
-BrainGate uses prompt mode with only `view,grep,glob` available. Write, shell, URL and memory permissions are explicitly denied, built-in MCP is disabled, custom instructions/remote/export/experimental behavior are disabled, and the routed model is pinned.
+macOS/Linux/WSL:
 
-The task/context is placed in a private temporary attachment (mode 0600) and deleted after the process. `COPILOT_HOME` points at an empty per-run temporary configuration directory so persisted local permissions/config do not broaden the session.
+```bash
+BRAINGATE="/absolute/path/to/BrainGate/apps/cli/bin/braingate.mjs"
+```
 
-Because BrainGate currently has no verified zero-model-call Copilot auth probe, automated Copilot shadow use requires a short-lived local `user-confirmed-oauth` subscription attestation. An explicit API auth observation always overrides and rejects such an attestation.
+PowerShell:
 
-## Blocked profiles
+```powershell
+$BRAINGATE = "C:\absolute\path\to\BrainGate\apps\cli\bin\braingate.mjs"
+```
 
-- **Codex CLI:** direct `exec --sandbox read-only` is not yet used because BrainGate has not attached the restricted-readable-roots app-server policy.
-- **Grok Build:** current sandbox trade-offs do not simultaneously prove project-only reads and zero project writes under BrainGate's clean-config requirements.
-- **Antigravity:** strict mode has not yet been proven as a stable per-invocation headless enforcement flag.
+Run commands as `node "$BRAINGATE" ...` on macOS/Linux/WSL or `node $BRAINGATE ...` in PowerShell.
 
-Blocked does not mean unsupported forever. Provider discovery and routing remain vendor-neutral; invocation is enabled only when the isolation contract is proven.
+## 2. Onboard one real project
 
-## Privacy and audit
+Change directory to the target Git repository, then create its local BrainGate identity. Example for Waslo:
 
-- Shadow input is never persisted by BrainGate as a task event.
-- Claude input uses stdin; Copilot uses an ephemeral attachment.
-- Task Ledger stores provider/model/role, duration and call count, not model output.
-- Token usage remains `unknown` unless a provider reports a trustworthy figure.
-- `.braingate/dogfood/` is ignored by Git so local regression captures never enter a project repository accidentally.
+```bash
+node "$BRAINGATE" init --project-id waslo --name "Waslo"
+```
+
+This creates `.brain/project.json` and adds `.brain/` to the repository's local Git exclude file (`.git/info/exclude`). It does not modify the tracked `.gitignore`.
+
+Re-running the exact same `init` is safe. A conflicting existing project ID/name/repository mapping is refused rather than overwritten.
+
+Suggested distinct IDs for the planned dogfood projects:
+
+```text
+waslo
+tabaq-ai
+saudigpt
+viral-x
+```
+
+Use lowercase alphanumeric/hyphen IDs only.
+
+## 3. Verify provider discovery
+
+```bash
+node "$BRAINGATE" discover --json
+```
+
+Check that the CLI you want to use is available and that subscription authentication is reported truthfully. BrainGate does not infer a subscription when discovery cannot prove it.
+
+Do not continue with a provider showing API authentication if your intent is subscription-only execution.
+
+## 4. Configure the local model catalog
+
+BrainGate intentionally does not invent model capability scores, model IDs, context limits, or quota pools. First inspect discovery, then add a scored definition for each model you want the router to use.
+
+Create a local JSON file outside the target repository or under its ignored `.brain/` directory. Example shape for a Claude coding model:
+
+```json
+{
+  "providerId": "anthropic",
+  "modelId": "<MODEL_ID_FROM_YOUR_VERIFIED_SETUP>",
+  "quotaPool": "claude-subscription",
+  "capabilities": {
+    "coder": 95,
+    "reviewer": 85,
+    "judge": 80
+  },
+  "speed": "balanced",
+  "contextCapacity": 0,
+  "writeCapable": true,
+  "reasoning": 90,
+  "underlyingFamily": null
+}
+```
+
+Replace `modelId` and `contextCapacity` with values you have verified for the installed provider/model. The placeholder `0` is intentionally not usable as a real capacity.
+
+Then add it:
+
+```bash
+node "$BRAINGATE" models add --definition .brain/claude-model.json
+```
+
+For Codex as an independent reviewer, add a separate OpenAI definition with `writeCapable: false` and a verified model ID/capacity. Codex remains reviewer-only and must pass the M10 isolation self-test before it can be selected.
+
+Inspect the catalog with:
+
+```bash
+node "$BRAINGATE" models list --json
+node "$BRAINGATE" models validate --json
+```
+
+## 5. Run zero-cost preflight
+
+```bash
+node "$BRAINGATE" dogfood preflight
+```
+
+Preflight checks:
+
+- project manifest and repository identity
+- source checkout cleanliness
+- model catalog state
+- provider availability/authentication
+- read-only primary eligibility
+- restricted Claude write eligibility
+- reviewer eligibility
+- Codex isolation when relevant
+
+It performs zero provider model calls. `ask` and `write` readiness are reported separately.
+
+## 6. First read-only trial
+
+Plan first:
+
+```bash
+node "$BRAINGATE" dogfood ask plan --task "Where is the theme configuration defined?"
+```
+
+No provider model call happens during the plan.
+
+Execute only after the plan looks correct:
+
+```bash
+node "$BRAINGATE" dogfood ask run --task "Where is the theme configuration defined?" --execute
+```
+
+The answer is returned to the terminal, while dogfood telemetry stores only sanitized execution metadata.
+
+If you explicitly want optional review for a task whose budget permits it:
+
+```bash
+node "$BRAINGATE" dogfood ask run --task "Explain this integration boundary" --review --execute
+```
+
+## 7. Label the result
+
+After a completed dogfood run, BrainGate prints its task UUID. Record what the task actually turned out to be:
+
+```bash
+node "$BRAINGATE" dogfood feedback \
+  --task-id <TASK_UUID> \
+  --actual-complexity T1 \
+  --outcome success
+```
+
+You can also label risk:
+
+```bash
+node "$BRAINGATE" dogfood feedback \
+  --task-id <TASK_UUID> \
+  --actual-complexity T2 \
+  --actual-risk medium \
+  --outcome partial
+```
+
+For a behavior that should become a regression case, add `--regression`.
+
+M12 activates a project/mode prior only after at least three labeled samples and at least 60% underprediction. The prior can only escalate future classifications.
+
+## 8. First small write trial
+
+Start with a harmless T0-T2 change such as copy, a small isolated UI string, or a narrow test-only change. Avoid auth, payments, migrations, security controls, production operations, or destructive changes.
+
+Plan with review disabled for the smallest initial writer smoke test:
+
+```bash
+node "$BRAINGATE" dogfood write plan \
+  --task "Change the local empty-state label from X to Y" \
+  --no-review
+```
+
+Execute:
+
+```bash
+node "$BRAINGATE" dogfood write run \
+  --task "Change the local empty-state label from X to Y" \
+  --no-review \
+  --execute
+```
+
+BrainGate returns the task worktree path and branch. The source checkout remains unchanged. Inspect the diff in that worktree yourself.
+
+Once Codex reviewer isolation is ready on Linux/macOS/WSL, omit `--no-review` to use the configured review path. Native Windows Codex review remains fail-closed in this milestone; WSL follows the Linux path and still has to pass the self-test.
+
+BrainGate does not merge the worktree branch for you in M12.
+
+## 9. Inspect dogfood learning
+
+```bash
+node "$BRAINGATE" dogfood report
+```
+
+The report includes:
+
+- run and feedback counts
+- feedback coverage
+- exact / under / over complexity predictions
+- regressions
+- provider/role counts
+- reviewer verdict counts
+- active ask/write project priors
+
+It does not contain prompts, model answers, reasoning, or diffs.
+
+## 10. Export sanitized regression metadata
+
+After marking runs with `--regression`:
+
+```bash
+node "$BRAINGATE" dogfood export
+```
+
+Default output is `.brain/dogfood-regressions.jsonl`, which remains under the project's local ignored `.brain/` directory.
+
+## Recommended rollout across the real projects
+
+Use one project at a time:
+
+1. Waslo — read-only questions first, then 3-5 harmless small writes.
+2. SaudiGPT — read-only and isolated UI/config changes.
+3. Viral-X — read-only plus narrow non-production Laravel/frontend changes.
+4. Tabaq AI — read-only first; keep payments/subscriptions/auth flows out of M12 writes.
+
+For the first 20-30 tasks, label complexity/outcome consistently. Treat every isolation, routing, quota, memory, or classification failure as a regression before widening the write boundary.
