@@ -10,7 +10,7 @@ const DIRECT_BILLING_ENV = new Set([
 ]);
 
 const SAFE_ENV = new Set([
-  "PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "HOME", "USERPROFILE", "TMP", "TEMP",
+  "PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "HOME", "USERPROFILE", "USER", "LOGNAME", "TMP", "TEMP",
   "LANG", "LC_ALL", "LC_CTYPE", "CI", "NO_COLOR", "TERM",
 ]);
 

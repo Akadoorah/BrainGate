@@ -47,3 +47,12 @@ test("execution environment is allowlisted and direct-billing keys are always re
   assert.equal(result.env.RANDOM_SECRET, undefined);
   assert.throws(() => guard.buildEnvironment({}, { allowedAdditionalKeys: ["OPENAI_API_KEY"], overrides: { OPENAI_API_KEY: "x" } }));
 });
+
+test("POSIX account-name variables survive so provider CLIs can reach their own credential store", () => {
+  const guard = new SecretGuard();
+  const result = guard.buildEnvironment({ USER: "dev", LOGNAME: "dev", USERPROFILE: "C:\\Users\\dev" }, {});
+  assert.equal(result.env.USER, "dev");
+  assert.equal(result.env.LOGNAME, "dev");
+  assert.equal(result.env.USERPROFILE, "C:\\Users\\dev");
+  assert.deepEqual(result.removed, []);
+});
