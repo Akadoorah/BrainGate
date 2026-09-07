@@ -4,6 +4,13 @@ import type { ModelRef, RouteCandidate } from "@braingate/router";
 export type WorkflowRole = "primary" | "reviewer" | "judge";
 export type ReviewVerdict = "approve" | "request_changes" | "disagree";
 export type JudgeVerdict = "approve" | "request_changes";
+export type ReviewIndependenceLevel = "cross-provider" | "same-provider-different-model" | "same-model-fresh-session" | "none";
+
+export interface ReviewIndependence {
+  readonly level: ReviewIndependenceLevel;
+  readonly sharedQuotaPool: boolean;
+  readonly humanApprovalRequired: boolean;
+}
 
 export interface AgentRequest {
   readonly role: WorkflowRole;
@@ -46,6 +53,7 @@ export interface WorkflowReceipt {
   readonly primary: RouteCandidate;
   readonly reviewer: RouteCandidate | null;
   readonly judge: RouteCandidate | null;
+  readonly reviewIndependence: ReviewIndependence;
   readonly events: readonly WorkflowEvent[];
   readonly budget: BudgetSnapshot;
   readonly finalOutput: string;
