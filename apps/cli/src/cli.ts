@@ -21,8 +21,11 @@ import {
 import { ProviderDiscovery, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
+  CodexIsolationVerifier,
   ShadowDogfoodRunner,
+  shadowProviderRoleStatus,
   shadowProviderStatus,
+  type CodexIsolationAttestation,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
@@ -31,6 +34,7 @@ export interface CliDependencies {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly discoverAll?: () => Promise<readonly ProviderSnapshot[]>;
+  readonly verifyCodexIsolation?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
@@ -43,6 +47,13 @@ export interface CliDependencies {
 export interface CliResult {
   readonly exitCode: number;
   readonly data: unknown;
+}
+
+interface CodexIsolationStatus {
+  readonly attempted: boolean;
+  readonly eligible: boolean;
+  readonly attestation: CodexIsolationAttestation | null;
+  readonly reason: string | null;
 }
 
 function removeFlag(args: string[], name: string): boolean {
@@ -139,6 +150,37 @@ function serializedPlan(plan: ReturnType<typeof buildShadowTaskPlan>): Readonly<
 
 async function discovery(deps: CliDependencies): Promise<readonly ProviderSnapshot[]> {
   return deps.discoverAll === undefined ? await new ProviderDiscovery().discoverAll() : await deps.discoverAll();
+}
+
+async function codexIsolationStatus(
+  snapshots: readonly ProviderSnapshot[],
+  deps: CliDependencies,
+  env: NodeJS.ProcessEnv,
+  shouldAttempt: boolean,
+): Promise<CodexIsolationStatus> {
+  const snapshot = snapshots.find((item) => item.providerId === "openai");
+  if (snapshot === undefined || snapshot.available.value !== true) {
+    return Object.freeze({ attempted: false, eligible: false, attestation: null, reason: "Codex CLI is unavailable." });
+  }
+  if (snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription") {
+    return Object.freeze({ attempted: false, eligible: false, attestation: null, reason: "ChatGPT subscription authentication is not proven by `codex login status`." });
+  }
+  if (!shouldAttempt) {
+    return Object.freeze({ attempted: false, eligible: false, attestation: null, reason: "Codex isolation self-test was not needed for this command." });
+  }
+  try {
+    const verified = deps.verifyCodexIsolation === undefined
+      ? await new CodexIsolationVerifier({ env }).verify(snapshot)
+      : await deps.verifyCodexIsolation(snapshot);
+    return Object.freeze({ attempted: true, eligible: true, attestation: verified, reason: null });
+  } catch (error) {
+    const safe = safeError(error);
+    return Object.freeze({ attempted: true, eligible: false, attestation: null, reason: `${safe.code}: ${safe.message}` });
+  }
+}
+
+function configuredOpenAi(state: OperatorStatePaths): boolean {
+  return new ModelCatalog(state.modelCatalogPath).load().some((entry) => entry.configured && entry.providerId === "openai");
 }
 
 function runtimeFor(
@@ -245,6 +287,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const project = projectFromManifest(state, manifest, cwd);
       const snapshots = await discovery(deps);
       const entries = new ModelCatalog(state.modelCatalogPath).load();
+      const isolation = await codexIsolationStatus(snapshots, deps, env, true);
       const store = new GlobalQuotaStore(state.globalDir);
       let runtimes: readonly unknown[] = [];
       try { runtimes = hydrateModelRegistry({ entries, providers: snapshots, quota: store.latest() }).runtimes; }
@@ -259,9 +302,25 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           authState: snapshot.authState.value,
           authMode: snapshot.authMode.value,
           shadow: shadowProviderStatus(snapshot.providerId),
+          roles: {
+            primary: shadowProviderRoleStatus(snapshot.providerId, "primary"),
+            reviewer: snapshot.providerId === "openai"
+              ? { enabled: isolation.eligible, reason: isolation.reason }
+              : shadowProviderRoleStatus(snapshot.providerId, "reviewer"),
+            judge: shadowProviderRoleStatus(snapshot.providerId, "judge"),
+          },
+          ...(snapshot.providerId === "openai" ? { isolation: { attempted: isolation.attempted, eligible: isolation.eligible, source: isolation.attestation?.source ?? null, profileHash: isolation.attestation?.profileHash ?? null, reason: isolation.reason } } : {}),
         })),
       };
-      emit(json, data, `Project ${project.projectId} valid. ${entries.filter((entry) => entry.configured).length} configured models.\n${snapshots.map((item) => `${item.providerId}: ${item.available.value ? "available" : "missing"} · shadow=${shadowProviderStatus(item.providerId).enabled ? "enabled" : "blocked"}`).join("\n")}`, stdout);
+      emit(
+        json,
+        data,
+        `Project ${project.projectId} valid. ${entries.filter((entry) => entry.configured).length} configured models.\n${snapshots.map((item) => {
+          if (item.providerId === "openai") return `${item.providerId}: ${item.available.value ? "available" : "missing"} · reviewer=${isolation.eligible ? "verified" : "blocked"}`;
+          return `${item.providerId}: ${item.available.value ? "available" : "missing"} · shadow=${shadowProviderStatus(item.providerId).enabled ? "enabled" : "blocked"}`;
+        }).join("\n")}`,
+        stdout,
+      );
       return Object.freeze({ exitCode: 0, data });
     }
 
@@ -306,14 +365,18 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const budget = budgetFor(classification, { writeRequested: false });
       const requiredContextTokens = contextTokens(task);
       const context = taskContext(project);
+      const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
+      const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state));
+      const codexIsolation = isolation.attestation ?? undefined;
       const plan = buildShadowTaskPlan({
         project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
         classification, budget, requiredContextTokens, optionalReview,
+        ...(codexIsolation === undefined ? {} : { codexIsolation }),
       });
       const planData = serializedPlan(plan);
 
       if (subcommand === "plan" || !execute) {
-        data = planData;
+        data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason } };
         emit(json, data, `${classification.complexity}/${classification.risk} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\nZero provider model calls executed.`, stdout);
         return Object.freeze({ exitCode: 0, data });
       }
@@ -327,6 +390,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           router: hydrated.router,
           snapshots,
           attestations,
+          ...(codexIsolation === undefined ? {} : { codexIsolation }),
           ...(deps.executor === undefined ? {} : { executor: deps.executor }),
         });
         const result = await runner.run({
