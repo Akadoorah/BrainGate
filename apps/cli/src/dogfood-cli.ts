@@ -15,7 +15,6 @@ import {
   applyDogfoodPrior,
   initializeDogfoodProject,
   inspectGitRepository,
-  type DogfoodMode,
   type DogfoodOutcome,
   type DogfoodReviewerVerdict,
   type DogfoodRole,
@@ -202,7 +201,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
 
   const askCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && shadowProviderRoleStatus(entry.providerId, "primary").enabled;
+    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && shadowProviderRoleStatus(snapshot.providerId, "primary").enabled;
   });
   let writeCandidate = false;
   for (const entry of configured) {
@@ -210,15 +209,15 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     const snapshot = providerById.get("anthropic");
     if (snapshot === undefined) continue;
     try {
-      assertClaudeWriteEligible(snapshot, { providerId: entry.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool });
+      assertClaudeWriteEligible(snapshot, { providerId: snapshot.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool });
       writeCandidate = true;
     } catch { /* reported as unavailable below */ }
   }
   const cleanForWrite = repositories.every((repo) => repo.clean);
   const reviewerCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    if (snapshot === undefined || !shadowProviderRoleStatus(entry.providerId, "reviewer").enabled) return false;
-    if (entry.providerId === "openai") return isolation.eligible;
+    if (snapshot === undefined || !shadowProviderRoleStatus(snapshot.providerId, "reviewer").enabled) return false;
+    if (snapshot.providerId === "openai") return isolation.eligible;
     return snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription";
   });
   const blockers: string[] = [];
