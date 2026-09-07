@@ -4,6 +4,7 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
+import { CODEX_STAGE_TOKEN } from "./codex-isolation.js";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "./types.js";
 
 function inside(root: string, candidate: string): boolean {
@@ -33,18 +34,32 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
   }): Promise<ShadowProcessResult> {
-    const cwd = assertShadowProjectCwd(input.project, input.plan.cwd);
+    const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 10 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
     let tempRoot: string | null = null;
+    let spawnCwd = sourceCwd;
     let args = [...input.plan.args];
     const overrides: Record<string, string> = { ...input.plan.envOverrides };
 
     try {
+      if (input.plan.workspaceMode === "staged-clean") {
+        tempRoot = mkdtempSync(join(tmpdir(), "braingate-shadow-stage-"));
+        spawnCwd = join(tempRoot, "workspace");
+        mkdirSync(spawnCwd, { mode: 0o700 });
+        args = args.map((argument) => argument.replaceAll(CODEX_STAGE_TOKEN, spawnCwd));
+        if (args.some((argument) => argument.includes(CODEX_STAGE_TOKEN))) {
+          throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Staged shadow invocation contains an unresolved workspace token.");
+        }
+      } else if (args.some((argument) => argument.includes(CODEX_STAGE_TOKEN))) {
+        throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Project-mode shadow invocation cannot contain a staged workspace token.");
+      }
+
       if (input.plan.inputMode === "temp-attachment") {
         if (input.plan.attachmentContent === null || input.plan.attachmentToken === null) {
           throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "Attachment-mode plan requires attachment content and token.");
         }
+        if (tempRoot !== null) throw new BrainGateInvariantError("SHADOW_STAGE_ATTACHMENT_CONFLICT", "Staged workspace and attachment modes cannot share a temporary root.");
         tempRoot = mkdtempSync(join(tmpdir(), "braingate-shadow-"));
         const attachmentPath = join(tempRoot, "input.json");
         writeFileSync(attachmentPath, input.plan.attachmentContent, { encoding: "utf8", mode: 0o600, flag: "wx" });
@@ -67,13 +82,12 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         let spawned = false;
         let settled = false;
         const child = spawn(input.plan.executable, args, {
-          cwd,
+          cwd: spawnCwd,
           env: environment.env,
           shell: false,
           stdio: ["pipe", "pipe", "pipe"],
           windowsHide: true,
         });
-        spawned = true;
         const finish = (exitCode: number | null) => {
           if (settled) return;
           settled = true;
@@ -95,6 +109,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           if (Buffer.byteLength(next, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
           if (target === "stdout") stdout = next; else stderr = next;
         };
+        child.on("spawn", () => { spawned = true; });
         child.stdout?.on("data", (chunk: Buffer) => append("stdout", chunk));
         child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
         child.on("error", (error) => { stderr += `\n${error.message}`; finish(null); });
