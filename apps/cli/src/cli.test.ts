@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawnSync } from "node:child_process";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import {
@@ -13,7 +14,14 @@ import {
   type ShadowProcessResult,
 } from "@braingate/shadow";
 import type { RegisteredProject } from "@braingate/core";
+import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "@braingate/write";
 import { runCli } from "./cli.js";
+
+function git(cwd: string, args: readonly string[]): string {
+  const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
+  if (result.status !== 0) throw new Error(String(result.stderr || result.stdout));
+  return String(result.stdout ?? "").trim();
+}
 
 function snapshot(): ProviderSnapshot {
   const observedAt = "2026-09-07T00:00:00.000Z";
@@ -74,10 +82,25 @@ class FakeExecutor implements ShadowProcessExecutor {
   }
 }
 
+class FakeWriteExecutor implements WriteProviderExecutor {
+  readonly calls: WriteProviderPlan[] = [];
+  async run(input: { plan: WriteProviderPlan }): Promise<WriteProviderResult> {
+    this.calls.push(input.plan);
+    writeFileSync(join(input.plan.cwd, "app.txt"), "after\n");
+    return { spawned: true, exitCode: 0, stdout: JSON.stringify({ result: "ok" }), stderr: "", timedOut: false, durationMs: 9, removedEnvironmentKeys: [] };
+  }
+}
+
 function fixture(withCodex = false) {
   const root = mkdtempSync(join(tmpdir(), "braingate-cli-"));
   const repo = join(root, "repo");
   mkdirSync(repo);
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.email", "test@example.invalid"]);
+  git(repo, ["config", "user.name", "BrainGate Test"]);
+  writeFileSync(join(repo, "app.txt"), "before\n");
+  git(repo, ["add", "app.txt"]);
+  git(repo, ["commit", "-m", "initial"]);
   const manifest = join(root, "project.json");
   writeFileSync(manifest, JSON.stringify({ project_id: "sample", name: "Sample", repositories: [repo] }));
   const home = join(root, "brain-home");
@@ -87,7 +110,7 @@ function fixture(withCodex = false) {
   catalog.upsert({
     providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription",
     capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000,
-    writeCapable: false, reasoning: 90, underlyingFamily: null,
+    writeCapable: true, reasoning: 90, underlyingFamily: null,
   });
   if (withCodex) {
     catalog.upsert({
@@ -271,6 +294,49 @@ test("shadow preflight rejects cwd outside registered repository before executor
   assert.equal(result.exitCode, 1);
   assert.equal(fake.calls.length, 0);
   assert.match(output.err(), /SHADOW_CWD_ESCAPE/);
+});
+
+test("write plan and unexecuted run make zero model calls and zero worktrees", async () => {
+  const f = fixture();
+  const writer = new FakeWriteExecutor();
+  const output = io();
+  const task = "change the button label UNIQUE_WRITE_PROMPT";
+  const deps = { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: output.stdout, stderr: output.stderr };
+  assert.equal((await runCli(["write", "plan", "--project", f.manifest, "--task", task, "--no-review", "--json"], deps)).exitCode, 0);
+  assert.equal((await runCli(["write", "run", "--project", f.manifest, "--task", task, "--no-review", "--json"], deps)).exitCode, 0);
+  assert.equal(writer.calls.length, 0);
+  assert.match(output.out(), /"createsWorktree": false/);
+  assert.match(output.out(), /"mergeAvailable": false/);
+  assert.doesNotMatch(output.out(), /UNIQUE_WRITE_PROMPT/);
+});
+
+test("write run --execute changes an isolated worktree and never the source checkout", async () => {
+  const f = fixture();
+  const writer = new FakeWriteExecutor();
+  const output = io();
+  const result = await runCli(["write", "run", "--project", f.manifest, "--task", "change the button label", "--no-review", "--execute", "--json"], {
+    cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: output.stdout, stderr: output.stderr,
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(writer.calls.length, 1);
+  assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), "before\n");
+  assert.equal(git(f.repo, ["status", "--porcelain"]), "");
+  assert.match(output.out(), /"approvalRequired": true/);
+  assert.match(output.out(), /"mergePerformed": false/);
+  assert.match(output.out(), /app\.txt/);
+});
+
+test("write high-risk task fails before provider execution", async () => {
+  const f = fixture();
+  const writer = new FakeWriteExecutor();
+  const output = io();
+  const result = await runCli(["write", "run", "--project", f.manifest, "--task", "fix auth login and session security", "--no-review", "--execute", "--json"], {
+    cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: output.stdout, stderr: output.stderr,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(writer.calls.length, 0);
+  assert.match(output.err(), /WRITE_SCOPE_BLOCKED/);
+  assert.equal(git(f.repo, ["status", "--porcelain"]), "");
 });
 
 test("models/status/dashboard safe paths do not invoke provider executor", async () => {
