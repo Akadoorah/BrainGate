@@ -9,6 +9,7 @@ BrainGate operates near valuable source code and authenticated developer tooling
 - Project repositories: isolated security domains.
 - Skills: executable/instruction-bearing capabilities requiring explicit authorization.
 - Memory: untrusted input until validated; canonical memory has a single writer.
+- Imported history: untrusted project-scoped evidence until an explicit supervisor promotion.
 - Dogfood telemetry: sanitized project-local experiment metadata, not a transcript or memory source.
 
 ## Required controls
@@ -19,13 +20,15 @@ Every project has an immutable explicit `project_id`. Project-scoped memory and 
 
 M12 `braingate init` writes `.brain/project.json` only after resolving the Git top-level repository. `.brain/` is added to the repository's local Git exclude file rather than tracked `.gitignore`; conflicting existing project identity is refused rather than overwritten.
 
+Memory-import previews are bound to the active project identity. A preview created for one project cannot be submitted to another project's memory store.
+
 ### Filesystem isolation
 
 Write agents operate in task-specific Git worktrees. Review-only agents receive read-only or separately materialized views where feasible. Provider prompts are never the sole enforcement mechanism.
 
 For the Codex reviewer path, BrainGate validates that the source CWD belongs to the registered project, but Codex itself is **not** started from that repository. BrainGate creates a fresh private staged workspace, substitutes that path into the verified permission profile, runs Codex there, and deletes the stage after the call. The real project repository is never granted as a Codex workspace root in this path.
 
-M11/M12 Claude writes use a restricted provider profile inside a task worktree. The source checkout is checked for mutation after the provider call and again after review. Sensitive files, Git/control-plane configuration, and agent instruction files are rejected by the guarded diff boundary. Current M12 write scope is limited to T0-T2 low/medium-risk changes; high/critical-risk or T3/T4 writes fail closed before worktree/provider execution.
+M11/M12 Claude writes use a restricted provider profile inside a task worktree. The source checkout is checked for mutation after the provider call and again after review. Sensitive files, Git/control-plane configuration, and agent instruction files are rejected by the guarded diff boundary. Current write scope is limited to T0-T2 low/medium-risk changes; high/critical-risk or T3/T4 writes fail closed before worktree/provider execution.
 
 ### Codex reviewer self-test
 
@@ -39,6 +42,19 @@ The resulting isolation attestation is bound to the Codex version, platform, and
 
 Codex execution additionally uses ephemeral mode, ignores user exec-policy rules and user config, uses a clean non-repository CWD, pins the routed model, and explicitly disables unnecessary model-visible surfaces such as shell/code execution, web search, apps/plugins, browser/computer use, memory, worktrees, and multi-agent/collaboration features. If required configuration is rejected by the installed CLI, strict configuration causes the run to fail rather than silently broaden permissions.
 
+### Reviewer independence
+
+Reviewer independence is graded rather than overstated:
+
+1. `cross-provider` — strongest current automated independence;
+2. `same-provider-different-model` — a separate fresh invocation from another model under the same provider authority;
+3. `same-model-fresh-session` — weakest automated fallback, using the same model identity in a new invocation;
+4. `none` — no automated review occurred.
+
+Same-provider models may share the same subscription quota pool and are never presented as separate provider authorities merely because model IDs differ. BrainGate records the independence level and whether the quota pool is shared.
+
+Critical tasks still require cross-provider/separate-authority review and fail closed when it is unavailable. Noncritical T4 work may receive same-provider review, but the receipt marks human approval as required before acceptance.
+
 ### Skill isolation
 
 Skills have explicit scope and allowlists. A worker cannot load a skill outside the active project's authorization even if it knows the skill's name.
@@ -46,6 +62,8 @@ Skills have explicit scope and allowlists. A worker cannot load a skill outside 
 ### Secret handling
 
 Default deny patterns include `.env`, `.env.*`, `credentials.*`, private keys, certificates, and configured secret paths. Secrets must never be persisted to task transcripts, canonical memory, logs, dogfood telemetry, or generated fixtures. Test/dummy credentials should be used where possible.
+
+Imported history passes through the same memory secret checks as ordinary proposals. The importer does not bypass canonical-memory sensitivity validation.
 
 ### Subscription authentication
 
@@ -55,6 +73,8 @@ In subscription mode, child environments remove known provider API-key/direct-bi
 
 BrainGate does not inspect, copy, parse, or persist provider auth-token files such as Codex `auth.json`.
 
+Conversation-history bootstrap is local-file based. BrainGate does not scrape ChatGPT, Claude, or other provider web sessions to obtain historical conversations.
+
 ### Process/network permissions
 
 Execution profiles declare read/write/shell/network permissions. High-risk permissions require policy approval. Where a provider cannot hard-enforce a restriction, BrainGate compensates with OS/filesystem/process boundaries or refuses the unsafe mode.
@@ -62,6 +82,8 @@ Execution profiles declare read/write/shell/network permissions. High-risk permi
 ### Memory integrity
 
 Workers propose memory updates. A validation layer checks project scope, source evidence, sensitivity, and conflicts before canonical storage. Canonical architectural/business facts do not expire automatically; temporary observations do.
+
+Historical imports use the same proposal/supervisor boundary. `memory preview` persists nothing. `memory import` creates proposals only. `memory promote` requires explicit evidence references and a confidence value before the existing supervisor creates a canonical record. ChatGPT-style imports are bounded historical extracts rather than full transcript persistence or wholesale context injection.
 
 ### Dogfood telemetry and adaptation
 
@@ -75,17 +97,19 @@ Adaptive priors are project-local and mode-local (`ask` vs `write`). They requir
 
 ### Auditability
 
-Task ledgers record classification, routing, provider/model role, permission grants, file activity metadata, verification, retries, usage source quality, and memory changes. Raw provider reasoning/event streams are not canonical task output. Dogfood reports summarize sanitized experiment metadata separately from canonical task/memory state.
+Task ledgers record classification, routing, provider/model role, permission grants, file activity metadata, verification, retries, usage source quality, and memory changes. Raw provider reasoning/event streams are not canonical task output. Dogfood reports summarize sanitized experiment metadata separately from canonical task/memory state. Workflow receipts distinguish cross-provider review from weaker same-provider/fresh-session review.
 
 ## Threats explicitly in scope
 
-- Cross-project context or telemetry leakage.
+- Cross-project context, imported history, or telemetry leakage.
 - Secret exfiltration or accidental logging.
-- Prompt injection through repository content or skills.
+- Stale or incorrect historical conversation claims becoming canonical facts.
+- Prompt injection through repository content, imported history, or skills.
 - Agent modifying the wrong checkout.
 - Provider reading outside an authorized staged/project root.
 - Infinite repair/review loops.
 - Misreported quota/token usage.
+- Overstating reviewer independence when multiple models share one provider/account.
 - Provider CLI behavior changing unexpectedly.
 - Compromised or malicious third-party skills.
 - Unsafe adaptation caused by a small or noisy dogfood sample.
