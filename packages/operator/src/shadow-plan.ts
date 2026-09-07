@@ -39,6 +39,7 @@ function payload(role: "primary" | "reviewer", task: string, context: unknown): 
     phase: "preflight",
     task,
     findings: Object.freeze([]),
+    candidateOutput: null,
     context,
     responseContract: Object.freeze(role === "primary"
       ? { kind: "work", output: "string" }
@@ -129,11 +130,5 @@ export function buildShadowTaskPlan(input: {
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, invocation: previewShadowInvocation(reviewerInvocation) }));
   }
 
-  return Object.freeze({
-    classification: input.classification,
-    budget: input.budget,
-    requiredContextTokens: input.requiredContextTokens,
-    cwd,
-    roles: Object.freeze(roles),
-  });
+  return Object.freeze({ classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, cwd, roles: Object.freeze(roles) });
 }
