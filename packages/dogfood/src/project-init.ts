@@ -6,7 +6,8 @@ import { BrainGateInvariantError, parseProjectConfig, parseProjectId } from "@br
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false, timeout: 15_000, maxBuffer: 1024 * 1024 });
   if (result.error || result.status !== 0) {
-    throw new BrainGateInvariantError("DOGFOOD_GIT_FAILED", result.error?.message ?? String(result.stderr || result.stdout).trim() || `git ${args[0]} failed`);
+    const output = String(result.stderr || result.stdout).trim();
+    throw new BrainGateInvariantError("DOGFOOD_GIT_FAILED", result.error?.message ?? (output || `git ${args[0]} failed`));
   }
   return String(result.stdout ?? "").trim();
 }
