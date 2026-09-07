@@ -197,7 +197,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
   const configured = catalog.filter((entry) => entry.configured);
   const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"));
-  const providerById = new Map(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
+  const providerById = new Map<string, ProviderSnapshot>(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
 
   const askCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
