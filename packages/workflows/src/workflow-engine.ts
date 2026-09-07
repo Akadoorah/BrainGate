@@ -48,13 +48,14 @@ export class WorkflowEngine {
       events.push(Object.freeze({ sequence: ++sequence, kind, role, model, detail }));
     };
 
+    const primaryExcluded = input.excludeProviders?.primary;
     const primaryRoute = this.#router.route({
       role: "coder",
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: input.writeRequired,
-      excludeProviders: input.excludeProviders?.primary,
+      ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
     });
     const primary = primaryRoute.selected;
     let finalOutput = "";
@@ -85,6 +86,7 @@ export class WorkflowEngine {
     const reviewerIndependence = input.classification.risk === "high" || input.classification.risk === "critical"
       ? { mode: "required" as const, models: [primaryRef] }
       : { mode: "preferred" as const, models: [primaryRef] };
+    const reviewerExcluded = input.excludeProviders?.reviewer;
     const reviewer = this.#router.route({
       role: "reviewer",
       classification: input.classification,
@@ -92,7 +94,7 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence: reviewerIndependence,
-      excludeProviders: input.excludeProviders?.reviewer,
+      ...(reviewerExcluded === undefined ? {} : { excludeProviders: reviewerExcluded }),
     }).selected;
     let reviewerResponse = await invoke("reviewer", reviewer, "review-1", [], true);
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
@@ -143,6 +145,7 @@ export class WorkflowEngine {
       return this.#receipt("blocked_disagreement", primary, reviewer, null, events, tracker, finalOutput);
     }
     tracker.recordCouncilRound();
+    const judgeExcluded = input.excludeProviders?.judge;
     const judge = this.#router.route({
       role: "judge",
       classification: input.classification,
@@ -150,7 +153,7 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence: { mode: "preferred", models: [modelRef(primary), modelRef(reviewer)] },
-      excludeProviders: input.excludeProviders?.judge,
+      ...(judgeExcluded === undefined ? {} : { excludeProviders: judgeExcluded }),
     }).selected;
     const bounded = boundFindings(findings);
     const response = await invoke("judge", judge, "judge-1", bounded, true);
