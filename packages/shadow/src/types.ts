@@ -31,12 +31,14 @@ export interface ShadowRolePayload {
 }
 
 export type ShadowInputMode = "stdin" | "temp-attachment";
+export type ShadowWorkspaceMode = "project" | "staged-clean";
 
 export interface ShadowInvocationPlan {
   readonly providerId: ProviderId;
   readonly executable: string;
   readonly args: readonly string[];
   readonly cwd: string;
+  readonly workspaceMode: ShadowWorkspaceMode;
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;
@@ -54,6 +56,7 @@ export interface ShadowInvocationPreview {
   readonly executable: string;
   readonly args: readonly string[];
   readonly cwd: string;
+  readonly workspaceMode: ShadowWorkspaceMode;
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;
