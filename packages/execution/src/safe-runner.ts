@@ -1,3 +1,4 @@
+import { realpathSync } from "node:fs";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
@@ -14,6 +15,11 @@ const READ_GIT = new Set(["status", "diff", "log", "show", "ls-files", "grep", "
 function inside(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
+}
+
+function canonical(path: string): string {
+  try { return realpathSync.native(resolve(path)); }
+  catch { throw new BrainGateInvariantError("COMMAND_CWD_INVALID", "Command working directory does not exist or cannot be resolved."); }
 }
 
 function key(command: Pick<StructuredCommand, "executable" | "args">): string {
@@ -44,7 +50,7 @@ export class SafeCommandRunner {
 
     let root: string;
     if (input.profile === "read-only") {
-      const cwd = resolve(input.command.cwd);
+      const cwd = canonical(input.command.cwd);
       const repo = input.project.repositories.find((candidate) => inside(candidate, cwd));
       if (repo === undefined) throw new BrainGateInvariantError("COMMAND_CWD_DENIED", "Read-only command cwd is outside the registered project repositories.");
       root = repo;
@@ -55,7 +61,7 @@ export class SafeCommandRunner {
       const worktree = input.worktree;
       if (worktree === undefined || worktree.projectId !== input.project.projectId) throw new BrainGateInvariantError("COMMAND_WORKTREE_REQUIRED", "This profile requires a project worktree handle.");
       root = worktree.worktreePath;
-      const cwd = resolve(input.command.cwd);
+      const cwd = canonical(input.command.cwd);
       if (!inside(root, cwd)) throw new BrainGateInvariantError("COMMAND_CWD_DENIED", "Command cwd escapes the task worktree.");
       if (input.profile === "worktree-write") {
         throw new BrainGateInvariantError("COMMAND_WRITE_ISOLATION_REQUIRED", "Untrusted write-capable processes remain blocked until an isolation backend is attached.");
@@ -63,7 +69,7 @@ export class SafeCommandRunner {
       if (!this.#verification.has(key(input.command))) throw new BrainGateInvariantError("COMMAND_VERIFY_DENIED", "Verification command is not declared in project policy.");
     }
 
-    const cwd = resolve(input.command.cwd);
+    const cwd = canonical(input.command.cwd);
     if (!inside(root, cwd)) throw new BrainGateInvariantError("COMMAND_CWD_DENIED", "Command cwd escapes its execution root.");
     const environmentOptions = input.allowedEnvKeys === undefined ? {} : { allowedAdditionalKeys: input.allowedEnvKeys };
     const environment = this.#secretGuard.buildEnvironment(input.env ?? process.env, environmentOptions);

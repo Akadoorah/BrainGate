@@ -46,7 +46,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
 
     try {
       if (input.plan.workspaceMode === "staged-clean") {
-        tempRoot = mkdtempSync(join(tmpdir(), "braingate-shadow-stage-"));
+        tempRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "braingate-shadow-stage-")));
         spawnCwd = join(tempRoot, "workspace");
         const isolatedHome = join(tempRoot, "home");
         mkdirSync(spawnCwd, { mode: 0o700 });
@@ -82,7 +82,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "Attachment-mode plan requires attachment content and token.");
         }
         if (tempRoot !== null) throw new BrainGateInvariantError("SHADOW_STAGE_ATTACHMENT_CONFLICT", "Staged workspace and attachment modes cannot share a temporary root.");
-        tempRoot = mkdtempSync(join(tmpdir(), "braingate-shadow-"));
+        tempRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "braingate-shadow-")));
         const attachmentPath = join(tempRoot, "input.json");
         writeFileSync(attachmentPath, input.plan.attachmentContent, { encoding: "utf8", mode: 0o600, flag: "wx" });
         const configHome = join(tempRoot, "copilot-home");
