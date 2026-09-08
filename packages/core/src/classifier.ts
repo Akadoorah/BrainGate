@@ -41,6 +41,22 @@ const QUESTION_TERMS = ["where is", "what does", "explain", "find", "which file"
 const WRITE_TERMS = ["add", "implement", "create", "change", "fix", "rename", "refactor", "اضف", "أضف", "نفذ", "سوي", "غير", "غيّر", "اصلح", "أصلح"];
 const DEBUG_TERMS = ["bug", "error", "fails", "broken", "debug", "race condition", "مشكله", "مشكلة", "خطا", "خطأ", "باق", "ما يشتغل", "لا يعمل"];
 const ARCHITECTURE_TERMS = ["architecture", "redesign", "rewrite", "multi-tenant", "multi tenant", "cross-repo", "migration", "migrate", "معمار", "اعادة بناء", "إعادة بناء", "ترحيل", "مايغريشن"];
+/**
+ * Cues that a question ranges over a codebase rather than pointing at a place in it.
+ *
+ * Breadth is a cost driver on its own, separate from risk. "What do you think about paywalls
+ * in the app" is not dangerous, but answering it means reading widely, and a task budgeted like
+ * a lookup runs out of tool-use turns before it reaches an answer. The classifier had no signal
+ * for this at all, so it rated a whole-application review below "where is X implemented".
+ */
+const BREADTH_TERMS = [
+  "across the", "throughout", "whole app", "whole application", "entire app", "entire codebase",
+  "overall", "in general", "generally", "everywhere", "all the", "every ",
+  "what do you think", "your opinion", "assess", "evaluate", "tradeoff", "trade-off",
+  "approach to", "strategy", "compare", "audit",
+  "بشكل عام", "عامة", "عموما", "عموماً", "بالتطبيق", "في التطبيق", "كل ال", "ما رأيك", "رايك", "رأيك", "قيّم", "قيم ", "استراتيجية", "مقارنة",
+];
+
 const FEATURE_TERMS = ["feature", "refactor", "integration", "endpoint", "workflow", "ميزة", "خاصية", "تكامل", "واجهة"];
 
 const DOMAIN_TERMS = {
@@ -121,6 +137,15 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
     reasons.push("review-requested");
   }
 
+  // Applied before the cue chain below so a broad question cannot be pinned back down to T0 by
+  // also containing a question word: "what do you think about X in the app" contains both.
+  const broad = hasAny(text, BREADTH_TERMS);
+  if (broad) {
+    complexity = maxComplexity(complexity, "T2");
+    confidence = Math.max(confidence, 0.75);
+    reasons.push("breadth-cue");
+  }
+
   if (hasAny(text, ARCHITECTURE_TERMS)) {
     complexity = "T4";
     confidence = Math.max(confidence, 0.95);
@@ -129,7 +154,10 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
     complexity = maxComplexity(complexity, "T2");
     confidence = Math.max(confidence, 0.82);
     reasons.push("debugging-cue");
-  } else if (hasAny(text, FEATURE_TERMS) || hasAny(text, WRITE_TERMS)) {
+  } else if ((hasAny(text, FEATURE_TERMS) || hasAny(text, WRITE_TERMS)) && !(mode === "ask" && reasons.includes("small-question-cue"))) {
+    // A short question that happens to contain an implementation word is still a question:
+    // "where is the paywall logic implemented?" asks about code that exists, and rating it as
+    // implementation work gave a lookup more budget than a whole-application review.
     complexity = maxComplexity(complexity, "T2");
     confidence = Math.max(confidence, 0.8);
     reasons.push("implementation-cue");
@@ -179,6 +207,13 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
   }
 
   for (const domain of domains) reasons.push(`sensitive-domain:${domain}`);
+
+  // A broad question that also asks for a judgement — an opinion, an assessment, a comparison —
+  // has to survey before it can conclude, which is the most turn-hungry shape a read task takes.
+  if (broad && hasAny(text, ["what do you think", "your opinion", "assess", "evaluate", "tradeoff", "trade-off", "compare", "audit", "ما رأيك", "رأيك", "رايك", "قيّم", "مقارنة"])) {
+    complexity = maxComplexity(complexity, "T3");
+    reasons.push("open-ended-judgement");
+  }
 
   if (risk === "high") complexity = maxComplexity(complexity, "T3");
   if (risk === "critical") complexity = "T4";
