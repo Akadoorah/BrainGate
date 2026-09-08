@@ -83,13 +83,26 @@ file lands in the provider's own home with no way to redirect it, so the collect
 exists for exactly this provider. It is first because the capability is proven and its
 isolation already is too, through the sandbox self-test.
 
-**xAI Grok Build — the cleaner contract, not yet verifiable here.** Grok Build ships native
-`generate_image` and `generate_video` tools and writes under `.grok/generated-media/` *unless a
-specific output path is requested*. A provider that accepts an output path does not need
-collection at all: BrainGate can name the task worktree directly, and the artifact is created
-inside the boundary rather than moved into it. Grok also runs its own sub-agents in per-branch
-worktrees, which is the same shape as the write boundary here. None of this is reachable yet —
-the CLI is not installed, and execution stays fail-closed until its isolation is proven.
+**xAI Grok Build — the cleaner contract, and one hazard the self-test must catch.** Now
+installed (1.0.13) and inspected. It ships native `generate_image` and `generate_video` and
+writes under `.grok/generated-media/` *unless a specific output path is requested*: a provider
+that accepts an output path needs no collection step, because the artifact can be created inside
+the task worktree rather than moved into it. It also runs its own sub-agents in per-branch
+worktrees, the same shape as the write boundary here.
+
+Its isolation surface is closer to Codex than to Antigravity, and has the piece Antigravity
+lacks: `GROK_HOME` relocates the configuration home, so BrainGate can hand it a configuration it
+controls. `--sandbox <PROFILE>` names a filesystem and network profile, defined in
+`sandbox.toml` under either the home or the project, and `--permission-mode` accepts `plan`.
+
+One behaviour makes a self-test mandatory rather than advisable: **a missing sandbox profile is
+a warning, not an error.** Asked for a profile that does not exist, Grok prints
+`warning: sandbox could not be applied` and continues *without a sandbox*. A provider that
+silently downgrades its own isolation cannot be trusted on the strength of the flags passed to
+it; the self-test must prove the profile took effect — read inside, denied outside, denied
+write — exactly as the Codex one does, and treat a warning as a failure.
+
+Execution stays fail-closed until that self-test exists and passes.
 
 **Google Antigravity — blocked by a conflict, not by effort.** Image generation is not native to
 `agy`. It is reached through MCP servers or community scripts, and every BrainGate profile
