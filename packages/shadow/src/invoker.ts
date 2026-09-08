@@ -90,6 +90,41 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
   return Object.freeze({ kind: "judge", verdict: parsed.verdict as "approve" | "request_changes", rationale: boundedText(parsed.rationale, 4_000), findings: boundedFindings(parsed.findings) });
 }
 
+
+/**
+ * Recovers the provider's own account of why a run failed.
+ *
+ * A CLI that exits non-zero usually says what went wrong — turns exhausted, a denied tool, an
+ * unreadable config — and BrainGate was discarding all of it in favour of "failed with exit 1".
+ * That reduced an actionable failure to an opaque one: the user could not tell a budget that was
+ * too small from a provider that was broken.
+ *
+ * Only recognised, bounded fields are surfaced. Provider output is untrusted and is not echoed
+ * wholesale into an error message.
+ */
+export function providerFailureReason(providerId: string, stdout: string, stderr: string): string | null {
+  if (providerId === "anthropic") {
+    try {
+      const parsed = JSON.parse(stdout.trim()) as { subtype?: unknown; errors?: unknown };
+      const errors = Array.isArray(parsed.errors) ? parsed.errors.filter((entry): entry is string => typeof entry === "string") : [];
+      if (errors.length > 0) return boundedText(errors[0], 300);
+      if (typeof parsed.subtype === "string" && parsed.subtype !== "success") return boundedText(parsed.subtype, 120);
+    } catch { /* not the structured shape; fall through to stderr */ }
+  }
+  const line = stderr.split(/\r?\n/).map((entry) => entry.trim()).find((entry) => entry.length > 0);
+  return line === undefined ? null : boundedText(line, 300);
+}
+
+/** What to do about a failure BrainGate can recognise, so the message ends with a next step. */
+function failureAdvice(reason: string | null): string {
+  if (reason === null) return "";
+  if (/maximum number of turns|max_turns/i.test(reason)) {
+    return " The task needed more tool-use turns than its complexity was budgeted for; label the finished task with `dogfood feedback --actual-complexity` so routing raises the floor, or ask something narrower.";
+  }
+  if (/not logged in|authentication/i.test(reason)) return " Sign in with the provider's own CLI and re-run `braingate discover`.";
+  return "";
+}
+
 export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #project: RegisteredProject;
   readonly #cwd: string;
@@ -161,7 +196,11 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       const result = await this.#executor.run({ project: this.#project, plan, ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }) });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         this.#event("shadow.provider.failed", { ...safeMeta, timedOut: result.timedOut, exitCode: result.exitCode, error: redactSecrets(result.stderr).slice(0, 500) });
-        throw new BrainGateInvariantError("SHADOW_PROVIDER_FAILED", `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
+        const reason = providerFailureReason(request.model.providerId, result.stdout, result.stderr);
+        throw new BrainGateInvariantError(
+          "SHADOW_PROVIDER_FAILED",
+          `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.${reason === null ? "" : ` The provider reported: ${reason}.`}${failureAdvice(reason)}`,
+        );
       }
       const response = parseRoleResponse(request.role, snapshot.providerId, result.stdout);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
