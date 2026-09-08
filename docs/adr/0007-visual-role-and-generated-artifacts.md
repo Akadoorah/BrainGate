@@ -73,5 +73,34 @@ is the authority.
 Providers whose generation surface cannot be observed this way stay ineligible for the visual
 role. That is the existing fail-closed posture and not a new restriction.
 
+## Per-provider notes
+
+These differ enough to shape the order of work, and were established from vendor documentation
+and, for Codex, a direct run.
+
+**OpenAI Codex — verified, collection required.** Generation works and produced a real PNG. The
+file lands in the provider's own home with no way to redirect it, so the collection step above
+exists for exactly this provider. It is first because the capability is proven and its
+isolation already is too, through the sandbox self-test.
+
+**xAI Grok Build — the cleaner contract, not yet verifiable here.** Grok Build ships native
+`generate_image` and `generate_video` tools and writes under `.grok/generated-media/` *unless a
+specific output path is requested*. A provider that accepts an output path does not need
+collection at all: BrainGate can name the task worktree directly, and the artifact is created
+inside the boundary rather than moved into it. Grok also runs its own sub-agents in per-branch
+worktrees, which is the same shape as the write boundary here. None of this is reachable yet —
+the CLI is not installed, and execution stays fail-closed until its isolation is proven.
+
+**Google Antigravity — blocked by a conflict, not by effort.** Image generation is not native to
+`agy`. It is reached through MCP servers or community scripts, and every BrainGate profile
+denies MCP: `--disallowedTools mcp__*`, `--disable-builtin-mcps`, and `noMcp: true` in all three
+guarantee sets. Enabling it would mean removing a security control that exists to keep a
+provider from reaching tools BrainGate did not grant. That trade is a separate decision and is
+not made here. The Antigravity desktop application does generate images, but it is not the
+surface BrainGate drives.
+
+The order follows from this: Codex, then Grok once installed and isolated, then Antigravity only
+if the MCP boundary is deliberately revisited.
+
 Until this is implemented, `"visual"` remains declared and unroutable, and this ADR is the
 record of why it is not simply switched on.
