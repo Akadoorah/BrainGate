@@ -131,3 +131,24 @@ test("/forget clears the thread without touching project memory", async () => {
   assert.equal(await s.run(), 0);
   assert.match(s.text(), /Project memory is untouched/);
 });
+
+test("a subdirectory of a registered repository is not offered registration again", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-repl-nested-"));
+  const repo = join(root, "monorepo"); mkdirSync(repo);
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.email", "test@example.invalid"]);
+  git(repo, ["config", "user.name", "BrainGate Test"]);
+  writeFileSync(join(repo, "README.md"), "root\n");
+  git(repo, ["add", "."]); git(repo, ["commit", "-m", "initial"]);
+  initializeDogfoodProject({ cwd: repo, projectId: "monorepo", name: "Monorepo" });
+
+  const nested = join(repo, "apps", "flutter_migration");
+  mkdirSync(nested, { recursive: true });
+
+  // init writes the manifest at the repository root. Offering to register from a subdirectory
+  // produced a second identity and then PROJECT_INIT_CONFLICT, which is what this pins against.
+  const s = session(nested, ["/exit"]);
+  assert.equal(await s.run(), 0);
+  assert.ok(!s.asked.some((q) => /Register this repository now/.test(q)), "registration was offered inside an already-registered repository");
+  assert.match(s.text(), /Type a request, or \/help/);
+});
