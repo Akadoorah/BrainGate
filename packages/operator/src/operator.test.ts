@@ -89,3 +89,4 @@ test("BRAINGATE_HOME override is isolated", () => {
   assert.notEqual(a.home, b.home);
   assert.notEqual(a.modelCatalogPath, b.modelCatalogPath);
 });
+

@@ -260,3 +260,26 @@ test("dogfood export writes only sanitized regression metadata", async () => {
   const text = readFileSync((exported.data as { path: string }).path, "utf8");
   assert.match(text, /"schemaVersion":1/); assert.doesNotMatch(text, /Where is config|safe dogfood answer|candidateOutput|reasoning|diff/);
 });
+
+// The plan is what an operator reads before spending. A preview that showed only the executor
+// would hide the model the task leads with, which is the routing decision worth seeing.
+test("a plan for complex work names the planner as well as the executor", async () => {
+  const f = fixture();
+  const state = resolveOperatorState(f.env, f.repo);
+  const catalog = new ModelCatalog(state.modelCatalogPath);
+  catalog.upsert({ providerId: "anthropic", modelId: "planner-model", quotaPool: "claude-subscription", capabilities: { planner: 96, coder: 40 }, speed: "deep", contextCapacity: 1_000_000, writeCapable: true, reasoning: 96, underlyingFamily: null });
+  // A reviewer as well, since anything reaching T3 requires one.
+  catalog.upsert({ providerId: "anthropic", modelId: "reviewer-model", quotaPool: "claude-subscription", capabilities: { reviewer: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 88, underlyingFamily: null });
+
+  const out = io();
+  const shadow = new FakeShadowExecutor();
+  const result = await runDogfoodCli(
+    ["dogfood", "ask", "plan", "--task", "Review the caching approach across the whole application and compare the options"],
+    { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], executor: shadow, stdout: out.stdout, stderr: out.stderr },
+  );
+  assert.equal(result.exitCode, 0, out.err());
+  assert.match(out.out(), /planner=anthropic\/planner-model/);
+  assert.match(out.out(), /primary=anthropic\/claude-test/);
+  // A preview costs nothing, planner or not.
+  assert.equal(shadow.calls.length, 0);
+});

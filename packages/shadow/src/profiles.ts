@@ -36,6 +36,11 @@ interface ProfileDefinition {
    * These run `staged-clean`: a fresh temporary directory holding only what BrainGate put
    * there, so the provider cannot leak a repository it was never shown. Roles that read the
    * real checkout are not here, and need the operator's recorded acceptance instead.
+   *
+   * Planning belongs here: deciding an approach works from the task and the context BrainGate
+   * supplies, not from reading the tree. A planner that cannot open the repository plans from
+   * less, but it plans without being able to leak anything either — which is what makes the
+   * strongest model in an otherwise unusable subscription reachable at all.
    */
   readonly stagedRoles?: readonly WorkflowRole[];
   /** True when project access is reachable only through an operator acceptance. */
@@ -52,7 +57,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // configuration, which BrainGate neither owns nor can neutralise for one call. GROK_HOME does
   // not move that source and does lose authentication. A sandbox profile that cannot be found
   // is also a warning rather than an error, so the run continues unsandboxed.
-  xai: { providerId: "xai", enabled: false, stagedRoles: ["reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Grok resolves its permissions from another tool's settings file and cannot be pointed at a BrainGate-supplied configuration without losing authentication; a missing sandbox profile is also a warning rather than an error." },
+  xai: { providerId: "xai", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Grok resolves its permissions from another tool's settings file and cannot be pointed at a BrainGate-supplied configuration without losing authentication; a missing sandbox profile is also a warning rather than an error." },
   // Headless `agy` is already fail-closed: a tool needing permission is auto-denied because
   // there is nobody to prompt. What is missing is the ability to say, per invocation, which
   // tools BrainGate is granting. Permissions live in settings.json under the user's home, and
@@ -60,7 +65,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // under HOME, so isolating the settings loses authentication. Opening permissions.allow
   // instead would widen them for every other use of agy on the machine, which BrainGate can
   // neither scope nor verify at call time.
-  google: { providerId: "google", enabled: false, stagedRoles: ["reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings.json and credentials share HOME, so granting tools for one BrainGate call would grant them for every other use of agy." },
+  google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings.json and credentials share HOME, so granting tools for one BrainGate call would grant them for every other use of agy." },
 });
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
