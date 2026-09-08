@@ -276,6 +276,19 @@ The full command surface:
 
 See [`docs/DOGFOOD.md`](docs/DOGFOOD.md) for the real-project trial workflow.
 
+## How memory reaches a task
+
+Canonical project memory is retrieved for every task and travels with it, so a decision you
+recorded once is available the next time it matters. Records are selected by relevance to the
+task, bounded to a share of that task's own context budget — a T0 lookup does not carry a T4
+task's worth of history — and whatever did not fit is counted in the receipt rather than
+silently dropped.
+
+Only canonical records are read. A proposal is not memory: it becomes canonical solely through
+`memory promote`, which requires explicit evidence, and injecting proposals into tasks would
+route around that gate. Secrets never enter memory in the first place, so they cannot arrive
+here.
+
 ## Memory bootstrap
 
 Existing project history can be imported from local Markdown/text, normalized JSONL, or a best-effort ChatGPT-style `conversations.json` export. BrainGate does not scrape provider sessions or authentication state to obtain chat history.
