@@ -10,7 +10,7 @@ import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "@braingate/write";
-import { runDogfoodCli } from "./dogfood-cli.js";
+import { runDogfoodCli, suggestedProjectId } from "./dogfood-cli.js";
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -110,6 +110,81 @@ test("braingate init is idempotent and keeps the source checkout clean", async (
   assert.equal((await runDogfoodCli(["init", "--project-id", "waslo", "--name", "Waslo", "--json"], deps)).exitCode, 0);
   assert.equal(git(repo, ["status", "--porcelain"]), "");
   assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "waslo");
+});
+
+function freshRepo(name: string): string {
+  const root = mkdtempSync(join(tmpdir(), "braingate-firstrun-"));
+  const repo = join(root, name); mkdirSync(repo);
+  git(repo, ["init", "-b", "main"]); git(repo, ["config", "user.email", "test@example.invalid"]); git(repo, ["config", "user.name", "BrainGate Test"]);
+  writeFileSync(join(repo, "x.txt"), "x\n"); git(repo, ["add", "x.txt"]); git(repo, ["commit", "-m", "initial"]);
+  return repo;
+}
+
+test("a project id is suggested from the directory name, or withheld when nothing usable remains", () => {
+  assert.equal(suggestedProjectId("my-cool-app"), "my-cool-app");
+  assert.equal(suggestedProjectId("My Cool App"), "my-cool-app");
+  assert.equal(suggestedProjectId("Waslo_v2 (final)"), "waslo-v2-final");
+  assert.equal(suggestedProjectId("...."), null);
+  assert.equal(suggestedProjectId(""), null);
+});
+
+test("init proposes an identity and uses the answers, rather than deciding silently", async () => {
+  const repo = freshRepo("my-cool-app");
+  const out = io();
+  const asked: string[] = [];
+  const result = await runDogfoodCli(["init"], {
+    cwd: repo,
+    env: { BRAINGATE_HOME: join(repo, "..", "brain-home") },
+    stdout: out.stdout, stderr: out.stderr,
+    ask: async (question) => { asked.push(question); return ""; },
+  });
+  assert.equal(result.exitCode, 0);
+  // Both answers were blank, so both suggestions stand.
+  assert.match(asked[0] ?? "", /\[my-cool-app\]/);
+  assert.match(asked[1] ?? "", /\[my-cool-app\]/);
+  assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "my-cool-app");
+  // The identity is the isolation boundary, so say so, and say what to run next.
+  assert.match(out.out(), /isolation boundary/);
+  assert.match(out.out(), /braingate dogfood preflight/);
+});
+
+test("an answer overrides the suggestion", async () => {
+  const repo = freshRepo("my-cool-app");
+  const out = io();
+  const answers = ["chosen-id", "Chosen Name"];
+  const result = await runDogfoodCli(["init"], {
+    cwd: repo, env: { BRAINGATE_HOME: join(repo, "..", "brain-home") },
+    stdout: out.stdout, stderr: out.stderr,
+    ask: async () => answers.shift() ?? "",
+  });
+  assert.equal(result.exitCode, 0);
+  const manifest = JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8"));
+  assert.equal(manifest.project_id, "chosen-id");
+  assert.equal(manifest.name, "Chosen Name");
+});
+
+test("with no terminal to ask, init names the flags instead of blocking on stdin", async () => {
+  const repo = freshRepo("my-cool-app");
+  const out = io();
+  // ask omitted: a pipe, CI, or an editor task. Reading stdin anyway would hang forever.
+  const result = await runDogfoodCli(["init"], { cwd: repo, env: { BRAINGATE_HOME: join(repo, "..", "brain-home") }, stdout: out.stdout, stderr: out.stderr });
+  assert.notEqual(result.exitCode, 0);
+  assert.match(out.err(), /--project-id/);
+  assert.match(out.err(), /suggested id: my-cool-app/);
+});
+
+test("explicit flags still skip the question entirely, so scripted use is unchanged", async () => {
+  const repo = freshRepo("my-cool-app");
+  const out = io();
+  let asked = 0;
+  const result = await runDogfoodCli(["init", "--project-id", "scripted", "--name", "Scripted"], {
+    cwd: repo, env: { BRAINGATE_HOME: join(repo, "..", "brain-home") },
+    stdout: out.stdout, stderr: out.stderr,
+    ask: async () => { asked += 1; return ""; },
+  });
+  assert.equal(result.exitCode, 0);
+  assert.equal(asked, 0);
+  assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "scripted");
 });
 
 // `braingate` is installed on PATH, so running it from the wrong directory is the ordinary

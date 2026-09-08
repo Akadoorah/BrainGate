@@ -1,5 +1,6 @@
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { basename, dirname, resolve } from "node:path";
+import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
 import {
   BrainGateInvariantError,
@@ -42,6 +43,12 @@ export interface DogfoodCliDependencies {
   readonly writeExecutor?: WriteProviderExecutor;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
+  /**
+   * Asks the operator a single question and resolves to their answer, or to null when there
+   * is nobody to ask. Injected so tests never depend on a terminal, and so a non-interactive
+   * run fails with a usable message instead of waiting on stdin forever.
+   */
+  readonly ask?: (question: string) => Promise<string | null>;
 }
 
 export interface DogfoodCliResult {
@@ -104,6 +111,82 @@ function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: s
   }
   const registry = new ProjectRegistry(state.home);
   return registry.loadFile(path);
+}
+
+/**
+ * A question function backed by the real terminal, or undefined when this run has no terminal
+ * to ask (a pipe, CI, an editor task). Returning undefined rather than reading stdin anyway is
+ * what keeps a scripted `braingate init` from hanging forever waiting for an answer.
+ */
+function terminalAsk(): ((question: string) => Promise<string | null>) | undefined {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) return undefined;
+  return async (question: string): Promise<string | null> => {
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    try { return await rl.question(question); }
+    catch { return null; }
+    finally { rl.close(); }
+  };
+}
+
+/**
+ * Turns a directory name into a candidate project id: lowercase, non-alphanumerics collapsed
+ * to single hyphens, trimmed to the registry's 64-character limit. Returns null when nothing
+ * usable survives, in which case the operator is asked outright rather than given a guess.
+ */
+export function suggestedProjectId(directoryName: string): string | null {
+  const slug = directoryName
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 64)
+    .replace(/-+$/g, "");
+  return slug.length === 0 ? null : slug;
+}
+
+/**
+ * Resolves the project identity for `init`.
+ *
+ * The identity is the isolation boundary — memory, worktrees and telemetry are all scoped to
+ * it — so BrainGate proposes one and has it confirmed rather than deciding silently. Explicit
+ * flags skip the question entirely, which keeps scripted use unchanged, and a run with nobody
+ * to ask fails with the flags to pass instead of blocking on stdin.
+ */
+async function resolveProjectIdentity(input: {
+  readonly cwd: string;
+  readonly projectId: string | null;
+  readonly name: string | null;
+  readonly ask: ((question: string) => Promise<string | null>) | undefined;
+  readonly stdout: (text: string) => void;
+}): Promise<{ readonly projectId: string; readonly name: string }> {
+  if (input.projectId !== null && input.name !== null) return { projectId: input.projectId, name: input.name };
+
+  const directory = basename(input.cwd);
+  const suggestion = suggestedProjectId(directory);
+  const missingFlags = new BrainGateInvariantError(
+    "CLI_OPTION_REQUIRED",
+    `Cannot ask for the project identity without a terminal. Pass --project-id <id> and --name <name>${suggestion === null ? "" : ` (suggested id: ${suggestion})`}.`,
+  );
+  if (input.ask === undefined) throw missingFlags;
+
+  input.stdout(`Registering the repository in ${directory} with BrainGate.\n`);
+  input.stdout("The project id is the isolation boundary: memory, worktrees and telemetry are scoped to it.\n\n");
+
+  let projectId = input.projectId;
+  if (projectId === null) {
+    const answer = await input.ask(suggestion === null ? "Project id: " : `Project id [${suggestion}]: `);
+    if (answer === null) throw missingFlags;
+    const chosen = answer.trim().length === 0 ? suggestion : answer.trim();
+    if (chosen === null) throw new BrainGateInvariantError("CLI_OPTION_REQUIRED", "A project id is required.");
+    projectId = chosen;
+  }
+
+  let name = input.name;
+  if (name === null) {
+    const answer = await input.ask(`Display name [${directory}]: `);
+    if (answer === null) throw missingFlags;
+    name = answer.trim().length === 0 ? directory : answer.trim();
+  }
+  return { projectId, name };
 }
 
 function manifestOption(args: string[]): string { return takeOption(args, "--project") ?? ".brain/project.json"; }
@@ -365,11 +448,26 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
   try {
     const command = args.shift();
     if (command === "init") {
-      const projectId = takeOption(args, "--project-id", true)!;
-      const name = takeOption(args, "--name", true)!;
+      const flagProjectId = takeOption(args, "--project-id") ?? null;
+      const flagName = takeOption(args, "--name") ?? null;
       noExtraArgs(args);
-      data = initializeDogfoodProject({ cwd, projectId, name });
-      emit(json, data, `${(data as { created: boolean }).created ? "Created" : "Using"} local BrainGate project manifest at ${(data as { manifestPath: string }).manifestPath}`, stdout);
+      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask: deps.ask ?? terminalAsk(), stdout });
+      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name });
+      const created = (data as { created: boolean }).created;
+      const manifestPath = (data as { manifestPath: string }).manifestPath;
+      emit(
+        json,
+        data,
+        [
+          `${created ? "Created" : "Using"} local BrainGate project manifest at ${manifestPath}`,
+          "",
+          "Next:",
+          "  braingate dogfood preflight                      check readiness, zero model calls",
+          '  braingate dogfood ask plan --task "<question>"   see the routing before spending anything',
+          '  braingate dogfood ask run  --task "<question>" --execute',
+        ].join("\n"),
+        stdout,
+      );
       return Object.freeze({ exitCode: 0, data });
     }
     if (command !== "dogfood") throw new BrainGateInvariantError("CLI_COMMAND_INVALID", "M12 dispatcher supports init or dogfood.");
