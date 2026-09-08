@@ -66,6 +66,38 @@ braingate
 The symlink points into this checkout, so the command stops working if the repository is moved,
 renamed, or lives on a volume that is not mounted.
 
+## Interactive session
+
+Run `braingate` with no arguments at a terminal and it opens a session, the way the provider
+CLIs it wraps do:
+
+```
+$ braingate
+  BrainGate · Dogfood preflight demo-api: ask=ready · write=ready · configured=5 · model calls=0
+  Type a request, or /help. Nothing is spent until you confirm.
+
+> what theme value is in config.yml?
+
+  read-only · T1/low · primary=anthropic/claude-sonnet-5
+  Run it? [y/N] y
+
+dark
+
+Task 3aceddf1 · observed=1 · outcome=completed_without_review
+```
+
+Type a request in plain words. A question is answered; an instruction to change something is
+recognised as a write and planned into an isolated worktree. Either way the plan is shown
+first — classification, the model that would run, any reviewer — and nothing is spent until you
+confirm. **The `--execute` gate does not disappear here; it becomes that confirmation.** If the
+intent is guessed wrongly, the line says `write · isolated worktree` before you answer, so a
+wrong guess costs a keystroke rather than a change.
+
+`/help`, `/status`, `/models`, `/providers`, `/doctor`, `/feedback`, `/exit` cover the rest.
+
+Piped or scripted, `braingate` prints its command listing instead, so nothing reading its output
+changes behaviour. The flag interface below is unchanged and remains the scripting surface.
+
 ## Quickstart
 
 **1. Check what BrainGate can see.** Sign in with each provider's own CLI first (`claude`,
