@@ -37,7 +37,14 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null },
   openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation." },
   xai: { providerId: "xai", enabled: false, minimumVersion: null, blockedReason: "Grok read-only permits broad filesystem reads while strict mode permits CWD writes; hardened clean-config isolation is not yet verified." },
-  google: { providerId: "google", enabled: false, minimumVersion: null, blockedReason: "Antigravity strict mode has not yet been verified as a stable per-invocation headless enforcement mechanism." },
+  // Headless `agy` is already fail-closed: a tool needing permission is auto-denied because
+  // there is nobody to prompt. What is missing is the ability to say, per invocation, which
+  // tools BrainGate is granting. Permissions live in settings.json under the user's home, and
+  // unlike Codex — where CODEX_HOME separates credentials from configuration — agy keeps both
+  // under HOME, so isolating the settings loses authentication. Opening permissions.allow
+  // instead would widen them for every other use of agy on the machine, which BrainGate can
+  // neither scope nor verify at call time.
+  google: { providerId: "google", enabled: false, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings.json and credentials share HOME, so granting tools for one BrainGate call would grant them for every other use of agy." },
 });
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
