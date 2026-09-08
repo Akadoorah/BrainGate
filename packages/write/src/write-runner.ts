@@ -195,8 +195,11 @@ export class WriteDogfoodRunner {
       this.#ledger.transition(task.taskId, "running", { write: true, branch: handle.branch, workspace: "task-worktree" });
       const primary = plan.roles[0]!;
       const primarySnapshot = snapshotFor(this.#providers, primary.model.providerId);
-      const invocation = planClaudeWriteInvocation({ snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath, task: input.task, context: input.context });
-      const result = await this.#writer.run({ plan: invocation, ...(input.env === undefined ? {} : { env: input.env }) });
+      // Turns and wall clock come from the task's own budget rather than a fixed ceiling, for
+      // the same reason maxContextTokens scales: a large repository costs turns to navigate
+      // before the edit is even reached.
+      const invocation = planClaudeWriteInvocation({ snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath, task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns });
+      const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `Claude write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });

@@ -81,6 +81,10 @@ test("Claude M11 write profile is restricted, worktree-scoped and keeps task out
   const plan = planClaudeWriteInvocation({ snapshot: snapshot("anthropic"), model: { providerId: "anthropic", modelId: "claude-write", quotaPool: "claude-subscription" }, cwd: "/tmp/worktree", task: "UNIQUE_PRIVATE_WRITE", context: { file: "app.txt" } });
   const command = plan.args.join(" ");
   assert.match(command, /--restricted/); assert.match(command, /--safe-mode/); assert.match(command, /acceptEdits/); assert.match(command, /Read,Glob,Grep,Edit,Write/);
+  // CLAUDE_CODE_SUBPROCESS_ENV_SCRUB forces permission mode back to default, so the explicit
+  // allowlist is what actually lets an edit through; without it every write is denied and the
+  // task ends with no changes.
+  assert.match(command, /--allowedTools Read,Glob,Grep,Edit,Write/);
   assert.match(command, /Bash,WebFetch,WebSearch/); assert.doesNotMatch(command, /dangerously|--bare|UNIQUE_PRIVATE_WRITE/);
   assert.match(plan.stdin, /UNIQUE_PRIVATE_WRITE/);
 });
