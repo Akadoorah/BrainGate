@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
@@ -24,6 +25,8 @@ import {
   codexIsolationProfileHash,
   codexReviewerConfigArgs,
   extractCodexAgentMessage,
+  assertSourceCheckoutUnchanged,
+  sourceCheckoutFingerprint,
   planShadowInvocation,
   previewShadowInvocation,
   shadowProviderRoleStatus,
@@ -37,10 +40,21 @@ import {
   type SubscriptionAttestation,
 } from "./index.js";
 
+function git(cwd: string, args: readonly string[]): void {
+  const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
+  if (result.status !== 0) throw new Error(String(result.stderr));
+}
+
+// A registered project is always a real checkout, so the fixture is one too: the read-only
+// source guard fingerprints it with git, and a bare directory would not exercise that path.
 function setupProject() {
   const root = mkdtempSync(join(tmpdir(), "braingate-shadow-test-"));
   const repo = join(root, "repo");
   mkdirSync(repo);
+  git(repo, ["init", "-b", "main"]);
+  writeFileSync(join(repo, "README.md"), "hello\n");
+  git(repo, ["add", "."]);
+  git(repo, ["-c", "user.name=BrainGate Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init"]);
   const registry = new ProjectRegistry(join(root, "registry"));
   const project = registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] }));
   return { root, repo, project };
@@ -314,6 +328,41 @@ test("dogfood dry-run performs full T0 preflight with zero executor calls and ze
     assert.equal(result.taskReceipt.usage.length, 0);
     assert.equal(result.taskReceipt.task.state, "completed");
   } finally { ledger.close(); }
+});
+
+// The read-only shadow profiles run with cwd set to the real checkout, and their read-only-ness
+// is a provider declaration rather than something BrainGate enforces. Every other test drives a
+// provider that behaves; these two drive one that does not.
+test("a read-only run that mutates the source checkout fails closed and the task is recorded failed", async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const misbehaving = new FakeExecutor((plan) => {
+    writeFileSync(join(plan.cwd, "provider-escaped.txt"), "written outside the profile\n");
+    return JSON.stringify({ result: JSON.stringify({ kind: "work", output: "answer" }) });
+  });
+  // Deliberately a low-risk read: a T3/T4 task would need a reviewer and fail at routing
+  // before ever reaching the guard under test.
+  const taskText = "What does the README file say?";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const runner = new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], executor: misbehaving });
+
+  await assert.rejects(
+    () => runner.run({
+      title: "Inspect readme", task: taskText, cwd: repo, classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 500,
+      context: {}, contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    }),
+    /SHADOW_SOURCE_MUTATED|changed the source checkout/,
+  );
+  assert.equal(existsSync(join(repo, "provider-escaped.txt")), true, "the fixture must actually have written, or the guard proves nothing");
+});
+
+test("a read-only run is still allowed against an already-dirty checkout it does not change", () => {
+  const { repo } = setupProject();
+  writeFileSync(join(repo, "work-in-progress.txt"), "uncommitted\n");
+  const before = sourceCheckoutFingerprint(repo);
+  assert.doesNotThrow(() => assertSourceCheckoutUnchanged(repo, before));
+  writeFileSync(join(repo, "work-in-progress.txt"), "changed by something else\n");
+  assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /changed the source checkout/);
 });
 
 test("high-risk workflow routes Claude primary plus Codex independent reviewer when isolation is proven", { skip: process.platform === "win32" }, async () => {

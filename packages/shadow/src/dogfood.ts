@@ -14,6 +14,7 @@ import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { SubscriptionShadowAgentInvoker } from "./invoker.js";
 import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
+import { assertSourceCheckoutUnchanged, sourceCheckoutFingerprint } from "./source-guard.js";
 import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 function modelRef(route: RouteResult): ModelRef {
@@ -143,7 +144,9 @@ export class ShadowDogfoodRunner {
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
       const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId });
+      const sourceBefore = sourceCheckoutFingerprint(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
+      assertSourceCheckoutUnchanged(cwd, sourceBefore);
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
       recordWorkflowReceipt(this.#ledger, task.taskId, workflow);
       this.#ledger.transition(task.taskId, "completed", { shadow: true, outcome: workflow.outcome });
