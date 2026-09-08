@@ -1,6 +1,6 @@
 # ADR 0006: Provider control keys are validated against the installed CLI, not assumed
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -53,6 +53,12 @@ control still fails closed.
 The cost is that the attestation becomes build-specific in one more dimension, so a Codex
 upgrade forces a fresh self-test. That is already true of the version and profile hash.
 
-Until this is implemented, `features.worktrees` remains removed from the declared list as a
-targeted fix for Codex 0.153.4, and that removal is the open control regression this ADR
-closes.
+`features.worktrees` has been restored to the declared list. Against the installed Codex
+0.153.4 the self-test drops it and `braingate doctor` reports
+`reviewer=verified · controls-dropped=worktrees`, which closes the control regression the
+hand-edit had opened.
+
+The probe submits the whole declared set and drops whichever key `--strict-config` names,
+until nothing is rejected: one invocation in the common case, at most one per declared key.
+It spends nothing, because `CODEX_HOME` points at an empty directory, so a run that gets past
+config validation has no credentials and is refused before any model work.

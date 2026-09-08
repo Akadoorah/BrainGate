@@ -42,6 +42,9 @@ export const CODEX_REVIEW_DISABLED_FEATURES = Object.freeze([
   "enable_mcp_apps",
   "network_proxy",
   "remote_plugin",
+  // Restored: this is the declared intent, not a list of keys the current CLI happens to
+  // accept. Codex 0.153.4 no longer knows it, and the self-test drops it there (ADR 0006).
+  "worktrees",
 ] as const);
 
 const PROFILE_POLICY = Object.freeze({
@@ -59,6 +62,13 @@ export interface CodexIsolationAttestation {
   readonly version: string;
   readonly platform: "darwin" | "linux";
   readonly profileHash: string;
+  /**
+   * Declared control keys this Codex build does not recognise (ADR 0006). A key the CLI
+   * rejects as unknown names a feature that build does not have, so nothing is left enabled
+   * by omitting it. They are recorded, and reported by `braingate doctor`, so a control
+   * disappearing upstream is visible rather than silent.
+   */
+  readonly droppedFeatureKeys: readonly string[];
   readonly observedAt: string;
   readonly expiresAt: string;
 }
@@ -85,8 +95,21 @@ function tomlString(value: string): string {
   return JSON.stringify(value);
 }
 
-export function codexIsolationProfileHash(): string {
-  return createHash("sha256").update(JSON.stringify(PROFILE_POLICY)).digest("hex");
+/**
+ * Binds an attestation to the controls actually in force (ADR 0006). Covering the *accepted*
+ * key set rather than the declared one means a change in what the installed Codex honours
+ * invalidates the attestation and forces a fresh self-test, instead of silently reusing an
+ * attestation earned under a different set of controls.
+ */
+export function codexIsolationProfileHash(acceptedFeatureKeys: readonly string[] = CODEX_REVIEW_DISABLED_FEATURES): string {
+  const accepted = [...acceptedFeatureKeys].sort();
+  return createHash("sha256").update(JSON.stringify({ policy: PROFILE_POLICY, accepted })).digest("hex");
+}
+
+/** Declared keys minus the ones this build rejected as unknown. */
+export function acceptedFeatureKeys(droppedFeatureKeys: readonly string[]): readonly string[] {
+  const dropped = new Set(droppedFeatureKeys);
+  return Object.freeze(CODEX_REVIEW_DISABLED_FEATURES.filter((key) => !dropped.has(key)));
 }
 
 export function codexPermissionInlineTable(stagePath: string): string {
@@ -94,7 +117,7 @@ export function codexPermissionInlineTable(stagePath: string): string {
   return `{ ${name} = { filesystem = { ":root" = "none", ":minimal" = "read", ${tomlString(stagePath)} = "read" }, network = { enabled = false } } }`;
 }
 
-export function codexReviewerConfigArgs(stagePath = CODEX_STAGE_TOKEN): readonly string[] {
+export function codexReviewerConfigArgs(stagePath = CODEX_STAGE_TOKEN, featureKeys: readonly string[] = CODEX_REVIEW_DISABLED_FEATURES): readonly string[] {
   const args: string[] = [
     "-c", `default_permissions=${tomlString(CODEX_REVIEW_PROFILE)}`,
     "-c", `permissions=${codexPermissionInlineTable(stagePath)}`,
@@ -107,8 +130,54 @@ export function codexReviewerConfigArgs(stagePath = CODEX_STAGE_TOKEN): readonly
     "-c", "tools.experimental_request_user_input.enabled=false",
     "-c", "tools.update_plan.enabled=false",
   ];
-  for (const feature of CODEX_REVIEW_DISABLED_FEATURES) args.push("-c", `features.${feature}=false`);
+  for (const feature of featureKeys) args.push("-c", `features.${feature}=false`);
   return Object.freeze(args);
+}
+
+const UNKNOWN_FIELD = /unknown configuration field `([^`]+)`/;
+
+/**
+ * Partitions the declared control keys into the ones this Codex build accepts and the ones it
+ * rejects as unknown (ADR 0006).
+ *
+ * `--strict-config` reports one unknown key per run, so the probe submits the whole set and
+ * drops whatever the CLI names, until nothing is rejected. That is one invocation in the
+ * common case and at most one per declared key.
+ *
+ * The probe spends nothing: `CODEX_HOME` points at an empty directory, so a run that gets past
+ * config validation has no credentials and is refused before any model work. Config parsing
+ * happens first, which is exactly the signal being read.
+ */
+async function probeFeatureKeys(
+  runner: CodexSandboxRunner,
+  binary: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+): Promise<{ readonly accepted: readonly string[]; readonly dropped: readonly string[] }> {
+  let candidates: string[] = [...CODEX_REVIEW_DISABLED_FEATURES];
+  const dropped: string[] = [];
+
+  for (let attempt = 0; attempt <= CODEX_REVIEW_DISABLED_FEATURES.length; attempt += 1) {
+    const args = ["exec", "--strict-config", "--skip-git-repo-check", "--json"];
+    for (const feature of candidates) args.push("-c", `features.${feature}=false`);
+    args.push("-");
+
+    const result = await runner.run({ binary, args, cwd, env });
+    const reported = UNKNOWN_FIELD.exec(`${result.stdout}\n${result.stderr}`)?.[1];
+    if (reported === undefined) return { accepted: Object.freeze(candidates), dropped: Object.freeze(dropped) };
+
+    const key = reported.startsWith("features.") ? reported.slice("features.".length) : reported;
+    if (!candidates.includes(key)) {
+      throw new BrainGateInvariantError(
+        "CODEX_ISOLATION_CONFIG_REJECTED",
+        `Codex rejected configuration field \`${reported}\`, which is not one of BrainGate's declared feature keys.`,
+      );
+    }
+    candidates = candidates.filter((candidate) => candidate !== key);
+    dropped.push(key);
+  }
+
+  throw new BrainGateInvariantError("CODEX_ISOLATION_CONFIG_REJECTED", "Codex rejected every declared reviewer control key.");
 }
 
 function profileConfig(stagePath: string): string {
@@ -149,7 +218,12 @@ export function validCodexIsolationAttestation(
 ): boolean {
   if (value === undefined || value.providerId !== "openai" || value.source !== "sandbox-self-test") return false;
   const platform = platformGate(options.platform ?? process.platform);
-  if (value.platform !== platform || value.version !== normalizedVersion(snapshot) || value.profileHash !== codexIsolationProfileHash()) return false;
+  // The hash covers the controls actually in force, so it is recomputed from the attestation's
+  // own dropped set. A dropped key that is not a declared key, or a hash that does not match
+  // the resulting accepted set, means the attestation was not produced by this policy.
+  const dropped = value.droppedFeatureKeys ?? [];
+  if (!Array.isArray(dropped) || dropped.some((key) => !CODEX_REVIEW_DISABLED_FEATURES.includes(key))) return false;
+  if (value.platform !== platform || value.version !== normalizedVersion(snapshot) || value.profileHash !== codexIsolationProfileHash(acceptedFeatureKeys(dropped))) return false;
   const now = options.now ?? new Date();
   const observed = new Date(value.observedAt);
   const expires = new Date(value.expiresAt);
@@ -246,7 +320,24 @@ export class CodexIsolationVerifier {
         throw new BrainGateInvariantError("CODEX_ISOLATION_SELF_TEST_FAILED", "Codex sandbox allowed writing inside the staged read-only workspace.");
       }
 
-      return Object.freeze({ providerId: "openai", source: "sandbox-self-test", version, platform, profileHash: codexIsolationProfileHash(), observedAt: now.toISOString(), expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString() });
+      // ADR 0006: the installed CLI, not a hand-edited list, decides which control keys are
+      // in force. This runs only after the filesystem probes above have already proven the
+      // sandbox, so a build that accepts a key but ignores it still fails closed.
+      const probeHome = join(root, "probe-home");
+      mkdirSync(probeHome, { mode: 0o700 });
+      const probeEnv = this.#secretGuard.buildEnvironment(this.#baseEnv, { allowedAdditionalKeys: ["CODEX_HOME"], overrides: { CODEX_HOME: probeHome } });
+      const keys = await probeFeatureKeys(this.#runner, snapshot.binary, stage, probeEnv.env);
+
+      return Object.freeze({
+        providerId: "openai",
+        source: "sandbox-self-test",
+        version,
+        platform,
+        profileHash: codexIsolationProfileHash(keys.accepted),
+        droppedFeatureKeys: keys.dropped,
+        observedAt: now.toISOString(),
+        expiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
+      });
     } finally {
       rmSync(root, { recursive: true, force: true });
     }

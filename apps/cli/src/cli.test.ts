@@ -51,6 +51,7 @@ function isolation(): CodexIsolationAttestation {
   return {
     providerId: "openai",
     source: "sandbox-self-test",
+    droppedFeatureKeys: [],
     version: "codex-cli 0.152.0",
     platform: process.platform === "darwin" ? "darwin" : "linux",
     profileHash: codexIsolationProfileHash(),
