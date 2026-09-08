@@ -4,6 +4,190 @@
 
 BrainGate is a private pre-alpha project for coordinating official AI coding CLIs across multiple software projects while keeping project context isolated, controlling quota usage, and recording what every agent did.
 
+**Read this in another language:**
+[العربية](docs/i18n/README.ar.md) ·
+[Türkçe](docs/i18n/README.tr.md) ·
+[Español](docs/i18n/README.es.md) ·
+[Français](docs/i18n/README.fr.md) ·
+[Deutsch](docs/i18n/README.de.md) ·
+[Português (BR)](docs/i18n/README.pt-BR.md) ·
+[Русский](docs/i18n/README.ru.md) ·
+[简体中文](docs/i18n/README.zh-CN.md) ·
+[日本語](docs/i18n/README.ja.md) ·
+[한국어](docs/i18n/README.ko.md) ·
+[हिन्दी](docs/i18n/README.hi.md)
+
+English is the source of truth. Translations cover installation and first use; the rest of
+this document and everything under `docs/` is English only.
+
+---
+
+## Requirements
+
+| | |
+|---|---|
+| Node.js | 22 or later |
+| Git | any recent version |
+| pnpm | through Corepack (`corepack enable`) |
+| A provider CLI | at least one official CLI, already signed in to a subscription you control |
+
+BrainGate never asks for an API key. It drives the provider CLIs you already sign into, and it
+strips known API-key and base-URL variables from the subprocesses it starts, so a stray
+`ANTHROPIC_API_KEY` or `OPENAI_API_KEY` cannot silently move you onto per-token billing.
+
+Provider support today:
+
+| Provider | CLI | Status |
+|---|---|---|
+| Anthropic Claude Code | `claude` | read and write |
+| OpenAI Codex | `codex` | independent reviewer only, after an isolation self-test |
+| GitHub Copilot | `copilot` | read only, subscription attested by you |
+| Google Antigravity | `agy` | discovery only; execution fail-closed |
+| xAI Grok Build | `grok` | discovery only; execution fail-closed |
+
+## Install
+
+```bash
+git clone https://github.com/Akadoorah/BrainGate.git
+cd BrainGate
+corepack enable
+pnpm install
+pnpm typecheck && pnpm test
+```
+
+Then put `braingate` on PATH — the launcher resolves its own location, so a symlink is enough.
+Nothing is copied and nothing is installed globally:
+
+```bash
+ln -s "$PWD/apps/cli/bin/braingate.mjs" ~/.local/bin/braingate
+braingate
+```
+
+The symlink points into this checkout, so the command stops working if the repository is moved,
+renamed, or lives on a volume that is not mounted.
+
+## Quickstart
+
+**1. Check what BrainGate can see.** Sign in with each provider's own CLI first (`claude`,
+`codex login`, and so on), then:
+
+```bash
+braingate discover
+```
+
+Authentication that cannot be proven is reported as `unknown` rather than assumed.
+
+**2. Configure the model catalog.** BrainGate does not invent model ids, context capacities, or
+capability scores, so you declare the models you want it to route to. The catalog is global:
+configure it once and every project uses it.
+
+```bash
+cat > claude-model.json <<'JSON'
+{
+  "providerId": "anthropic",
+  "modelId": "<MODEL_ID_YOU_HAVE_VERIFIED>",
+  "quotaPool": "claude-subscription",
+  "capabilities": { "coder": 88, "reviewer": 84, "judge": 82 },
+  "speed": "balanced",
+  "contextCapacity": 200000,
+  "writeCapable": true,
+  "reasoning": 85,
+  "underlyingFamily": null
+}
+JSON
+
+braingate models add --definition claude-model.json
+braingate models profile
+```
+
+Add one entry per model you want available. `speed` is `fast`, `balanced`, or `deep`, and it is
+the cheap-first lever: `fast` is favoured on simple tasks, `deep` on hard ones. The scores are
+your routing policy — see [`docs/ROUTING_AND_REVIEW.md`](docs/ROUTING_AND_REVIEW.md).
+
+**3. Register a repository.**
+
+```bash
+cd /path/to/your/project
+braingate init
+```
+
+It proposes a project id from the directory name and asks you to confirm. The id is the
+isolation boundary — memory, worktrees, and telemetry are scoped to it — so BrainGate never
+picks one silently. Pass `--project-id <id> --name <name>` to skip the prompt in scripts.
+
+**4. Check readiness. This spends nothing.**
+
+```bash
+braingate dogfood preflight
+```
+
+**5. Ask a question.** Always plan first: a plan makes no provider call and shows you the
+classification, which model would run, and whether a reviewer is required.
+
+```bash
+braingate dogfood ask plan --task "Where is the theme configuration defined?"
+braingate dogfood ask run  --task "Where is the theme configuration defined?" --execute
+```
+
+`--execute` is the only gate that reaches a model. Nothing before it costs quota.
+
+**6. Record what the task actually turned out to be.** This is how routing improves.
+
+```bash
+braingate dogfood feedback --task-id <TASK_UUID> --actual-complexity T1 --outcome success
+```
+
+**7. Make a small change.** Writes need a clean checkout, and they land in a task worktree —
+never in your working tree.
+
+```bash
+braingate dogfood write plan --task "Change the empty-state label from X to Y"
+braingate dogfood write run  --task "Change the empty-state label from X to Y" --execute
+```
+
+Review the branch it reports and merge it yourself if you want it. BrainGate performs no merge,
+push, or deploy.
+
+## What it will and will not do
+
+| It does | It never does |
+|---|---|
+| Route each task to the cheapest capable model | Read or copy provider auth-token files |
+| Add an independent reviewer for risky work | Write to your checkout — changes go to a task worktree |
+| Verify afterwards that your checkout is untouched | Merge, push, or deploy anything |
+| Label usage `native`, `measured`, `estimated`, or `unknown` | Present an estimate as a measurement |
+| Keep memory, worktrees, and telemetry per project | Carry context across project boundaries by default |
+| Block high-risk and T3/T4 writes outright | Store credentials, `.env` contents, or secrets in memory |
+
+## Verifying it actually works
+
+`pnpm test` runs the full suite with no provider calls, which proves BrainGate's own logic but
+not that an installed CLI produced a real result. Two opt-in integration tests close that gap by
+driving real providers against a throwaway repository:
+
+```bash
+pnpm test:integration
+```
+
+They spend real subscription quota and never run in CI. Run them after upgrading a provider CLI
+or touching a provider profile. See [`docs/DOGFOOD.md`](docs/DOGFOOD.md).
+
+## Documentation
+
+| | |
+|---|---|
+| [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) | how the pieces fit together |
+| [`docs/SECURITY.md`](docs/SECURITY.md) | the security boundaries and why they hold |
+| [`docs/SAFE_EXECUTION.md`](docs/SAFE_EXECUTION.md) | worktrees, command allowlists, fail-closed rules |
+| [`docs/ROUTING_AND_REVIEW.md`](docs/ROUTING_AND_REVIEW.md) | how a task is classified and routed |
+| [`docs/DOGFOOD.md`](docs/DOGFOOD.md) | trialling BrainGate on a real repository |
+| [`docs/PROVIDER_DISCOVERY.md`](docs/PROVIDER_DISCOVERY.md) | what is probed per provider, and why fields stay `unknown` |
+| [`docs/MEMORY_AND_CONTEXT.md`](docs/MEMORY_AND_CONTEXT.md) | the memory model and its single validated write path |
+| [`docs/adr/`](docs/adr) | accepted architecture decisions |
+| [`AGENTS.md`](AGENTS.md) | rules for coding agents working in this repository |
+
+---
+
 ## Core principles
 
 - **Subscription-first:** use official provider CLIs and their existing account sessions; no token scraping or private endpoints.
@@ -31,24 +215,12 @@ See:
 
 ## Current local operator
 
-### Putting `braingate` on PATH
+`braingate` works from any directory. Commands that act on a project read `.brain/project.json`
+from the current directory, so the project is whichever repository you are standing in;
+`--project <manifest>` overrides that. Run it outside a registered project and it says so
+rather than failing obscurely.
 
-The launcher resolves its own location, so a symlink from a directory already on PATH is
-enough — no global install, and nothing is copied:
-
-```bash
-ln -s "$PWD/apps/cli/bin/braingate.mjs" ~/.local/bin/braingate
-```
-
-`braingate` then works from any directory. Commands that act on a project read
-`.brain/project.json` from the current directory, so the project is whichever repository you
-are standing in; `--project <manifest>` overrides that. Run it outside a registered project
-and it says so rather than failing obscurely.
-
-The symlink points into this checkout, so the command stops working if the repository is
-moved, renamed, or lives on a volume that is not mounted.
-
-The repository includes a local `braingate` CLI with:
+The full command surface:
 
 - `braingate init --project-id <id> --name <name>`
 - `braingate discover`
