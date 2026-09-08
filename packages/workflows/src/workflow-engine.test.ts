@@ -187,3 +187,25 @@ test("with no model declaring a planner capability the task still runs", async (
   });
   assert.deepEqual(roles, ["primary"], "planning is a routing preference, not a requirement");
 });
+
+// "who planned, who wrote, who reviewed" is the question the receipt exists to answer, and the
+// planner was missing from it while every other role was there.
+test("the receipt names the planner, so attribution is complete", async () => {
+  const invoker: AgentInvoker = { invoke: async (request) => ({ kind: "work", output: `${request.role} output` }) };
+  const classification = classifyTask({ text: "Audit how payment webhooks are verified and whether replay attacks are prevented", mode: "ask" });
+  const budget = { ...budgetFor(classification, { writeRequested: false }), reviewerPolicy: "none" as const };
+  const receipt = await new WorkflowEngine(new CapabilityRouter(plannerAndCoder()), invoker).run({
+    task: "Audit the webhooks", classification, budget, requiredContextTokens: 500, writeRequired: false, optionalReview: false,
+  });
+  assert.equal(receipt.planner?.model.definition.modelId, "strong-planner");
+  assert.equal(receipt.primary.model.definition.modelId, "cheap-coder");
+});
+
+test("a task with no planning pass records no planner rather than a wrong one", async () => {
+  const invoker: AgentInvoker = { invoke: async () => ({ kind: "work", output: "ok" }) };
+  const classification = classifyTask({ text: "What Node version does this need?", mode: "ask" });
+  const receipt = await new WorkflowEngine(new CapabilityRouter(plannerAndCoder()), invoker).run({
+    task: "What Node version does this need?", classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 200, writeRequired: false, optionalReview: false,
+  });
+  assert.equal(receipt.planner, null);
+});

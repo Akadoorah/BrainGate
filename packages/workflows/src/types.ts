@@ -57,6 +57,8 @@ export type WorkflowOutcome =
 
 export interface WorkflowReceipt {
   readonly outcome: WorkflowOutcome;
+  /** The model that decided the approach, when the task had a separate planning pass. */
+  readonly planner: RouteCandidate | null;
   readonly primary: RouteCandidate;
   readonly reviewer: RouteCandidate | null;
   readonly judge: RouteCandidate | null;

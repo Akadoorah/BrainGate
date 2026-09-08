@@ -238,6 +238,8 @@ function roleSummary(role: "planner" | "primary" | "reviewer" | "judge", candida
 
 export function summarizeWorkflowReceipt(receipt: WorkflowReceipt): WorkflowReceiptSummary {
   const roles = [
+    // First, because it is the decision the rest of the task follows from.
+    roleSummary("planner", receipt.planner),
     roleSummary("primary", receipt.primary),
     roleSummary("reviewer", receipt.reviewer),
     roleSummary("judge", receipt.judge),

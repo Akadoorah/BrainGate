@@ -411,7 +411,20 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const project = projectFromManifest(state, manifest, cwd);
       data = snapshotProvider(state, project)();
       const dashboard = data as DashboardSnapshot;
-      emit(json, data, `BrainGate ${project.projectId}: ${dashboard.activeTasks.length} active, ${dashboard.recentTasks.length} recent tasks.`, stdout);
+      // "who planned, who wrote, who reviewed" is the question this command exists to answer,
+      // and every part of it was already in the data and shown as a count.
+      const lines = [`BrainGate ${project.projectId}: ${dashboard.activeTasks.length} active, ${dashboard.recentTasks.length} recent tasks.`];
+      for (const entry of dashboard.recentTasks.slice(0, 10)) {
+        const byRole = new Map(entry.route.map((step) => [step.role, `${step.providerId}/${step.modelId}`]));
+        const attribution = (["planner", "primary", "reviewer", "judge"] as const)
+          .filter((role) => byRole.has(role))
+          .map((role) => `${role}=${byRole.get(role)!}`)
+          .join(" · ");
+        const calls = entry.budget?.providerCalls;
+        lines.push(`  ${entry.complexity}/${entry.risk}  ${attribution.length === 0 ? "no route recorded" : attribution}`);
+        lines.push(`    ${entry.outcome ?? "unknown"}${calls == null ? "" : ` · ${String(calls)} provider call${calls === 1 ? "" : "s"}`} · ${entry.taskId.slice(0, 8)}`);
+      }
+      emit(json, data, lines.join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
