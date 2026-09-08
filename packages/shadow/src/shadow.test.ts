@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  BrainGateInvariantError,
   ProjectRegistry,
   TaskLedger,
   budgetFor,
@@ -185,8 +186,16 @@ test("Codex is enabled only for reviewer role and requires current isolation att
 test("Grok and Antigravity automated shadow profiles remain fail closed", () => {
   const { repo } = setupProject();
   for (const providerId of ["xai", "google"] as const) {
-    assert.equal(shadowProviderStatus(providerId).enabled, false);
-    assert.throws(() => planShadowInvocation({ snapshot: snapshot(providerId), model: { providerId, modelId: "model-x", quotaPool: `${providerId}-pool` }, cwd: repo, payload }), /blocked|verified|read/i);
+    const status = shadowProviderStatus(providerId);
+    assert.equal(status.enabled, false);
+    // The reason is what a user acts on, so it must say something specific rather than
+    // restate that the provider is blocked. It is prose and will be reworded; assert that it
+    // exists and is substantive rather than matching its current wording.
+    assert.ok((status.reason ?? "").length > 40, `${providerId} must explain why it is blocked`);
+    assert.throws(
+      () => planShadowInvocation({ snapshot: snapshot(providerId), model: { providerId, modelId: "model-x", quotaPool: `${providerId}-pool` }, cwd: repo, payload }),
+      (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_BLOCKED",
+    );
   }
 });
 
