@@ -95,14 +95,33 @@ lacks: `GROK_HOME` relocates the configuration home, so BrainGate can hand it a 
 controls. `--sandbox <PROFILE>` names a filesystem and network profile, defined in
 `sandbox.toml` under either the home or the project, and `--permission-mode` accepts `plan`.
 
-One behaviour makes a self-test mandatory rather than advisable: **a missing sandbox profile is
-a warning, not an error.** Asked for a profile that does not exist, Grok prints
-`warning: sandbox could not be applied` and continues *without a sandbox*. A provider that
-silently downgrades its own isolation cannot be trusted on the strength of the flags passed to
-it; the self-test must prove the profile took effect — read inside, denied outside, denied
-write — exactly as the Codex one does, and treat a warning as a failure.
+Two behaviours found by running it decide otherwise.
 
-Execution stays fail-closed until that self-test exists and passes.
+**A missing sandbox profile is a warning, not an error.** Asked for a profile that does not
+exist, Grok prints `warning: sandbox could not be applied` and continues *without a sandbox*.
+
+**It reads another tool's configuration.** `grok inspect` in a scratch directory, with a
+project-local `sandbox.toml` defining a profile and `--permission-mode plan`, reports:
+
+```
+Permissions
+└ Source: /Users/<user>/.claude/settings.local.json (settings)
+Skills (124)
+```
+
+Its permissions came from Claude Code's settings file, and it loaded that installation's skills.
+With the profile applied, it read a canary from outside the workspace. `GROK_HOME` does not
+change this — the permission source is unchanged with it set — and setting it loses
+authentication, exactly as with Antigravity. There is no flag to ignore ambient configuration.
+
+So Grok has the surface Antigravity lacks and still cannot be scoped: what it may do is decided
+by a file belonging to a different tool, which BrainGate neither owns nor can neutralise for one
+call. This is a stronger reason to keep it closed than the one it replaces, and it is not a
+statement about the sandbox mechanism, which may well work when it is the thing in force.
+
+Execution stays fail-closed. What would open it is upstream: a way to run Grok against a
+configuration BrainGate supplies without moving its credentials, and a sandbox that fails closed
+when the profile it was given is absent.
 
 **Google Antigravity — blocked by a conflict, not by effort.** Image generation is not native to
 `agy`. It is reached through MCP servers or community scripts, and every BrainGate profile

@@ -36,7 +36,13 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null },
   "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null },
   openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation." },
-  xai: { providerId: "xai", enabled: false, minimumVersion: null, blockedReason: "Grok read-only permits broad filesystem reads while strict mode permits CWD writes; hardened clean-config isolation is not yet verified." },
+  // Grok has the isolation surface Antigravity lacks — GROK_HOME, --sandbox profiles,
+  // --permission-mode — and still cannot be scoped. `grok inspect` reports its permissions
+  // source as ~/.claude/settings.local.json: it takes what it may do from a different tool's
+  // configuration, which BrainGate neither owns nor can neutralise for one call. GROK_HOME does
+  // not move that source and does lose authentication. A sandbox profile that cannot be found
+  // is also a warning rather than an error, so the run continues unsandboxed.
+  xai: { providerId: "xai", enabled: false, minimumVersion: null, blockedReason: "Grok resolves its permissions from another tool's settings file and cannot be pointed at a BrainGate-supplied configuration without losing authentication; a missing sandbox profile is also a warning rather than an error." },
   // Headless `agy` is already fail-closed: a tool needing permission is auto-denied because
   // there is nobody to prompt. What is missing is the ability to say, per invocation, which
   // tools BrainGate is granting. Permissions live in settings.json under the user's home, and
