@@ -307,6 +307,33 @@ test("reviewer response missing the literal kind key is accepted, and a mismatch
   );
 });
 
+// A fixed six-turn ceiling made every T3 audit of a real repository fail with
+// error_max_turns: the budget granted 96k context tokens but not the turns to reach them.
+test("inspection turns scale with complexity so a deep task can reach its context budget", () => {
+  const turnsFor = (text: string): number => {
+    const classification = classifyTask({ text, mode: "ask" });
+    return budgetFor(classification, { writeRequested: false }).maxInspectionTurns;
+  };
+  const trivial = turnsFor("What Node version does this need?");
+  const deep = turnsFor("Audit how payment webhooks are verified and whether replay attacks are prevented");
+  assert.ok(deep > trivial, `a deep audit must get more turns than a lookup (${String(deep)} vs ${String(trivial)})`);
+  assert.ok(deep <= 12, "the profile clamps at 12 turns, so the budget must not exceed it");
+});
+
+test("the runner spends the budget's turns rather than a fixed ceiling", async () => {
+  const { repo, project } = setupProject();
+  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "answer" }) }));
+  const taskText = "What does the README file say?";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  await new ShadowDogfoodRunner({ project, ledger: new TaskLedger(project), router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], executor: fake }).run({
+    title: "Inspect readme", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+    context: {}, contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+  });
+  const turns = fake.calls[0]!.args[fake.calls[0]!.args.indexOf("--max-turns") + 1];
+  assert.equal(turns, String(budget.maxInspectionTurns));
+});
+
 test("the role prompt never carries task text and tells the provider not to echo the request", () => {
   const { repo } = setupProject();
   const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: new Date("2026-09-07T01:00:00Z") });

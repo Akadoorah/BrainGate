@@ -143,7 +143,7 @@ export class ShadowDogfoodRunner {
 
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       assertSourceCheckoutUnchanged(cwd, sourceBefore);
