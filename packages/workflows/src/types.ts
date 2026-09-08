@@ -1,7 +1,14 @@
 import type { BudgetSnapshot, ExecutionBudget, TaskClassification } from "@braingate/core";
 import type { ModelRef, RouteCandidate } from "@braingate/router";
 
-export type WorkflowRole = "primary" | "reviewer" | "judge";
+/**
+ * `planner` decides the approach; `primary` carries it out.
+ *
+ * They are separate because they want different models. Deciding how to build something rewards
+ * the strongest model available; typing it out afterwards, against a plan that already exists,
+ * does not — and on a shared quota that difference is the whole point of routing.
+ */
+export type WorkflowRole = "planner" | "primary" | "reviewer" | "judge";
 export type ReviewVerdict = "approve" | "request_changes" | "disagree";
 export type JudgeVerdict = "approve" | "request_changes";
 export type ReviewIndependenceLevel = "cross-provider" | "same-provider-different-model" | "same-model-fresh-session" | "none";

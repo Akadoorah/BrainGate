@@ -119,3 +119,71 @@ test("T2 optional review remains off unless explicitly requested", async () => {
   assert.equal(receipt.outcome, "completed_without_review");
   assert.equal(invoker.calls.length, 1);
 });
+
+/** A registry shaped like the operator's goal: a strong planner, a cheaper executor. */
+function plannerAndCoder(): ModelRegistry {
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "strong-planner", quotaPool: "claude-subscription", capabilities: { planner: 97, coder: 60 }, speed: "deep", contextCapacity: 1_000_000, writeCapable: true, reasoning: 98, underlyingFamily: null },
+    runtime(),
+  );
+  registry.register(
+    { providerId: "anthropic", modelId: "cheap-coder", quotaPool: "claude-subscription", capabilities: { coder: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 85, underlyingFamily: null },
+    runtime(),
+  );
+  return registry;
+}
+
+// The whole point of routing across a shared quota: deciding how to build something rewards the
+// strongest model available, typing it out afterwards does not.
+test("complex work is planned by one model and carried out by another", async () => {
+  const seen: { role: string; modelId: string; candidate: string | null }[] = [];
+  const invoker: AgentInvoker = {
+    invoke: async (request) => {
+      seen.push({ role: request.role, modelId: request.model.modelId, candidate: request.candidateOutput ?? null });
+      return { kind: "work", output: request.role === "planner" ? "STEP 1: change the label" : "done" };
+    },
+  };
+  const classification = classifyTask({ text: "Audit how payment webhooks are verified and whether replay attacks are prevented", mode: "ask" });
+  const budget = { ...budgetFor(classification, { writeRequested: false }), reviewerPolicy: "none" as const };
+  await new WorkflowEngine(new CapabilityRouter(plannerAndCoder()), invoker).run({
+    task: "Audit how payment webhooks are verified", classification, budget, requiredContextTokens: 500, writeRequired: false, optionalReview: false,
+  });
+
+  assert.deepEqual(seen.map((entry) => entry.role), ["planner", "primary"]);
+  assert.equal(seen[0]!.modelId, "strong-planner", "planning must go to the model that declares it");
+  assert.equal(seen[1]!.modelId, "cheap-coder", "execution must not inherit the planner");
+  // The plan reaches the executor as something to work from, not as a suggestion it may ignore.
+  assert.equal(seen[1]!.candidate, "STEP 1: change the label");
+});
+
+test("a small task is not planned separately, because a plan for it decides nothing", async () => {
+  const roles: string[] = [];
+  const invoker: AgentInvoker = {
+    invoke: async (request) => { roles.push(request.role); return { kind: "work", output: "ok" }; },
+  };
+  const classification = classifyTask({ text: "What Node version does this need?", mode: "ask" });
+  await new WorkflowEngine(new CapabilityRouter(plannerAndCoder()), invoker).run({
+    task: "What Node version does this need?", classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 200, writeRequired: false, optionalReview: false,
+  });
+  assert.deepEqual(roles, ["primary"], "a lookup must not spend a provider call on planning");
+});
+
+test("with no model declaring a planner capability the task still runs", async () => {
+  const roles: string[] = [];
+  const invoker: AgentInvoker = {
+    invoke: async (request) => { roles.push(request.role); return { kind: "work", output: "ok" }; },
+  };
+  // Only a coder is configured, which is every existing installation before this change.
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "coder-only", quotaPool: "pool", capabilities: { coder: 95 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null },
+    runtime(),
+  );
+  const classification = classifyTask({ text: "Audit how payment webhooks are verified", mode: "ask" });
+  const budget = { ...budgetFor(classification, { writeRequested: false }), reviewerPolicy: "none" as const };
+  await new WorkflowEngine(new CapabilityRouter(registry), invoker).run({
+    task: "Audit how payment webhooks are verified", classification, budget, requiredContextTokens: 500, writeRequired: false, optionalReview: false,
+  });
+  assert.deepEqual(roles, ["primary"], "planning is a routing preference, not a requirement");
+});

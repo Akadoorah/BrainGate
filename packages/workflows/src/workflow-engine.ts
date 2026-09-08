@@ -115,7 +115,36 @@ export class WorkflowEngine {
       }
     };
 
-    const initial = await invoke("primary", primary, "initial", [], null, false);
+    // A separate planning pass, on complex work only (ADR: the budget decides). The planner is
+    // routed on its own capability, so the strongest model available decides the approach while
+    // a cheaper one carries it out — which is the point of routing across a shared quota. Its
+    // plan is handed to the executor as the candidate to work from, not as a suggestion.
+    let plan: RouteCandidate | null = null;
+    let approach: string | null = null;
+    if (input.budget.separatePlanningPass) {
+      try {
+        plan = this.#router.route({
+          role: "planner",
+          classification: input.classification,
+          budget: input.budget,
+          requiredContextTokens: input.requiredContextTokens,
+          writeRequired: false,
+          ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
+        }).selected;
+      } catch (error) {
+        // No model declares a planning capability. The task still runs; it simply plans and
+        // executes in one pass, as it did before this stage existed.
+        if (!isNoEligibleModel(error)) throw error;
+        emit("planner.unavailable", "planner", null, "no model declares a planner capability");
+      }
+      if (plan !== null) {
+        const planned = await invoke("planner", plan, "planning", [], null, false);
+        if (planned.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Planner response was not work.");
+        approach = planned.output;
+      }
+    }
+
+    const initial = await invoke("primary", primary, "initial", [], approach, false);
     if (initial.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Primary response was not work.");
     finalOutput = initial.output;
 

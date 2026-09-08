@@ -8,7 +8,9 @@ import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 function responseContract(role: AgentRequest["role"]): Readonly<Record<string, unknown>> {
-  if (role === "primary") return Object.freeze({ kind: "work", output: "string" });
+  // A plan is work: it produces the approach the executor then follows. It is not a review, and
+  // asking for a verdict here would get an opinion about the task instead of a way to do it.
+  if (role === "planner" || role === "primary") return Object.freeze({ kind: "work", output: "string" });
   if (role === "reviewer") return Object.freeze({ kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" });
   return Object.freeze({ kind: "judge", verdict: ["approve", "request_changes"], rationale: "string", findings: "string[]" });
 }
@@ -71,10 +73,10 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
   // `kind` only restates the role BrainGate already routed, so a provider that omits it has not
   // widened anything. A present-but-wrong `kind` still fails closed, because that means the
   // provider answered as a different role than the one that was requested.
-  const expectedKind = role === "primary" ? "work" : role === "reviewer" ? "review" : "judge";
+  const expectedKind = role === "planner" || role === "primary" ? "work" : role === "reviewer" ? "review" : "judge";
   if (parsed.kind === undefined || parsed.kind === null) parsed = { ...parsed, kind: expectedKind };
 
-  if (role === "primary") {
+  if (role === "planner" || role === "primary") {
     if (parsed.kind !== "work") throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Primary shadow response must have kind=work.");
     return Object.freeze({ kind: "work", output: boundedText(parsed.output) });
   }
@@ -177,6 +179,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       task: request.task,
       findings: Object.freeze([...request.findings]),
       candidateOutput: request.candidateOutput == null ? null : boundedText(request.candidateOutput),
+      // Without this the executor receives a plan in the same field a reviewer receives a draft,
+      // and treats the approach it was given as something to critique rather than to follow.
+      candidateOutputRole: request.candidateOutput == null ? null : (request.role === "primary" ? "approach-to-follow" : "prior-result-under-review"),
       context: this.#context,
       responseContract: responseContract(request.role),
     });

@@ -44,6 +44,8 @@ export interface ShadowRolePayload {
   readonly findings: readonly string[];
   /** Current candidate output for review/judge/repair phases; omitted only by legacy/preflight callers. */
   readonly candidateOutput?: string | null;
+  /** What the candidate is for this role: an approach to follow, or a result to judge. */
+  readonly candidateOutputRole?: "approach-to-follow" | "prior-result-under-review" | null;
   readonly context: unknown;
   readonly responseContract: Readonly<Record<string, unknown>>;
 }
