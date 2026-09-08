@@ -106,8 +106,23 @@ passing through a conversation. `/forget` drops it; project memory is untouched.
 `/help`, `/status`, `/models`, `/providers`, `/doctor`, `/feedback`, `/forget`, `/exit` cover
 the rest.
 
-`NO_COLOR` drops the colour, `BRAINGATE_NO_ANIMATION=1` draws the banner in one frame, and a
-`dumb` terminal gets both.
+Arriving in a repository BrainGate does not know is the ordinary first run, so the session
+offers to register it there and then rather than printing an instruction and exiting.
+
+While a request is in flight the same motif keeps moving, with the seconds counted:
+
+```
+  ▌  · · ▸ · ◈ · · · ·  working · 18s
+```
+
+That count is the useful part. A visual task runs for minutes and a T4 audit longer, and the
+elapsed time is what distinguishes a normal run from a stuck one. The indicator erases itself
+before the first byte of the answer, so it never shares a line with output.
+
+`NO_COLOR` drops the colour, `BRAINGATE_NO_ANIMATION=1` draws the banner in one frame and
+suppresses the indicator, and a `dumb` terminal gets both. Where the line cannot be redrawn
+nothing is drawn at all, because an indicator that cannot erase itself leaves every frame in
+the log.
 
 Piped or scripted, `braingate` prints its command listing instead, so nothing reading its output
 changes behaviour. The flag interface below is unchanged and remains the scripting surface.

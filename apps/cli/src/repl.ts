@@ -5,6 +5,7 @@ import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { SessionContext } from "./session-context.js";
 import { COLOURED, PLAIN, renderBanner } from "./banner.js";
+import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js";
 
 /**
  * The interactive session: `braingate` with no arguments and a terminal attached.
@@ -43,6 +44,10 @@ export function looksLikeWriteRequest(text: string): boolean {
   return WRITE_INTENT.test(text);
 }
 
+function progressStyle(deps: ReplDeps): { style: typeof PLAIN_PROGRESS; animate: boolean } {
+  return { style: deps.colour === false ? PLAIN_PROGRESS : COLOURED_PROGRESS, animate: deps.animate !== false };
+}
+
 function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
 }
@@ -53,9 +58,11 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   const capture = (text: string): void => { captured.push(text); };
   const sessionTurns = (budget: number) => session.recent(budget);
 
+  const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });
   const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input], {
     cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns,
   });
+  planning.stop();
   const summary = firstLine(captured.join(""));
   if (plan.exitCode !== 0) { deps.stderr(`${captured.join("")}\n`); return; }
 
@@ -65,12 +72,15 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
 
   deps.stdout("\n");
   const spoken: string[] = [];
+  // The indicator has to be gone before the first byte of real output, or the two share a line.
+  const working = startProgress({ write: deps.stdout, label: mode === "write" ? "writing" : "working", ...progressStyle(deps) });
   const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--execute"], {
     cwd: deps.cwd,
-    stdout: (text) => { spoken.push(text); deps.stdout(text); },
-    stderr: deps.stderr,
+    stdout: (text) => { working.stop(); spoken.push(text); deps.stdout(text); },
+    stderr: (text) => { working.stop(); deps.stderr(text); },
     sessionTurns,
   });
+  working.stop();
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
   // premise of the next follow-up.
   if (result.exitCode === 0) session.record(input, spoken.join("").replace(/\n*Task [0-9a-f-]{36}.*$/s, "").trim());
@@ -142,17 +152,6 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
  * is the only sensible surface and `braingate` prints its command listing instead.
  */
 export async function runRepl(deps: ReplDeps): Promise<number> {
-  if (!existsSync(resolve(deps.cwd, ".brain", "project.json"))) {
-    deps.stderr([
-      `  No BrainGate project in ${basename(deps.cwd)}.`,
-      "",
-      "  Run `braingate init` here first. The project id is the isolation boundary for",
-      "  memory, worktrees and telemetry, so it is registered explicitly rather than assumed.",
-      "",
-    ].join("\n"));
-    return 1;
-  }
-
   await renderBanner({
     write: deps.stdout,
     // Colour is opt-out; NO_COLOR is the convention and it is honoured rather than reinvented.
@@ -161,6 +160,27 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     // asked to keep quiet, the finished picture is printed once.
     still: deps.animate === false,
   });
+
+  // Arriving in an unregistered directory is the ordinary first run, not an error to be turned
+  // away at. The banner has already said what this is; now offer the one command that starts,
+  // rather than printing an instruction and exiting.
+  if (!existsSync(resolve(deps.cwd, ".brain", "project.json"))) {
+    deps.stdout([
+      `  No BrainGate project in ${basename(deps.cwd)} yet.`,
+      "  The project id is the isolation boundary for memory, worktrees and telemetry,",
+      "  so it is registered explicitly rather than assumed.",
+      "",
+    ].join("\n"));
+    const answer = await deps.ask("  Register this repository now? [Y/n] ");
+    if (answer === null || /^n(o)?$/i.test(answer.trim())) {
+      deps.stdout("\n  Nothing registered. Run `braingate init` here when you are ready.\n\n");
+      return 1;
+    }
+    deps.stdout("\n");
+    const init = await runDogfoodCli(["init"], { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr, ask: deps.ask, quiet: true });
+    if (init.exitCode !== 0) return init.exitCode;
+    deps.stdout("\n");
+  }
 
   const header: string[] = [];
   await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t) });

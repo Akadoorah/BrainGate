@@ -56,6 +56,8 @@ export interface DogfoodCliDependencies {
    * persisted or promoted to memory.
    */
   readonly sessionTurns?: (contextTokenBudget: number) => readonly { readonly request: string; readonly answer: string }[];
+  /** Set by the interactive session, which has already introduced itself and shows its own prompt. */
+  readonly quiet?: boolean;
 }
 
 export interface DogfoodCliResult {
@@ -164,6 +166,7 @@ async function resolveProjectIdentity(input: {
   readonly name: string | null;
   readonly ask: ((question: string) => Promise<string | null>) | undefined;
   readonly stdout: (text: string) => void;
+  readonly quiet?: boolean;
 }): Promise<{ readonly projectId: string; readonly name: string }> {
   if (input.projectId !== null && input.name !== null) return { projectId: input.projectId, name: input.name };
 
@@ -175,8 +178,12 @@ async function resolveProjectIdentity(input: {
   );
   if (input.ask === undefined) throw missingFlags;
 
-  input.stdout(`Registering the repository in ${directory} with BrainGate.\n`);
-  input.stdout("The project id is the isolation boundary: memory, worktrees and telemetry are scoped to it.\n\n");
+  // A session has already introduced itself and explained the boundary, so it passes quiet:true
+  // rather than have the operator read the same two sentences twice.
+  if (input.quiet !== true) {
+    input.stdout(`Registering the repository in ${directory} with BrainGate.\n`);
+    input.stdout("The project id is the isolation boundary: memory, worktrees and telemetry are scoped to it.\n\n");
+  }
 
   let projectId = input.projectId;
   if (projectId === null) {
@@ -468,21 +475,23 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       const flagProjectId = takeOption(args, "--project-id") ?? null;
       const flagName = takeOption(args, "--name") ?? null;
       noExtraArgs(args);
-      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask: deps.ask ?? terminalAsk(), stdout });
+      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask: deps.ask ?? terminalAsk(), stdout, quiet: deps.quiet === true });
       data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name });
       const created = (data as { created: boolean }).created;
       const manifestPath = (data as { manifestPath: string }).manifestPath;
       emit(
         json,
         data,
-        [
-          `${created ? "Created" : "Using"} local BrainGate project manifest at ${manifestPath}`,
-          "",
-          "Next:",
-          "  braingate dogfood preflight                      check readiness, zero model calls",
-          '  braingate dogfood ask plan --task "<question>"   see the routing before spending anything',
-          '  braingate dogfood ask run  --task "<question>" --execute',
-        ].join("\n"),
+        deps.quiet === true
+          ? `${created ? "Registered" : "Using"} ${identity.projectId}.`
+          : [
+            `${created ? "Created" : "Using"} local BrainGate project manifest at ${manifestPath}`,
+            "",
+            "Next:",
+            "  braingate dogfood preflight                      check readiness, zero model calls",
+            '  braingate dogfood ask plan --task "<question>"   see the routing before spending anything',
+            '  braingate dogfood ask run  --task "<question>" --execute',
+          ].join("\n"),
         stdout,
       );
       return Object.freeze({ exitCode: 0, data });
