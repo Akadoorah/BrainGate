@@ -97,3 +97,31 @@ test("no eligible independent model fails closed", () => {
   const classification = classifyTask({ text: "review payment authentication change", mode: "review" });
   assert.throws(() => new CapabilityRouter(registry).route({ role: "reviewer", classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 1_000, writeRequired: false, independence: { mode: "required", models: [{ providerId: "anthropic", modelId: "primary", quotaPool: "anthropic:max" }] } }), (e: unknown) => e instanceof BrainGateInvariantError && e.code === "ROUTE_NO_ELIGIBLE_MODEL");
 });
+
+// "visual" has been in ModelRole since the router was written, unreachable because nothing
+// routed it (ADR 0007). Nothing had to change to make it fail closed — an absent capability
+// scores zero, below every floor — but that is a property worth pinning rather than assuming.
+test("a model without a visual capability cannot take a visual task", () => {
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "text-only", quotaPool: "pool", capabilities: { coder: 95, reviewer: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null },
+    runtime("healthy"),
+  );
+  const router = new CapabilityRouter(registry);
+  const classification = classifyTask({ text: "produce a hero image", mode: "write" });
+  const budget = budgetFor(classification, { writeRequested: true });
+
+  assert.throws(
+    () => router.route({ role: "visual", classification, budget, requiredContextTokens: 500, writeRequired: true }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL",
+    "a text-only model must not be silently accepted for visual work",
+  );
+
+  // Declaring the capability makes the same model eligible; nothing else changed.
+  registry.register(
+    { providerId: "openai", modelId: "visual-capable", quotaPool: "pool-2", capabilities: { coder: 80, visual: 88 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 85, underlyingFamily: null },
+    runtime("healthy"),
+  );
+  const routed = router.route({ role: "visual", classification, budget, requiredContextTokens: 500, writeRequired: true });
+  assert.equal(routed.selected.model.definition.modelId, "visual-capable");
+});

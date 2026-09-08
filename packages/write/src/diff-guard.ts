@@ -1,6 +1,7 @@
 import { existsSync, lstatSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { BrainGateInvariantError } from "@braingate/core";
 import { isSensitivePath, redactSecrets } from "@braingate/security";
 
@@ -53,8 +54,21 @@ export interface GuardedDiff {
   readonly diff: string;
 }
 
-export function collectGuardedDiff(worktreePathInput: string): GuardedDiff {
+/**
+ * Collects the reviewable diff for a write task.
+ *
+ * `collectedArtifacts` names files that already passed the artifact collector — proven to be
+ * inside the worktree, a regular file, within the size cap, and of an allowed media type by
+ * magic bytes. Those, and only those, are exempt from the binary-content rejection below.
+ *
+ * The exemption is by exact path rather than by extension or directory: a generated image is
+ * reviewable as "a new 40 KB image/png with this hash at this path", while an arbitrary binary
+ * is not reviewable at all. Widening it to a pattern would let anything that matched the
+ * pattern through, which is the rejection this guard exists to make.
+ */
+export function collectGuardedDiff(worktreePathInput: string, collectedArtifacts: readonly { readonly path: string; readonly mediaType: string; readonly bytes: number; readonly sha256: string }[] = []): GuardedDiff {
   const worktreePath = realpathSync.native(worktreePathInput);
+  const artifactsByPath = new Map(collectedArtifacts.map((artifact) => [artifact.path, artifact]));
   const tracked = nul(git(worktreePath, ["diff", "--name-only", "-z", "HEAD", "--"]));
   const untracked = nul(git(worktreePath, ["ls-files", "--others", "--exclude-standard", "-z", "--"]));
   for (const ignored of ignoredPaths(worktreePath)) {
@@ -70,8 +84,27 @@ export function collectGuardedDiff(worktreePathInput: string): GuardedDiff {
     const absolute = resolve(worktreePath, safe);
     if (!existsSync(absolute) || lstatSync(absolute).isDirectory()) continue;
     const stat = lstatSync(absolute);
-    if (stat.size > MAX_UNTRACKED_FILE_BYTES) throw new BrainGateInvariantError("WRITE_UNTRACKED_TOO_LARGE", `Untracked file exceeds M11 review cap: ${safe}`);
+    const artifact = artifactsByPath.get(safe);
+    // The 128 KiB cap exists because an untracked text file is inlined into the review diff. A
+    // collected artifact is summarised in one line instead, so that cap does not apply to it —
+    // it was already bounded by the collector's own, larger limit. Applying this one would
+    // reject an ordinary generated image, which is the whole point of the visual role.
+    if (artifact === undefined && stat.size > MAX_UNTRACKED_FILE_BYTES) {
+      throw new BrainGateInvariantError("WRITE_UNTRACKED_TOO_LARGE", `Untracked file exceeds M11 review cap: ${safe}`);
+    }
     const data = readFileSync(absolute);
+    if (artifact !== undefined) {
+      // A collected artifact is summarised rather than inlined. Its bytes were already verified
+      // by the collector, and a reviewer reads the hash and media type, not a megabyte of PNG.
+      // The hash is recomputed here from what is actually on disk, so a file swapped between
+      // collection and review does not pass on the strength of the earlier check.
+      const onDisk = createHash("sha256").update(data).digest("hex");
+      if (onDisk !== artifact.sha256 || data.length !== artifact.bytes) {
+        throw new BrainGateInvariantError("WRITE_ARTIFACT_ALTERED", `A collected artifact changed after it was verified: ${safe}`);
+      }
+      diff += `\n--- /dev/null\n+++ b/${safe}\n@@ new artifact @@\n+${artifact.mediaType} ${String(artifact.bytes)} bytes sha256:${artifact.sha256}\n`;
+      continue;
+    }
     if (data.includes(0)) throw new BrainGateInvariantError("WRITE_BINARY_UNTRACKED", `Untracked binary file is not allowed in M11: ${safe}`);
     diff += `\n--- /dev/null\n+++ b/${safe}\n@@ new file @@\n${data.toString("utf8").split(/\r?\n/).map((line) => `+${line}`).join("\n")}\n`;
   }
