@@ -12,7 +12,17 @@ import type { ShadowInvocationPlan, ShadowInvocationPreview, ShadowRolePayload, 
 
 const CLAUDE_MINIMUM = "2.1.248";
 const ATTACHMENT_TOKEN = "__BRAINGATE_SHADOW_INPUT__";
-const GENERIC_PROMPT = "Read the BrainGate shadow input supplied out-of-band. Analyze only; do not modify files, run commands, access the network, or use external tools. Return only valid JSON matching responseContract.";
+const GENERIC_PROMPT = [
+  "You receive one JSON request object (appended below this instruction, or supplied as the attached file).",
+  "Use its `task` field as the request and its `context` field as supporting data.",
+  "Its `responseContract` field describes the JSON object you must produce: each key is a field name, and each value describes that field's type or allowed values.",
+  "Analyze only; do not modify files, run commands, access the network, or use external tools.",
+  "Output one new top-level JSON object whose keys are exactly the keys of `responseContract`, filled with real values you produce.",
+  "Include every key from `responseContract`, including any key whose described value is a fixed literal string.",
+  "Do not echo the request back, do not nest your answer inside `responseContract`, and emit no prose and no markdown code fences.",
+  "Example: for responseContract {\"kind\":\"work\",\"output\":\"string\"} the entire reply is exactly {\"kind\":\"work\",\"output\":\"<your answer here>\"}.",
+  "If you cannot complete the request, still reply in that same shape and put the reason in the text field.",
+].join(" ");
 
 interface ProfileDefinition {
   readonly providerId: ProviderId;
