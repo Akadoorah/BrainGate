@@ -24,11 +24,40 @@ test("Arabic payment write becomes critical T4", () => {
   assert.ok(result.sensitiveDomains.includes("payments"));
 });
 
-test("auth question is treated as high risk even when phrased as a question", () => {
-  const result = classifyTask({ text: "ليش تسجيل الدخول أحيانا يطلع المستخدم؟", mode: "ask" });
-  assert.equal(result.complexity, "T3");
-  assert.equal(result.risk, "high");
-  assert.ok(result.sensitiveDomains.includes("auth"));
+// Risk is what a task could damage. Reading about authentication damages nothing — no worktree
+// is opened, no file changes, nothing merges — and pricing the question as if it did bought a
+// planner and a required reviewer for a one-line lookup.
+test("a question about a sensitive area records the domain without paying for a change", () => {
+  for (const text of ["where is the authentication logic?", "ليش تسجيل الدخول أحيانا يطلع المستخدم؟"]) {
+    const result = classifyTask({ text, mode: "ask" });
+    assert.ok(result.sensitiveDomains.includes("auth"), `${text} must still record the domain`);
+    assert.equal(result.risk, "medium", "the domain is worth noting, not worth a high-risk floor");
+    assert.notEqual(result.complexity, "T3");
+    assert.notEqual(result.complexity, "T4");
+  }
+});
+
+test("a change to the same area keeps the floor the question does not get", () => {
+  const change = classifyTask({ text: "add oauth login to the settings screen", mode: "write" });
+  assert.equal(change.risk, "high");
+  assert.equal(change.complexity, "T3");
+
+  // Review mode judges a change that already exists, so it carries the change's risk.
+  const review = classifyTask({ text: "review this change to the auth guard", mode: "review" });
+  assert.equal(review.risk, "high");
+
+  // And the critical combinations still are.
+  assert.equal(classifyTask({ text: "delete all user accounts from the production database", mode: "write" }).risk, "critical");
+  assert.equal(classifyTask({ text: "change the stripe subscription price", mode: "write" }).risk, "critical");
+});
+
+test("a sensitive question can be reviewed on request, without being reviewed by default", () => {
+  // The middle ground the old rule had no room for: either one call with no reviewer reachable,
+  // or four calls with a planner. A second opinion on an auth answer is worth offering.
+  const budget = budgetFor(classifyTask({ text: "where is the authentication logic?", mode: "ask" }), { writeRequested: false });
+  assert.equal(budget.reviewerPolicy, "optional");
+  assert.equal(budget.separatePlanningPass, false);
+  assert.ok(budget.maxReviewers >= 1, "asking for --review must be able to do something");
 });
 
 test("inspection escalates hidden impact", () => {

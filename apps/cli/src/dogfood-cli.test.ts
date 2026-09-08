@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -282,4 +282,71 @@ test("a plan for complex work names the planner as well as the executor", async 
   assert.match(out.out(), /primary=anthropic\/claude-test/);
   // A preview costs nothing, planner or not.
   assert.equal(shadow.calls.length, 0);
+});
+
+// The first thing anyone does is open BrainGate in a new folder. It asked for a project id and
+// a display name, then failed with git's own error — so the answer arrived after the questions,
+// in a vocabulary that belongs to a different tool.
+test("a directory with no repository is offered one before the identity questions", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "braingate-cli-fresh-"));
+  const asked: string[] = [];
+  const output = io();
+  const result = await runDogfoodCli(["init"], {
+    cwd: bare,
+    env: { BRAINGATE_HOME: join(bare, "brain-home") },
+    stdout: output.stdout,
+    stderr: output.stderr,
+    ask: async (question: string) => {
+      asked.push(question);
+      if (/git init/.test(question)) return "y";
+      return /id/i.test(question) ? "fresh" : "Fresh";
+    },
+  });
+
+  assert.equal(result.exitCode, 0);
+  assert.match(asked[0] ?? "", /git init/, "the repository question must come first");
+  assert.match(output.out(), /needs a repository to work in/);
+  assert.equal(existsSync(join(bare, ".git")), true);
+  assert.equal(existsSync(join(bare, ".brain", "project.json")), true);
+});
+
+test("declining leaves the directory exactly as it was", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "braingate-cli-declined-"));
+  const output = io();
+  const result = await runDogfoodCli(["init"], {
+    cwd: bare,
+    env: { BRAINGATE_HOME: join(bare, "brain-home") },
+    stdout: output.stdout,
+    stderr: output.stderr,
+    ask: async () => "n",
+  });
+
+  assert.equal(result.exitCode, 1);
+  assert.match(output.err(), /PROJECT_NOT_A_REPOSITORY/);
+  // Saying no has to mean nothing happened, including no half-registered project.
+  assert.equal(existsSync(join(bare, ".git")), false);
+  assert.equal(existsSync(join(bare, ".brain")), false);
+});
+
+test("with no terminal to ask, nothing is created on a guess", async () => {
+  const bare = mkdtempSync(join(tmpdir(), "braingate-cli-noninteractive-"));
+  const output = io();
+  const result = await runDogfoodCli(["init", "--project-id", "fresh", "--name", "Fresh"], {
+    cwd: bare,
+    env: { BRAINGATE_HOME: join(bare, "brain-home") },
+    stdout: output.stdout,
+    stderr: output.stderr,
+  });
+  assert.equal(result.exitCode, 1);
+  assert.equal(existsSync(join(bare, ".git")), false);
+
+  // `--git-init` is how a script says yes, since there is nobody to ask.
+  const explicit = await runDogfoodCli(["init", "--git-init", "--project-id", "fresh", "--name", "Fresh"], {
+    cwd: bare,
+    env: { BRAINGATE_HOME: join(bare, "brain-home") },
+    stdout: output.stdout,
+    stderr: output.stderr,
+  });
+  assert.equal(explicit.exitCode, 0);
+  assert.equal(existsSync(join(bare, ".git")), true);
 });

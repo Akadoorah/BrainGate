@@ -184,7 +184,10 @@ test("high-risk shadow plan verifies Codex isolation but makes zero provider mod
   const fake = new FakeExecutor();
   const output = io();
   let isolationChecks = 0;
-  const task = "Where is the auth session stored? UNIQUE_AUTH_PROMPT";
+  // Reviewer routing needs a task that actually requires a reviewer. Reading about auth no
+  // longer does — a question damages nothing — so the fixture is a breadth-and-judgement task,
+  // which is the shape that genuinely earns a second opinion.
+  const task = "Audit the auth session storage across the whole application UNIQUE_AUTH_PROMPT";
   const result = await runCli(["shadow", "plan", "--project", f.manifest, "--task", task, "--json"], {
     cwd: f.repo,
     env: f.env,
@@ -224,7 +227,7 @@ test("high-risk execute routes Claude primary then self-tested Codex reviewer an
   const fake = new FakeExecutor();
   const output = io();
   let isolationChecks = 0;
-  const executed = await runCli(["shadow", "run", "--project", f.manifest, "--task", "Where is the auth session stored?", "--execute"], {
+  const executed = await runCli(["shadow", "run", "--project", f.manifest, "--task", "Audit the auth session storage across the whole application", "--execute"], {
     cwd: f.repo,
     env: f.env,
     discoverAll: async () => [snapshot(), openaiSnapshot()],
@@ -251,7 +254,7 @@ test("failed Codex isolation removes it from reviewer routing before any provide
   const fake = new FakeExecutor();
   const output = io();
   let isolationChecks = 0;
-  const result = await runCli(["shadow", "plan", "--project", f.manifest, "--task", "Where is the auth session stored?", "--json"], {
+  const result = await runCli(["shadow", "plan", "--project", f.manifest, "--task", "Audit the auth session storage across the whole application", "--json"], {
     cwd: f.repo,
     env: f.env,
     discoverAll: async () => [snapshot(), openaiSnapshot()],
@@ -260,9 +263,14 @@ test("failed Codex isolation removes it from reviewer routing before any provide
     stdout: output.stdout,
     stderr: output.stderr,
   });
-  assert.equal(result.exitCode, 1);
+  // The claim is that a failed self-test takes Codex out of reviewer routing before anything is
+  // spent — not that the task dies. Another reviewer may exist, and refusing to plan at all
+  // when one does would be a worse outcome than routing to it.
   assert.equal(isolationChecks, 1);
   assert.equal(fake.calls.length, 0);
+  const roles = (result.data as { roles?: readonly { role: string; model: { providerId: string } }[] }).roles ?? [];
+  assert.equal(roles.some((entry) => entry.role === "reviewer" && entry.model.providerId === "openai"), false, "Codex must not be routed on a failed self-test");
+  // The reason the self-test failed is the provider's, and it is not echoed into BrainGate's output.
   assert.doesNotMatch(output.out() + output.err(), /sandbox denied outside-root invariant/);
 });
 
@@ -271,7 +279,7 @@ test("API-authenticated Codex is never self-tested or accepted as subscription r
   const fake = new FakeExecutor();
   const output = io();
   let isolationChecks = 0;
-  const result = await runCli(["shadow", "plan", "--project", f.manifest, "--task", "Where is the auth session stored?", "--json"], {
+  const result = await runCli(["shadow", "plan", "--project", f.manifest, "--task", "Audit the auth session storage across the whole application", "--json"], {
     cwd: f.repo,
     env: f.env,
     discoverAll: async () => [snapshot(), openaiSnapshot("api")],
@@ -280,9 +288,10 @@ test("API-authenticated Codex is never self-tested or accepted as subscription r
     stdout: output.stdout,
     stderr: output.stderr,
   });
-  assert.equal(result.exitCode, 1);
-  assert.equal(isolationChecks, 0);
+  assert.equal(isolationChecks, 0, "an API-billed Codex is refused before it is worth self-testing");
   assert.equal(fake.calls.length, 0);
+  const roles = (result.data as { roles?: readonly { role: string; model: { providerId: string } }[] }).roles ?? [];
+  assert.equal(roles.some((entry) => entry.model.providerId === "openai"), false, "direct billing is never routed to");
 });
 
 test("shadow preflight rejects cwd outside registered repository before executor call", async () => {

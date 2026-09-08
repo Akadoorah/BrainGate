@@ -56,6 +56,19 @@ export function budgetFor(classification: TaskClassification, options: { writeRe
   const base = BASE_BUDGETS[classification.complexity];
   let budget: ExecutionBudget = { ...base };
 
+  // A sensitive question is worth a second opinion, not a mandatory one. Medium risk makes the
+  // reviewer reachable — `--review` now does something — while leaving a lookup priced as a
+  // lookup. Without this the choice was "one call, no review available" or "four calls with a
+  // planner", and a question about auth kept landing on the wrong side of it.
+  if (classification.risk === "medium" && budget.reviewerPolicy === "none") {
+    budget = {
+      ...budget,
+      maxProviderCalls: Math.max(budget.maxProviderCalls, 2),
+      maxReviewers: Math.max(budget.maxReviewers, 1),
+      reviewerPolicy: "optional",
+    };
+  }
+
   if (classification.risk === "high") {
     budget = {
       ...budget,

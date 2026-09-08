@@ -17,6 +17,7 @@ import {
   applyDogfoodPrior,
   initializeDogfoodProject,
   inspectGitRepository,
+  repositoryReadiness,
   type DogfoodOutcome,
   type DogfoodReviewerVerdict,
   type DogfoodRole,
@@ -354,6 +355,10 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     } catch { /* reported as unavailable below */ }
   }
   const cleanForWrite = repositories.every((repo) => repo.clean);
+  // A repository created a moment ago has a branch and no commit. Worktree writes branch from
+  // a commit, so they cannot start yet — and saying that plainly beats letting the write path
+  // fail later on `HEAD`.
+  const uncommitted = repositories.filter((repo) => repo.head === null);
   const reviewerCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
     if (snapshot === undefined || !roleStatus(snapshot.providerId, "reviewer").enabled) return false;
@@ -366,6 +371,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   if (askCandidates.length === 0) blockers.push("No authenticated configured model is eligible as a read-only primary.");
   if (!writeCandidate) blockers.push("No authenticated configured Claude model is eligible for M11 restricted writes.");
   if (!cleanForWrite) blockers.push("At least one registered repository is dirty; worktree writes require a clean source checkout.");
+  if (uncommitted.length > 0) blockers.push("No commit yet in this repository; make a first commit before asking for a change, since worktree writes branch from one. Questions work now.");
 
   const data = Object.freeze({
     project: { projectId: project.projectId, name: project.name, manifest: resolve(cwd, manifest) },
@@ -373,7 +379,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     catalog: { entries: catalog.length, configured: configured.length, unscored: catalog.length - configured.length },
     providers: snapshots.map((snapshot) => ({ providerId: snapshot.providerId, available: snapshot.available.value, version: snapshot.version.value, authState: snapshot.authState.value, authMode: snapshot.authMode.value })),
     ask: { ready: askCandidates.length > 0, candidates: askCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
-    write: { ready: writeCandidate && cleanForWrite, primaryReady: writeCandidate, sourceClean: cleanForWrite, reviewerReady: reviewerCandidates.length > 0, reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
+    write: { ready: writeCandidate && cleanForWrite && uncommitted.length === 0, primaryReady: writeCandidate, sourceClean: cleanForWrite, reviewerReady: reviewerCandidates.length > 0, reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
     codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason },
     grokIsolation: { attempted: grok.attempted, eligible: grok.eligible, reason: grok.reason },
     acceptedProviders: acceptances.map((item) => item.providerId),
@@ -517,9 +523,33 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
     if (command === "init") {
       const flagProjectId = takeOption(args, "--project-id") ?? null;
       const flagName = takeOption(args, "--name") ?? null;
+      const gitInitFlag = removeFlag(args, "--git-init");
       noExtraArgs(args);
-      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask: deps.ask ?? terminalAsk(), stdout, quiet: deps.quiet === true });
-      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name });
+      // Asked first, because it decides whether the identity questions are worth asking at all.
+      // A new directory is where people start, and finding out it cannot be registered only
+      // after answering two prompts — with git's own error, not BrainGate's — is the ordering
+      // that made this feel like a wall rather than a step.
+      const ask = deps.ask ?? terminalAsk();
+      let createRepository = gitInitFlag;
+      if (!createRepository && repositoryReadiness(cwd).repositoryPath === null) {
+        if (json) throw new BrainGateInvariantError("PROJECT_NOT_A_REPOSITORY", "There is no Git repository here. Re-run with --git-init to create one, or run `git init` yourself.");
+        stdout([
+          "",
+          `  ${cwd} is not a Git repository yet.`,
+          "  BrainGate makes every change in a task worktree and fingerprints your checkout",
+          "  before and after each run, so it needs a repository to work in.",
+          "",
+        ].join("\n"));
+        // Without a terminal there is nobody to ask, and creating a repository unasked would
+        // be BrainGate writing to their disk on a guess.
+        const answer = ask === undefined ? null : await ask("  Create one here with `git init`? [Y/n] ");
+        if (answer === null || /^n(o)?$/i.test(answer.trim())) {
+          throw new BrainGateInvariantError("PROJECT_NOT_A_REPOSITORY", "Nothing was created. Run `git init` here when you are ready, then `braingate init` again — or `braingate init --git-init` to do both.");
+        }
+        createRepository = true;
+      }
+      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask, stdout, quiet: deps.quiet === true });
+      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name, createRepository });
       const created = (data as { created: boolean }).created;
       const manifestPath = (data as { manifestPath: string }).manifestPath;
       emit(

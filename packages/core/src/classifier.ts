@@ -1,6 +1,8 @@
 import type { TaskComplexity, TaskRisk } from "./task-ledger.js";
 
-export const CLASSIFIER_RULE_VERSION = "2026-09-07.1";
+// Bumped because the rules changed, not the code: a receipt written under the old version
+// classified a read-only question about a sensitive area three tiers higher than this one does.
+export const CLASSIFIER_RULE_VERSION = "2026-09-09.1";
 
 export type TaskMode = "ask" | "write" | "review";
 
@@ -193,15 +195,29 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
   }
 
   const domains = detectDomains(text, inspection);
+  /**
+   * Risk is what a task could damage, and a question damages nothing.
+   *
+   * "Where is the authentication logic?" opens no worktree, changes no file and merges nothing,
+   * yet naming a sensitive area was enough to make it high risk — which forces T3, which buys a
+   * planner and a required reviewer for a one-line lookup. The domain is still worth recording:
+   * it drives redaction, it appears in the receipt, and it is the reason a second opinion is
+   * *offered*. It is not a reason to pay for one. In write and review mode the floor is
+   * unchanged, because there the task really can break the thing it names.
+   */
+  const canDamage = mode !== "ask";
+  const domainRisk: TaskRisk = canDamage ? "high" : "medium";
   if (domains.has("payments") || domains.has("auth") || domains.has("database") || domains.has("production") || domains.has("security")) {
-    risk = maxRisk(risk, "high");
+    risk = maxRisk(risk, domainRisk);
   }
   if (domains.has("destructive")) {
-    risk = maxRisk(risk, "high");
+    risk = maxRisk(risk, domainRisk);
   }
   if (
-    (domains.has("payments") && mode === "write") ||
-    (domains.has("destructive") && (domains.has("database") || domains.has("production") || domains.has("auth")))
+    canDamage && (
+      (domains.has("payments") && mode === "write") ||
+      (domains.has("destructive") && (domains.has("database") || domains.has("production") || domains.has("auth")))
+    )
   ) {
     risk = "critical";
   }

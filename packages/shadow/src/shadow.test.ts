@@ -522,8 +522,11 @@ test("high-risk workflow routes Claude primary plus Codex independent reviewer w
     const review = JSON.stringify({ kind: "review", verdict: "approve", findings: [] });
     return [JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "ignored" } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: review } })].join("\n");
   });
-  const taskText = "Where is the auth session stored?";
-  const classification = classifyTask({ text: taskText, mode: "ask" });
+  // A review of a change, not a question about one: reading about authentication is not risky,
+  // and this test is about who reviews a risky task rather than about what makes one risky.
+  const taskText = "Review the auth session handling change";
+  const classification = classifyTask({ text: taskText, mode: "review" });
+  assert.equal(classification.risk, "high", "the fixture must actually be a task that requires review");
   const budget = budgetFor(classification, { writeRequested: false });
   try {
     const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake }).run({
@@ -543,8 +546,8 @@ test("high-risk auth shadow preflight without Codex isolation spends zero provid
   const ledger = new TaskLedger(project);
   const router = new CapabilityRouter(registryWithClaudeAndCodex());
   const fake = new FakeExecutor(() => "must not run");
-  const taskText = "Where is the auth session stored?";
-  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const taskText = "Review the auth session handling change";
+  const classification = classifyTask({ text: taskText, mode: "review" });
   const budget = budgetFor(classification, { writeRequested: false });
   try {
     await assert.rejects(() => new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], executor: fake }).run({
