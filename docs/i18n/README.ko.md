@@ -42,8 +42,10 @@ BrainGate는 pre-alpha 단계의 프로젝트로, 각 사의 공식 AI 코딩 CL
 | Anthropic Claude Code | `claude` | 읽기 및 쓰기 |
 | OpenAI Codex | `codex` | 격리 자체 검사 통과 후 독립 검토자로만 |
 | GitHub Copilot | `copilot` | 읽기 전용, 구독은 사용자가 확인 |
-| Google Antigravity | `agy` | 탐지만 가능; 실행은 차단 |
-| xAI Grok Build | `grok` | 탐지만 가능; 실행은 차단 |
+| Google Antigravity | `agy` | 계획·검토·판정 — 아래 위험을 수락한 뒤 |
+| xAI Grok Build | `grok` | 계획·검토·판정, 샌드박스 자체 검사를 통과한 뒤 |
+
+`braingate providers list` 를 실행하면 각 제공자가 이 머신에서 어떤 역할을 맡을 수 있는지, 닫힌 역할은 왜 닫혔는지 알 수 있습니다. 제공자가 역할을 얻는 방식과 `braingate providers accept` 로 무엇을 수락하게 되는지는 영어 README 의 **How a provider earns a role** 를 보세요.
 
 ## 설치
 

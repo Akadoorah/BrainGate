@@ -1,6 +1,6 @@
 # ADR 0008: A provider BrainGate cannot isolate may still be used, if the operator says so
 
-Status: Proposed
+Status: Accepted, amended by implementation (see Amendment) and narrowed by ADR 0009
 
 ## Context
 
@@ -9,6 +9,11 @@ configuration and credentials under the same `HOME`, so isolating one loses the 
 resolves its permissions from `~/.claude/settings.local.json` — a different tool's file — and
 `GROK_HOME` neither moves that nor survives authentication. Both were established by running
 them, and both stand.
+
+> **Since superseded for Grok.** Re-measured against grok 1.0.13, neither Grok finding holds:
+> `GROK_HOME` now preserves authentication under an isolated `HOME`, and a custom sandbox profile
+> that cannot be applied aborts the run. Grok's isolation is proven per run instead of accepted;
+> see ADR 0009. This ADR governs Antigravity, and any future provider in the same position.
 
 What does not follow is that BrainGate should refuse to use them.
 
@@ -58,12 +63,31 @@ for any role once the operator has accepted the residual risk explicitly.
 - **The default stays closed.** A fresh installation routes to nothing that has not proven its
   isolation. Acceptance is a decision the operator makes, not a default they discover.
 
+## Amendment: acceptance gates the provider, staged roles gate the role
+
+Building this exposed a contradiction between two bullets above. "Project access needs
+acceptance" implies staged roles need none — but "the default stays closed" cannot hold if a
+fresh installation will route planning to an unscoped provider nobody agreed to run.
+
+The staged workspace bounds what a provider is **shown**. It does not bound what an unscoped
+provider can **reach** on its own: that residual is present in every invocation, not only the
+ones that open the checkout. Confining the workspace does not confine the process.
+
+So the two controls are separated, and both apply:
+
+- **Acceptance gates the provider.** No role at all, staged included, for a provider BrainGate
+  cannot isolate, until the operator has recorded the decision.
+- **The staged role list gates the role.** Even accepted, such a provider reaches only planner,
+  reviewer and judge. Executing means reading the checkout, and nothing about acceptance makes
+  that safer than it was.
+
+A fresh installation therefore routes to neither, which is what the last bullet above intended.
+
 ## Consequences
 
 The operator can use the subscriptions they pay for. Planning can go to the strongest model
 available in any of them, code can be written by a cheaper one, and review can come from a
-different vendor — which is the point of the project and is currently reachable across two
-providers out of five.
+different vendor — which is the point of the project.
 
 The cost is honest rather than hidden: for an accepted provider, BrainGate's guarantee narrows
 from "this provider was proven unable to reach outside its workspace" to "whatever it did to the

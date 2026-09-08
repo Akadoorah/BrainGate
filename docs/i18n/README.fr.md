@@ -43,8 +43,10 @@ silencieusement vers une facturation au jeton.
 | Anthropic Claude Code | `claude` | lecture et écriture |
 | OpenAI Codex | `codex` | relecteur indépendant uniquement, après un auto-test d'isolation |
 | GitHub Copilot | `copilot` | lecture seule, abonnement attesté par vous |
-| Google Antigravity | `agy` | découverte seule ; exécution verrouillée |
-| xAI Grok Build | `grok` | découverte seule ; exécution verrouillée |
+| Google Antigravity | `agy` | planification, revue et arbitrage — après avoir accepté le risque ci-dessous |
+| xAI Grok Build | `grok` | planification, revue et arbitrage, après un auto-test d'isolement |
+
+Lancez `braingate providers list` pour voir quel rôle chaque fournisseur peut prendre sur votre machine, et pourquoi les rôles fermés le sont. Voir **How a provider earns a role** dans le README anglais pour comprendre comment un fournisseur gagne son rôle et ce que vous acceptez avec `braingate providers accept`.
 
 ## Installation
 

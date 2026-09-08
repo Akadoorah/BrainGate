@@ -122,3 +122,28 @@ test("dashboard snapshot is deterministic and task cards reject cross-project mi
     a.ledger.close(); b.ledger.close(); quota.close();
   }
 });
+
+// The route says who did the work; without this the receipt could not say at what price, which
+// is the half that tells you whether routing to a cheaper model actually saved anything.
+test("a task card totals each model's own token count, and refuses to guess the rest", () => {
+  const { project, ledger } = setupProject();
+  try {
+    const task = ledger.createTask({ title: "Routed task", complexity: "T3", risk: "low" });
+    const row = (provider: string, model: string, value: number | null, evidence: "native" | "unknown") =>
+      ledger.recordUsage({ taskId: task.taskId, provider, model, evidence, metric: "provider_tokens", value, unit: "tokens" });
+    row("anthropic", "claude-fable-5-1", 4_000, "native");
+    row("anthropic", "claude-sonnet-5", 1_200, "native");
+    row("anthropic", "claude-sonnet-5", 800, "native");
+    row("openai", "gpt-6-astra", null, "unknown");
+
+    const card = buildTaskCard(project, normalizeTaskReceipt(ledger.receipt(task.taskId)));
+    const byModel = new Map(card.tokensByModel.map((entry) => [entry.modelId, entry]));
+    assert.equal(byModel.get("claude-fable-5-1")?.tokens, 4_000);
+    // Two calls to the same model add up; that is one model's share of the task.
+    assert.equal(byModel.get("claude-sonnet-5")?.tokens, 2_000);
+    // A provider that reported nothing stays null rather than becoming a zero a reader would
+    // take for a free call.
+    assert.equal(byModel.get("gpt-6-astra")?.tokens, null);
+    assert.equal(byModel.get("gpt-6-astra")?.evidence, "unknown");
+  } finally { ledger.close(); }
+});

@@ -357,3 +357,62 @@ test("models/status/dashboard safe paths do not invoke provider executor", async
   assert.equal(dashboardStarts, 1);
   assert.equal(fake.calls.length, 0);
 });
+
+// ADR 0008/0009. Two providers, two different answers to the same question — "may BrainGate
+// run this?" — and the difference has to be visible on the command line, because a refusal
+// nobody can act on is the same as a missing feature.
+test("providers list says which roles each provider may take and why", async () => {
+  const f = fixture();
+  const output = io();
+  const result = await runCli(["providers", "list", "--json"], { cwd: f.repo, env: f.env, stdout: output.stdout, stderr: output.stderr });
+  assert.equal(result.exitCode, 0);
+  const rows = result.data as readonly { providerId: string; acceptance: unknown; roles: readonly { role: string; enabled: boolean; reason: string | null }[] }[];
+  const google = rows.find((row) => row.providerId === "google")!;
+  assert.equal(google.acceptance, null);
+  assert.equal(google.roles.every((entry) => !entry.enabled), true);
+  assert.match(google.roles[0]!.reason ?? "", /braingate providers accept google/);
+
+  const xai = rows.find((row) => row.providerId === "xai")!;
+  // Grok's isolation is proven per run rather than accepted, so the policy opens its staged
+  // roles and closes the one that would need the checkout.
+  assert.equal(xai.roles.find((entry) => entry.role === "planner")?.enabled, true);
+  assert.equal(xai.roles.find((entry) => entry.role === "primary")?.enabled, false);
+});
+
+test("accepting a provider opens its staged roles, and revoking closes them again", async () => {
+  const f = fixture();
+  const output = io();
+  const deps = { cwd: f.repo, env: f.env, stdout: output.stdout, stderr: output.stderr };
+
+  const accepted = await runCli(["providers", "accept", "google"], deps);
+  assert.equal(accepted.exitCode, 0);
+  // The operator has to be told what they just agreed to, in the same breath as agreeing.
+  assert.match(output.out(), /elsewhere on this machine is unchecked/);
+  assert.match(output.out(), /Staged roles only/);
+  assert.match(output.out(), /braingate providers revoke google/);
+
+  const listed = (await runCli(["providers", "list", "--json"], deps)).data as readonly { providerId: string; roles: readonly { role: string; enabled: boolean; acceptedByOperator: boolean }[] }[];
+  const google = listed.find((row) => row.providerId === "google")!;
+  assert.equal(google.roles.find((entry) => entry.role === "planner")?.enabled, true);
+  assert.equal(google.roles.find((entry) => entry.role === "planner")?.acceptedByOperator, true);
+  // Acceptance widens which providers may be asked, never what one may see.
+  assert.equal(google.roles.find((entry) => entry.role === "primary")?.enabled, false);
+
+  assert.equal((await runCli(["providers", "revoke", "google"], deps)).exitCode, 0);
+  const after = (await runCli(["providers", "list", "--json"], deps)).data as readonly { providerId: string; roles: readonly { enabled: boolean }[] }[];
+  assert.equal(after.find((row) => row.providerId === "google")!.roles.every((entry) => !entry.enabled), true);
+});
+
+test("accepting a provider that needs no acceptance is refused rather than recorded", async () => {
+  const f = fixture();
+  const output = io();
+  const deps = { cwd: f.repo, env: f.env, stdout: output.stdout, stderr: output.stderr };
+  // Recording a decision that changes nothing would imply the operator is taking a risk they
+  // are not, and would quietly become the reason a later reader thinks they accepted one.
+  for (const providerId of ["anthropic", "xai"] as const) {
+    const result = await runCli(["providers", "accept", providerId], deps);
+    assert.equal(result.exitCode, 1);
+    assert.match(output.err(), /does not run on operator acceptance/);
+  }
+  assert.equal((await runCli(["providers", "accept", "not-a-provider"], deps)).exitCode, 1);
+});

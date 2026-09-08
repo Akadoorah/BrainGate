@@ -72,7 +72,10 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     versionArgs: ["version"],
     helpArgs: ["--help"],
     modelArgs: ["models"],
-    authArgs: null,
+    // `grok models` names the signed-in account before it lists anything, and it neither
+    // prompts nor mutates. That is a zero-prompt command that reports authentication, which is
+    // the bar; it was recorded as unknown only because nothing here had read its output.
+    authArgs: ["models"],
     headlessPatterns: [/\s-p[ ,]/i, /headless/i],
     structuredPatterns: [/output[- ]format/i, /json/i],
     modelPatterns: [/--model\b/i, /\s-m[ ,]/i],
@@ -182,9 +185,21 @@ function parseCodexAuth(result: ProbeResult): ParsedAuth {
   return { state: result.exitCode === 0 ? "authenticated" : "unknown", mode: "unknown", evidence: result.exitCode === 0 ? "native" : "unknown" };
 }
 
+function parseGrokAuth(result: ProbeResult): ParsedAuth {
+  if (!result.spawned || result.timedOut) return { state: "unknown", mode: "unknown", evidence: "unknown" };
+  const output = combinedOutput(result).trim();
+  if (/not authenticated|not logged in/i.test(output)) return { state: "unauthenticated", mode: "unknown", evidence: "native" };
+  // An API key is direct billing, which is the one mode BrainGate refuses outright, so it is
+  // matched before the general logged-in case rather than being folded into it.
+  if (/logged in with (?:an )?api key|using an api key/i.test(output)) return { state: "authenticated", mode: "api", evidence: "native" };
+  if (/logged in with grok\.com|logged in as/i.test(output)) return { state: "authenticated", mode: "subscription", evidence: "native" };
+  return { state: "unknown", mode: "unknown", evidence: "unknown" };
+}
+
 function parseAuth(providerId: ProviderId, result: ProbeResult): ParsedAuth {
   if (providerId === "anthropic") return parseClaudeAuth(result);
   if (providerId === "openai") return parseCodexAuth(result);
+  if (providerId === "xai") return parseGrokAuth(result);
   return { state: "unknown", mode: "unknown", evidence: "unknown" };
 }
 

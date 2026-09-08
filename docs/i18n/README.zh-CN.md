@@ -41,8 +41,10 @@ API 密钥与 base URL 变量，避免遗留的 `ANTHROPIC_API_KEY` 或 `OPENAI_
 | Anthropic Claude Code | `claude` | 读与写 |
 | OpenAI Codex | `codex` | 仅作独立评审，需先通过隔离自检 |
 | GitHub Copilot | `copilot` | 只读，订阅由你声明 |
-| Google Antigravity | `agy` | 仅探测；执行为关闭状态 |
-| xAI Grok Build | `grok` | 仅探测；执行为关闭状态 |
+| Google Antigravity | `agy` | 规划、评审与裁决 —— 在你接受下方风险之后 |
+| xAI Grok Build | `grok` | 规划、评审与裁决，需先通过一次沙箱自检 |
+
+运行 `braingate providers list` 查看每个提供方在你机器上可以承担哪些角色，以及被关闭的角色为何关闭。提供方如何取得角色、以及 `braingate providers accept` 到底让你接受了什么，见英文 README 的 **How a provider earns a role** 一节。
 
 ## 安装
 

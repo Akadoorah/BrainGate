@@ -43,8 +43,10 @@ Variablen für API-Schlüssel und Basis-URLs. So kann ein vergessener `ANTHROPIC
 | Anthropic Claude Code | `claude` | Lesen und Schreiben |
 | OpenAI Codex | `codex` | nur unabhängiger Prüfer, nach bestandenem Isolations-Selbsttest |
 | GitHub Copilot | `copilot` | nur Lesen, Abo von Ihnen bestätigt |
-| Google Antigravity | `agy` | nur Erkennung; Ausführung gesperrt |
-| xAI Grok Build | `grok` | nur Erkennung; Ausführung gesperrt |
+| Google Antigravity | `agy` | Planung, Review und Schiedsspruch — nachdem Sie das unten genannte Risiko akzeptiert haben |
+| xAI Grok Build | `grok` | Planung, Review und Schiedsspruch, nach einem Isolations-Selbsttest |
+
+Führen Sie `braingate providers list` aus, um zu sehen, welche Rolle jeder Anbieter auf Ihrem Rechner übernehmen darf und warum die geschlossenen geschlossen sind. Siehe **How a provider earns a role** in der englischen README dazu, wie ein Anbieter seine Rolle verdient und was Sie mit `braingate providers accept` akzeptieren.
 
 ## Installation
 

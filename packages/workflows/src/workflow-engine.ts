@@ -122,6 +122,10 @@ export class WorkflowEngine {
     let plan: RouteCandidate | null = null;
     let approach: string | null = null;
     if (input.budget.separatePlanningPass) {
+      // Planning has its own exclusion list. Reusing the executor's would tie the two together
+      // exactly where they differ: a provider confined to a staged workspace can plan from the
+      // task and the supplied context, and cannot execute against the checkout it never sees.
+      const plannerExcluded = input.excludeProviders?.planner ?? primaryExcluded;
       try {
         plan = this.#router.route({
           role: "planner",
@@ -129,7 +133,7 @@ export class WorkflowEngine {
           budget: input.budget,
           requiredContextTokens: input.requiredContextTokens,
           writeRequired: false,
-          ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
+          ...(plannerExcluded === undefined ? {} : { excludeProviders: plannerExcluded }),
         }).selected;
       } catch (error) {
         // No model declares a planning capability. The task still runs; it simply plans and

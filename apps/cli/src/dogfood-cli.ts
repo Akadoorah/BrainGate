@@ -30,9 +30,11 @@ import {
   ShadowDogfoodRunner,
   shadowProviderRoleStatus,
   type CodexIsolationAttestation,
+  type GrokIsolationAttestation,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
+import { acceptedSubscriptions, configuredProvider, grokIsolationStatus, loadAcceptances } from "./provider-proof.js";
 import { collectTaskMemory } from "./task-memory.js";
 import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
 
@@ -41,6 +43,7 @@ export interface DogfoodCliDependencies {
   readonly env?: NodeJS.ProcessEnv;
   readonly discoverAll?: () => Promise<readonly ProviderSnapshot[]>;
   readonly verifyCodexIsolation?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
+  readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
   readonly writeExecutor?: WriteProviderExecutor;
   readonly stdout?: (text: string) => void;
@@ -209,10 +212,13 @@ async function resolveProjectIdentity(input: {
 function manifestOption(args: string[]): string { return takeOption(args, "--project") ?? ".brain/project.json"; }
 function contextTokens(task: string): number { return Math.max(128, conservativeTokenEstimate(task) + 64); }
 
-function attestations(args: string[]): readonly SubscriptionAttestation[] {
-  if (!removeFlag(args, "--attest-copilot-oauth")) return Object.freeze([]);
+function attestations(copilotOauth: boolean, state: OperatorStatePaths): readonly SubscriptionAttestation[] {
+  // An acceptance already carries the operator's statement about how that provider is billed,
+  // so it does not need a second flag on every command.
+  const accepted = acceptedSubscriptions(state);
+  if (!copilotOauth) return Object.freeze(accepted);
   const observed = new Date();
-  return Object.freeze([Object.freeze({
+  return Object.freeze([...accepted, Object.freeze({
     providerId: "github-copilot",
     mode: "subscription",
     source: "user-confirmed-oauth",
@@ -246,6 +252,23 @@ async function codexIsolationStatus(
     const safe = safeError(error);
     return Object.freeze({ attempted: true, eligible: false, attestation: null, reason: `${safe.code}: ${safe.message}` });
   }
+}
+
+/** Grok's sandbox, re-proved for this command; see apps/cli/src/provider-proof.ts. */
+async function grokProof(
+  state: OperatorStatePaths,
+  snapshots: readonly ProviderSnapshot[],
+  deps: DogfoodCliDependencies,
+  env: NodeJS.ProcessEnv,
+  project?: RegisteredProject,
+): Promise<Awaited<ReturnType<typeof grokIsolationStatus>>> {
+  return await grokIsolationStatus({
+    snapshots,
+    env,
+    shouldAttempt: configuredProvider(new ModelCatalog(state.modelCatalogPath).load(), "xai"),
+    ...(project === undefined ? {} : { project }),
+    ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
+  });
 }
 
 function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnapshot[]): { readonly router: CapabilityRouter; readonly runtimes: readonly unknown[] } {
@@ -308,11 +331,17 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
   const configured = catalog.filter((entry) => entry.configured);
   const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"));
+  const grok = await grokProof(state, snapshots, deps, env, project);
+  const acceptances = loadAcceptances(state);
+  const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer") => {
+    const acceptance = acceptances.find((item) => item.providerId === providerId);
+    return shadowProviderRoleStatus(providerId, role, acceptance === undefined ? {} : { acceptance });
+  };
   const providerById = new Map<string, ProviderSnapshot>(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
 
   const askCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && shadowProviderRoleStatus(snapshot.providerId, "primary").enabled;
+    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && roleStatus(snapshot.providerId, "primary").enabled;
   });
   let writeCandidate = false;
   for (const entry of configured) {
@@ -327,8 +356,9 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const cleanForWrite = repositories.every((repo) => repo.clean);
   const reviewerCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    if (snapshot === undefined || !shadowProviderRoleStatus(snapshot.providerId, "reviewer").enabled) return false;
+    if (snapshot === undefined || !roleStatus(snapshot.providerId, "reviewer").enabled) return false;
     if (snapshot.providerId === "openai") return isolation.eligible;
+    if (snapshot.providerId === "xai") return grok.eligible;
     return snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription";
   });
   const blockers: string[] = [];
@@ -345,6 +375,8 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     ask: { ready: askCandidates.length > 0, candidates: askCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
     write: { ready: writeCandidate && cleanForWrite, primaryReady: writeCandidate, sourceClean: cleanForWrite, reviewerReady: reviewerCandidates.length > 0, reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
     codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason },
+    grokIsolation: { attempted: grok.attempted, eligible: grok.eligible, reason: grok.reason },
+    acceptedProviders: acceptances.map((item) => item.providerId),
     blockers,
     providerModelCalls: 0,
   });
@@ -359,11 +391,12 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
   const task = takeOption(args, "--task", true)!;
   const execute = removeFlag(args, "--execute");
   const optionalReview = removeFlag(args, "--review");
-  const oauth = attestations(args);
+  const copilotOauth = removeFlag(args, "--attest-copilot-oauth");
   noExtraArgs(args);
   if (action === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with dogfood ask run.");
 
   const state = resolveOperatorState(env);
+  const oauth = attestations(copilotOauth, state);
   const project = projectFromManifest(state, manifest, cwd);
   const snapshots = await discovery(deps);
   const runtime = runtimeFor(state, snapshots);
@@ -389,7 +422,10 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
     const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state));
     const codexIsolation = isolation.attestation ?? undefined;
-    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, ...(codexIsolation === undefined ? {} : { codexIsolation }) });
+    const grok = await grokProof(state, snapshots, deps, env, project);
+    const grokIsolation = grok.attestation ?? undefined;
+    const acceptances = loadAcceptances(state);
+    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     const planData = Object.freeze({ classification: view, budget, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })), providerCallsOnPlan: 0 });
 
@@ -401,7 +437,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }) });
+      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }) });
       const result = await runner.run({ title: `Dogfood ask ${effective.complexity}`, task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
@@ -421,11 +457,12 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
   const baseRef = takeOption(args, "--base") ?? "HEAD";
   const execute = removeFlag(args, "--execute");
   const review = !removeFlag(args, "--no-review");
-  const oauth = attestations(args);
+  const copilotOauth = removeFlag(args, "--attest-copilot-oauth");
   noExtraArgs(args);
   if (action === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with dogfood write run.");
 
   const state = resolveOperatorState(env);
+  const oauth = attestations(copilotOauth, state);
   const project = projectFromManifest(state, manifest, cwd);
   const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
   const snapshots = await discovery(deps);
@@ -440,7 +477,10 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const requiredContextTokens = contextTokens(task);
     const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state));
     const codexIsolation = isolation.attestation ?? undefined;
-    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, ...(codexIsolation === undefined ? {} : { codexIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const grok = await grokProof(state, snapshots, deps, env, project);
+    const grokIsolation = grok.attestation ?? undefined;
+    const acceptances = loadAcceptances(state);
+    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     const planData = Object.freeze({ classification: view, budget, repositoryPath, baseRef, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })), providerCallsOnPlan: 0, createsWorktree: false, mergeAvailable: false });
 
@@ -452,7 +492,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       const mapped = writeOutcome(result);

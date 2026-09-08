@@ -11,11 +11,12 @@ import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
 import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
+import type { GrokIsolationAttestation } from "./grok-isolation.js";
 import { SubscriptionShadowAgentInvoker } from "./invoker.js";
 import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import { assertSourceCheckoutUnchanged, sourceCheckoutFingerprint } from "./source-guard.js";
-import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
+import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 function modelRef(route: RouteResult): ModelRef {
   const definition = route.selected.model.definition;
@@ -37,10 +38,24 @@ function attestationFor(attestations: readonly SubscriptionAttestation[], provid
   return attestation === undefined ? Object.freeze({}) : Object.freeze({ attestation });
 }
 
-function exclusionsFor(snapshots: readonly ProviderSnapshot[], role: WorkflowRole, codexIsolation?: CodexIsolationAttestation): readonly string[] {
+function acceptanceFor(acceptances: readonly OperatorProviderAcceptance[], providerId: string): Readonly<{ acceptance?: OperatorProviderAcceptance }> {
+  const acceptance = acceptances.find((item) => item.providerId === providerId);
+  return acceptance === undefined ? Object.freeze({}) : Object.freeze({ acceptance });
+}
+
+function exclusionsFor(
+  snapshots: readonly ProviderSnapshot[],
+  role: WorkflowRole,
+  isolation: { readonly codex?: CodexIsolationAttestation; readonly grok?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[] } = {},
+): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
-    if (!shadowProviderRoleStatus(snapshot.providerId, role).enabled) return true;
-    if (snapshot.providerId === "openai" && role === "reviewer" && codexIsolation === undefined) return true;
+    const acceptance = (isolation.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
+    if (!shadowProviderRoleStatus(snapshot.providerId, role, acceptance === undefined ? {} : { acceptance }).enabled) return true;
+    // A provider whose isolation is proven per run, not per install, is not routable until this
+    // run has the proof. Excluding it here means the router never selects it and the operator
+    // never sees a plan naming a model the invocation would then refuse.
+    if (snapshot.providerId === "openai" && role === "reviewer" && isolation.codex === undefined) return true;
+    if (snapshot.providerId === "xai" && isolation.grok === undefined) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
 }
@@ -58,7 +73,9 @@ export class ShadowDogfoodRunner {
   readonly #router: CapabilityRouter;
   readonly #snapshots: readonly ProviderSnapshot[];
   readonly #attestations: readonly SubscriptionAttestation[];
+  readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
+  readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
 
   constructor(input: {
@@ -67,7 +84,9 @@ export class ShadowDogfoodRunner {
     readonly router: CapabilityRouter;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
+    readonly acceptances?: readonly OperatorProviderAcceptance[];
     readonly codexIsolation?: CodexIsolationAttestation;
+    readonly grokIsolation?: GrokIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
   }) {
     this.#project = input.project;
@@ -75,7 +94,9 @@ export class ShadowDogfoodRunner {
     this.#router = input.router;
     this.#snapshots = input.snapshots;
     this.#attestations = input.attestations ?? [];
+    this.#acceptances = input.acceptances ?? [];
     this.#codexIsolation = input.codexIsolation;
+    this.#grokIsolation = input.grokIsolation;
     this.#executor = input.executor;
   }
 
@@ -101,15 +122,21 @@ export class ShadowDogfoodRunner {
     if (input.task.trim().length === 0) throw new BrainGateInvariantError("SHADOW_TASK_INVALID", "Shadow task must be non-empty.");
     if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("SHADOW_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
     const cwd = assertShadowProjectCwd(this.#project, input.cwd);
-    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", this.#codexIsolation);
-    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", this.#codexIsolation);
-    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", this.#codexIsolation);
+    const isolation = Object.freeze({
+      ...(this.#codexIsolation === undefined ? {} : { codex: this.#codexIsolation }),
+      ...(this.#grokIsolation === undefined ? {} : { grok: this.#grokIsolation }),
+      acceptances: this.#acceptances,
+    });
+    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation);
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation);
 
     const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
-    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd, payload: preflightPayload("primary", input.task, input.context), ...attestationFor(this.#attestations, primaryRef.providerId) });
+    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd, payload: preflightPayload("primary", input.task, input.context), ...attestationFor(this.#attestations, primaryRef.providerId), ...acceptanceFor(this.#acceptances, primaryRef.providerId) });
 
     const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && (input.optionalReview ?? false));
     if (needsReview) {
@@ -125,7 +152,9 @@ export class ShadowDogfoodRunner {
         cwd,
         payload: preflightPayload("reviewer", input.task, input.context),
         ...attestationFor(this.#attestations, reviewerRef.providerId),
+        ...acceptanceFor(this.#acceptances, reviewerRef.providerId),
         ...(reviewerRef.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
+        ...(reviewerRef.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
       });
     }
 
@@ -143,9 +172,9 @@ export class ShadowDogfoodRunner {
 
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
-      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
+      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       assertSourceCheckoutUnchanged(cwd, sourceBefore);
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
       recordWorkflowReceipt(this.#ledger, task.taskId, workflow);

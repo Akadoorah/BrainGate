@@ -6,9 +6,9 @@ import { spawn } from "node:child_process";
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { SecretGuard, redactSecrets } from "@braingate/security";
+import { STAGE_PATH_TOKEN } from "./types.js";
 
 export const CODEX_REVIEW_PROFILE = "braingate-review";
-export const CODEX_STAGE_TOKEN = "__BRAINGATE_CODEX_STAGE__";
 
 export const CODEX_REVIEW_DISABLED_FEATURES = Object.freeze([
   // Mirrors the isolation-oriented temporary structured request surface in current Codex,
@@ -117,7 +117,7 @@ export function codexPermissionInlineTable(stagePath: string): string {
   return `{ ${name} = { filesystem = { ":root" = "none", ":minimal" = "read", ${tomlString(stagePath)} = "read" }, network = { enabled = false } } }`;
 }
 
-export function codexReviewerConfigArgs(stagePath = CODEX_STAGE_TOKEN, featureKeys: readonly string[] = CODEX_REVIEW_DISABLED_FEATURES): readonly string[] {
+export function codexReviewerConfigArgs(stagePath = STAGE_PATH_TOKEN, featureKeys: readonly string[] = CODEX_REVIEW_DISABLED_FEATURES): readonly string[] {
   const args: string[] = [
     "-c", `default_permissions=${tomlString(CODEX_REVIEW_PROFILE)}`,
     "-c", `permissions=${codexPermissionInlineTable(stagePath)}`,
