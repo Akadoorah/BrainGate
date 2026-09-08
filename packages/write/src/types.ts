@@ -67,3 +67,15 @@ export interface WriteRunResult {
   readonly mergePerformed: false;
   readonly taskReceipt: TaskReceipt | null;
 }
+
+/**
+ * An artifact-producing pass attached to a write task (ADR 0007).
+ *
+ * Optional: a write task without one behaves exactly as before, which is why the visual role
+ * reuses the write boundary rather than introducing a second path beside it.
+ */
+export interface VisualRequest {
+  readonly model: ModelRef;
+  readonly task: string;
+  readonly context?: unknown;
+}
