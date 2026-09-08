@@ -4,6 +4,7 @@ import { createInterface, type Interface } from "node:readline/promises";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { SessionContext } from "./session-context.js";
+import { COLOURED, PLAIN, renderBanner } from "./banner.js";
 
 /**
  * The interactive session: `braingate` with no arguments and a terminal attached.
@@ -23,6 +24,10 @@ interface ReplDeps {
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
   readonly ask: (question: string) => Promise<string | null>;
+  /** False on a terminal that should not be redrawn, or when the operator asked for quiet. */
+  readonly animate?: boolean;
+  /** False under NO_COLOR or a dumb terminal. */
+  readonly colour?: boolean;
 }
 
 const WRITE_INTENT = /^\s*(add|append|change|convert|correct|create|delete|drop|edit|extract|fix|implement|inline|insert|migrate|move|refactor|remove|rename|reorder|replace|rewrite|set|split|swap|update|write)\b/i;
@@ -148,9 +153,18 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     return 1;
   }
 
+  await renderBanner({
+    write: deps.stdout,
+    // Colour is opt-out; NO_COLOR is the convention and it is honoured rather than reinvented.
+    style: deps.colour === false ? PLAIN : COLOURED,
+    // Redrawing in place needs a terminal that will move the cursor. Anywhere else, and when
+    // asked to keep quiet, the finished picture is printed once.
+    still: deps.animate === false,
+  });
+
   const header: string[] = [];
   await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t) });
-  deps.stdout(`\n  BrainGate · ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
+  deps.stdout(`  ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
 
   const session = new SessionContext();
   for (;;) {
@@ -170,8 +184,12 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
 export async function runReplOnTerminal(cwd: string): Promise<number> {
   const rl: Interface = createInterface({ input: process.stdin, output: process.stdout });
   try {
+    const env = process.env;
+    const dumb = env.TERM === "dumb";
     return await runRepl({
       cwd,
+      animate: !dumb && env.BRAINGATE_NO_ANIMATION !== "1",
+      colour: !dumb && (env.NO_COLOR === undefined || env.NO_COLOR === ""),
       stdout: (text) => process.stdout.write(text),
       stderr: (text) => process.stderr.write(text),
       ask: async (question) => {
