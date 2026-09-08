@@ -330,7 +330,9 @@ test("inspection turns scale with complexity so a deep task can reach its contex
   const trivial = turnsFor("What Node version does this need?");
   const deep = turnsFor("Audit how payment webhooks are verified and whether replay attacks are prevented");
   assert.ok(deep > trivial, `a deep audit must get more turns than a lookup (${String(deep)} vs ${String(trivial)})`);
-  assert.ok(deep <= 12, "the profile clamps at 12 turns, so the budget must not exceed it");
+  // The old assertion pinned the profile's clamp at 12, which is what silently reimposed the
+  // limit the budget was meant to lift. The clamp is a runaway bound now, well above any tier.
+  assert.ok(deep <= 60, "the budget must stay within the profile's runaway ceiling");
 });
 
 test("the runner spends the budget's turns rather than a fixed ceiling", async () => {
@@ -597,4 +599,16 @@ test("acceptance does not reopen a provider that is closed for a different reaso
   // Codex is reviewer-only because generation and judgement must stay separate, not because of
   // isolation. Accepting risk does not change that.
   assert.equal(shadowProviderRoleStatus("openai", "primary", { acceptance: acceptance("openai") }).enabled, false);
+});
+
+// The clamp in the profile silently reimposed the limit the budget had just lifted. A ceiling
+// that the layer below quietly lowers is not a ceiling.
+test("the invocation profile honours the budget's turn allowance instead of capping it", () => {
+  const { repo } = setupProject();
+  for (const complexity of ["T0", "T4"] as const) {
+    const budget = budgetFor({ ...classifyTask({ text: "any task", mode: "ask" }), complexity }, { writeRequested: false });
+    const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, maxTurns: budget.maxInspectionTurns, now: new Date("2026-09-07T01:00:00Z") });
+    const granted = Number(plan.args[plan.args.indexOf("--max-turns") + 1]);
+    assert.equal(granted, budget.maxInspectionTurns, `${complexity} was clamped from ${String(budget.maxInspectionTurns)} to ${String(granted)}`);
+  }
 });

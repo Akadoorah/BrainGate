@@ -14,14 +14,23 @@ export interface ExecutionBudget {
   readonly maxCouncilRounds: number;
   readonly maxContextTokens: number;
   /**
-   * Tool-use turns a read-only inspection may spend gathering context. It scales with
-   * complexity for the same reason maxContextTokens does: a budget that allows 96k tokens of
-   * context but only the turn count of a trivial lookup cannot actually reach it.
+   * Tool-use turns an inspection may spend before BrainGate treats the run as runaway.
+   *
+   * This is a ceiling, not a budget, and the difference matters. Truncating at a turn limit does
+   * not buy half an answer for half the price: the run ends with no result at all, and every
+   * turn already spent is wasted. A limit set where work becomes expensive therefore costs more
+   * than it saves — it converts a completed task into a failed one at nearly the same price.
+   *
+   * Cost is controlled where it is actually decided: by which model is doing the reading. The
+   * same twenty files cost very differently through a deep model than a fast one, and routing
+   * already chooses that. These numbers exist to stop pathology — a loop, a model that never
+   * concludes — not to stop ordinary work.
    */
   readonly maxInspectionTurns: number;
   /**
-   * Wall-clock allowance for one read-only inspection. Scales with the turn allowance for the
-   * same reason: turns the provider is permitted but has no time to spend are not a budget.
+   * Wall-clock allowance for one inspection, and the other half of the runaway bound. Set so a
+   * task that is working normally finishes inside it, since a timeout wastes the run exactly as
+   * a turn limit does.
    */
   readonly maxInspectionMs: number;
   /**
@@ -36,11 +45,11 @@ export interface ExecutionBudget {
 }
 
 const BASE_BUDGETS: Readonly<Record<TaskComplexity, ExecutionBudget>> = {
-  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 4, maxInspectionMs: 60000, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 6, maxInspectionMs: 120000, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 8, maxInspectionMs: 240000, separatePlanningPass: false, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 10, maxInspectionMs: 420000, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 12, maxInspectionMs: 600000, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
+  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 15, maxInspectionMs: 180000, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 20, maxInspectionMs: 300000, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 25, maxInspectionMs: 420000, separatePlanningPass: false, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 35, maxInspectionMs: 600000, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 50, maxInspectionMs: 900000, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
 };
 
 export function budgetFor(classification: TaskClassification, options: { writeRequested: boolean }): ExecutionBudget {

@@ -158,7 +158,9 @@ export function planShadowInvocation(input: {
   const now = input.now ?? new Date();
   const profile = assertProfile(input.snapshot, input.model, input.attestation, now);
   const body = serializedPayload(input.payload);
-  const maxTurns = Math.max(1, Math.min(12, Math.floor(input.maxTurns ?? 6)));
+  // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
+  // lower than the budget asks for would silently reimpose the limit this stopped being.
+  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
 
   if (input.snapshot.providerId === "anthropic") {
     const args = Object.freeze([

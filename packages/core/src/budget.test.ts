@@ -2,7 +2,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { BrainGateInvariantError } from "./errors.js";
 import { BudgetTracker, budgetFor } from "./budget.js";
-import { classifyTask } from "./classifier.js";
+import { classifyTask, type TaskClassification } from "./classifier.js";
 
 test("tiny tasks permit one provider call and no council", () => {
   const classification = classifyTask({ text: "وين ملف اللوجو؟", mode: "ask" });
@@ -71,4 +71,27 @@ test("repair and retry loops cannot exceed policy", () => {
   assert.throws(() => tracker.recordRepairRound(), /repair rounds/);
   tracker.recordAutomaticRetry();
   assert.throws(() => tracker.recordAutomaticRetry(), /automatic retries/);
+});
+
+// Truncating at a turn limit does not buy half an answer for half the price: the run ends with
+// no result and every turn already spent is wasted. So these are ceilings on pathology, and a
+// simple lookup in a real repository must fit inside the smallest of them.
+test("even the smallest tier allows enough turns for real exploration", () => {
+  const smallest = budgetFor(classifyTask({ text: "Where is the paywall logic implemented?", mode: "ask" }), { writeRequested: false });
+  assert.ok(smallest.maxInspectionTurns >= 12, `a lookup got ${String(smallest.maxInspectionTurns)} turns, which a real repository does not fit inside`);
+  assert.ok(smallest.maxInspectionMs >= 120_000);
+});
+
+/** A classification of a given tier, without inventing the shape the classifier produces. */
+function atTier(complexity: "T0" | "T1" | "T2" | "T3" | "T4"): TaskClassification {
+  return { ...classifyTask({ text: "any task", mode: "ask" }), complexity };
+}
+
+test("the ceilings widen with complexity and never narrow", () => {
+  const order = ["T0", "T1", "T2", "T3", "T4"] as const;
+  const budgets = order.map((complexity) => budgetFor(atTier(complexity), { writeRequested: false }));
+  for (let index = 1; index < budgets.length; index += 1) {
+    assert.ok(budgets[index]!.maxInspectionTurns >= budgets[index - 1]!.maxInspectionTurns, `${order[index]!} allows fewer turns than ${order[index - 1]!}`);
+    assert.ok(budgets[index]!.maxInspectionMs >= budgets[index - 1]!.maxInspectionMs, `${order[index]!} allows less time than ${order[index - 1]!}`);
+  }
 });
