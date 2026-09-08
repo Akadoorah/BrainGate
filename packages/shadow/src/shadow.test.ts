@@ -30,6 +30,7 @@ import {
   assertSourceCheckoutUnchanged,
   sourceCheckoutFingerprint,
   planShadowInvocation,
+  providerFailureReason,
   previewShadowInvocation,
   shadowProviderRoleStatus,
   shadowProviderStatus,
@@ -279,12 +280,13 @@ test("Codex JSONL parser extracts only completed agent_message and ignores reaso
 });
 
 class FakeExecutor implements ShadowProcessExecutor {
+  exitCode = 0;
   calls: ShadowInvocationPlan[] = [];
   readonly response: (plan: ShadowInvocationPlan) => string;
   constructor(response: (plan: ShadowInvocationPlan) => string) { this.response = response; }
   async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
     this.calls.push(input.plan);
-    return { spawned: true, exitCode: 0, stdout: this.response(input.plan), stderr: "", timedOut: false, durationMs: 12, removedEnvironmentKeys: ["OPENAI_API_KEY"] };
+    return { spawned: true, exitCode: this.exitCode, stdout: this.response(input.plan), stderr: "", timedOut: false, durationMs: 12, removedEnvironmentKeys: ["OPENAI_API_KEY"] };
   }
 }
 
@@ -520,4 +522,37 @@ test("Codex reviewer deny list and inline profile remain explicit", () => {
   assert.match(args, /:root/);
   assert.match(args, /:minimal/);
   assert.match(args, /enabled = false|enabled=false/);
+});
+
+// "failed with exit 1" told the operator nothing: a budget that was too small looked exactly
+// like a broken provider. The CLI had already said which it was, and BrainGate discarded it.
+test("a provider's own account of a failure is surfaced, with what to do about it", () => {
+  const maxTurns = JSON.stringify({ is_error: true, subtype: "error_max_turns", errors: ["Reached maximum number of turns (6)"], result: null });
+  assert.equal(providerFailureReason("anthropic", maxTurns, ""), "Reached maximum number of turns (6)");
+
+  // A non-success subtype is a reason even when no message accompanies it.
+  assert.equal(providerFailureReason("anthropic", JSON.stringify({ subtype: "error_during_execution" }), ""), "error_during_execution");
+
+  // Providers that do not report structurally still have their first stderr line read.
+  assert.equal(providerFailureReason("openai", "", "Error loading config.toml: unknown field\nsecond line"), "Error loading config.toml: unknown field");
+
+  // A successful run has nothing to explain, and neither does silence.
+  assert.equal(providerFailureReason("anthropic", JSON.stringify({ subtype: "success" }), ""), null);
+  assert.equal(providerFailureReason("anthropic", "", ""), null);
+});
+
+test("a provider failure reaches the operator with the reason attached", async () => {
+  const { repo, project } = setupProject();
+  const exhausted = new FakeExecutor(() => JSON.stringify({ is_error: true, subtype: "error_max_turns", errors: ["Reached maximum number of turns (6)"] }));
+  // The fake returns the shape a real run out of turns returns, and exits non-zero.
+  exhausted.exitCode = 1;
+  const invoker = new SubscriptionShadowAgentInvoker({ project, cwd: repo, snapshots: [snapshot("anthropic")], context: {}, executor: exhausted });
+  await assert.rejects(
+    () => invoker.invoke({ role: "primary", model, phase: "initial", task: "anything", findings: [] }),
+    (error: unknown) => {
+      if (!(error instanceof BrainGateInvariantError) || error.code !== "SHADOW_PROVIDER_FAILED") return false;
+      // The reason, and a next step rather than a dead end.
+      return /Reached maximum number of turns/.test(error.message) && /dogfood feedback/.test(error.message);
+    },
+  );
 });
