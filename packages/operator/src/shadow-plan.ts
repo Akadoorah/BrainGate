@@ -1,3 +1,4 @@
+import { BrainGateInvariantError } from "@braingate/core";
 import type { ExecutionBudget, RegisteredProject, TaskClassification } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
@@ -13,7 +14,7 @@ import {
 } from "@braingate/shadow";
 
 export interface PlannedShadowRole {
-  readonly role: "primary" | "reviewer";
+  readonly role: "planner" | "primary" | "reviewer";
   readonly model: ModelRef;
   readonly route: RouteResult;
   readonly invocation: ShadowInvocationPreview;
@@ -32,7 +33,7 @@ function modelRef(route: RouteResult): ModelRef {
   return Object.freeze({ providerId: definition.providerId, modelId: definition.modelId, quotaPool: definition.quotaPool });
 }
 
-function payload(role: "primary" | "reviewer", task: string, context: unknown): ShadowRolePayload {
+function payload(role: "planner" | "primary" | "reviewer", task: string, context: unknown): ShadowRolePayload {
   return Object.freeze({
     schemaVersion: 1,
     role,
@@ -60,7 +61,7 @@ function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string)
 
 function excludedProviders(input: {
   readonly providers: readonly ProviderSnapshot[];
-  readonly role: "primary" | "reviewer";
+  readonly role: "planner" | "primary" | "reviewer";
   readonly codexIsolation?: CodexIsolationAttestation;
 }): readonly string[] {
   return Object.freeze(input.providers.filter((snapshot) => {
@@ -102,7 +103,40 @@ export function buildShadowTaskPlan(input: {
     payload: payload("primary", input.task, input.context),
     ...attestationFor(attestations, primaryModel.providerId),
   });
-  const roles: PlannedShadowRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, invocation: previewShadowInvocation(primaryInvocation) })];
+  const roles: PlannedShadowRole[] = [];
+
+  // The planning pass, previewed before it is spent. A plan that showed only the executor would
+  // hide the model the task actually leads with, which is the routing decision worth seeing.
+  if (input.budget.separatePlanningPass) {
+    try {
+      const plannerRoute = input.router.route({
+        role: "planner",
+        classification: input.classification,
+        budget: input.budget,
+        requiredContextTokens: input.requiredContextTokens,
+        writeRequired: false,
+        excludeProviders: excludedProviders({ providers: input.providers, role: "planner", ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }) }),
+      });
+      const plannerModel = modelRef(plannerRoute);
+      roles.push(Object.freeze({
+        role: "planner",
+        model: plannerModel,
+        route: plannerRoute,
+        invocation: previewShadowInvocation(planShadowInvocation({
+          snapshot: snapshotFor(input.providers, plannerModel.providerId),
+          model: plannerModel,
+          cwd,
+          payload: payload("planner", input.task, input.context),
+          ...attestationFor(attestations, plannerModel.providerId),
+        })),
+      }));
+    } catch (error) {
+      // No model declares a planner capability; the task plans and executes in one pass.
+      if (!(error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL")) throw error;
+    }
+  }
+
+  roles.push(Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, invocation: previewShadowInvocation(primaryInvocation) }));
 
   const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && (input.optionalReview ?? false));
   if (needsReview) {
