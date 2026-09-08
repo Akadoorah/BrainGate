@@ -3,4 +3,5 @@ export * from "./codex-isolation.js";
 export * from "./profiles.js";
 export * from "./process-executor.js";
 export * from "./invoker.js";
+export * from "./source-guard.js";
 export * from "./dogfood.js";
