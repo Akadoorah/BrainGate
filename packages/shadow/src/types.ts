@@ -10,6 +10,22 @@ export interface SubscriptionAttestation {
   readonly expiresAt?: string | null;
 }
 
+/**
+ * The operator accepting, for one provider, a residual risk BrainGate cannot remove (ADR 0008).
+ *
+ * A provider whose permissions BrainGate cannot scope may read or write outside the project,
+ * elsewhere on the machine. No guard here sees that. It is the same exposure as running the CLI
+ * by hand, which the operator already does, but it is not zero — so it is accepted explicitly,
+ * per provider, with a timestamp, and never inferred from the provider being installed,
+ * authenticated, or previously used.
+ */
+export interface OperatorProviderAcceptance {
+  readonly providerId: ProviderId;
+  readonly source: "operator-accepted-unscoped-provider";
+  readonly acceptedAt: string;
+  readonly expiresAt?: string | null;
+}
+
 export interface ShadowGuarantees {
   readonly projectOnlyRead: boolean;
   readonly noProjectWrites: boolean;

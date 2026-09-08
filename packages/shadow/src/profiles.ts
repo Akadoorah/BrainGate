@@ -9,7 +9,7 @@ import {
   validCodexIsolationAttestation,
   type CodexIsolationAttestation,
 } from "./codex-isolation.js";
-import type { ShadowInvocationPlan, ShadowInvocationPreview, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
+import type { OperatorProviderAcceptance, ShadowInvocationPlan, ShadowInvocationPreview, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
 const ATTACHMENT_TOKEN = "__BRAINGATE_SHADOW_INPUT__";
@@ -30,6 +30,16 @@ interface ProfileDefinition {
   readonly enabled: boolean;
   readonly minimumVersion: string | null;
   readonly blockedReason: string | null;
+  /**
+   * Roles this provider may take without proven per-invocation isolation (ADR 0008).
+   *
+   * These run `staged-clean`: a fresh temporary directory holding only what BrainGate put
+   * there, so the provider cannot leak a repository it was never shown. Roles that read the
+   * real checkout are not here, and need the operator's recorded acceptance instead.
+   */
+  readonly stagedRoles?: readonly WorkflowRole[];
+  /** True when project access is reachable only through an operator acceptance. */
+  readonly needsOperatorAcceptance?: boolean;
 }
 
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
@@ -42,7 +52,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // configuration, which BrainGate neither owns nor can neutralise for one call. GROK_HOME does
   // not move that source and does lose authentication. A sandbox profile that cannot be found
   // is also a warning rather than an error, so the run continues unsandboxed.
-  xai: { providerId: "xai", enabled: false, minimumVersion: null, blockedReason: "Grok resolves its permissions from another tool's settings file and cannot be pointed at a BrainGate-supplied configuration without losing authentication; a missing sandbox profile is also a warning rather than an error." },
+  xai: { providerId: "xai", enabled: false, stagedRoles: ["reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Grok resolves its permissions from another tool's settings file and cannot be pointed at a BrainGate-supplied configuration without losing authentication; a missing sandbox profile is also a warning rather than an error." },
   // Headless `agy` is already fail-closed: a tool needing permission is auto-denied because
   // there is nobody to prompt. What is missing is the ability to say, per invocation, which
   // tools BrainGate is granting. Permissions live in settings.json under the user's home, and
@@ -50,7 +60,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // under HOME, so isolating the settings loses authentication. Opening permissions.allow
   // instead would widen them for every other use of agy on the machine, which BrainGate can
   // neither scope nor verify at call time.
-  google: { providerId: "google", enabled: false, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings.json and credentials share HOME, so granting tools for one BrainGate call would grant them for every other use of agy." },
+  google: { providerId: "google", enabled: false, stagedRoles: ["reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings.json and credentials share HOME, so granting tools for one BrainGate call would grant them for every other use of agy." },
 });
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
@@ -279,9 +289,50 @@ export function shadowProviderStatus(providerId: ProviderId): Readonly<{ enabled
   return Object.freeze({ enabled: profile.enabled, minimumVersion: profile.minimumVersion, reason: profile.blockedReason });
 }
 
-export function shadowProviderRoleStatus(providerId: ProviderId, role: WorkflowRole): Readonly<{ enabled: boolean; reason: string | null }> {
+/**
+ * Whether the operator's acceptance of a provider is present and current (ADR 0008).
+ *
+ * Stale acceptance is refused rather than honoured: a decision made months ago about a provider
+ * that has since changed is not a decision about the provider in front of you.
+ */
+export function validOperatorAcceptance(value: OperatorProviderAcceptance | undefined, providerId: ProviderId, now = new Date()): boolean {
+  if (value === undefined || value.providerId !== providerId || value.source !== "operator-accepted-unscoped-provider") return false;
+  const accepted = new Date(value.acceptedAt);
+  if (Number.isNaN(accepted.getTime())) return false;
+  if (accepted.getTime() > now.getTime() + 60_000) return false;
+  if (now.getTime() - accepted.getTime() > 90 * 24 * 60 * 60 * 1000) return false;
+  if (value.expiresAt !== undefined && value.expiresAt !== null) {
+    const expires = new Date(value.expiresAt);
+    if (Number.isNaN(expires.getTime()) || expires.getTime() <= now.getTime()) return false;
+  }
+  return true;
+}
+
+export function shadowProviderRoleStatus(
+  providerId: ProviderId,
+  role: WorkflowRole,
+  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date } = {},
+): Readonly<{ enabled: boolean; reason: string | null; acceptedByOperator: boolean }> {
   const profile = PROFILES[providerId];
-  if (!profile.enabled) return Object.freeze({ enabled: false, reason: profile.blockedReason });
-  if (providerId === "openai" && role !== "reviewer") return Object.freeze({ enabled: false, reason: "Codex is reviewer-only in M10." });
-  return Object.freeze({ enabled: true, reason: providerId === "openai" ? "Requires current sandbox self-test attestation." : null });
+
+  if (!profile.enabled) {
+    // ADR 0008: a provider that cannot be isolated is still eligible for roles that never see
+    // the real checkout, because those run in a staged directory holding only what BrainGate
+    // put there. Anything beyond that needs the operator's recorded acceptance.
+    const staged = profile.stagedRoles ?? [];
+    if (staged.includes(role)) {
+      return Object.freeze({ enabled: true, reason: "Runs in a staged workspace that never contains the project.", acceptedByOperator: false });
+    }
+    if (profile.needsOperatorAcceptance === true && validOperatorAcceptance(options.acceptance, providerId, options.now)) {
+      return Object.freeze({
+        enabled: true,
+        reason: "Enabled by operator acceptance; BrainGate cannot scope what this provider reaches outside the project.",
+        acceptedByOperator: true,
+      });
+    }
+    return Object.freeze({ enabled: false, reason: profile.blockedReason, acceptedByOperator: false });
+  }
+
+  if (providerId === "openai" && role !== "reviewer") return Object.freeze({ enabled: false, reason: "Codex is reviewer-only in M10.", acceptedByOperator: false });
+  return Object.freeze({ enabled: true, reason: providerId === "openai" ? "Requires current sandbox self-test attestation." : null, acceptedByOperator: false });
 }
