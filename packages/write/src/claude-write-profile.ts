@@ -78,6 +78,12 @@ export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSn
     "--disable-slash-commands",
     "--permission-mode", "acceptEdits",
     "--tools", "Read,Glob,Grep,Edit,Write",
+    // CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, which this profile sets, makes Claude Code force
+    // permission mode back to default, so --permission-mode alone leaves every Edit awaiting
+    // an approval that never comes in a headless run and the task ends with no changes. The
+    // CLI's own guidance is to declare the allowlist explicitly, which is narrower than a
+    // permission mode: exactly these five tools, still under the deny list in --settings.
+    "--allowedTools", "Read,Glob,Grep,Edit,Write",
     "--disallowedTools", "Bash,WebFetch,WebSearch,Agent,NotebookEdit,mcp__*",
     "--strict-mcp-config",
     "--mcp-config", "{\"mcpServers\":{}}",
