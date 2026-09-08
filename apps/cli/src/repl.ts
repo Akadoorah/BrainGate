@@ -3,6 +3,7 @@ import { basename, resolve } from "node:path";
 import { createInterface, type Interface } from "node:readline/promises";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
+import { SessionContext } from "./session-context.js";
 
 /**
  * The interactive session: `braingate` with no arguments and a terminal attached.
@@ -41,13 +42,14 @@ function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
 }
 
-async function runPlanned(input: string, deps: ReplDeps): Promise<void> {
+async function runPlanned(input: string, deps: ReplDeps, session: SessionContext): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const captured: string[] = [];
   const capture = (text: string): void => { captured.push(text); };
+  const sessionTurns = (budget: number) => session.recent(budget);
 
   const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input], {
-    cwd: deps.cwd, stdout: capture, stderr: capture,
+    cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns,
   });
   const summary = firstLine(captured.join(""));
   if (plan.exitCode !== 0) { deps.stderr(`${captured.join("")}\n`); return; }
@@ -57,13 +59,20 @@ async function runPlanned(input: string, deps: ReplDeps): Promise<void> {
   if (answer === null || !/^y(es)?$/i.test(answer.trim())) { deps.stdout("  Skipped. Nothing was spent.\n\n"); return; }
 
   deps.stdout("\n");
+  const spoken: string[] = [];
   const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--execute"], {
-    cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr,
+    cwd: deps.cwd,
+    stdout: (text) => { spoken.push(text); deps.stdout(text); },
+    stderr: deps.stderr,
+    sessionTurns,
   });
+  // Only a clean result joins the thread. A failed or rejected task would otherwise become the
+  // premise of the next follow-up.
+  if (result.exitCode === 0) session.record(input, spoken.join("").replace(/\n*Task [0-9a-f-]{36}.*$/s, "").trim());
   deps.stdout(result.exitCode === 0 ? "\n" : "\n  Exit 1: completed but needs your review.\n\n");
 }
 
-async function runSlash(line: string, deps: ReplDeps): Promise<"continue" | "exit"> {
+async function runSlash(line: string, deps: ReplDeps, session: SessionContext): Promise<"continue" | "exit"> {
   const [command, ...rest] = line.slice(1).trim().split(/\s+/);
   const io = { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr };
 
@@ -77,14 +86,22 @@ async function runSlash(line: string, deps: ReplDeps): Promise<"continue" | "exi
         "  something is planned as a write into an isolated worktree. Either way you see the",
         "  plan and confirm before anything is spent.",
         "",
+        "  Follow-ups resolve against earlier turns in this session. That thread lives in this",
+        "  process only: it is never written to disk and never becomes project memory.",
+        "",
         "  /status     recent tasks in this project",
         "  /models     configured models and reviewer independence",
         "  /providers  which provider CLIs are available and how they authenticate",
         "  /doctor     validate project, models and reviewer isolation",
+        "  /forget     drop this session's thread (project memory is untouched)",
         "  /feedback <task-id> <T0-T4> <success|partial|failure>",
         "  /exit",
         "",
       ].join("\n"));
+      return "continue";
+    case "forget":
+      session.clear();
+      deps.stdout("  Session thread cleared. Project memory is untouched.\n");
       return "continue";
     case "status":
       await runCli(["status", "--project", ".brain/project.json"], io);
@@ -135,16 +152,17 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t) });
   deps.stdout(`\n  BrainGate · ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
 
+  const session = new SessionContext();
   for (;;) {
     const line = await deps.ask("> ");
     if (line === null) return 0;
     const input = line.trim();
     if (input.length === 0) continue;
     if (input.startsWith("/")) {
-      if (await runSlash(input, deps) === "exit") return 0;
+      if (await runSlash(input, deps, session) === "exit") return 0;
       continue;
     }
-    await runPlanned(input, deps);
+    await runPlanned(input, deps, session);
   }
 }
 

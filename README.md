@@ -93,7 +93,13 @@ confirm. **The `--execute` gate does not disappear here; it becomes that confirm
 intent is guessed wrongly, the line says `write · isolated worktree` before you answer, so a
 wrong guess costs a keystroke rather than a change.
 
-`/help`, `/status`, `/models`, `/providers`, `/doctor`, `/feedback`, `/exit` cover the rest.
+Follow-ups resolve against earlier turns, so `and the other one?` means something. That thread
+is ephemeral: it lives in the session process only, is never written to disk, and never becomes
+project memory — an unverified answer must not acquire the standing of a promoted record by
+passing through a conversation. `/forget` drops it; project memory is untouched.
+
+`/help`, `/status`, `/models`, `/providers`, `/doctor`, `/feedback`, `/forget`, `/exit` cover
+the rest.
 
 Piped or scripted, `braingate` prints its command listing instead, so nothing reading its output
 changes behaviour. The flag interface below is unchanged and remains the scripting surface.
@@ -288,6 +294,14 @@ Only canonical records are read. A proposal is not memory: it becomes canonical 
 `memory promote`, which requires explicit evidence, and injecting proposals into tasks would
 route around that gate. Secrets never enter memory in the first place, so they cannot arrive
 here.
+
+Memory is per project, not shared between them. Each registered project gets its own SQLite
+database under its own storage directory, and every query is additionally filtered by project
+id, so one project's decisions are not reachable from another.
+
+An interactive session's thread is a separate, weaker thing: ephemeral, in-process, never
+written to disk, and never promoted. Keeping the two apart is what stops an unverified answer
+from acquiring the standing of a verified one.
 
 ## Memory bootstrap
 
