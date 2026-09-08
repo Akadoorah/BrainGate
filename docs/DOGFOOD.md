@@ -13,6 +13,30 @@ This guide is for trying BrainGate locally against one real Git repository befor
 - Dogfood telemetry is project-local and does not persist raw task text, model answers, candidate diffs, provider reasoning, or secrets.
 - Adaptive routing in M12 can only raise project-local complexity/risk floors. It never silently lowers them or changes model scores.
 
+## 0. Proving the real path works
+
+`pnpm test` never lets a provider answer: every suite drives a fake executor that returns a
+perfectly shaped response. That proves BrainGate's own plumbing and nothing about whether an
+installed CLI actually produced a result — a gap that hid a stripped environment variable, a
+role contract no model had satisfied, turn and wall-clock ceilings no real repository fit
+inside, and a write path disabled by its own hardening. All four shipped green.
+
+Two integration tests close it. They build a throwaway Git repository, register it under an
+isolated `BRAINGATE_HOME`, and assert outcomes rather than arguments: an answer that could only
+come from reading the working tree, and a file whose bytes actually changed in the task
+worktree while the source checkout stays byte-identical.
+
+They spend real subscription quota, so they are opt-in and are not part of `pnpm test` or CI:
+
+```bash
+pnpm test:integration
+```
+
+Run them after upgrading a provider CLI, after touching a provider profile or the role
+contract, and before trusting a release. They need the provider CLIs signed in and a model
+catalog already configured; the catalog is copied from your real one so the test never invents
+model ids.
+
 ## 1. Prepare BrainGate
 
 Requirements:

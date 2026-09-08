@@ -9,7 +9,8 @@
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "test": "tsx --test src/*.test.ts"
+    "test": "tsx --test src/*.test.ts",
+    "test:integration": "BRAINGATE_INTEGRATION=1 tsx --test src/integration.test.ts"
   },
   "dependencies": {
     "@braingate/context": "workspace:*",
