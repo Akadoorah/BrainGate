@@ -86,15 +86,19 @@ function registryWithClaudeAndCodex(): ModelRegistry {
 const model: ModelRef = { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription" };
 const payload: ShadowRolePayload = { schemaVersion: 1, role: "primary", phase: "initial", task: "private task body", findings: [], context: { secretContext: "private context body" }, responseContract: { kind: "work", output: "string" } };
 
-function codexIsolation(values: Partial<CodexIsolationAttestation> = {}): CodexIsolationAttestation {
+// Times are relative to `reference` so the fixture stays a *current* attestation. Hard-coded
+// instants silently turn this into a time bomb: the suite passes until the wall clock crosses
+// the literal expiry, then fails everywhere at once for reasons unrelated to the code.
+// Call sites that pin `now` must pass the same instant here.
+function codexIsolation(values: Partial<CodexIsolationAttestation> = {}, reference = Date.now()): CodexIsolationAttestation {
   return {
     providerId: "openai",
     source: "sandbox-self-test",
     version: "1.0.0",
     platform: process.platform === "darwin" ? "darwin" : "linux",
     profileHash: codexIsolationProfileHash(),
-    observedAt: "2026-09-07T00:00:00.000Z",
-    expiresAt: "2026-09-08T00:00:00.000Z",
+    observedAt: new Date(reference - 60 * 60 * 1000).toISOString(),
+    expiresAt: new Date(reference + 60 * 60 * 1000).toISOString(),
     ...values,
   };
 }
@@ -145,7 +149,7 @@ test("Codex is enabled only for reviewer role and requires current isolation att
   assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload }), /reviewer-only/);
   const reviewPayload: ShadowRolePayload = { ...payload, role: "reviewer", responseContract: { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" } };
   assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload }), /isolation/);
-  const plan = planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload, codexIsolation: codexIsolation(), now: new Date("2026-09-07T01:00:00Z") });
+  const plan = planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload, codexIsolation: codexIsolation({}, new Date("2026-09-07T01:00:00Z").getTime()), now: new Date("2026-09-07T01:00:00Z") });
   assert.equal(plan.workspaceMode, "staged-clean");
   assert.equal(plan.inputMode, "stdin");
   assert.ok(plan.args.includes("--ephemeral"));
