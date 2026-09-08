@@ -112,6 +112,20 @@ test("braingate init is idempotent and keeps the source checkout clean", async (
   assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "waslo");
 });
 
+// `braingate` is installed on PATH, so running it from the wrong directory is the ordinary
+// mistake. It used to reach the catch-all and print CLI_UNEXPECTED with details suppressed,
+// which tells the user nothing about what to do next.
+test("running outside a registered project says so, instead of an unexpected failure", async () => {
+  const elsewhere = mkdtempSync(join(tmpdir(), "braingate-no-project-"));
+  const out = io();
+  const result = await runDogfoodCli(["dogfood", "preflight"], { cwd: elsewhere, env: { BRAINGATE_HOME: join(elsewhere, "brain-home") }, stdout: out.stdout, stderr: out.stderr });
+  assert.notEqual(result.exitCode, 0);
+  const text = `${out.out()}${out.err()}`;
+  assert.match(text, /CLI_PROJECT_NOT_FOUND/);
+  assert.match(text, /braingate init/);
+  assert.doesNotMatch(text, /CLI_UNEXPECTED/);
+});
+
 test("dogfood preflight uses metadata only and reports ask/write readiness", async () => {
   const f = fixture(); const shadow = new FakeShadowExecutor(); const writer = new FakeWriteExecutor(); const out = io();
   const result = await runDogfoodCli(["dogfood", "preflight", "--json"], { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], executor: shadow, writeExecutor: writer, stdout: out.stdout, stderr: out.stderr });

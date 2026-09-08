@@ -1,4 +1,4 @@
-import { readFileSync, realpathSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { conservativeTokenEstimate } from "@braingate/context";
 import {
@@ -98,8 +98,19 @@ function safeError(error: unknown): { readonly code: string; readonly message: s
 }
 
 function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
+  const path = resolve(cwd, manifest);
+  // A missing manifest is the ordinary "you are not in a registered project" case, especially
+  // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
+  // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about
+  // what to do next. The message names the relative path only, never the resolved one.
+  if (!existsSync(path)) {
+    throw new BrainGateInvariantError(
+      "CLI_PROJECT_NOT_FOUND",
+      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
+    );
+  }
   const registry = new ProjectRegistry(state.home);
-  return registry.loadFile(resolve(cwd, manifest));
+  return registry.loadFile(path);
 }
 
 function taskContext(project: RegisteredProject): Readonly<Record<string, unknown>> {

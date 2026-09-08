@@ -31,6 +31,23 @@ See:
 
 ## Current local operator
 
+### Putting `braingate` on PATH
+
+The launcher resolves its own location, so a symlink from a directory already on PATH is
+enough — no global install, and nothing is copied:
+
+```bash
+ln -s "$PWD/apps/cli/bin/braingate.mjs" ~/.local/bin/braingate
+```
+
+`braingate` then works from any directory. Commands that act on a project read
+`.brain/project.json` from the current directory, so the project is whichever repository you
+are standing in; `--project <manifest>` overrides that. Run it outside a registered project
+and it says so rather than failing obscurely.
+
+The symlink points into this checkout, so the command stops working if the repository is
+moved, renamed, or lives on a volume that is not mounted.
+
 The repository includes a local `braingate` CLI with:
 
 - `braingate init --project-id <id> --name <name>`

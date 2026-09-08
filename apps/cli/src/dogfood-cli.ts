@@ -1,4 +1,4 @@
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { conservativeTokenEstimate } from "@braingate/context";
 import {
@@ -91,8 +91,19 @@ function emit(json: boolean, data: unknown, human: string, stdout: (text: string
 }
 
 function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
+  const path = resolve(cwd, manifest);
+  // A missing manifest is the ordinary "you are not in a registered project" case, especially
+  // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
+  // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about
+  // what to do next. The message names the relative path only, never the resolved one.
+  if (!existsSync(path)) {
+    throw new BrainGateInvariantError(
+      "CLI_PROJECT_NOT_FOUND",
+      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
+    );
+  }
   const registry = new ProjectRegistry(state.home);
-  return registry.loadFile(resolve(cwd, manifest));
+  return registry.loadFile(path);
 }
 
 function manifestOption(args: string[]): string { return takeOption(args, "--project") ?? ".brain/project.json"; }
