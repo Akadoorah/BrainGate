@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -81,13 +81,32 @@ test("slash commands work and /exit ends the session", async () => {
   assert.match(s.text(), /\/feedback <task-id>/);
 });
 
-test("outside a registered project the session refuses and points at init", async () => {
+test("an unregistered directory is offered registration, not turned away", async () => {
   const empty = mkdtempSync(join(tmpdir(), "braingate-repl-empty-"));
-  const s = session(empty, []);
+  // Declining leaves nothing registered, but the offer is the point: arriving somewhere new is
+  // the ordinary first run, and the banner has already said what this is.
+  const s = session(empty, ["n"]);
   assert.notEqual(await s.run(), 0);
-  assert.match(s.text(), /braingate init/);
+  assert.ok(s.asked.some((q) => /Register this repository now/.test(q)), "registration was never offered");
   assert.match(s.text(), /isolation boundary/);
-  assert.equal(s.asked.length, 0, "it must not prompt before knowing which project it is in");
+  assert.match(s.text(), /braingate init/);
+});
+
+test("accepting the offer registers the project and continues into the session", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-repl-adopt-"));
+  const repo = join(root, "my-service"); mkdirSync(repo);
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.email", "test@example.invalid"]);
+  git(repo, ["config", "user.name", "BrainGate Test"]);
+  writeFileSync(join(repo, "x.txt"), "x\n");
+  git(repo, ["add", "."]); git(repo, ["commit", "-m", "initial"]);
+
+  // Accept, then take both suggested identity answers, then leave.
+  const s = session(repo, ["y", "", "", "/exit"]);
+  assert.equal(await s.run(), 0);
+  assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "my-service");
+  // The session must actually start, not merely register and stop.
+  assert.match(s.text(), /Type a request, or \/help/);
 });
 
 test("a session turn never becomes project memory", async () => {
