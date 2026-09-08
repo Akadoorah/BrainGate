@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
+import { ProjectRegistry } from "@braingate/core";
+import { ProjectMemory } from "@braingate/memory";
 import { looksLikeWriteRequest, runRepl } from "./repl.js";
 
 function git(cwd: string, args: readonly string[]): void {
@@ -13,6 +15,8 @@ function git(cwd: string, args: readonly string[]): void {
 }
 
 function project(): string {
+  // returns the repo path; the registry lives beside it
+
   const root = mkdtempSync(join(tmpdir(), "braingate-repl-"));
   const repo = join(root, "demo"); mkdirSync(repo);
   git(repo, ["init", "-b", "main"]);
@@ -84,4 +88,27 @@ test("outside a registered project the session refuses and points at init", asyn
   assert.match(s.text(), /braingate init/);
   assert.match(s.text(), /isolation boundary/);
   assert.equal(s.asked.length, 0, "it must not prompt before knowing which project it is in");
+});
+
+test("a session turn never becomes project memory", async () => {
+  const repo = project();
+  // Two exchanges, both declined so nothing is spent; the thread is still recorded in-process.
+  const s = session(repo, ["which modules send email?", "n", "and the other one?", "n", "/exit"]);
+  assert.equal(await s.run(), 0);
+
+  // Project memory is durable and evidence-gated. A session turn is neither, and must not have
+  // acquired the standing of a promoted record by passing through the session.
+  const registry = new ProjectRegistry(join(repo, "..", "registry"));
+  const registered = registry.loadFile(join(repo, ".brain", "project.json"));
+  const memory = new ProjectMemory(registered);
+  try {
+    assert.equal(memory.listEffective(50).length, 0, "the session wrote to project memory");
+  } finally { memory.close(); }
+});
+
+test("/forget clears the thread without touching project memory", async () => {
+  const repo = project();
+  const s = session(repo, ["/forget", "/exit"]);
+  assert.equal(await s.run(), 0);
+  assert.match(s.text(), /Project memory is untouched/);
 });

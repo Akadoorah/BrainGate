@@ -50,6 +50,12 @@ export interface DogfoodCliDependencies {
    * run fails with a usable message instead of waiting on stdin forever.
    */
   readonly ask?: (question: string) => Promise<string | null>;
+  /**
+   * Turns already exchanged in an interactive session, so a follow-up resolves against them.
+   * Supplied only by the session; the flag interface never sets it, and nothing here is
+   * persisted or promoted to memory.
+   */
+  readonly sessionTurns?: (contextTokenBudget: number) => readonly { readonly request: string; readonly answer: string }[];
 }
 
 export interface DogfoodCliResult {
@@ -367,6 +373,8 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       // Canonical memory only. Proposals become canonical through `memory promote`, which
       // requires explicit evidence; surfacing them here would route around that gate.
       memory: memory.records,
+      // Ephemeral: this session's earlier turns, never written to disk and never promoted.
+      session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
     const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state));
@@ -435,7 +443,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const ledger = new TaskLedger(project);
     try {
       const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
-      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records }), review, dryRun: false, env });
+      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       const mapped = writeOutcome(result);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "write", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
