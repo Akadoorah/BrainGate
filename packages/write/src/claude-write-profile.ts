@@ -66,7 +66,9 @@ export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSn
     responseContract: WRITE_SCHEMA,
   }));
   if (body.length === 0 || body.length > 2_000_000) throw new BrainGateInvariantError("WRITE_PAYLOAD_INVALID", "Write payload must be between 1 and 2,000,000 characters.");
-  const maxTurns = Math.max(1, Math.min(12, Math.floor(input.maxTurns ?? 6)));
+  // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
+  // lower than the budget asks for would silently reimpose the limit this stopped being.
+  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
   const args = Object.freeze([
     "--restricted",
     "--safe-mode",
@@ -109,7 +111,7 @@ export class NodeClaudeWriteExecutor implements WriteProviderExecutor {
   readonly #guard = new SecretGuard();
 
   async run(input: { readonly plan: WriteProviderPlan; readonly env?: NodeJS.ProcessEnv; readonly timeoutMs?: number; readonly maxOutputBytes?: number }): Promise<WriteProviderResult> {
-    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 5 * 60_000, 1_000), 10 * 60_000);
+    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 5 * 60_000, 1_000), 20 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
     const environment = this.#guard.buildEnvironment(input.env ?? process.env, { allowedAdditionalKeys: input.plan.allowedEnvKeys, overrides: input.plan.envOverrides });
     const started = Date.now();

@@ -35,7 +35,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly maxOutputBytes?: number;
   }): Promise<ShadowProcessResult> {
     const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
-    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 10 * 60_000);
+    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 20 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
     const baseEnv = input.env ?? process.env;
     let tempRoot: string | null = null;
