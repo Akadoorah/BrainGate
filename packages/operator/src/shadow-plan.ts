@@ -8,6 +8,8 @@ import {
   previewShadowInvocation,
   shadowProviderRoleStatus,
   type CodexIsolationAttestation,
+  type GrokIsolationAttestation,
+  type OperatorProviderAcceptance,
   type ShadowInvocationPreview,
   type ShadowRolePayload,
   type SubscriptionAttestation,
@@ -42,7 +44,9 @@ function payload(role: "planner" | "primary" | "reviewer", task: string, context
     findings: Object.freeze([]),
     candidateOutput: null,
     context,
-    responseContract: Object.freeze(role === "primary"
+    // A planner produces the approach, so its contract is work — the same one the executor
+    // gets. Previewing it as a review would size and describe a request that is never sent.
+    responseContract: Object.freeze(role === "primary" || role === "planner"
       ? { kind: "work", output: "string" }
       : { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" }),
   });
@@ -51,6 +55,27 @@ function payload(role: "planner" | "primary" | "reviewer", task: string, context
 function attestationFor(attestations: readonly SubscriptionAttestation[], providerId: string): Readonly<{ attestation?: SubscriptionAttestation }> {
   const value = attestations.find((item) => item.providerId === providerId);
   return value === undefined ? Object.freeze({}) : Object.freeze({ attestation: value });
+}
+
+/**
+ * The per-provider proof a plan needs to preview an invocation the runner would accept.
+ *
+ * The preview and the run have to agree about eligibility, or the plan advertises a model the
+ * invocation then refuses — which is the failure the operator sees only after committing.
+ */
+interface ProviderProof {
+  readonly codexIsolation?: CodexIsolationAttestation;
+  readonly grokIsolation?: GrokIsolationAttestation;
+  readonly acceptances?: readonly OperatorProviderAcceptance[];
+}
+
+function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIsolation?: CodexIsolationAttestation; grokIsolation?: GrokIsolationAttestation; acceptance?: OperatorProviderAcceptance }> {
+  const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId);
+  return Object.freeze({
+    ...(providerId === "openai" && proof.codexIsolation !== undefined ? { codexIsolation: proof.codexIsolation } : {}),
+    ...(providerId === "xai" && proof.grokIsolation !== undefined ? { grokIsolation: proof.grokIsolation } : {}),
+    ...(acceptance === undefined ? {} : { acceptance }),
+  });
 }
 
 function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
@@ -62,11 +87,13 @@ function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string)
 function excludedProviders(input: {
   readonly providers: readonly ProviderSnapshot[];
   readonly role: "planner" | "primary" | "reviewer";
-  readonly codexIsolation?: CodexIsolationAttestation;
+  readonly proof: ProviderProof;
 }): readonly string[] {
   return Object.freeze(input.providers.filter((snapshot) => {
-    if (!shadowProviderRoleStatus(snapshot.providerId, input.role).enabled) return true;
-    if (snapshot.providerId === "openai" && input.role === "reviewer" && input.codexIsolation === undefined) return true;
+    const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, acceptance === undefined ? {} : { acceptance }).enabled) return true;
+    if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
+    if (snapshot.providerId === "xai" && input.proof.grokIsolation === undefined) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
 }
@@ -78,6 +105,8 @@ export function buildShadowTaskPlan(input: {
   readonly providers: readonly ProviderSnapshot[];
   readonly attestations?: readonly SubscriptionAttestation[];
   readonly codexIsolation?: CodexIsolationAttestation;
+  readonly grokIsolation?: GrokIsolationAttestation;
+  readonly acceptances?: readonly OperatorProviderAcceptance[];
   readonly task: string;
   readonly context: unknown;
   readonly classification: TaskClassification;
@@ -87,13 +116,18 @@ export function buildShadowTaskPlan(input: {
 }): ShadowTaskPlan {
   const cwd = assertShadowProjectCwd(input.project, input.cwd);
   const attestations = input.attestations ?? [];
+  const proof: ProviderProof = Object.freeze({
+    ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
+    ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+    acceptances: input.acceptances ?? [],
+  });
   const primaryRoute = input.router.route({
     role: "coder",
     classification: input.classification,
     budget: input.budget,
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
-    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }) }),
+    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof }),
   });
   const primaryModel = modelRef(primaryRoute);
   const primaryInvocation = planShadowInvocation({
@@ -102,6 +136,7 @@ export function buildShadowTaskPlan(input: {
     cwd,
     payload: payload("primary", input.task, input.context),
     ...attestationFor(attestations, primaryModel.providerId),
+    ...proofFor(proof, primaryModel.providerId),
   });
   const roles: PlannedShadowRole[] = [];
 
@@ -115,7 +150,7 @@ export function buildShadowTaskPlan(input: {
         budget: input.budget,
         requiredContextTokens: input.requiredContextTokens,
         writeRequired: false,
-        excludeProviders: excludedProviders({ providers: input.providers, role: "planner", ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }) }),
+        excludeProviders: excludedProviders({ providers: input.providers, role: "planner", proof }),
       });
       const plannerModel = modelRef(plannerRoute);
       roles.push(Object.freeze({
@@ -128,6 +163,7 @@ export function buildShadowTaskPlan(input: {
           cwd,
           payload: payload("planner", input.task, input.context),
           ...attestationFor(attestations, plannerModel.providerId),
+          ...proofFor(proof, plannerModel.providerId),
         })),
       }));
     } catch (error) {
@@ -150,7 +186,7 @@ export function buildShadowTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence,
-      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }) }),
+      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", proof }),
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({
@@ -159,7 +195,7 @@ export function buildShadowTaskPlan(input: {
       cwd,
       payload: payload("reviewer", input.task, input.context),
       ...attestationFor(attestations, reviewerModel.providerId),
-      ...(reviewerModel.providerId === "openai" && input.codexIsolation !== undefined ? { codexIsolation: input.codexIsolation } : {}),
+      ...proofFor(proof, reviewerModel.providerId),
     });
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, invocation: previewShadowInvocation(reviewerInvocation) }));
   }

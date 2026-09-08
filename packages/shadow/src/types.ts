@@ -2,6 +2,16 @@ import type { RegisteredProject } from "@braingate/core";
 import type { ProviderId } from "@braingate/providers";
 import type { WorkflowRole } from "@braingate/workflows";
 
+/**
+ * Placeholder for the staged workspace path, substituted at spawn time.
+ *
+ * A staged invocation has to name its workspace on the command line, but the directory does not
+ * exist when the plan is built — and a plan that carried a real path would be a plan whose
+ * preview no longer described the run. Every provider that stages uses this one token, so the
+ * executor's "no unresolved token reached the child" check covers all of them rather than one.
+ */
+export const STAGE_PATH_TOKEN = "__BRAINGATE_STAGE_PATH__";
+
 export interface SubscriptionAttestation {
   readonly providerId: ProviderId;
   readonly mode: "subscription";
@@ -50,7 +60,14 @@ export interface ShadowRolePayload {
   readonly responseContract: Readonly<Record<string, unknown>>;
 }
 
-export type ShadowInputMode = "stdin" | "temp-attachment";
+/**
+ * How the request body reaches the provider.
+ *
+ * `staged-file` writes it inside the staged workspace: the only route for a CLI that takes its
+ * prompt from a path rather than stdin, and safe precisely because the staged workspace is the
+ * one directory such a provider is confined to.
+ */
+export type ShadowInputMode = "stdin" | "temp-attachment" | "staged-file";
 export type ShadowWorkspaceMode = "project" | "staged-clean";
 
 export interface ShadowInvocationPlan {

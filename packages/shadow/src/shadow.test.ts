@@ -18,7 +18,7 @@ import { CapabilityRouter, ModelRegistry, type ModelRef } from "@braingate/route
 import type { AgentRequest } from "@braingate/workflows";
 import {
   CODEX_REVIEW_DISABLED_FEATURES,
-  CODEX_STAGE_TOKEN,
+  STAGE_PATH_TOKEN,
   CodexIsolationVerifier,
   NodeShadowProcessExecutor,
   ShadowDogfoodRunner,
@@ -35,7 +35,15 @@ import {
   shadowProviderRoleStatus,
   validOperatorAcceptance,
   shadowProviderStatus,
+  providerTokenUsage,
   validCodexIsolationAttestation,
+  validGrokIsolationAttestation,
+  grokIsolationProfileHash,
+  grokSandboxProfileToml,
+  latestProfileApplied,
+  unexpectedRoots,
+  GROK_SANDBOX_PROFILE,
+  type GrokIsolationAttestation,
   type CodexIsolationAttestation,
   type OperatorProviderAcceptance,
   type CodexSandboxRunner,
@@ -178,28 +186,12 @@ test("Codex is enabled only for reviewer role and requires current isolation att
   assert.ok(plan.args.includes("--ignore-rules"));
   assert.ok(plan.args.includes("--strict-config"));
   assert.ok(plan.args.includes("--skip-git-repo-check"));
-  assert.ok(plan.args.includes(CODEX_STAGE_TOKEN));
+  assert.ok(plan.args.includes(STAGE_PATH_TOKEN));
   assert.ok(!plan.args.includes("--sandbox"));
   assert.ok(!plan.args.includes("--dangerously-bypass-approvals-and-sandbox"));
   const command = plan.args.join(" ");
   for (const feature of CODEX_REVIEW_DISABLED_FEATURES) assert.match(command, new RegExp(`features\\.${feature}=false`));
   assert.doesNotMatch(command, /private task body|private context body/);
-});
-
-test("Grok and Antigravity automated shadow profiles remain fail closed", () => {
-  const { repo } = setupProject();
-  for (const providerId of ["xai", "google"] as const) {
-    const status = shadowProviderStatus(providerId);
-    assert.equal(status.enabled, false);
-    // The reason is what a user acts on, so it must say something specific rather than
-    // restate that the provider is blocked. It is prose and will be reworded; assert that it
-    // exists and is substantive rather than matching its current wording.
-    assert.ok((status.reason ?? "").length > 40, `${providerId} must explain why it is blocked`);
-    assert.throws(
-      () => planShadowInvocation({ snapshot: snapshot(providerId), model: { providerId, modelId: "model-x", quotaPool: `${providerId}-pool` }, cwd: repo, payload }),
-      (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_BLOCKED",
-    );
-  }
 });
 
 class FakeSandboxRunner implements CodexSandboxRunner {
@@ -212,6 +204,51 @@ class FakeSandboxRunner implements CodexSandboxRunner {
     return { spawned: true, exitCode: result.exitCode, stdout: result.stdout ?? "", stderr: result.stderr ?? "", timedOut: false };
   }
 }
+
+test("Antigravity is closed until the operator accepts what BrainGate cannot check", () => {
+  const { repo } = setupProject();
+  // agy keeps settings and credentials under one HOME, so BrainGate cannot hand it an isolated
+  // one the way it can Codex and Grok. Nothing about that is provable, so nothing here tries:
+  // the provider stays closed until the operator records the decision themselves.
+  const status = shadowProviderStatus("google");
+  assert.equal(status.enabled, false);
+  assert.ok((status.reason ?? "").length > 40, "google must explain why it is blocked");
+  assert.throws(
+    () => planShadowInvocation({ snapshot: snapshot("google"), model: { providerId: "google", modelId: "model-x", quotaPool: "google-pool" }, cwd: repo, payload: { ...payload, role: "planner" } }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_BLOCKED",
+  );
+});
+
+test("an accepted Antigravity reaches staged roles and no others", () => {
+  const { repo } = setupProject();
+  const accepted = acceptance("google");
+  assert.equal(shadowProviderRoleStatus("google", "planner", { acceptance: accepted }).enabled, true);
+  assert.equal(shadowProviderRoleStatus("google", "planner", { acceptance: accepted }).acceptedByOperator, true);
+  // Acceptance widens which providers may be asked. It does not widen what a provider may see:
+  // executing means reading the checkout, and the staged workspace is the whole guarantee.
+  assert.equal(shadowProviderRoleStatus("google", "primary", { acceptance: accepted }).enabled, false);
+
+  const plan = planShadowInvocation({
+    snapshot: snapshot("google"),
+    model: { providerId: "google", modelId: "gemini-test", quotaPool: "antigravity-subscription" },
+    cwd: repo,
+    payload: { ...payload, role: "planner" },
+    acceptance: accepted,
+  });
+  assert.equal(plan.workspaceMode, "staged-clean");
+  // The one profile BrainGate publishes that cannot claim an isolated user config, said out
+  // loud rather than quietly asserted alongside the others.
+  assert.equal(plan.guarantees.isolatedUserConfig, false);
+  assert.doesNotMatch(plan.args.join(" "), /dangerously-skip-permissions/);
+});
+
+test("an unaccepted provider names the command that would open it", () => {
+  const reason = shadowProviderRoleStatus("google", "planner").reason ?? "";
+  // A refusal that does not say what to do next is a dead end; this one is the whole UI for
+  // ADR 0008.
+  assert.match(reason, /braingate providers accept google/);
+});
+
 
 test("Codex sandbox self-test proves allow-inside deny-outside deny-write without model calls", async () => {
   const runner = new FakeSandboxRunner([
@@ -378,7 +415,7 @@ test("node executor blocks cwd escapes, scrubs API env overrides and stages clea
     ...basePlan,
     providerId: "openai",
     workspaceMode: "staged-clean",
-    args: ["-e", "process.stdout.write(process.cwd()+'|'+process.argv[1])", CODEX_STAGE_TOKEN],
+    args: ["-e", "process.stdout.write(process.cwd()+'|'+process.argv[1])", STAGE_PATH_TOKEN],
   };
   const staged = await executor.run({ project, plan: stagedPlan, env: { PATH: process.env.PATH } });
   const [spawnCwd, tokenPath] = staged.stdout.split("|");
@@ -561,6 +598,24 @@ test("a provider failure reaches the operator with the reason attached", async (
   );
 });
 
+const grokModel: ModelRef = { providerId: "xai", modelId: "grok-4.6", quotaPool: "grok-subscription" };
+
+function grokIsolation(values: Partial<GrokIsolationAttestation> = {}, reference = Date.now()): GrokIsolationAttestation {
+  return {
+    providerId: "xai",
+    source: "sandbox-event-self-test",
+    version: "1.0.13",
+    platform: process.platform === "darwin" ? "darwin" : "linux",
+    profileHash: grokIsolationProfileHash(),
+    readableRoots: ["/usr"],
+    networkRestricted: process.platform === "linux",
+    configSurfaces: [],
+    observedAt: new Date(reference - 60_000).toISOString(),
+    expiresAt: new Date(reference + 3_600_000).toISOString(),
+    ...values,
+  };
+}
+
 function acceptance(providerId: ProviderId, values: Partial<OperatorProviderAcceptance> = {}): OperatorProviderAcceptance {
   return { providerId, source: "operator-accepted-unscoped-provider", acceptedAt: new Date(Date.now() - 60_000).toISOString(), ...values } as OperatorProviderAcceptance;
 }
@@ -570,21 +625,130 @@ function acceptance(providerId: ProviderId, values: Partial<OperatorProviderAcce
 // Eligibility and execution must agree. Declaring a role reachable for a provider that
 // planShadowInvocation then refuses is worse than declaring it closed: the router selects the
 // model, the operator reads it in the plan, and the failure arrives after they committed.
-test("no role is offered for a provider that has no invocation profile", () => {
-  const { repo } = setupProject();
-  for (const providerId of ["xai", "google"] as const) {
-    for (const role of ["planner", "reviewer", "judge"] as const) {
-      const status = shadowProviderRoleStatus(providerId, role);
-      assert.equal(status.enabled, false, `${providerId}/${role} was offered without a way to run it`);
-      assert.match(status.reason ?? "", /not implemented yet/);
-    }
-    // And planning it really does fail, which is what the eligibility now admits up front.
-    assert.throws(
-      () => planShadowInvocation({ snapshot: snapshot(providerId), model: { providerId, modelId: "m", quotaPool: `${providerId}-pool` }, cwd: repo, payload }),
-      (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_BLOCKED",
-    );
-  }
+test("a staged Grok run gets its sandbox profile and its prompt, and neither survives the run", async () => {
+  const { repo, project } = setupProject();
+  const executor = new NodeShadowProcessExecutor();
+  const plan: ShadowInvocationPlan = {
+    providerId: "xai", executable: process.execPath,
+    // Reports the staged workspace, the sandbox profile it was given, and the prompt file —
+    // all three of which the executor, not the plan, is responsible for putting there.
+    args: ["-e", "const fs=require('node:fs');process.stdout.write([process.cwd(),fs.readFileSync('.grok/sandbox.toml','utf8'),fs.readFileSync(process.argv[1],'utf8'),String(process.env.GROK_HOME),String(process.env.HOME)].join('\\u0000'))", `${STAGE_PATH_TOKEN}/braingate-request.txt`],
+    cwd: repo, workspaceMode: "staged-clean", modelId: "grok-4.6", quotaPool: "grok-subscription",
+    inputMode: "staged-file", stdin: null, attachmentContent: "REQUEST BODY", attachmentToken: "braingate-request.txt",
+    allowedEnvKeys: [], envOverrides: {},
+    guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
+    minimumVersion: null,
+  };
+  const result = await executor.run({ project, plan, env: { PATH: process.env.PATH, HOME: "/operator/home" } });
+  const [stage, sandboxToml, prompt, grokHome, home] = result.stdout.split("\u0000");
+  assert.match(sandboxToml!, new RegExp(`\\[profiles\\.${GROK_SANDBOX_PROFILE}\\]`));
+  assert.equal(prompt, "REQUEST BODY");
+  // Authentication comes from the operator's Grok home; the settings file another tool keeps
+  // under HOME does not, because HOME is not theirs for this run.
+  assert.equal(grokHome, "/operator/home/.grok");
+  assert.notEqual(home, "/operator/home");
+  assert.equal(existsSync(stage!), false, "the staged workspace, its profile and the prompt must not outlive the run");
 });
+
+test("a staged request file cannot be aimed anywhere but the staged workspace", async () => {
+  const { repo, project } = setupProject();
+  const plan: ShadowInvocationPlan = {
+    providerId: "xai", executable: process.execPath, args: ["-e", "0"],
+    cwd: repo, workspaceMode: "staged-clean", modelId: "m", quotaPool: "q",
+    inputMode: "staged-file", stdin: null, attachmentContent: "body", attachmentToken: "../escaped.txt",
+    allowedEnvKeys: [], envOverrides: {},
+    guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
+    minimumVersion: null,
+  };
+  await assert.rejects(() => new NodeShadowProcessExecutor().run({ project, plan }), /plain file name inside the workspace/);
+});
+
+test("Grok runs staged roles on a proven sandbox, and nothing else", () => {
+  const { repo } = setupProject();
+  // Grok's sandbox is kernel-enforced and confined to the working directory, which is exactly
+  // what a staged role needs and exactly what an executor cannot use.
+  for (const role of ["planner", "reviewer", "judge"] as const) {
+    assert.equal(shadowProviderRoleStatus("xai", role).enabled, true, `xai/${role} should be reachable`);
+  }
+  assert.equal(shadowProviderRoleStatus("xai", "primary").enabled, false);
+  assert.match(shadowProviderRoleStatus("xai", "primary").reason ?? "", /staged roles only/i);
+
+  // Eligibility is policy; the attestation is this machine, a moment ago. Without one the
+  // invocation refuses rather than running unprotected.
+  assert.throws(
+    () => planShadowInvocation({ snapshot: snapshot("xai", { version: "1.0.13" }), model: grokModel, cwd: repo, payload: { ...payload, role: "planner" } }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_GROK_ISOLATION_REQUIRED",
+  );
+
+  const plan = planShadowInvocation({
+    snapshot: snapshot("xai", { version: "1.0.13" }),
+    model: grokModel,
+    cwd: repo,
+    payload: { ...payload, role: "planner" },
+    grokIsolation: grokIsolation(),
+  });
+  assert.equal(plan.workspaceMode, "staged-clean");
+  assert.equal(plan.inputMode, "staged-file");
+  const command = plan.args.join(" ");
+  // A built-in profile only warns when it cannot be applied; a custom one refuses to start.
+  assert.match(command, new RegExp(`--sandbox ${GROK_SANDBOX_PROFILE}`));
+  assert.doesNotMatch(command, /--sandbox (strict|workspace|read-only|devbox)\b/);
+  assert.doesNotMatch(command, /always-approve|dangerously/);
+  // The task body travels in a file inside the staged workspace, never on the command line.
+  assert.doesNotMatch(command, /private task body|private context body/);
+  assert.ok(plan.args.some((argument) => argument.includes(STAGE_PATH_TOKEN)));
+});
+
+test("a Grok build older than the refusing-sandbox release is rejected", () => {
+  const { repo } = setupProject();
+  // Below 1.0.13 a missing custom profile was a warning and the run continued unsandboxed, so
+  // `--sandbox` was a request rather than a guarantee.
+  assert.throws(
+    () => planShadowInvocation({ snapshot: snapshot("xai", { version: "1.0.12" }), model: grokModel, cwd: repo, payload: { ...payload, role: "planner" }, grokIsolation: grokIsolation({ version: "1.0.12" }) }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_VERSION_TOO_OLD",
+  );
+});
+
+test("a Grok attestation is bound to the version, platform and profile it was earned under", () => {
+  const current = snapshot("xai", { version: "1.0.13" });
+  assert.equal(validGrokIsolationAttestation(grokIsolation(), current), true);
+  assert.equal(validGrokIsolationAttestation(grokIsolation({ version: "1.0.12" }), current), false, "an attestation from another build says nothing about this one");
+  assert.equal(validGrokIsolationAttestation(grokIsolation({ profileHash: "0".repeat(64) }), current), false);
+  assert.equal(validGrokIsolationAttestation(grokIsolation({ expiresAt: new Date(Date.now() - 1_000).toISOString() }), current), false);
+  assert.equal(validGrokIsolationAttestation(undefined, current), false);
+});
+
+// The self-test reads Grok's own record of the policy the kernel applied, because BrainGate's
+// copy of the config file proves nothing when a same-named profile in the operator's own
+// sandbox.toml silently takes precedence over the project one.
+test("the applied sandbox policy is read back from Grok's event log", () => {
+  const log = [
+    JSON.stringify({ event_type: "ProfileApplied", profile: GROK_SANDBOX_PROFILE, workspace: "/elsewhere", enforced: true, read_only_paths: ["/usr"] }),
+    JSON.stringify({ event_type: "ProfileApplied", profile: GROK_SANDBOX_PROFILE, workspace: "/stage", enforced: true, read_only_paths: ["/usr", "/stage"], read_write_paths: ["/stage"] }),
+  ].join("\n");
+  const event = latestProfileApplied(log, "/stage");
+  assert.equal(event?.workspace, "/stage");
+  assert.deepEqual(unexpectedRoots(event!, ["/stage"]), []);
+  assert.equal(latestProfileApplied(log, "/nowhere"), null);
+});
+
+test("a shadowing profile that grants the home directory is caught by the roots it applied", () => {
+  const event = latestProfileApplied(
+    JSON.stringify({ event_type: "ProfileApplied", profile: GROK_SANDBOX_PROFILE, workspace: "/stage", enforced: true, read_write_paths: ["/stage", "/Users/someone"] }),
+    "/stage",
+  );
+  // `extends = "devbox"` in the operator's own sandbox.toml would look exactly like this, and
+  // BrainGate would otherwise report an isolation it never had.
+  assert.deepEqual(unexpectedRoots(event!, ["/stage"]), ["/Users/someone"]);
+});
+
+test("the sandbox profile BrainGate writes is the narrowest base, with the network shut", () => {
+  const toml = grokSandboxProfileToml();
+  assert.match(toml, new RegExp(`\\[profiles\\.${GROK_SANDBOX_PROFILE}\\]`));
+  assert.match(toml, /extends = "strict"/);
+  assert.match(toml, /restrict_network = true/);
+});
+
 
 test("an acceptance is checked on its own terms: current, unexpired, and for this provider", () => {
   // The acceptance rules are policy that outlives any one provider's implementation status.
@@ -611,4 +775,28 @@ test("the invocation profile honours the budget's turn allowance instead of capp
     const granted = Number(plan.args[plan.args.indexOf("--max-turns") + 1]);
     assert.equal(granted, budget.maxInspectionTurns, `${complexity} was clamped from ${String(budget.maxInspectionTurns)} to ${String(granted)}`);
   }
+});
+
+// "Which model burned what" is the question routing across subscriptions exists to answer, and
+// the ledger was recording `unknown` for every call while two providers were reporting it.
+test("a provider's own token count is recorded as native, including what it read from cache", () => {
+  const claude = providerTokenUsage("anthropic", JSON.stringify({ result: "ok", usage: { input_tokens: 6, output_tokens: 264, cache_read_input_tokens: 12_000 } }));
+  // `input_tokens` alone reads as six tokens for a request that carried twelve thousand.
+  assert.deepEqual(claude, { input: 6, output: 264, cacheRead: 12_000 });
+
+  const grok = providerTokenUsage("xai", JSON.stringify({ text: "{}", usage: { input_tokens: 14_856, output_tokens: 509, cache_read_input_tokens: 13_440 } }));
+  assert.equal(grok?.output, 509);
+
+  const agy = providerTokenUsage("google", JSON.stringify({ status: "SUCCESS", response: "{}", usage: { input_tokens: 6_484, output_tokens: 572, cache_read_tokens: 8_097 } }));
+  assert.equal(agy?.cacheRead, 8_097);
+});
+
+test("a count that is absent, malformed or from a provider that reports none stays unknown", () => {
+  // An invented number labelled `native` is worse than no number: the whole point of the
+  // evidence label is that a reader can tell measurement from inference.
+  assert.equal(providerTokenUsage("anthropic", "not json"), null);
+  assert.equal(providerTokenUsage("anthropic", JSON.stringify({ usage: { input_tokens: "many", output_tokens: 1 } })), null);
+  assert.equal(providerTokenUsage("anthropic", JSON.stringify({ usage: { input_tokens: -1, output_tokens: 1 } })), null);
+  assert.equal(providerTokenUsage("openai", JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } })), null, "Codex reports usage in a JSONL stream this parser does not read");
+  assert.equal(providerTokenUsage("anthropic", JSON.stringify({ result: "ok" })), null);
 });

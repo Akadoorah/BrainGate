@@ -43,8 +43,10 @@ para cobrança por token.
 | Anthropic Claude Code | `claude` | leitura e escrita |
 | OpenAI Codex | `codex` | apenas revisor independente, após autoteste de isolamento |
 | GitHub Copilot | `copilot` | somente leitura, com a assinatura atestada por você |
-| Google Antigravity | `agy` | apenas descoberta; execução bloqueada |
-| xAI Grok Build | `grok` | apenas descoberta; execução bloqueada |
+| Google Antigravity | `agy` | planejamento, revisão e arbitragem — depois de você aceitar o risco abaixo |
+| xAI Grok Build | `grok` | planejamento, revisão e arbitragem, após um autoteste de isolamento |
+
+Rode `braingate providers list` para ver qual papel cada provedor pode assumir na sua máquina e por que os fechados estão fechados. Veja **How a provider earns a role** no README em inglês para entender como um provedor conquista seu papel e o que você aceita com `braingate providers accept`.
 
 ## Instalação
 

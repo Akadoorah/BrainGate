@@ -42,45 +42,69 @@ Provider support today:
 | Anthropic Claude Code | `claude` | read and write |
 | OpenAI Codex | `codex` | independent reviewer only, after an isolation self-test |
 | GitHub Copilot | `copilot` | read only, subscription attested by you |
-| Google Antigravity | `agy` | discovered, not yet invocable |
-| xAI Grok Build | `grok` | discovered, not yet invocable |
+| Google Antigravity | `agy` | planning, review and judging — after you accept the risk below |
+| xAI Grok Build | `grok` | planning, review and judging, after a sandbox self-test |
 
-### Providers BrainGate cannot scope
+Run `braingate providers list` to see which roles each provider may take on your machine, and
+why the closed ones are closed.
 
-Codex can be handed a configuration BrainGate controls, through `CODEX_HOME`, so what it may do
-during a run is provable. Antigravity and Grok cannot: Antigravity keeps configuration and
-credentials under the same `HOME`, so isolating one loses the other, and Grok resolves its
-permissions from `~/.claude/settings.local.json` — a different tool's file that BrainGate neither
-owns nor can neutralise for a single call.
+### How a provider earns a role
 
-Refusing to run them would not make you safer, because you already run them yourself, so the
-policy for reaching them is settled:
+BrainGate will not send your work to a CLI it cannot say something definite about. There are two
+ways a provider becomes usable, and they are not interchangeable.
 
-- **Planning, review and judgement will need no acceptance.** Those run in a staged workspace: a
-  fresh temporary directory holding only what BrainGate put there. A provider working in one
-  cannot leak a repository it was never shown.
-- **Reading and writing your project will need your explicit acceptance**, per provider.
+**Proven, per run.** Codex and Grok can both be pointed at a configuration BrainGate controls, so
+what they may do during a run is *measured* rather than trusted — and re-measured every time,
+because the CLI may have been updated since. Codex takes a permission profile through
+`CODEX_HOME`; Grok takes a kernel sandbox (Seatbelt on macOS, Landlock on Linux) defined in the
+staged workspace itself. Both self-tests cost nothing: each reads a decision the CLI has already
+made, before any model call. If the self-test fails, the provider is not offered.
 
-What is missing is the invocation profile that would actually run them — the flags, the staged
-home, the isolation checks, the way Codex and Claude each have one. Until that exists neither
-provider is selectable, and `braingate doctor` says so rather than offering a role that would
-fail once chosen.
+**Accepted, by you.** Antigravity keeps its settings and its credentials under the same `HOME`
+and offers no second variable to separate them, so BrainGate cannot hand it a scoped
+configuration for one call. Nothing here can prove what such a run may reach, so nothing tries:
+it stays closed until you say otherwise.
+
+```bash
+braingate providers accept google      # opens planning, review and judging
+braingate providers revoke google      # closes them again
+```
 
 > [!WARNING]
-> **What you accept.** BrainGate cannot limit what these two reach *outside* your project. They
-> may read or write elsewhere on your machine, and no guard here sees that. It is the same
-> exposure as running `agy` or `grok` yourself, which is why accepting it is reasonable — but it
-> is not zero.
+> **What accepting means.** BrainGate cannot limit what an unscoped provider reaches *outside*
+> your project. It may read or write elsewhere on your machine, and no guard here sees that. It
+> is the same exposure as running `agy` yourself — which is why accepting it is reasonable — but
+> it is not zero. Accepting also records that you are signed in with a subscription rather than
+> direct API billing, because the CLI does not report which.
 >
-> What does **not** change: writes still happen in a task worktree, your checkout is fingerprinted
-> before and after, every changed path passes the diff guard, and nothing merges without you.
-> Those verify the outcome, so they hold whether or not the provider was isolated going in.
-> Acceptance widens which providers may be asked, never what any provider may leave behind.
+> What does **not** change: an accepted provider still reaches only planning, review and
+> judging, each in a temporary directory that never contains your project. Writes still happen
+> in a task worktree, your checkout is fingerprinted before and after, every changed path passes
+> the diff guard, and nothing merges without you. Those verify the outcome, so they hold whether
+> or not the provider was isolated going in. Acceptance widens which providers may be *asked*,
+> never what any provider may leave behind.
 
-Acceptance is per provider, recorded with a timestamp, refused once stale, and never inferred
-from a provider being installed or signed in. `braingate doctor` names every provider running on
-your acceptance rather than proven isolation. See
-[`docs/adr/0008-operator-accepted-providers.md`](docs/adr/0008-operator-accepted-providers.md).
+Acceptance is per provider, recorded with a timestamp, expires after 30 days, and is never
+inferred from a provider being installed or signed in. A fresh installation routes to nothing
+that has neither proven itself nor been accepted.
+
+### What is still not scoped, even when a self-test passes
+
+Grok's credentials live in your own `~/.grok`, and BrainGate will not copy them out to get a
+clean home. So that home's configuration loads inside the sandbox with the run:
+
+- **MCP servers stop the run.** An MCP server is an arbitrary process with its own network
+  access and no per-invocation off switch. Disable them (`grok mcp`) or Grok stays closed.
+- **Hooks and marketplace plugins are named, not blocked.** `braingate doctor` prints
+  `grok-home-loads=...` so you can see what came along.
+- **Network blocking is Linux-only.** `restrict_network` is enforced by seccomp on Linux and is
+  a documented no-op on macOS. The attestation records which, so no receipt overclaims.
+
+None of these can reach your project — the sandbox is kernel-enforced and confined to the staged
+workspace — but they are inside the run, and saying so is better than implying otherwise.
+
+See [`docs/adr/0008-operator-accepted-providers.md`](docs/adr/0008-operator-accepted-providers.md)
+and [`docs/adr/0009-grok-sandbox-is-provable.md`](docs/adr/0009-grok-sandbox-is-provable.md).
 
 ## Install
 
@@ -409,7 +433,8 @@ Current hardened execution paths:
 - **Anthropic Claude Code:** restricted read-only shadow path and M11 small-write primary path inside guarded task worktrees.
 - **OpenAI Codex CLI:** independent **reviewer-only** path when `codex login status` proves ChatGPT authentication and a local zero-model-call sandbox self-test proves the required filesystem policy for the installed Codex version.
 - **GitHub Copilot CLI:** bounded read-only path when subscription authentication is explicitly attested where safe native discovery is unavailable.
-- **Google Antigravity / xAI Grok Build:** discovery exists, but automated execution remains fail-closed until equivalent isolation is proven.
+- **xAI Grok Build:** planning, review and judging, in a kernel-sandboxed staged workspace proven per run; never the project checkout.
+- **Google Antigravity:** the same three roles, reachable only after `braingate providers accept google`, because its isolation cannot be proven.
 
 Codex review runs from a fresh staged workspace rather than the real repository. Native Windows Codex review is blocked in this milestone; WSL uses the Linux path and must still pass the self-test.
 

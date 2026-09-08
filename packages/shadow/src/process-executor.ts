@@ -4,8 +4,8 @@ import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
-import { CODEX_STAGE_TOKEN } from "./codex-isolation.js";
-import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "./types.js";
+import { grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
+import { STAGE_PATH_TOKEN, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "./types.js";
 
 function inside(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
@@ -69,12 +69,40 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           overrides.HOME = isolatedHome;
         }
 
-        args = args.map((argument) => argument.replaceAll(CODEX_STAGE_TOKEN, spawnCwd));
-        if (args.some((argument) => argument.includes(CODEX_STAGE_TOKEN))) {
+        if (input.plan.providerId === "xai") {
+          // The sandbox profile has to live where Grok looks for a project profile: inside the
+          // workspace it is being pointed at. Writing it here rather than into the operator's
+          // own sandbox.toml means BrainGate never edits their Grok configuration, and the
+          // profile disappears with the stage.
+          mkdirSync(join(spawnCwd, ".grok"), { mode: 0o700 });
+          writeFileSync(join(spawnCwd, ".grok", "sandbox.toml"), grokSandboxProfileToml(), { encoding: "utf8", mode: 0o600, flag: "wx" });
+          // Same shape as Codex: an isolated HOME so the run cannot see another tool's
+          // settings file, and the provider's own home variable so authentication survives.
+          internalAllowedEnv.add("GROK_HOME");
+          overrides.GROK_HOME = resolveGrokHome(baseEnv.GROK_HOME === undefined && baseEnv.HOME === undefined ? process.env : baseEnv);
+          overrides.HOME = isolatedHome;
+        }
+
+        if (input.plan.inputMode === "staged-file") {
+          if (input.plan.attachmentContent === null || input.plan.attachmentToken === null) {
+            throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "Staged-file plan requires request content and a file name.");
+          }
+          if (input.plan.attachmentToken.includes("/") || input.plan.attachmentToken.includes("\\") || input.plan.attachmentToken.includes("..")) {
+            throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "Staged request file name must be a plain file name inside the workspace.");
+          }
+          writeFileSync(join(spawnCwd, input.plan.attachmentToken), input.plan.attachmentContent, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        }
+
+        args = args.map((argument) => argument.replaceAll(STAGE_PATH_TOKEN, spawnCwd));
+        if (args.some((argument) => argument.includes(STAGE_PATH_TOKEN))) {
           throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Staged shadow invocation contains an unresolved workspace token.");
         }
-      } else if (args.some((argument) => argument.includes(CODEX_STAGE_TOKEN))) {
+      } else if (args.some((argument) => argument.includes(STAGE_PATH_TOKEN))) {
         throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Project-mode shadow invocation cannot contain a staged workspace token.");
+      }
+
+      if (input.plan.inputMode === "staged-file" && input.plan.workspaceMode !== "staged-clean") {
+        throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "A staged request file has nowhere to go outside a staged workspace.");
       }
 
       if (input.plan.inputMode === "temp-attachment") {

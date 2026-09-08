@@ -45,6 +45,19 @@ export interface DashboardTaskCard {
   readonly approvalStatus: string | null;
   readonly outcome: string | null;
   readonly usageProvenance: readonly UsageEvidence[];
+  /**
+   * What each model in the route actually cost, when the provider counted it itself.
+   *
+   * `null` where it did not: an absent number is the honest answer, and a zero would read as a
+   * free call. This is the other half of "who did what" — the roles say who, this says at what
+   * price, which is the whole reason routing across subscriptions is worth doing.
+   */
+  readonly tokensByModel: readonly {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly tokens: number | null;
+    readonly evidence: UsageEvidence;
+  }[];
 }
 
 export interface DashboardSnapshot {
@@ -57,6 +70,25 @@ export interface DashboardSnapshot {
 
 function uniqueSorted<T extends string>(values: readonly T[]): readonly T[] {
   return Object.freeze([...new Set(values)].sort() as T[]);
+}
+
+function tokensByModel(receipt: NormalizedTaskReceipt): DashboardTaskCard["tokensByModel"] {
+  const totals = new Map<string, { providerId: string; modelId: string; tokens: number | null; evidence: UsageEvidence }>();
+  for (const usage of receipt.usage) {
+    if (usage.metric !== "provider_tokens" || usage.model === null) continue;
+    const key = `${usage.provider}\u0000${usage.model}`;
+    const current = totals.get(key);
+    const value = usage.value;
+    if (current === undefined) {
+      totals.set(key, { providerId: usage.provider, modelId: usage.model, tokens: value, evidence: usage.evidence });
+      continue;
+    }
+    // One model may be called more than once in a task. A run the provider did not count makes
+    // the total for that model unknown rather than a partial sum presented as a whole.
+    current.tokens = current.tokens === null || value === null ? null : current.tokens + value;
+    if (usage.evidence !== current.evidence) current.evidence = "unknown";
+  }
+  return Object.freeze([...totals.values()].map((entry) => Object.freeze(entry)));
 }
 
 export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTaskReceipt): DashboardTaskCard {
@@ -89,6 +121,7 @@ export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTas
     approvalStatus: brief?.permissions.humanApprovalStatus ?? null,
     outcome: workflow?.outcome ?? null,
     usageProvenance: uniqueSorted(receipt.usage.map((usage) => usage.evidence)),
+    tokensByModel: tokensByModel(receipt),
   });
 }
 

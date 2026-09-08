@@ -7,6 +7,7 @@ export interface OperatorStatePaths {
   readonly home: string;
   readonly globalDir: string;
   readonly modelCatalogPath: string;
+  readonly providerAcceptancePath: string;
 }
 
 function privateDirectory(path: string): void {
@@ -28,5 +29,10 @@ export function resolveOperatorState(
   const globalDir = resolve(home, "global");
   privateDirectory(home);
   privateDirectory(globalDir);
-  return Object.freeze({ home, globalDir, modelCatalogPath: resolve(globalDir, "models.json") });
+  return Object.freeze({
+    home,
+    globalDir,
+    modelCatalogPath: resolve(globalDir, "models.json"),
+    providerAcceptancePath: resolve(globalDir, "provider-acceptance.json"),
+  });
 }

@@ -3,12 +3,12 @@ import type { ProviderSnapshot } from "@braingate/providers";
 import type { ModelRef } from "@braingate/router";
 import {
   CODEX_REVIEW_DISABLED_FEATURES,
-  CODEX_STAGE_TOKEN,
   acceptedFeatureKeys,
   codexReviewerConfigArgs,
   validCodexIsolationAttestation,
   type CodexIsolationAttestation,
 } from "./codex-isolation.js";
+import { STAGE_PATH_TOKEN } from "./types.js";
 import type { ShadowInvocationPlan } from "./types.js";
 
 /**
@@ -82,8 +82,8 @@ export function planCodexVisualInvocation(input: {
     "--skip-git-repo-check",
     "--json",
     "--model", input.model.modelId,
-    "-C", CODEX_STAGE_TOKEN,
-    ...codexReviewerConfigArgs(CODEX_STAGE_TOKEN, codexVisualFeatureKeys(dropped)),
+    "-C", STAGE_PATH_TOKEN,
+    ...codexReviewerConfigArgs(STAGE_PATH_TOKEN, codexVisualFeatureKeys(dropped)),
     `-c`, `features.${VISUAL_FEATURE}=true`,
     "-",
   ]);

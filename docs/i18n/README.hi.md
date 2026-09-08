@@ -43,8 +43,10 @@ BrainGate एक pre-alpha चरण की परियोजना है ज�
 | Anthropic Claude Code | `claude` | पढ़ना और लिखना |
 | OpenAI Codex | `codex` | केवल स्वतंत्र समीक्षक, आइसोलेशन सेल्फ़-टेस्ट के बाद |
 | GitHub Copilot | `copilot` | केवल पढ़ना, सब्सक्रिप्शन की पुष्टि आप करते हैं |
-| Google Antigravity | `agy` | केवल खोज; निष्पादन बंद |
-| xAI Grok Build | `grok` | केवल खोज; निष्पादन बंद |
+| Google Antigravity | `agy` | योजना, समीक्षा और निर्णय — नीचे बताया गया जोखिम स्वीकार करने के बाद |
+| xAI Grok Build | `grok` | योजना, समीक्षा और निर्णय, एक सैंडबॉक्स सेल्फ़-टेस्ट के बाद |
+
+`braingate providers list` चलाकर देखें कि आपकी मशीन पर हर प्रोवाइडर कौन-सी भूमिका ले सकता है, और बंद भूमिकाएँ क्यों बंद हैं। कोई प्रोवाइडर भूमिका कैसे अर्जित करता है और `braingate providers accept` से आप वास्तव में क्या स्वीकार कर रहे हैं, इसके लिए अंग्रेज़ी README का **How a provider earns a role** खंड देखें।
 
 ## इंस्टॉलेशन
 

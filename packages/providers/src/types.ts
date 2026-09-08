@@ -1,6 +1,19 @@
 import type { UsageEvidence } from "@braingate/core";
 
-export type ProviderId = "anthropic" | "openai" | "google" | "xai" | "github-copilot";
+/**
+ * The provider ids, as one list the type is derived from.
+ *
+ * A bare string-literal union has no runtime form, so every place that needed to check or
+ * enumerate ids grew its own copy — and a copy that fell behind is exactly how a valid role
+ * became "invalid" at the boundary between two packages. Adding a provider here changes the
+ * type and the runtime check together, or it fails to compile.
+ */
+export const PROVIDER_IDS = ["anthropic", "openai", "google", "xai", "github-copilot"] as const;
+export type ProviderId = (typeof PROVIDER_IDS)[number];
+
+export function isProviderId(value: string): value is ProviderId {
+  return (PROVIDER_IDS as readonly string[]).includes(value);
+}
 export type ProviderAuthState = "authenticated" | "unauthenticated" | "unknown";
 export type ProviderAuthMode = "subscription" | "api" | "unknown";
 export type CapabilityValue = boolean | "unknown";

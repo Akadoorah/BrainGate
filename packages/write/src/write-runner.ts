@@ -2,7 +2,7 @@ import { BrainGateInvariantError, type ExecutionBudget, type RegisteredProject, 
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
-import { NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
+import { NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { assertClaudeWriteEligible, NodeClaudeWriteExecutor, planClaudeWriteInvocation } from "./claude-write-profile.js";
 import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
 import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
@@ -31,9 +31,16 @@ function validSubscriptionAttestation(attestations: readonly SubscriptionAttesta
   return true;
 }
 
-function reviewerExclusions(snapshots: readonly ProviderSnapshot[], codexIsolation: CodexIsolationAttestation | undefined, attestations: readonly SubscriptionAttestation[]): readonly string[] {
+function reviewerExclusions(
+  snapshots: readonly ProviderSnapshot[],
+  codexIsolation: CodexIsolationAttestation | undefined,
+  attestations: readonly SubscriptionAttestation[],
+  proof: { readonly grokIsolation?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[] } = {},
+): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
-    if (!shadowProviderRoleStatus(snapshot.providerId, "reviewer").enabled) return true;
+    const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
+    if (!shadowProviderRoleStatus(snapshot.providerId, "reviewer", acceptance === undefined ? {} : { acceptance }).enabled) return true;
+    if (snapshot.providerId === "xai") return proof.grokIsolation === undefined;
     if (snapshot.providerId === "openai") return snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription" || codexIsolation === undefined;
     if (snapshot.providerId === "github-copilot") {
       if (snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription") return false;
@@ -88,6 +95,8 @@ export function buildWriteTaskPlan(input: {
   readonly providers: readonly ProviderSnapshot[];
   readonly attestations?: readonly SubscriptionAttestation[];
   readonly codexIsolation?: CodexIsolationAttestation;
+  readonly grokIsolation?: GrokIsolationAttestation;
+  readonly acceptances?: readonly OperatorProviderAcceptance[];
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
   readonly requiredContextTokens: number;
@@ -111,7 +120,10 @@ export function buildWriteTaskPlan(input: {
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       primaryModel,
-      excludeProviders: reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? []),
+      excludeProviders: reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? [], {
+        ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+        acceptances: input.acceptances ?? [],
+      }),
     });
     const reviewerModel = modelRef(reviewerRoute);
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, workspace: reviewerModel.providerId === "openai" ? "staged-review" : "project-read-only" }));
@@ -137,6 +149,8 @@ export class WriteDogfoodRunner {
   readonly #providers: readonly ProviderSnapshot[];
   readonly #attestations: readonly SubscriptionAttestation[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
+  readonly #grokIsolation: GrokIsolationAttestation | undefined;
+  readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #writer: WriteProviderExecutor;
   readonly #reviewExecutor: ShadowProcessExecutor | undefined;
   readonly #visualExecutor: ShadowProcessExecutor | undefined;
@@ -147,7 +161,9 @@ export class WriteDogfoodRunner {
     readonly router: CapabilityRouter;
     readonly providers: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
+    readonly acceptances?: readonly OperatorProviderAcceptance[];
     readonly codexIsolation?: CodexIsolationAttestation;
+    readonly grokIsolation?: GrokIsolationAttestation;
     readonly writer?: WriteProviderExecutor;
     readonly reviewExecutor?: ShadowProcessExecutor;
     /** Executor for the artifact-producing pass; defaults to the real one. */
@@ -159,6 +175,8 @@ export class WriteDogfoodRunner {
     this.#providers = input.providers;
     this.#attestations = input.attestations ?? [];
     this.#codexIsolation = input.codexIsolation;
+    this.#grokIsolation = input.grokIsolation;
+    this.#acceptances = input.acceptances ?? [];
     this.#writer = input.writer ?? new NodeClaudeWriteExecutor();
     this.#reviewExecutor = input.reviewExecutor;
     this.#visualExecutor = input.visualExecutor;
@@ -183,7 +201,9 @@ export class WriteDogfoodRunner {
       router: this.#router,
       providers: this.#providers,
       attestations: this.#attestations,
+      acceptances: this.#acceptances,
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+      ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
@@ -246,7 +266,9 @@ export class WriteDogfoodRunner {
           cwd: handle.repositoryPath,
           snapshots: this.#providers,
           attestations: this.#attestations,
+          acceptances: this.#acceptances,
           ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+          ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
           context: { changedFiles: guarded.changedFiles, mode: "worktree-diff-review" },
           ...(this.#reviewExecutor === undefined ? {} : { executor: this.#reviewExecutor }),
           ledger: this.#ledger,

@@ -14,12 +14,14 @@ import { startDashboardServer } from "@braingate/dashboard";
 import { buildDashboardSnapshot, GlobalQuotaStore, type DashboardSnapshot } from "@braingate/observability";
 import {
   ModelCatalog,
+  ProviderAcceptanceStore,
+  UNSCOPED_PROVIDER_RISK,
   buildShadowTaskPlan,
   hydrateModelRegistry,
   resolveOperatorState,
   type OperatorStatePaths,
 } from "@braingate/operator";
-import { ProviderDiscovery, type ProviderSnapshot } from "@braingate/providers";
+import { PROVIDER_IDS, ProviderDiscovery, isProviderId, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
   CodexIsolationVerifier,
@@ -27,9 +29,11 @@ import {
   shadowProviderRoleStatus,
   shadowProviderStatus,
   type CodexIsolationAttestation,
+  type GrokIsolationAttestation,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
+import { acceptedSubscriptions, configuredProvider, grokIsolationStatus, loadAcceptances } from "./provider-proof.js";
 import { WriteDogfoodRunner, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
 
 export interface CliDependencies {
@@ -37,6 +41,7 @@ export interface CliDependencies {
   readonly env?: NodeJS.ProcessEnv;
   readonly discoverAll?: () => Promise<readonly ProviderSnapshot[]>;
   readonly verifyCodexIsolation?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
+  readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
   readonly writeExecutor?: WriteProviderExecutor;
   readonly stdout?: (text: string) => void;
@@ -116,6 +121,30 @@ function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: s
   return registry.loadFile(path);
 }
 
+/**
+ * Per-role eligibility as doctor should print it: the policy, plus the two proofs that are
+ * re-measured per run rather than remembered.
+ *
+ * `shadowProviderRoleStatus` knows the policy but not whether this machine's self-test passed
+ * a moment ago, so a provider that policy allows and the probe rejected must read as blocked
+ * here — otherwise doctor promises a role the next command will refuse.
+ */
+function roleReport(
+  providerId: ProviderSnapshot["providerId"],
+  acceptances: readonly { readonly providerId: string }[],
+  codex: CodexIsolationStatus,
+  grok: { readonly eligible: boolean; readonly reason: string | null },
+): Readonly<Record<string, unknown>> {
+  const acceptance = acceptances.find((item) => item.providerId === providerId) as never;
+  const entries = (["planner", "primary", "reviewer", "judge"] as const).map((role) => {
+    const status = shadowProviderRoleStatus(providerId, role, acceptance === undefined ? {} : { acceptance });
+    if (providerId === "openai" && role === "reviewer") return [role, { enabled: codex.eligible, reason: codex.reason, acceptedByOperator: false }] as const;
+    if (providerId === "xai" && status.enabled && !grok.eligible) return [role, { enabled: false, reason: grok.reason, acceptedByOperator: false }] as const;
+    return [role, status] as const;
+  });
+  return Object.freeze(Object.fromEntries(entries));
+}
+
 function taskContext(project: RegisteredProject): Readonly<Record<string, unknown>> {
   return Object.freeze({ projectId: project.projectId, scope: "registered-project-cwd", access: "read-only" });
 }
@@ -128,11 +157,14 @@ function contextTokens(task: string): number {
   return Math.max(128, conservativeTokenEstimate(task) + 64);
 }
 
-function attestation(args: string[]): readonly SubscriptionAttestation[] {
-  if (!removeFlag(args, "--attest-copilot-oauth")) return Object.freeze([]);
+function attestation(args: string[], state?: OperatorStatePaths): readonly SubscriptionAttestation[] {
+  // An acceptance already carries the operator's statement about how that provider is billed,
+  // so it does not need a second flag on every command.
+  const accepted = state === undefined ? [] : acceptedSubscriptions(state);
+  if (!removeFlag(args, "--attest-copilot-oauth")) return Object.freeze(accepted);
   const observed = new Date();
   const expires = new Date(observed.getTime() + 60 * 60 * 1000);
-  return Object.freeze([Object.freeze({
+  return Object.freeze([...accepted, Object.freeze({
     providerId: "github-copilot",
     mode: "subscription",
     source: "user-confirmed-oauth",
@@ -229,6 +261,29 @@ function configuredOpenAi(state: OperatorStatePaths): boolean {
   return new ModelCatalog(state.modelCatalogPath).load().some((entry) => entry.configured && entry.providerId === "openai");
 }
 
+/**
+ * Everything a command needs before it may route to a provider whose eligibility is decided per
+ * run rather than per install: Grok's sandbox re-proved now, and the operator's acceptances.
+ *
+ * The self-test runs only when a Grok model is actually in the catalogue, so an operator who
+ * does not use Grok never pays for a probe of a CLI they may not have installed.
+ */
+async function grokProof(
+  state: OperatorStatePaths,
+  snapshots: readonly ProviderSnapshot[],
+  deps: CliDependencies,
+  env: NodeJS.ProcessEnv,
+  project?: RegisteredProject,
+): Promise<Awaited<ReturnType<typeof grokIsolationStatus>>> {
+  return await grokIsolationStatus({
+    snapshots,
+    env,
+    shouldAttempt: configuredProvider(new ModelCatalog(state.modelCatalogPath).load(), "xai"),
+    ...(project === undefined ? {} : { project }),
+    ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
+  });
+}
+
 function runtimeFor(
   state: OperatorStatePaths,
   snapshots: readonly ProviderSnapshot[],
@@ -271,7 +326,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       // init and dogfood are dispatched before this handler is reached, so they were absent
       // from the only listing a new user sees — which left the two commands they actually
       // need undiscoverable. The listing describes every command the binary accepts.
-      data = { commands: ["init", "dogfood", "doctor", "discover", "models", "memory", "shadow", "write", "status", "dashboard"] };
+      data = { commands: ["init", "dogfood", "doctor", "discover", "providers", "models", "memory", "shadow", "write", "status", "dashboard"] };
       emit(
         json,
         data,
@@ -286,6 +341,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "",
           "Everything else",
           "  discover     which provider CLIs are installed and how they are authenticated",
+          "  providers    list | accept | revoke — which roles each provider may take, and why",
           "  doctor       validate the project, models and reviewer isolation",
           "  models       list | validate | add | remove | import-discovered | profile",
           "  memory       preview | import | promote | list",
@@ -356,6 +412,80 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "models requires list, validate, add, remove, or import-discovered.");
     }
 
+    if (command === "providers") {
+      const subcommand = args.shift();
+      const store = new ProviderAcceptanceStore(state.providerAcceptancePath);
+
+      if (subcommand === "list") {
+        noExtraArgs(args);
+        const acceptances = loadAcceptances(state);
+        const now = new Date();
+        const rows = PROVIDER_IDS.map((providerId) => {
+          const record = store.find(providerId);
+          const roles = (["planner", "primary", "reviewer", "judge"] as const).map((role) => {
+            const acceptance = acceptances.find((item) => item.providerId === providerId);
+            const status = shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now });
+            return Object.freeze({ role, enabled: status.enabled, acceptedByOperator: status.acceptedByOperator, reason: status.reason });
+          });
+          return Object.freeze({
+            providerId,
+            shadow: shadowProviderStatus(providerId),
+            acceptance: record === null ? null : Object.freeze({ acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, current: new Date(record.expiresAt).getTime() > now.getTime() }),
+            roles,
+          });
+        });
+        data = rows;
+        emit(json, data, rows.map((row) => {
+          const open = row.roles.filter((entry) => entry.enabled).map((entry) => entry.role);
+          const how = row.roles.some((entry) => entry.acceptedByOperator) ? " (operator-accepted)" : "";
+          return `${row.providerId}: ${open.length === 0 ? "no roles" : open.join(", ")}${how}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
+        }).join("\n"), stdout);
+        return Object.freeze({ exitCode: 0, data });
+      }
+
+      if (subcommand === "accept" || subcommand === "revoke") {
+        const providerId = args.shift();
+        noExtraArgs(args);
+        if (providerId === undefined || !isProviderId(providerId)) {
+          throw new BrainGateInvariantError("CLI_PROVIDER_INVALID", `providers ${subcommand} needs one of: ${PROVIDER_IDS.join(", ")}.`);
+        }
+        if (subcommand === "revoke") {
+          const removed = store.revoke(providerId);
+          data = { providerId, revoked: removed };
+          emit(json, data, removed ? `Revoked the acceptance for ${providerId}. It is closed again for every role.` : `${providerId} had no acceptance on record.`, stdout);
+          return Object.freeze({ exitCode: 0, data });
+        }
+        // Accepting a provider BrainGate can already isolate would record a decision that
+        // changes nothing and implies a risk the operator is not actually taking.
+        const needsAcceptance = (["planner", "primary", "reviewer", "judge"] as const)
+          .some((role) => (shadowProviderRoleStatus(providerId, role).reason ?? "").includes("braingate providers accept"));
+        if (!needsAcceptance) {
+          throw new BrainGateInvariantError(
+            "CLI_PROVIDER_ACCEPTANCE_UNNEEDED",
+            `${providerId} does not run on operator acceptance: BrainGate either proves its isolation per run or has no invocation profile for it. Nothing to accept.`,
+          );
+        }
+        const record = store.accept(providerId);
+        data = { providerId, acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, acknowledged: record.acknowledged };
+        emit(
+          json,
+          data,
+          [
+            `Accepted ${providerId} until ${record.expiresAt}.`,
+            "",
+            UNSCOPED_PROVIDER_RISK,
+            "",
+            "Staged roles only — planning, review and judging, each in a temporary directory that never contains your project.",
+            `Undo at any time with \`braingate providers revoke ${providerId}\`.`,
+          ].join("\n"),
+          stdout,
+        );
+        return Object.freeze({ exitCode: 0, data });
+      }
+
+      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "providers requires list, accept, or revoke.");
+    }
+
     if (command === "doctor") {
       const manifest = takeOption(args, "--project", true)!;
       noExtraArgs(args);
@@ -363,6 +493,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const snapshots = await discovery(deps);
       const entries = new ModelCatalog(state.modelCatalogPath).load();
       const isolation = await codexIsolationStatus(snapshots, deps, env, true);
+      const grok = await grokProof(state, snapshots, deps, env, project);
+      const acceptances = loadAcceptances(state);
       const store = new GlobalQuotaStore(state.globalDir);
       let runtimes: readonly unknown[] = [];
       try { runtimes = hydrateModelRegistry({ entries, providers: snapshots, quota: store.latest() }).runtimes; }
@@ -377,14 +509,10 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           authState: snapshot.authState.value,
           authMode: snapshot.authMode.value,
           shadow: shadowProviderStatus(snapshot.providerId),
-          roles: {
-            primary: shadowProviderRoleStatus(snapshot.providerId, "primary"),
-            reviewer: snapshot.providerId === "openai"
-              ? { enabled: isolation.eligible, reason: isolation.reason }
-              : shadowProviderRoleStatus(snapshot.providerId, "reviewer"),
-            judge: shadowProviderRoleStatus(snapshot.providerId, "judge"),
-          },
+          roles: roleReport(snapshot.providerId, acceptances, isolation, grok),
           ...(snapshot.providerId === "openai" ? { isolation: { attempted: isolation.attempted, eligible: isolation.eligible, source: isolation.attestation?.source ?? null, profileHash: isolation.attestation?.profileHash ?? null, reason: isolation.reason } } : {}),
+          ...(snapshot.providerId === "xai" ? { isolation: { attempted: grok.attempted, eligible: grok.eligible, source: grok.attestation?.source ?? null, profileHash: grok.attestation?.profileHash ?? null, networkRestricted: grok.attestation?.networkRestricted ?? null, configSurfaces: grok.attestation?.configSurfaces ?? [], reason: grok.reason } } : {}),
+          ...(acceptances.some((item) => item.providerId === snapshot.providerId) ? { acceptance: acceptances.find((item) => item.providerId === snapshot.providerId) } : {}),
         })),
       };
       emit(
@@ -398,7 +526,15 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
             const note = dropped.length === 0 ? "" : ` · controls-dropped=${dropped.join(",")}`;
             return `${item.providerId}: ${item.available.value ? "available" : "missing"} · reviewer=${isolation.eligible ? "verified" : "blocked"}${note}`;
           }
-          return `${item.providerId}: ${item.available.value ? "available" : "missing"} · shadow=${shadowProviderStatus(item.providerId).enabled ? "enabled" : "blocked"}`;
+          if (item.providerId === "xai") {
+            const surfaces = grok.attestation?.configSurfaces ?? [];
+            // A surface loaded from the operator's own Grok home is inside the sandbox with the
+            // run. Naming it beats leaving them to assume nothing is loaded.
+            const note = surfaces.length === 0 ? "" : ` · grok-home-loads=${surfaces.join(",")}`;
+            return `${item.providerId}: ${item.available.value ? "available" : "missing"} · sandbox=${grok.eligible ? "verified" : "blocked"}${note}`;
+          }
+          const accepted = acceptances.some((entry) => entry.providerId === item.providerId);
+          return `${item.providerId}: ${item.available.value ? "available" : "missing"} · shadow=${shadowProviderStatus(item.providerId).enabled ? "enabled" : accepted ? "operator-accepted" : "blocked"}`;
         }).join("\n")}`,
         stdout,
       );
@@ -421,8 +557,15 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           .map((role) => `${role}=${byRole.get(role)!}`)
           .join(" · ");
         const calls = entry.budget?.providerCalls;
+        // Tokens per model, where the provider counted them itself. Routing exists to move work
+        // onto the cheaper model that can still do it, and this is the only line that says
+        // whether that happened.
+        const spend = entry.tokensByModel
+          .filter((row) => row.tokens !== null && row.evidence === "native")
+          .map((row) => `${row.modelId}=${String(row.tokens)}t`)
+          .join(" · ");
         lines.push(`  ${entry.complexity}/${entry.risk}  ${attribution.length === 0 ? "no route recorded" : attribution}`);
-        lines.push(`    ${entry.outcome ?? "unknown"}${calls == null ? "" : ` · ${String(calls)} provider call${calls === 1 ? "" : "s"}`} · ${entry.taskId.slice(0, 8)}`);
+        lines.push(`    ${entry.outcome ?? "unknown"}${calls == null ? "" : ` · ${String(calls)} provider call${calls === 1 ? "" : "s"}`}${spend.length === 0 ? "" : ` · ${spend}`} · ${entry.taskId.slice(0, 8)}`);
       }
       emit(json, data, lines.join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -451,7 +594,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const baseRef = takeOption(args, "--base") ?? "HEAD";
       const execute = removeFlag(args, "--execute");
       const review = !removeFlag(args, "--no-review");
-      const attestations = attestation(args);
+      const attestations = attestation(args, state);
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `write run`.");
 
@@ -464,10 +607,15 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const requiredContextTokens = contextTokens(task);
       const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state));
       const codexIsolation = isolation.attestation ?? undefined;
+      const grok = await grokProof(state, snapshots, deps, env, project);
+      const grokIsolation = grok.attestation ?? undefined;
+      const acceptances = loadAcceptances(state);
       const plan = buildWriteTaskPlan({
         router: hydrated.router,
         providers: snapshots,
         ...(codexIsolation === undefined ? {} : { codexIsolation }),
+        ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        acceptances,
         classification,
         budget,
         requiredContextTokens,
@@ -492,7 +640,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           router: hydrated.router,
           providers: snapshots,
           attestations,
+          acceptances,
           ...(codexIsolation === undefined ? {} : { codexIsolation }),
+          ...(grokIsolation === undefined ? {} : { grokIsolation }),
           ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }),
           ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }),
         });
@@ -534,7 +684,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const task = takeOption(args, "--task", true)!;
       const execute = removeFlag(args, "--execute");
       const optionalReview = removeFlag(args, "--review");
-      const attestations = attestation(args);
+      const attestations = attestation(args, state);
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `shadow run`.");
       const project = projectFromManifest(state, manifest, cwd);
@@ -547,10 +697,14 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
       const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state));
       const codexIsolation = isolation.attestation ?? undefined;
+      const grok = await grokProof(state, snapshots, deps, env, project);
+      const grokIsolation = grok.attestation ?? undefined;
+      const acceptances = loadAcceptances(state);
       const plan = buildShadowTaskPlan({
         project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
-        classification, budget, requiredContextTokens, optionalReview,
+        classification, budget, requiredContextTokens, optionalReview, acceptances,
         ...(codexIsolation === undefined ? {} : { codexIsolation }),
+        ...(grokIsolation === undefined ? {} : { grokIsolation }),
       });
       const planData = serializedPlan(plan);
 
@@ -569,7 +723,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           router: hydrated.router,
           snapshots,
           attestations,
+          acceptances,
           ...(codexIsolation === undefined ? {} : { codexIsolation }),
+          ...(grokIsolation === undefined ? {} : { grokIsolation }),
           ...(deps.executor === undefined ? {} : { executor: deps.executor }),
         });
         const result = await runner.run({

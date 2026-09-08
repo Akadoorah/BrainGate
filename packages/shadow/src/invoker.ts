@@ -3,9 +3,10 @@ import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
+import type { GrokIsolationAttestation } from "./grok-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
-import type { ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
+import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 function responseContract(role: AgentRequest["role"]): Readonly<Record<string, unknown>> {
   // A plan is work: it produces the approach the executor then follows. It is not a review, and
@@ -46,6 +47,35 @@ export function extractCodexAgentMessage(stdout: string): string {
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   const trimmed = stdout.trim();
   if (providerId === "openai") return extractCodexAgentMessage(trimmed);
+  if (providerId === "xai") {
+    // Grok's `--output-format json` wraps the reply in an envelope carrying the text, the stop
+    // reason and native token counts. The contract JSON is the `text` field.
+    try {
+      const outer = JSON.parse(trimmed) as Record<string, unknown>;
+      if (typeof outer.text === "string") return outer.text;
+      if (typeof outer.message === "string") throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", `Grok reported: ${boundedText(outer.message, 300)}`);
+    } catch (error) {
+      if (error instanceof BrainGateInvariantError) throw error;
+    }
+  }
+  if (providerId === "google") {
+    // agy answers with a result envelope; a run whose tools were auto-denied still reports
+    // SUCCESS with an empty response, so an empty answer is a failure rather than a reply.
+    try {
+      const outer = JSON.parse(trimmed) as Record<string, unknown>;
+      const response = outer.response;
+      if (typeof response === "string" && response.trim().length > 0) return response;
+      const denied = Array.isArray(outer.denied_actions) ? outer.denied_actions.length : 0;
+      throw new BrainGateInvariantError(
+        "SHADOW_RESPONSE_INVALID",
+        denied > 0
+          ? "Antigravity produced no answer because the tools it tried to use were auto-denied in headless mode."
+          : "Antigravity returned an empty response.",
+      );
+    } catch (error) {
+      if (error instanceof BrainGateInvariantError) throw error;
+    }
+  }
   if (providerId === "anthropic") {
     try {
       const outer = JSON.parse(trimmed) as Record<string, unknown>;
@@ -94,6 +124,34 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
 
 
 /**
+ * Token counts a provider reports for itself, or null when it reports none.
+ *
+ * This is the difference between `native` and `estimated` in a receipt. Grok and Claude both
+ * return their own accounting in headless JSON, and BrainGate was throwing it away and
+ * recording `unknown` — which made "who burned what" the one question the ledger could not
+ * answer, and that question is the reason the router exists.
+ */
+export function providerTokenUsage(providerId: string, stdout: string): { readonly input: number; readonly output: number; readonly cacheRead: number } | null {
+  let envelope: Record<string, unknown>;
+  try { envelope = JSON.parse(stdout.trim()) as Record<string, unknown>; }
+  catch { return null; }
+  if (providerId !== "xai" && providerId !== "anthropic" && providerId !== "google") return null;
+  const usage = envelope.usage;
+  if (typeof usage !== "object" || usage === null) return null;
+  const record = usage as Record<string, unknown>;
+  const input = record.input_tokens;
+  const output = record.output_tokens;
+  if (typeof input !== "number" || typeof output !== "number") return null;
+  if (!Number.isFinite(input) || !Number.isFinite(output) || input < 0 || output < 0) return null;
+  // Claude counts cached prompt tokens separately, so `input_tokens` alone reads as six tokens
+  // for a request that actually carried thousands. Recording the cache read keeps the total
+  // honest instead of flattering.
+  const cached = record.cache_read_input_tokens ?? record.cache_read_tokens;
+  const cacheRead = typeof cached === "number" && Number.isFinite(cached) && cached >= 0 ? cached : 0;
+  return Object.freeze({ input, output, cacheRead });
+}
+
+/**
  * Recovers the provider's own account of why a run failed.
  *
  * A CLI that exits non-zero usually says what went wrong — turns exhausted, a denied tool, an
@@ -132,7 +190,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #cwd: string;
   readonly #snapshots: ReadonlyMap<string, ProviderSnapshot>;
   readonly #attestations: ReadonlyMap<string, SubscriptionAttestation>;
+  readonly #acceptances: ReadonlyMap<string, OperatorProviderAcceptance>;
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
+  readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #context: unknown;
   readonly #executor: ShadowProcessExecutor;
   readonly #ledger: TaskLedger | null;
@@ -145,7 +205,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly cwd: string;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
+    readonly acceptances?: readonly OperatorProviderAcceptance[];
     readonly codexIsolation?: CodexIsolationAttestation;
+    readonly grokIsolation?: GrokIsolationAttestation;
     readonly context: unknown;
     readonly executor?: ShadowProcessExecutor;
     readonly ledger?: TaskLedger;
@@ -159,7 +221,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#cwd = input.cwd;
     this.#snapshots = new Map(input.snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
     this.#attestations = new Map((input.attestations ?? []).map((attestation) => [attestation.providerId, attestation]));
+    this.#acceptances = new Map((input.acceptances ?? []).map((acceptance) => [acceptance.providerId, acceptance]));
     this.#codexIsolation = input.codexIsolation;
+    this.#grokIsolation = input.grokIsolation;
     this.#context = input.context;
     this.#executor = input.executor ?? new NodeShadowProcessExecutor();
     this.#ledger = input.ledger ?? null;
@@ -186,6 +250,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       responseContract: responseContract(request.role),
     });
     const attestation = this.#attestations.get(request.model.providerId);
+    const acceptance = this.#acceptances.get(request.model.providerId);
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
@@ -193,7 +258,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       payload,
       ...(this.#maxTurns === undefined ? {} : { maxTurns: this.#maxTurns }),
       ...(attestation === undefined ? {} : { attestation }),
+      ...(acceptance === undefined ? {} : { acceptance }),
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
+      ...(request.model.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
     });
     const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
     this.#event("shadow.provider.started", safeMeta);
@@ -209,7 +276,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       }
       const response = parseRoleResponse(request.role, snapshot.providerId, result.stdout);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
-      this.#usage(request, result.durationMs);
+      this.#usage(request, result.durationMs, providerTokenUsage(snapshot.providerId, result.stdout));
       return response;
     } catch (error) {
       if (!(error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_FAILED")) {
@@ -223,10 +290,20 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     if (this.#ledger !== null && this.#taskId !== null) this.#ledger.appendEvent(this.#taskId, kind, payload);
   }
 
-  #usage(request: AgentRequest, durationMs: number): void {
+  #usage(request: AgentRequest, durationMs: number, tokens: { readonly input: number; readonly output: number; readonly cacheRead: number } | null): void {
     if (this.#ledger === null || this.#taskId === null) return;
-    this.#ledger.recordUsage({ taskId: this.#taskId, provider: request.model.providerId, model: request.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
-    this.#ledger.recordUsage({ taskId: this.#taskId, provider: request.model.providerId, model: request.model.modelId, evidence: "measured", metric: "duration_ms", value: durationMs, unit: "ms" });
-    this.#ledger.recordUsage({ taskId: this.#taskId, provider: request.model.providerId, model: request.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });
+    const row = { taskId: this.#taskId, provider: request.model.providerId, model: request.model.modelId } as const;
+    this.#ledger.recordUsage({ ...row, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
+    this.#ledger.recordUsage({ ...row, evidence: "measured", metric: "duration_ms", value: durationMs, unit: "ms" });
+    // `native` only when the provider counted them itself. A total assembled from anything
+    // else stays `unknown` rather than becoming a number the operator would read as authority.
+    if (tokens === null) {
+      this.#ledger.recordUsage({ ...row, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });
+      return;
+    }
+    this.#ledger.recordUsage({ ...row, evidence: "native", metric: "provider_input_tokens", value: tokens.input, unit: "tokens" });
+    this.#ledger.recordUsage({ ...row, evidence: "native", metric: "provider_output_tokens", value: tokens.output, unit: "tokens" });
+    this.#ledger.recordUsage({ ...row, evidence: "native", metric: "provider_cache_read_tokens", value: tokens.cacheRead, unit: "tokens" });
+    this.#ledger.recordUsage({ ...row, evidence: "native", metric: "provider_tokens", value: tokens.input + tokens.output + tokens.cacheRead, unit: "tokens" });
   }
 }

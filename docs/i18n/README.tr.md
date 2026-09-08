@@ -43,8 +43,10 @@ belirteç başına faturalandırmaya geçiremez.
 | Anthropic Claude Code | `claude` | okuma ve yazma |
 | OpenAI Codex | `codex` | yalnızca bağımsız denetçi, yalıtım öz testinden sonra |
 | GitHub Copilot | `copilot` | yalnızca okuma, aboneliği siz beyan edersiniz |
-| Google Antigravity | `agy` | yalnızca keşif; çalıştırma kapalı |
-| xAI Grok Build | `grok` | yalnızca keşif; çalıştırma kapalı |
+| Google Antigravity | `agy` | planlama, inceleme ve hakemlik — aşağıdaki riski kabul ettikten sonra |
+| xAI Grok Build | `grok` | planlama, inceleme ve hakemlik, bir kum havuzu öz testinden sonra |
+
+Hangi sağlayıcının makinenizde hangi rolü alabileceğini ve kapalı olanların neden kapalı olduğunu görmek için `braingate providers list` çalıştırın. Bir sağlayıcının rolü nasıl hak ettiği ve `braingate providers accept` ile neyi kabul ettiğiniz için İngilizce README'deki **How a provider earns a role** bölümüne bakın.
 
 ## Kurulum
 
