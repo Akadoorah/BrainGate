@@ -68,6 +68,12 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
     catch { throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider returned malformed JSON for the role contract."); }
   }
 
+  // `kind` only restates the role BrainGate already routed, so a provider that omits it has not
+  // widened anything. A present-but-wrong `kind` still fails closed, because that means the
+  // provider answered as a different role than the one that was requested.
+  const expectedKind = role === "primary" ? "work" : role === "reviewer" ? "review" : "judge";
+  if (parsed.kind === undefined || parsed.kind === null) parsed = { ...parsed, kind: expectedKind };
+
   if (role === "primary") {
     if (parsed.kind !== "work") throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Primary shadow response must have kind=work.");
     return Object.freeze({ kind: "work", output: boundedText(parsed.output) });

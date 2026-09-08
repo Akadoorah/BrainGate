@@ -241,6 +241,33 @@ test("shadow invoker sends Claude payload through stdin while argv remains gener
   assert.doesNotMatch(fake.calls[0]!.args.join(" "), /private task body/);
 });
 
+// Both shapes below were produced by real provider CLIs, not invented: Codex omits the literal
+// `kind` key while answering the reviewer contract correctly.
+test("reviewer response missing the literal kind key is accepted, and a mismatched kind still fails closed", async () => {
+  const { repo, project } = setupProject();
+  const reviewerRequest: AgentRequest = { role: "reviewer", model: { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription" }, phase: "review", task: "review this", findings: [] };
+
+  const withoutKind = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ verdict: "approve", findings: [] }) }));
+  const accepted = await new SubscriptionShadowAgentInvoker({ project, cwd: repo, snapshots: [snapshot("anthropic")], context: {}, executor: withoutKind }).invoke(reviewerRequest);
+  assert.deepEqual(accepted, { kind: "review", verdict: "approve", findings: [] });
+
+  const wrongKind = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", verdict: "approve", findings: [] }) }));
+  await assert.rejects(
+    () => new SubscriptionShadowAgentInvoker({ project, cwd: repo, snapshots: [snapshot("anthropic")], context: {}, executor: wrongKind }).invoke(reviewerRequest),
+    /invalid verdict/,
+  );
+});
+
+test("the role prompt never carries task text and tells the provider not to echo the request", () => {
+  const { repo } = setupProject();
+  const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: new Date("2026-09-07T01:00:00Z") });
+  const prompt = plan.args.join(" ");
+  assert.doesNotMatch(prompt, /private task body|private context body/);
+  assert.match(prompt, /responseContract/);
+  assert.match(prompt, /Do not echo the request back/);
+  assert.match(prompt, /no markdown code fences/);
+});
+
 test("node executor blocks cwd escapes, scrubs API env overrides and stages clean workspace", async () => {
   const { repo, project, root } = setupProject();
   const basePlan: ShadowInvocationPlan = {
