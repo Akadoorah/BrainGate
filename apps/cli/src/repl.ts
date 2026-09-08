@@ -1,0 +1,167 @@
+import { existsSync } from "node:fs";
+import { basename, resolve } from "node:path";
+import { createInterface, type Interface } from "node:readline/promises";
+import { runCli } from "./cli.js";
+import { runDogfoodCli } from "./dogfood-cli.js";
+
+/**
+ * The interactive session: `braingate` with no arguments and a terminal attached.
+ *
+ * It is a thin shell over the same `runCli` / `runDogfoodCli` entry points the flags drive, so
+ * there is no second implementation of routing, budgets, or the write boundary to drift.
+ *
+ * One property is deliberately preserved rather than smoothed away. `--execute` is the only
+ * thing that reaches a model, and typing a sentence must not quietly become that. So every
+ * request is planned first — which costs nothing — and the plan is shown with its
+ * classification, the model that would run, and any reviewer, before anything is spent. The
+ * gate does not disappear here; it becomes a human confirmation instead of a flag.
+ */
+
+interface ReplDeps {
+  readonly cwd: string;
+  readonly stdout: (text: string) => void;
+  readonly stderr: (text: string) => void;
+  readonly ask: (question: string) => Promise<string | null>;
+}
+
+const WRITE_INTENT = /^\s*(add|append|change|convert|correct|create|delete|drop|edit|extract|fix|implement|inline|insert|migrate|move|refactor|remove|rename|reorder|replace|rewrite|set|split|swap|update|write)\b/i;
+
+/**
+ * Guesses whether free text asks for a change rather than an answer.
+ *
+ * A wrong guess is safe by construction: the mode is named in the confirmation line before
+ * anything runs, so the operator sees "write" and can decline. Detection is a convenience, and
+ * the confirmation — not this regular expression — is what protects the checkout.
+ */
+export function looksLikeWriteRequest(text: string): boolean {
+  return WRITE_INTENT.test(text);
+}
+
+function firstLine(text: string): string {
+  return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
+}
+
+async function runPlanned(input: string, deps: ReplDeps): Promise<void> {
+  const mode = looksLikeWriteRequest(input) ? "write" : "ask";
+  const captured: string[] = [];
+  const capture = (text: string): void => { captured.push(text); };
+
+  const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input], {
+    cwd: deps.cwd, stdout: capture, stderr: capture,
+  });
+  const summary = firstLine(captured.join(""));
+  if (plan.exitCode !== 0) { deps.stderr(`${captured.join("")}\n`); return; }
+
+  deps.stdout(`\n  ${mode === "write" ? "write · isolated worktree" : "read-only"} · ${summary}\n`);
+  const answer = await deps.ask(mode === "write" ? "  Run it? This changes a task worktree, never your checkout. [y/N] " : "  Run it? [y/N] ");
+  if (answer === null || !/^y(es)?$/i.test(answer.trim())) { deps.stdout("  Skipped. Nothing was spent.\n\n"); return; }
+
+  deps.stdout("\n");
+  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--execute"], {
+    cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr,
+  });
+  deps.stdout(result.exitCode === 0 ? "\n" : "\n  Exit 1: completed but needs your review.\n\n");
+}
+
+async function runSlash(line: string, deps: ReplDeps): Promise<"continue" | "exit"> {
+  const [command, ...rest] = line.slice(1).trim().split(/\s+/);
+  const io = { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr };
+
+  switch (command) {
+    case "exit": case "quit": case "q":
+      return "exit";
+    case "help": case "?":
+      deps.stdout([
+        "",
+        "  Type a request in plain words. A question is answered; an instruction to change",
+        "  something is planned as a write into an isolated worktree. Either way you see the",
+        "  plan and confirm before anything is spent.",
+        "",
+        "  /status     recent tasks in this project",
+        "  /models     configured models and reviewer independence",
+        "  /providers  which provider CLIs are available and how they authenticate",
+        "  /doctor     validate project, models and reviewer isolation",
+        "  /feedback <task-id> <T0-T4> <success|partial|failure>",
+        "  /exit",
+        "",
+      ].join("\n"));
+      return "continue";
+    case "status":
+      await runCli(["status", "--project", ".brain/project.json"], io);
+      return "continue";
+    case "models":
+      await runCli(["models", "profile"], io);
+      return "continue";
+    case "providers":
+      await runCli(["discover"], io);
+      return "continue";
+    case "doctor":
+      await runCli(["doctor", "--project", ".brain/project.json"], io);
+      return "continue";
+    case "feedback": {
+      const [taskId, complexity, outcome] = rest;
+      if (taskId === undefined || complexity === undefined || outcome === undefined) {
+        deps.stderr("  Usage: /feedback <task-id> <T0-T4> <success|partial|failure>\n");
+        return "continue";
+      }
+      await runDogfoodCli(["dogfood", "feedback", "--task-id", taskId, "--actual-complexity", complexity, "--outcome", outcome], io);
+      return "continue";
+    }
+    default:
+      deps.stderr(`  Unknown command /${String(command)}. Try /help.\n`);
+      return "continue";
+  }
+}
+
+/**
+ * Runs the session. Returns the process exit code.
+ *
+ * Callers are responsible for deciding that a terminal exists; without one the flag interface
+ * is the only sensible surface and `braingate` prints its command listing instead.
+ */
+export async function runRepl(deps: ReplDeps): Promise<number> {
+  if (!existsSync(resolve(deps.cwd, ".brain", "project.json"))) {
+    deps.stderr([
+      `  No BrainGate project in ${basename(deps.cwd)}.`,
+      "",
+      "  Run `braingate init` here first. The project id is the isolation boundary for",
+      "  memory, worktrees and telemetry, so it is registered explicitly rather than assumed.",
+      "",
+    ].join("\n"));
+    return 1;
+  }
+
+  const header: string[] = [];
+  await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t) });
+  deps.stdout(`\n  BrainGate · ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
+
+  for (;;) {
+    const line = await deps.ask("> ");
+    if (line === null) return 0;
+    const input = line.trim();
+    if (input.length === 0) continue;
+    if (input.startsWith("/")) {
+      if (await runSlash(input, deps) === "exit") return 0;
+      continue;
+    }
+    await runPlanned(input, deps);
+  }
+}
+
+/** Wires the session to the real terminal. */
+export async function runReplOnTerminal(cwd: string): Promise<number> {
+  const rl: Interface = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return await runRepl({
+      cwd,
+      stdout: (text) => process.stdout.write(text),
+      stderr: (text) => process.stderr.write(text),
+      ask: async (question) => {
+        try { return await rl.question(question); }
+        catch { return null; }
+      },
+    });
+  } finally {
+    rl.close();
+  }
+}
