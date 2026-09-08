@@ -2,10 +2,11 @@ import { BrainGateInvariantError, type ExecutionBudget, type RegisteredProject, 
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
-import { SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
+import { NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { assertClaudeWriteEligible, NodeClaudeWriteExecutor, planClaudeWriteInvocation } from "./claude-write-profile.js";
 import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
-import type { PlannedWriteRole, WriteProviderExecutor, WriteRunResult, WriteTaskPlan, WriteVerificationResult } from "./types.js";
+import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
+import type { PlannedWriteRole, VisualRequest, WriteProviderExecutor, WriteRunResult, WriteTaskPlan, WriteVerificationResult } from "./types.js";
 
 function modelRef(route: RouteResult): ModelRef {
   const definition = route.selected.model.definition;
@@ -138,6 +139,7 @@ export class WriteDogfoodRunner {
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #writer: WriteProviderExecutor;
   readonly #reviewExecutor: ShadowProcessExecutor | undefined;
+  readonly #visualExecutor: ShadowProcessExecutor | undefined;
 
   constructor(input: {
     readonly project: RegisteredProject;
@@ -148,6 +150,8 @@ export class WriteDogfoodRunner {
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly writer?: WriteProviderExecutor;
     readonly reviewExecutor?: ShadowProcessExecutor;
+    /** Executor for the artifact-producing pass; defaults to the real one. */
+    readonly visualExecutor?: ShadowProcessExecutor;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
@@ -157,6 +161,7 @@ export class WriteDogfoodRunner {
     this.#codexIsolation = input.codexIsolation;
     this.#writer = input.writer ?? new NodeClaudeWriteExecutor();
     this.#reviewExecutor = input.reviewExecutor;
+    this.#visualExecutor = input.visualExecutor;
   }
 
   async run(input: {
@@ -166,6 +171,8 @@ export class WriteDogfoodRunner {
     readonly classification: TaskClassification;
     readonly budget: ExecutionBudget;
     readonly requiredContextTokens: number;
+    /** When present, an artifact-producing pass runs in the same worktree (ADR 0007). */
+    readonly visual?: VisualRequest;
     readonly context: unknown;
     readonly review?: boolean;
     readonly dryRun?: boolean;
@@ -205,9 +212,21 @@ export class WriteDogfoodRunner {
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });
 
-      const guarded = collectGuardedDiff(handle.worktreePath);
+      // A visual task runs a second, artifact-producing invocation in the same worktree. It is
+      // the same task, guarded the same way: the artifacts join the diff rather than bypassing
+      // it, and everything below — verification, review, approval — is unchanged.
+      let artifacts: readonly CollectedArtifact[] = [];
+      if (input.visual !== undefined) {
+        artifacts = await this.#runVisual({ input, task, handle, visual: input.visual });
+      }
+
+      const guarded = collectGuardedDiff(handle.worktreePath, artifacts);
       assertSourceCheckoutClean(handle.repositoryPath);
       this.#ledger.appendEvent(task.taskId, "write.changes_collected", { changedFiles: guarded.changedFiles, changedFileCount: guarded.changedFiles.length, diffBytes: Buffer.byteLength(guarded.diff, "utf8") });
+      if (artifacts.length > 0) {
+        // Path, media type, size and hash: what a reviewer needs to judge a file they cannot read.
+        this.#ledger.appendEvent(task.taskId, "write.artifacts_collected", { artifacts: artifacts.map((artifact) => ({ path: artifact.path, mediaType: artifact.mediaType, bytes: artifact.bytes, sha256: artifact.sha256 })) });
+      }
 
       const verifier = new SafeCommandRunner([{ executable: "git", args: ["diff", "--check"] }]);
       const verifyResult = await verifier.run({ project: this.#project, profile: "verify", worktree: handle, command: { executable: "git", args: ["diff", "--check"], cwd: handle.worktreePath }, ...(input.env === undefined ? {} : { env: input.env }), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 });
@@ -252,4 +271,42 @@ export class WriteDogfoodRunner {
       worktrees.close();
     }
   }
+
+  /**
+   * Runs the artifact-producing pass and collects what it declared.
+   *
+   * The provider runs read-only against the worktree: it writes its image into its own home,
+   * declares the path, and BrainGate copies it in (ADR 0007). Nothing here relaxes the write
+   * boundary — the collector proves each file, and the diff guard exempts only those exact
+   * paths.
+   */
+  async #runVisual(input: {
+    readonly input: { readonly budget: ExecutionBudget; readonly env?: NodeJS.ProcessEnv };
+    readonly task: { readonly taskId: string };
+    readonly handle: { readonly worktreePath: string };
+    readonly visual: VisualRequest;
+  }): Promise<readonly CollectedArtifact[]> {
+    const snapshot = snapshotFor(this.#providers, input.visual.model.providerId);
+    const plan = planCodexVisualInvocation({
+      snapshot,
+      model: input.visual.model,
+      cwd: input.handle.worktreePath,
+      payload: { schemaVersion: 1, role: "visual", task: input.visual.task, context: input.visual.context ?? {} },
+      ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+    });
+
+    const executor = this.#visualExecutor ?? new NodeShadowProcessExecutor();
+    const result = await executor.run({ project: this.#project, plan, timeoutMs: input.input.budget.maxInspectionMs });
+    if (!result.spawned || result.timedOut || result.exitCode !== 0) {
+      throw new BrainGateInvariantError("VISUAL_PROVIDER_FAILED", `Codex visual provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
+    }
+    this.#ledger.recordUsage({ taskId: input.task.taskId, provider: plan.providerId, model: plan.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
+
+    const declarations = parseArtifactDeclarations(extractCodexAgentMessage(result.stdout));
+    if (declarations.length === 0) {
+      throw new BrainGateInvariantError("VISUAL_NO_ARTIFACTS", "The visual provider declared no artifacts, so the task produced nothing to review.");
+    }
+    return collectArtifacts({ worktreePath: input.handle.worktreePath, declarations });
+  }
+
 }
