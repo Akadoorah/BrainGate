@@ -22,6 +22,7 @@ import {
   NodeShadowProcessExecutor,
   ShadowDogfoodRunner,
   SubscriptionShadowAgentInvoker,
+  acceptedFeatureKeys,
   codexIsolationProfileHash,
   codexReviewerConfigArgs,
   extractCodexAgentMessage,
@@ -31,6 +32,7 @@ import {
   previewShadowInvocation,
   shadowProviderRoleStatus,
   shadowProviderStatus,
+  validCodexIsolationAttestation,
   type CodexIsolationAttestation,
   type CodexSandboxRunner,
   type ShadowInvocationPlan,
@@ -111,6 +113,7 @@ function codexIsolation(values: Partial<CodexIsolationAttestation> = {}, referen
     version: "1.0.0",
     platform: process.platform === "darwin" ? "darwin" : "linux",
     profileHash: codexIsolationProfileHash(),
+    droppedFeatureKeys: [],
     observedAt: new Date(reference - 60 * 60 * 1000).toISOString(),
     expiresAt: new Date(reference + 60 * 60 * 1000).toISOString(),
     ...values,
@@ -203,13 +206,45 @@ test("Codex sandbox self-test proves allow-inside deny-outside deny-write withou
     { exitCode: 0, stdout: "BRAINGATE_INSIDE_CANARY" },
     { exitCode: 1, stderr: "denied" },
     { exitCode: 1, stderr: "denied" },
+    // The ADR 0006 control-key probe: no unknown field reported, so every declared key stands.
+    { exitCode: 1, stderr: "stream error: unauthorized" },
   ]);
   const attestation = await new CodexIsolationVerifier({ runner, platform: "linux", env: { PATH: process.env.PATH } }).verify(snapshot("openai"), new Date("2026-09-07T01:00:00Z"));
-  assert.equal(runner.calls.length, 3);
+  assert.equal(runner.calls.length, 4);
+  assert.deepEqual(attestation.droppedFeatureKeys, []);
   assert.equal(attestation.profileHash, codexIsolationProfileHash());
   assert.equal(attestation.platform, "linux");
-  assert.ok(runner.calls.every((args) => args[0] === "sandbox" && args.includes("--permission-profile")));
-  assert.ok(runner.calls.every((args) => !args.includes("exec") && !args.includes("--model")));
+  const sandboxCalls = runner.calls.slice(0, 3);
+  assert.ok(sandboxCalls.every((args) => args[0] === "sandbox" && args.includes("--permission-profile")));
+  assert.ok(runner.calls.every((args) => !args.includes("--model")), "the probe must never pin a model");
+});
+
+test("the control-key probe drops only keys this Codex build rejects, and rebinds the profile hash", async () => {
+  // Codex 0.153.4 removed features.worktrees; --strict-config reports one unknown key per run,
+  // so the probe drops it and retries.
+  const runner = new FakeSandboxRunner([
+    { exitCode: 0, stdout: "BRAINGATE_INSIDE_CANARY" },
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "Error loading config.toml: unknown configuration field `features.hooks` in -c/--config override" },
+    { exitCode: 1, stderr: "stream error: unauthorized" },
+  ]);
+  const attestation = await new CodexIsolationVerifier({ runner, platform: "linux", env: { PATH: process.env.PATH } }).verify(snapshot("openai"), new Date("2026-09-07T01:00:00Z"));
+
+  assert.deepEqual(attestation.droppedFeatureKeys, ["hooks"]);
+  assert.notEqual(attestation.profileHash, codexIsolationProfileHash(), "a different control set must not reuse the full-set hash");
+  assert.equal(attestation.profileHash, codexIsolationProfileHash(acceptedFeatureKeys(["hooks"])));
+  assert.ok(validCodexIsolationAttestation(attestation, snapshot("openai"), { platform: "linux", now: new Date("2026-09-07T02:00:00Z") }));
+
+  // The dropped key is gone from the reviewer invocation; everything else still ships.
+  const args = codexReviewerConfigArgs("/stage", acceptedFeatureKeys(attestation.droppedFeatureKeys)).join(" ");
+  assert.doesNotMatch(args, /features\.hooks=/);
+  assert.match(args, /features\.shell_tool=false/);
+});
+
+test("an attestation naming a key BrainGate never declared is refused", () => {
+  const forged = { ...codexIsolation(), droppedFeatureKeys: ["not_a_braingate_key"] };
+  assert.equal(validCodexIsolationAttestation(forged, snapshot("openai"), { platform: "linux", now: new Date("2026-09-07T00:30:00Z") }), false);
 });
 
 test("Codex sandbox self-test fails closed if outside read succeeds and native Windows is blocked", async () => {

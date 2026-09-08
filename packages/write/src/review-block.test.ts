@@ -41,7 +41,7 @@ class RejectingReviewer implements ShadowProcessExecutor {
 }
 
 function isolation(): CodexIsolationAttestation {
-  return { providerId: "openai", source: "sandbox-self-test", version: "1.0.0", platform: process.platform === "darwin" ? "darwin" : "linux", profileHash: codexIsolationProfileHash(), observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() };
+  return { providerId: "openai", source: "sandbox-self-test", version: "1.0.0", platform: process.platform === "darwin" ? "darwin" : "linux", profileHash: codexIsolationProfileHash(), droppedFeatureKeys: [], observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3600_000).toISOString() };
 }
 
 test("review request_changes leaves worktree inspectable but marks task blocked", { skip: process.platform === "win32" }, async () => {

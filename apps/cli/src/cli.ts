@@ -348,7 +348,13 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         json,
         data,
         `Project ${project.projectId} valid. ${entries.filter((entry) => entry.configured).length} configured models.\n${snapshots.map((item) => {
-          if (item.providerId === "openai") return `${item.providerId}: ${item.available.value ? "available" : "missing"} · reviewer=${isolation.eligible ? "verified" : "blocked"}`;
+          if (item.providerId === "openai") {
+            // ADR 0006: a control key this Codex build does not recognise is reported rather
+            // than passed over, so a control disappearing upstream stays visible.
+            const dropped = isolation.attestation?.droppedFeatureKeys ?? [];
+            const note = dropped.length === 0 ? "" : ` · controls-dropped=${dropped.join(",")}`;
+            return `${item.providerId}: ${item.available.value ? "available" : "missing"} · reviewer=${isolation.eligible ? "verified" : "blocked"}${note}`;
+          }
           return `${item.providerId}: ${item.available.value ? "available" : "missing"} · shadow=${shadowProviderStatus(item.providerId).enabled ? "enabled" : "blocked"}`;
         }).join("\n")}`,
         stdout,

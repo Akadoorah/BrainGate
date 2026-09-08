@@ -74,7 +74,7 @@ class FakeReviewExecutor implements ShadowProcessExecutor {
 }
 
 function codexIsolation(): CodexIsolationAttestation {
-  return { providerId: "openai", source: "sandbox-self-test", version: "1.0.0", platform: process.platform === "darwin" ? "darwin" : "linux", profileHash: codexIsolationProfileHash(), observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() };
+  return { providerId: "openai", source: "sandbox-self-test", version: "1.0.0", platform: process.platform === "darwin" ? "darwin" : "linux", profileHash: codexIsolationProfileHash(), droppedFeatureKeys: [], observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString() };
 }
 
 test("Claude M11 write profile is restricted, worktree-scoped and keeps task out of argv", () => {

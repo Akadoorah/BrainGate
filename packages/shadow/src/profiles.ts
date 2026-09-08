@@ -4,6 +4,7 @@ import type { ModelRef } from "@braingate/router";
 import type { WorkflowRole } from "@braingate/workflows";
 import {
   CODEX_STAGE_TOKEN,
+  acceptedFeatureKeys,
   codexReviewerConfigArgs,
   validCodexIsolationAttestation,
   type CodexIsolationAttestation,
@@ -173,7 +174,9 @@ export function planShadowInvocation(input: {
       "--json",
       "--model", input.model.modelId,
       "-C", CODEX_STAGE_TOKEN,
-      ...codexReviewerConfigArgs(),
+      // Only the keys this build proved it accepts during the self-test (ADR 0006). Sending a
+      // key it does not know would abort the run under --strict-config.
+      ...codexReviewerConfigArgs(CODEX_STAGE_TOKEN, acceptedFeatureKeys(input.codexIsolation?.droppedFeatureKeys ?? [])),
       "-",
     ]);
     if (args.includes("--sandbox") || args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--full-auto")) {
