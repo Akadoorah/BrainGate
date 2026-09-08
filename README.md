@@ -42,8 +42,41 @@ Provider support today:
 | Anthropic Claude Code | `claude` | read and write |
 | OpenAI Codex | `codex` | independent reviewer only, after an isolation self-test |
 | GitHub Copilot | `copilot` | read only, subscription attested by you |
-| Google Antigravity | `agy` | discovery only; execution fail-closed |
-| xAI Grok Build | `grok` | discovery only; execution fail-closed |
+| Google Antigravity | `agy` | review and judgement; project access needs your acceptance |
+| xAI Grok Build | `grok` | review and judgement; project access needs your acceptance |
+
+### Providers BrainGate cannot scope
+
+Codex can be handed a configuration BrainGate controls, through `CODEX_HOME`, so what it may do
+during a run is provable. Antigravity and Grok cannot: Antigravity keeps configuration and
+credentials under the same `HOME`, so isolating one loses the other, and Grok resolves its
+permissions from `~/.claude/settings.local.json` — a different tool's file that BrainGate neither
+owns nor can neutralise for a single call.
+
+They are still useful, and refusing to run them would not make you safer, because you already run
+them yourself. So:
+
+- **Review and judgement need no acceptance.** Those run in a staged workspace: a fresh temporary
+  directory holding only what BrainGate put there. A provider working in one cannot leak a
+  repository it was never shown.
+- **Reading and writing your project needs your explicit acceptance**, per provider. Without it,
+  those roles stay closed.
+
+> [!WARNING]
+> **What you accept.** BrainGate cannot limit what these two reach *outside* your project. They
+> may read or write elsewhere on your machine, and no guard here sees that. It is the same
+> exposure as running `agy` or `grok` yourself, which is why accepting it is reasonable — but it
+> is not zero.
+>
+> What does **not** change: writes still happen in a task worktree, your checkout is fingerprinted
+> before and after, every changed path passes the diff guard, and nothing merges without you.
+> Those verify the outcome, so they hold whether or not the provider was isolated going in.
+> Acceptance widens which providers may be asked, never what any provider may leave behind.
+
+Acceptance is per provider, recorded with a timestamp, refused once stale, and never inferred
+from a provider being installed or signed in. `braingate doctor` names every provider running on
+your acceptance rather than proven isolation. See
+[`docs/adr/0008-operator-accepted-providers.md`](docs/adr/0008-operator-accepted-providers.md).
 
 ## Install
 

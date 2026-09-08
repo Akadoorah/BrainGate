@@ -33,9 +33,11 @@ import {
   providerFailureReason,
   previewShadowInvocation,
   shadowProviderRoleStatus,
+  validOperatorAcceptance,
   shadowProviderStatus,
   validCodexIsolationAttestation,
   type CodexIsolationAttestation,
+  type OperatorProviderAcceptance,
   type CodexSandboxRunner,
   type ShadowInvocationPlan,
   type ShadowProcessExecutor,
@@ -555,4 +557,48 @@ test("a provider failure reaches the operator with the reason attached", async (
       return /Reached maximum number of turns/.test(error.message) && /dogfood feedback/.test(error.message);
     },
   );
+});
+
+function acceptance(providerId: ProviderId, values: Partial<OperatorProviderAcceptance> = {}): OperatorProviderAcceptance {
+  return { providerId, source: "operator-accepted-unscoped-provider", acceptedAt: new Date(Date.now() - 60_000).toISOString(), ...values } as OperatorProviderAcceptance;
+}
+
+// ADR 0008. Refusing to invoke a provider the operator already runs by hand removes nothing from
+// their exposure; it only makes BrainGate less useful while the same work happens outside it.
+test("a provider that cannot be isolated may still review, because review never sees the project", () => {
+  for (const providerId of ["xai", "google"] as const) {
+    const status = shadowProviderRoleStatus(providerId, "reviewer");
+    assert.equal(status.enabled, true, `${providerId} should be eligible to review`);
+    assert.equal(status.acceptedByOperator, false, "a staged role needs no acceptance");
+    assert.match(status.reason ?? "", /staged workspace/);
+  }
+});
+
+test("project access stays closed until the operator accepts it, and the default is closed", () => {
+  for (const providerId of ["xai", "google"] as const) {
+    // No acceptance: a fresh installation routes to nothing unproven.
+    assert.equal(shadowProviderRoleStatus(providerId, "primary").enabled, false);
+    // Accepted: eligible, and the reason says what was given up.
+    const accepted = shadowProviderRoleStatus(providerId, "primary", { acceptance: acceptance(providerId) });
+    assert.equal(accepted.enabled, true);
+    assert.equal(accepted.acceptedByOperator, true);
+    assert.match(accepted.reason ?? "", /cannot scope what this provider reaches outside the project/);
+  }
+});
+
+test("an acceptance is refused when it is stale, expired, or for another provider", () => {
+  const old = acceptance("xai", { acceptedAt: new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString() });
+  assert.equal(shadowProviderRoleStatus("xai", "primary", { acceptance: old }).enabled, false, "a decision made months ago is not a decision about the provider in front of you");
+
+  const expired = acceptance("xai", { expiresAt: new Date(Date.now() - 1_000).toISOString() });
+  assert.equal(shadowProviderRoleStatus("xai", "primary", { acceptance: expired }).enabled, false);
+
+  const wrongProvider = acceptance("google");
+  assert.equal(shadowProviderRoleStatus("xai", "primary", { acceptance: wrongProvider }).enabled, false);
+});
+
+test("acceptance does not reopen a provider that is closed for a different reason", () => {
+  // Codex is reviewer-only because generation and judgement must stay separate, not because of
+  // isolation. Accepting risk does not change that.
+  assert.equal(shadowProviderRoleStatus("openai", "primary", { acceptance: acceptance("openai") }).enabled, false);
 });
