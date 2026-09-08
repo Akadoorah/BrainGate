@@ -356,6 +356,40 @@ test("a read-only run that mutates the source checkout fails closed and the task
   assert.equal(existsSync(join(repo, "provider-escaped.txt")), true, "the fixture must actually have written, or the guard proves nothing");
 });
 
+// Each of these was silently invisible to a porcelain-status-only fingerprint. They are the
+// surfaces that leak credentials, rewrite BrainGate's own view of the project, or grant
+// execution on the next git command, so each gets a case rather than a shared loop.
+test("the source guard sees writes that git status hides: ignored paths and .git internals", () => {
+  const { repo } = setupProject();
+  writeFileSync(join(repo, ".gitignore"), ".env\n.brain/\nnode_modules/\n");
+  git(repo, ["add", "."]);
+  git(repo, ["-c", "user.name=BrainGate Test", "-c", "user.email=test@example.invalid", "commit", "-m", "ignores"]);
+  mkdirSync(join(repo, ".brain"));
+  mkdirSync(join(repo, "node_modules"));
+
+  const caught = (label: string, mutate: () => void): void => {
+    const before = sourceCheckoutFingerprint(repo);
+    mutate();
+    assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /changed the source checkout/, label);
+  };
+
+  caught("a gitignored credential file", () => writeFileSync(join(repo, ".env"), "SECRET=1\n"));
+  caught("BrainGate's own project manifest", () => writeFileSync(join(repo, ".brain", "project.json"), "{}\n"));
+  caught("code dropped into an ignored dependency tree", () => writeFileSync(join(repo, "node_modules", "planted.js"), "//\n"));
+  caught("a git hook, which runs on the next git command", () => writeFileSync(join(repo, ".git", "hooks", "pre-commit"), "#!/bin/sh\n"));
+  caught("git config, where core.fsmonitor is an executed command", () => writeFileSync(join(repo, ".git", "config"), "[core]\n\tfsmonitor = /tmp/planted\n"));
+});
+
+test("the source guard does not execute a planted core.fsmonitor while checking", () => {
+  const { repo } = setupProject();
+  const marker = join(repo, "..", "fsmonitor-ran.txt");
+  writeFileSync(join(repo, ".git", "config"), `[core]\n\trepositoryformatversion = 0\n\tfsmonitor = "sh -c 'touch ${marker}'"\n`);
+  // The guard runs git against a checkout an untrusted provider just had write access to, so
+  // it must not honour command-valued config it finds there.
+  assert.doesNotThrow(() => sourceCheckoutFingerprint(repo));
+  assert.equal(existsSync(marker), false, "a planted fsmonitor command must never run");
+});
+
 test("a read-only run is still allowed against an already-dirty checkout it does not change", () => {
   const { repo } = setupProject();
   writeFileSync(join(repo, "work-in-progress.txt"), "uncommitted\n");
