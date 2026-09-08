@@ -47,6 +47,16 @@ interface ProfileDefinition {
   readonly needsOperatorAcceptance?: boolean;
 }
 
+/**
+ * Providers with an actual invocation profile below.
+ *
+ * Eligibility and execution have to agree. Declaring a role reachable for a provider that
+ * `planShadowInvocation` then refuses is worse than declaring it closed: the router selects the
+ * model, the operator sees it in the plan, and the failure arrives only after they have
+ * committed to the run.
+ */
+const INVOCABLE: ReadonlySet<ProviderId> = new Set<ProviderId>(["anthropic", "openai", "github-copilot"]);
+
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
   anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null },
   "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null },
@@ -324,6 +334,16 @@ export function shadowProviderRoleStatus(
     // ADR 0008: a provider that cannot be isolated is still eligible for roles that never see
     // the real checkout, because those run in a staged directory holding only what BrainGate
     // put there. Anything beyond that needs the operator's recorded acceptance.
+    if (!INVOCABLE.has(providerId)) {
+      // The staged roles and the acceptance route are the policy for this provider; what is
+      // missing is the code that would actually run it. Saying so is more useful than either
+      // silently refusing or promising a role that fails once selected.
+      return Object.freeze({
+        enabled: false,
+        reason: `${profile.blockedReason ?? "Provider is blocked."} A staged invocation profile for this provider is not implemented yet, so no role is reachable.`,
+        acceptedByOperator: false,
+      });
+    }
     const staged = profile.stagedRoles ?? [];
     if (staged.includes(role)) {
       return Object.freeze({ enabled: true, reason: "Runs in a staged workspace that never contains the project.", acceptedByOperator: false });

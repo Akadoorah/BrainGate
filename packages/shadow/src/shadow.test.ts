@@ -565,36 +565,32 @@ function acceptance(providerId: ProviderId, values: Partial<OperatorProviderAcce
 
 // ADR 0008. Refusing to invoke a provider the operator already runs by hand removes nothing from
 // their exposure; it only makes BrainGate less useful while the same work happens outside it.
-test("a provider that cannot be isolated may still review, because review never sees the project", () => {
+// Eligibility and execution must agree. Declaring a role reachable for a provider that
+// planShadowInvocation then refuses is worse than declaring it closed: the router selects the
+// model, the operator reads it in the plan, and the failure arrives after they committed.
+test("no role is offered for a provider that has no invocation profile", () => {
+  const { repo } = setupProject();
   for (const providerId of ["xai", "google"] as const) {
-    const status = shadowProviderRoleStatus(providerId, "reviewer");
-    assert.equal(status.enabled, true, `${providerId} should be eligible to review`);
-    assert.equal(status.acceptedByOperator, false, "a staged role needs no acceptance");
-    assert.match(status.reason ?? "", /staged workspace/);
+    for (const role of ["planner", "reviewer", "judge"] as const) {
+      const status = shadowProviderRoleStatus(providerId, role);
+      assert.equal(status.enabled, false, `${providerId}/${role} was offered without a way to run it`);
+      assert.match(status.reason ?? "", /not implemented yet/);
+    }
+    // And planning it really does fail, which is what the eligibility now admits up front.
+    assert.throws(
+      () => planShadowInvocation({ snapshot: snapshot(providerId), model: { providerId, modelId: "m", quotaPool: `${providerId}-pool` }, cwd: repo, payload }),
+      (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_BLOCKED",
+    );
   }
 });
 
-test("project access stays closed until the operator accepts it, and the default is closed", () => {
-  for (const providerId of ["xai", "google"] as const) {
-    // No acceptance: a fresh installation routes to nothing unproven.
-    assert.equal(shadowProviderRoleStatus(providerId, "primary").enabled, false);
-    // Accepted: eligible, and the reason says what was given up.
-    const accepted = shadowProviderRoleStatus(providerId, "primary", { acceptance: acceptance(providerId) });
-    assert.equal(accepted.enabled, true);
-    assert.equal(accepted.acceptedByOperator, true);
-    assert.match(accepted.reason ?? "", /cannot scope what this provider reaches outside the project/);
-  }
-});
-
-test("an acceptance is refused when it is stale, expired, or for another provider", () => {
-  const old = acceptance("xai", { acceptedAt: new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString() });
-  assert.equal(shadowProviderRoleStatus("xai", "primary", { acceptance: old }).enabled, false, "a decision made months ago is not a decision about the provider in front of you");
-
-  const expired = acceptance("xai", { expiresAt: new Date(Date.now() - 1_000).toISOString() });
-  assert.equal(shadowProviderRoleStatus("xai", "primary", { acceptance: expired }).enabled, false);
-
-  const wrongProvider = acceptance("google");
-  assert.equal(shadowProviderRoleStatus("xai", "primary", { acceptance: wrongProvider }).enabled, false);
+test("an acceptance is checked on its own terms: current, unexpired, and for this provider", () => {
+  // The acceptance rules are policy that outlives any one provider's implementation status.
+  assert.equal(validOperatorAcceptance(acceptance("xai"), "xai"), true);
+  assert.equal(validOperatorAcceptance(acceptance("xai", { acceptedAt: new Date(Date.now() - 91 * 24 * 60 * 60 * 1000).toISOString() }), "xai"), false, "a decision made months ago is not a decision about the provider in front of you");
+  assert.equal(validOperatorAcceptance(acceptance("xai", { expiresAt: new Date(Date.now() - 1_000).toISOString() }), "xai"), false);
+  assert.equal(validOperatorAcceptance(acceptance("google"), "xai"), false);
+  assert.equal(validOperatorAcceptance(undefined, "xai"), false);
 });
 
 test("acceptance does not reopen a provider that is closed for a different reason", () => {

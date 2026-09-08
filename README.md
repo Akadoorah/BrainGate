@@ -42,8 +42,8 @@ Provider support today:
 | Anthropic Claude Code | `claude` | read and write |
 | OpenAI Codex | `codex` | independent reviewer only, after an isolation self-test |
 | GitHub Copilot | `copilot` | read only, subscription attested by you |
-| Google Antigravity | `agy` | review and judgement; project access needs your acceptance |
-| xAI Grok Build | `grok` | review and judgement; project access needs your acceptance |
+| Google Antigravity | `agy` | discovered, not yet invocable |
+| xAI Grok Build | `grok` | discovered, not yet invocable |
 
 ### Providers BrainGate cannot scope
 
@@ -53,14 +53,18 @@ credentials under the same `HOME`, so isolating one loses the other, and Grok re
 permissions from `~/.claude/settings.local.json` — a different tool's file that BrainGate neither
 owns nor can neutralise for a single call.
 
-They are still useful, and refusing to run them would not make you safer, because you already run
-them yourself. So:
+Refusing to run them would not make you safer, because you already run them yourself, so the
+policy for reaching them is settled:
 
-- **Review and judgement need no acceptance.** Those run in a staged workspace: a fresh temporary
-  directory holding only what BrainGate put there. A provider working in one cannot leak a
-  repository it was never shown.
-- **Reading and writing your project needs your explicit acceptance**, per provider. Without it,
-  those roles stay closed.
+- **Planning, review and judgement will need no acceptance.** Those run in a staged workspace: a
+  fresh temporary directory holding only what BrainGate put there. A provider working in one
+  cannot leak a repository it was never shown.
+- **Reading and writing your project will need your explicit acceptance**, per provider.
+
+What is missing is the invocation profile that would actually run them — the flags, the staged
+home, the isolation checks, the way Codex and Claude each have one. Until that exists neither
+provider is selectable, and `braingate doctor` says so rather than offering a role that would
+fail once chosen.
 
 > [!WARNING]
 > **What you accept.** BrainGate cannot limit what these two reach *outside* your project. They
