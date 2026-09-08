@@ -73,7 +73,12 @@ CLIs it wraps do:
 
 ```
 $ braingate
-  BrainGate · Dogfood preflight demo-api: ask=ready · write=ready · configured=5 · model calls=0
+
+  ▌  B R A I N G A T E
+  ▌  · · · · ◈ · · · ·
+  ▌  route each task to the cheapest worker that can do it
+
+  Dogfood preflight demo-api: ask=ready · write=ready · configured=5 · model calls=0
   Type a request, or /help. Nothing is spent until you confirm.
 
 > what theme value is in config.yml?
@@ -100,6 +105,9 @@ passing through a conversation. `/forget` drops it; project memory is untouched.
 
 `/help`, `/status`, `/models`, `/providers`, `/doctor`, `/feedback`, `/forget`, `/exit` cover
 the rest.
+
+`NO_COLOR` drops the colour, `BRAINGATE_NO_ANIMATION=1` draws the banner in one frame, and a
+`dumb` terminal gets both.
 
 Piped or scripted, `braingate` prints its command listing instead, so nothing reading its output
 changes behaviour. The flag interface below is unchanged and remains the scripting surface.
