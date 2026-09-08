@@ -117,7 +117,43 @@ export function collectArtifacts(input: {
   return Object.freeze(collected);
 }
 
-const DECLARATION_BLOCK = /BRAINGATE_ARTIFACTS\s*(\{[\s\S]*?\}|\[[\s\S]*?\])/;
+const DECLARATION_MARKER = "BRAINGATE_ARTIFACTS";
+
+/**
+ * Extracts the JSON value that follows the marker, by matching brackets.
+ *
+ * A regular expression cannot do this: a lazy one stops at the first closing brace and truncates
+ * every nested declaration, and a greedy one swallows whatever prose follows. Strings are
+ * tracked so a bracket inside a filename does not end the scan early.
+ */
+function declarationBlock(reply: string): string | null {
+  const marker = reply.indexOf(DECLARATION_MARKER);
+  if (marker < 0) return null;
+  let index = marker + DECLARATION_MARKER.length;
+  while (index < reply.length && /\s/.test(reply[index]!)) index += 1;
+
+  const open = reply[index];
+  if (open !== "{" && open !== "[") return null;
+  const close = open === "{" ? "}" : "]";
+
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let cursor = index; cursor < reply.length; cursor += 1) {
+    const char = reply[cursor]!;
+    if (escaped) { escaped = false; continue; }
+    if (char === "\\") { escaped = true; continue; }
+    if (char === '"') { inString = !inString; continue; }
+    if (inString) continue;
+    if (char === open) depth += 1;
+    else if (char === close) {
+      depth -= 1;
+      if (depth === 0) return reply.slice(index, cursor + 1);
+    }
+  }
+  // Opened and never closed: unreadable, which is not the same as absent.
+  throw new BrainGateInvariantError("ARTIFACT_DECLARATION_INVALID", "The provider's artifact declaration is not closed.");
+}
 
 /**
  * Reads artifact declarations out of a provider's reply.
@@ -128,11 +164,11 @@ const DECLARATION_BLOCK = /BRAINGATE_ARTIFACTS\s*(\{[\s\S]*?\}|\[[\s\S]*?\])/;
  * "produced nothing" and "said something unreadable" call for different responses.
  */
 export function parseArtifactDeclarations(reply: string): readonly ArtifactDeclaration[] {
-  const match = DECLARATION_BLOCK.exec(reply);
-  if (match === null) return Object.freeze([]);
+  const block = declarationBlock(reply);
+  if (block === null) return Object.freeze([]);
 
   let parsed: unknown;
-  try { parsed = JSON.parse(match[1]!); }
+  try { parsed = JSON.parse(block); }
   catch { throw new BrainGateInvariantError("ARTIFACT_DECLARATION_INVALID", "The provider's artifact declaration is not valid JSON."); }
 
   const entries = Array.isArray(parsed) ? parsed : (parsed as { artifacts?: unknown }).artifacts;
