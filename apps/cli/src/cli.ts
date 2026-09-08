@@ -265,8 +265,37 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     const state = resolveOperatorState(env);
     const command = args.shift();
     if (command === undefined || command === "help" || command === "--help") {
-      data = { commands: ["doctor", "discover", "models", "shadow", "write", "status", "dashboard"] };
-      emit(json, data, "BrainGate commands: doctor, discover, models, shadow, write, status, dashboard", stdout);
+      // init and dogfood are dispatched before this handler is reached, so they were absent
+      // from the only listing a new user sees — which left the two commands they actually
+      // need undiscoverable. The listing describes every command the binary accepts.
+      data = { commands: ["init", "dogfood", "doctor", "discover", "models", "memory", "shadow", "write", "status", "dashboard"] };
+      emit(
+        json,
+        data,
+        [
+          "BrainGate — one local control plane for the AI coding subscriptions you already use.",
+          "",
+          "Start here",
+          "  braingate init                       register the repository in the current directory",
+          "  braingate dogfood preflight          check readiness, zero model calls",
+          '  braingate dogfood ask plan --task "<question>"',
+          '  braingate dogfood ask run  --task "<question>" --execute',
+          "",
+          "Everything else",
+          "  discover     which provider CLIs are installed and how they are authenticated",
+          "  doctor       validate the project, models and reviewer isolation",
+          "  models       list | validate | add | remove | import-discovered | profile",
+          "  memory       preview | import | promote | list",
+          "  dogfood      preflight | ask | write | feedback | report | export",
+          "  shadow       read-only provider run outside the dogfood flow",
+          "  write        worktree-only change outside the dogfood flow",
+          "  status       recent tasks for a project",
+          "  dashboard    local read-only web view",
+          "",
+          "plan and run without --execute make no provider model calls.",
+        ].join("\n"),
+        stdout,
+      );
       return Object.freeze({ exitCode: 0, data });
     }
 
