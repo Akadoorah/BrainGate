@@ -1,3 +1,4 @@
+import { findManifest } from "./manifest-path.js";
 import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -107,7 +108,9 @@ function emit(json: boolean, data: unknown, human: string, stdout: (text: string
 }
 
 function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
-  const path = resolve(cwd, manifest);
+  // Walks upward, because init writes the manifest at the repository root and this may be run
+  // from any directory beneath it.
+  const path = findManifest(cwd, manifest);
   // A missing manifest is the ordinary "you are not in a registered project" case, especially
   // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
   // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about

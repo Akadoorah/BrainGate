@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { basename, resolve } from "node:path";
+import { basename } from "node:path";
+import { findManifest } from "./manifest-path.js";
 import { createInterface, type Interface } from "node:readline/promises";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
@@ -164,7 +165,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   // Arriving in an unregistered directory is the ordinary first run, not an error to be turned
   // away at. The banner has already said what this is; now offer the one command that starts,
   // rather than printing an instruction and exiting.
-  if (!existsSync(resolve(deps.cwd, ".brain", "project.json"))) {
+  if (!existsSync(findManifest(deps.cwd))) {
     deps.stdout([
       `  No BrainGate project in ${basename(deps.cwd)} yet.`,
       "  The project id is the isolation boundary for memory, worktrees and telemetry,",
