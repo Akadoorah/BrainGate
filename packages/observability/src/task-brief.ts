@@ -216,7 +216,7 @@ export function recordTaskBrief(ledger: TaskLedger, brief: TaskBrief): void {
 export interface WorkflowReceiptSummary {
   readonly outcome: WorkflowReceipt["outcome"];
   readonly roles: readonly {
-    readonly role: "primary" | "reviewer" | "judge";
+    readonly role: "planner" | "primary" | "reviewer" | "judge";
     readonly providerId: string;
     readonly modelId: string;
     readonly quotaPool: string;
@@ -225,7 +225,7 @@ export interface WorkflowReceiptSummary {
   readonly budget: BudgetSnapshot;
 }
 
-function roleSummary(role: "primary" | "reviewer" | "judge", candidate: WorkflowReceipt["primary"] | null) {
+function roleSummary(role: "planner" | "primary" | "reviewer" | "judge", candidate: WorkflowReceipt["primary"] | null) {
   if (candidate === null) return null;
   const definition = candidate.model.definition;
   return Object.freeze({

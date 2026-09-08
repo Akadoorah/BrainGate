@@ -5,7 +5,7 @@ export type DogfoodOutcome = "success" | "partial" | "blocked" | "failed";
 export type DogfoodReviewerVerdict = "approve" | "request_changes" | "disagree" | null;
 
 export interface DogfoodRole {
-  readonly role: "primary" | "reviewer" | "judge";
+  readonly role: "planner" | "primary" | "reviewer" | "judge";
   readonly providerId: string;
   readonly modelId: string;
 }
