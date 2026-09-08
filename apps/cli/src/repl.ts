@@ -107,7 +107,7 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
         "",
         "  /status     recent tasks in this project",
         "  /models     configured models and reviewer independence",
-        "  /providers  which provider CLIs are available and how they authenticate",
+        "  /providers  which CLIs are installed, and which role each may take here",
         "  /doctor     validate project, models and reviewer isolation",
         "  /forget     drop this session's thread (project memory is untouched)",
         "  /feedback <task-id> <T0-T4> <success|partial|failure>",
@@ -126,7 +126,12 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
       await runCli(["models", "profile"], io);
       return "continue";
     case "providers":
+      // Two halves of one question. Discovery says what is installed and how it is signed in;
+      // the role listing says what BrainGate will actually let each one do on this machine,
+      // and why the closed ones are closed. Either alone leaves the operator guessing.
       await runCli(["discover"], io);
+      deps.stdout("\n");
+      await runCli(["providers", "list"], io);
       return "continue";
     case "doctor":
       await runCli(["doctor", "--project", ".brain/project.json"], io);
