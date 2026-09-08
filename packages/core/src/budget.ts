@@ -13,17 +13,28 @@ export interface ExecutionBudget {
   readonly maxAutomaticRetries: number;
   readonly maxCouncilRounds: number;
   readonly maxContextTokens: number;
+  /**
+   * Tool-use turns a read-only inspection may spend gathering context. It scales with
+   * complexity for the same reason maxContextTokens does: a budget that allows 96k tokens of
+   * context but only the turn count of a trivial lookup cannot actually reach it.
+   */
+  readonly maxInspectionTurns: number;
+  /**
+   * Wall-clock allowance for one read-only inspection. Scales with the turn allowance for the
+   * same reason: turns the provider is permitted but has no time to spend are not a budget.
+   */
+  readonly maxInspectionMs: number;
   readonly reviewerPolicy: ReviewerPolicy;
   readonly councilPolicy: CouncilPolicy;
   readonly humanApprovalBeforeWrite: boolean;
 }
 
 const BASE_BUDGETS: Readonly<Record<TaskComplexity, ExecutionBudget>> = {
-  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
+  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 4, maxInspectionMs: 60000, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 6, maxInspectionMs: 120000, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 8, maxInspectionMs: 240000, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 10, maxInspectionMs: 420000, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 12, maxInspectionMs: 600000, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
 };
 
 export function budgetFor(classification: TaskClassification, options: { writeRequested: boolean }): ExecutionBudget {

@@ -100,6 +100,8 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #executor: ShadowProcessExecutor;
   readonly #ledger: TaskLedger | null;
   readonly #taskId: string | null;
+  readonly #maxTurns: number | undefined;
+  readonly #timeoutMs: number | undefined;
 
   constructor(input: {
     readonly project: RegisteredProject;
@@ -111,6 +113,10 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly executor?: ShadowProcessExecutor;
     readonly ledger?: TaskLedger;
     readonly taskId?: string;
+    /** Tool-use turns a read-only inspection may spend; from the task's execution budget. */
+    readonly maxTurns?: number;
+    /** Wall-clock allowance for one invocation; from the task's execution budget. */
+    readonly timeoutMs?: number;
   }) {
     this.#project = input.project;
     this.#cwd = input.cwd;
@@ -121,6 +127,8 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#executor = input.executor ?? new NodeShadowProcessExecutor();
     this.#ledger = input.ledger ?? null;
     this.#taskId = input.taskId ?? null;
+    this.#maxTurns = input.maxTurns;
+    this.#timeoutMs = input.timeoutMs;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
 
@@ -143,13 +151,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       model: request.model,
       cwd: this.#cwd,
       payload,
+      ...(this.#maxTurns === undefined ? {} : { maxTurns: this.#maxTurns }),
       ...(attestation === undefined ? {} : { attestation }),
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
     });
     const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
     this.#event("shadow.provider.started", safeMeta);
     try {
-      const result = await this.#executor.run({ project: this.#project, plan });
+      const result = await this.#executor.run({ project: this.#project, plan, ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }) });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         this.#event("shadow.provider.failed", { ...safeMeta, timedOut: result.timedOut, exitCode: result.exitCode, error: redactSecrets(result.stderr).slice(0, 500) });
         throw new BrainGateInvariantError("SHADOW_PROVIDER_FAILED", `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
