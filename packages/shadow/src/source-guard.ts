@@ -143,9 +143,13 @@ export function sourceCheckoutFingerprint(repositoryPath: string): string {
  */
 export function assertSourceCheckoutUnchanged(repositoryPath: string, before: string): void {
   if (sourceCheckoutFingerprint(repositoryPath) !== before) {
+    // The guard sees that the checkout changed; it cannot see who changed it. Editing your own
+    // files while a task runs trips it exactly as a misbehaving provider would, and blaming the
+    // provider for your own edit sends the reader after the wrong thing. Both possibilities are
+    // named, strongest first, because the dangerous one must not be buried.
     throw new BrainGateInvariantError(
       "SHADOW_SOURCE_MUTATED",
-      "A read-only shadow run changed the source checkout. The provider did not honour its read-only profile.",
+      "The source checkout changed while a read-only task was running. Either the provider did not honour its read-only profile, or the checkout was edited during the run — check `git status` and re-run if the change was yours.",
     );
   }
 }

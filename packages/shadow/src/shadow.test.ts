@@ -428,7 +428,7 @@ test("a read-only run that mutates the source checkout fails closed and the task
       title: "Inspect readme", task: taskText, cwd: repo, classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 500,
       context: {}, contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
     }),
-    /SHADOW_SOURCE_MUTATED|changed the source checkout/,
+    /SHADOW_SOURCE_MUTATED|checkout changed while a read-only task was running/,
   );
   assert.equal(existsSync(join(repo, "provider-escaped.txt")), true, "the fixture must actually have written, or the guard proves nothing");
 });
@@ -447,7 +447,7 @@ test("the source guard sees writes that git status hides: ignored paths and .git
   const caught = (label: string, mutate: () => void): void => {
     const before = sourceCheckoutFingerprint(repo);
     mutate();
-    assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /changed the source checkout/, label);
+    assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /checkout changed while a read-only task was running/, label);
   };
 
   caught("a gitignored credential file", () => writeFileSync(join(repo, ".env"), "SECRET=1\n"));
@@ -473,7 +473,7 @@ test("a read-only run is still allowed against an already-dirty checkout it does
   const before = sourceCheckoutFingerprint(repo);
   assert.doesNotThrow(() => assertSourceCheckoutUnchanged(repo, before));
   writeFileSync(join(repo, "work-in-progress.txt"), "changed by something else\n");
-  assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /changed the source checkout/);
+  assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /checkout changed while a read-only task was running/);
 });
 
 test("high-risk workflow routes Claude primary plus Codex independent reviewer when isolation is proven", { skip: process.platform === "win32" }, async () => {

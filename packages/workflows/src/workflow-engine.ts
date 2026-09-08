@@ -149,7 +149,7 @@ export class WorkflowEngine {
     finalOutput = initial.output;
 
     const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && input.optionalReview);
-    if (!needsReview) return this.#receipt(input, "completed_without_review", primary, null, null, events, tracker, finalOutput);
+    if (!needsReview) return this.#receipt(input, "completed_without_review", plan, primary, null, null, events, tracker, finalOutput);
 
     const primaryRef = modelRef(primary);
     const reviewerExcluded = input.excludeProviders?.reviewer;
@@ -187,13 +187,13 @@ export class WorkflowEngine {
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
 
-    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved", primary, reviewer, null, events, tracker, finalOutput);
+    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved", plan, primary, reviewer, null, events, tracker, finalOutput);
 
     if (reviewerResponse.verdict === "disagree") {
-      return await this.#resolveDisagreement(input, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke);
+      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke);
     }
 
-    if (input.budget.maxRepairRounds < 1) return this.#receipt(input, "blocked_changes_required", primary, reviewer, null, events, tracker, finalOutput);
+    if (input.budget.maxRepairRounds < 1) return this.#receipt(input, "blocked_changes_required", plan, primary, reviewer, null, events, tracker, finalOutput);
     tracker.recordRepairRound();
     const findings = boundFindings(reviewerResponse.findings);
     const repair = await invoke("primary", primary, "repair-1", findings, finalOutput, false);
@@ -202,21 +202,22 @@ export class WorkflowEngine {
     emit("repair.completed", "primary", primaryRef, `findings:${findings.length}`);
 
     if (input.budget.maxReviewers < 2 || tracker.snapshot().providerCalls >= input.budget.maxProviderCalls) {
-      return this.#receipt(input, "repaired_needs_review", primary, reviewer, null, events, tracker, finalOutput);
+      return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput);
     }
 
     reviewerResponse = await invoke("reviewer", reviewer, "review-2", [], finalOutput, true);
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
-    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved_after_repair", primary, reviewer, null, events, tracker, finalOutput);
+    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved_after_repair", plan, primary, reviewer, null, events, tracker, finalOutput);
     if (reviewerResponse.verdict === "disagree") {
-      return await this.#resolveDisagreement(input, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke);
+      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke);
     }
-    return this.#receipt(input, "repaired_needs_review", primary, reviewer, null, events, tracker, finalOutput);
+    return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput);
   }
 
   async #resolveDisagreement(
     input: WorkflowInput,
+    plan: RouteCandidate | null,
     primary: RouteCandidate,
     reviewer: RouteCandidate,
     findings: readonly string[],
@@ -226,10 +227,10 @@ export class WorkflowEngine {
     invoke: (role: AgentRequest["role"], candidate: RouteCandidate, phase: string, findings: readonly string[], candidateOutput: string | null, reviewerLike: boolean) => Promise<AgentResponse>,
   ): Promise<WorkflowReceipt> {
     if (input.budget.councilPolicy !== "disagreement-only" || input.budget.maxCouncilRounds < 1) {
-      return this.#receipt(input, "blocked_disagreement", primary, reviewer, null, events, tracker, finalOutput);
+      return this.#receipt(input, "blocked_disagreement", plan, primary, reviewer, null, events, tracker, finalOutput);
     }
     if (tracker.snapshot().reviewers >= input.budget.maxReviewers || tracker.snapshot().providerCalls >= input.budget.maxProviderCalls) {
-      return this.#receipt(input, "blocked_disagreement", primary, reviewer, null, events, tracker, finalOutput);
+      return this.#receipt(input, "blocked_disagreement", plan, primary, reviewer, null, events, tracker, finalOutput);
     }
     tracker.recordCouncilRound();
     const judgeExcluded = input.excludeProviders?.judge;
@@ -246,10 +247,10 @@ export class WorkflowEngine {
     const response = await invoke("judge", judge, "judge-1", bounded, finalOutput, true);
     if (response.kind !== "judge") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Judge response was not judge.");
     events.push(Object.freeze({ sequence: events.length + 1, kind: `judge.${response.verdict}`, role: "judge", model: modelRef(judge), detail: response.rationale.slice(0, 1_000) }));
-    return this.#receipt(input, response.verdict === "approve" ? "approved_by_judge" : "blocked_changes_required", primary, reviewer, judge, events, tracker, finalOutput);
+    return this.#receipt(input, response.verdict === "approve" ? "approved_by_judge" : "blocked_changes_required", plan, primary, reviewer, judge, events, tracker, finalOutput);
   }
 
-  #receipt(input: WorkflowInput, outcome: WorkflowOutcome, primary: RouteCandidate, reviewer: RouteCandidate | null, judge: RouteCandidate | null, events: WorkflowEvent[], tracker: BudgetTracker, finalOutput: string): WorkflowReceipt {
-    return Object.freeze({ outcome, primary, reviewer, judge, reviewIndependence: reviewIndependence(primary, reviewer, input), events: Object.freeze([...events]), budget: tracker.snapshot(), finalOutput });
+  #receipt(input: WorkflowInput, outcome: WorkflowOutcome, planner: RouteCandidate | null, primary: RouteCandidate, reviewer: RouteCandidate | null, judge: RouteCandidate | null, events: WorkflowEvent[], tracker: BudgetTracker, finalOutput: string): WorkflowReceipt {
+    return Object.freeze({ outcome, planner, primary, reviewer, judge, reviewIndependence: reviewIndependence(primary, reviewer, input), events: Object.freeze([...events]), budget: tracker.snapshot(), finalOutput });
   }
 }
