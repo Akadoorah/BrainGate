@@ -158,3 +158,24 @@ test("report and regression JSONL are deterministic and contain no prompt/diff s
     assert.deepEqual(lines.map((line) => line.taskId), [...lines.map((line) => line.taskId)].sort());
   } finally { store.close(); }
 });
+
+// `planner` was added to WorkflowRole and this validator was not updated, so a task planned,
+// executed and reviewed successfully and was then rejected on the way into telemetry — after
+// the work was done and paid for. Every role the engine can route must be storable.
+test("every workflow role can be recorded, so none fails a task after it succeeded", () => {
+  const f = registered("all-roles");
+  const store = new DogfoodStore(f.project);
+  try {
+    const roles = (["planner", "primary", "reviewer", "judge"] as const).map((role) => ({ role, providerId: "anthropic", modelId: `${role}-model` }));
+    store.recordRun({
+      receipt: receipt(f.project, "T3", "low"),
+      mode: "ask",
+      predicted: classification("T3", "low"),
+      effective: classification("T3", "low"),
+      roles,
+      outcome: "success",
+    });
+    const stored = store.listRuns().at(-1)!;
+    assert.deepEqual(stored.roles.map((entry) => entry.role), ["planner", "primary", "reviewer", "judge"]);
+  } finally { store.close(); }
+});

@@ -97,7 +97,9 @@ function mapUsage(receipt: TaskReceipt): readonly DogfoodUsage[] {
 
 function validateRoles(roles: readonly DogfoodRole[]): readonly DogfoodRole[] {
   return Object.freeze(roles.map((role) => {
-    if (!["primary", "reviewer", "judge"].includes(role.role) || role.providerId.trim().length === 0 || role.modelId.trim().length === 0) {
+    // Kept in step with WorkflowRole. A role the engine can route but the store rejects fails
+    // the task after the work is done and paid for, which is how `planner` first surfaced.
+    if (!["planner", "primary", "reviewer", "judge"].includes(role.role) || role.providerId.trim().length === 0 || role.modelId.trim().length === 0) {
       throw new BrainGateInvariantError("DOGFOOD_ROLE_INVALID", "Dogfood roles require a valid role, providerId and modelId.");
     }
     return Object.freeze({ role: role.role, providerId: role.providerId.trim(), modelId: role.modelId.trim() });
