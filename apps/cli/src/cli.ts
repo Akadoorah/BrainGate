@@ -11,7 +11,7 @@ import {
   type RegisteredProject,
 } from "@braingate/core";
 import { startDashboardServer } from "@braingate/dashboard";
-import { buildDashboardSnapshot, GlobalQuotaStore, type DashboardSnapshot } from "@braingate/observability";
+import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot } from "@braingate/observability";
 import {
   ModelCatalog,
   ProviderAcceptanceStore,
@@ -297,6 +297,40 @@ function runtimeFor(
     const quota = store.latest();
     const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota });
     return Object.freeze({ router: new CapabilityRouter(hydrated.registry), runtimes: hydrated.runtimes, quota });
+  } finally { store.close(); }
+}
+
+
+/**
+ * Feeds what a task spent back into the pool-load signal.
+ *
+ * The receipt already says which model burned what, natively. Until this, that number was only
+ * ever read by a person: nothing turned it into a reason to route the next task differently,
+ * which is why every role went to the strongest model every time.
+ *
+ * Only the pool, the provider and a count leave the project. A pool is shared across every
+ * project on the machine, so its load has to be global — the ledger it comes from deliberately
+ * is not.
+ */
+function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { readonly provider: string; readonly model: string | null; readonly metric: string; readonly value: number | null; readonly evidence: string }[], models: readonly ModelDefinition[]): void {
+  const poolOf = new Map(models.map((definition) => [`${definition.providerId}\u0000${definition.modelId}`, definition.quotaPool]));
+  const spend = new Map<string, { provider: string; quotaPool: string; tokens: number }>();
+  for (const row of usage) {
+    // Only what a provider counted for itself. An estimate fed back into routing would become a
+    // reason to move work, and the reason would be a guess.
+    if (row.metric !== "provider_tokens" || row.evidence !== "native" || row.value === null || row.model === null) continue;
+    const quotaPool = poolOf.get(`${row.provider}\u0000${row.model}`);
+    if (quotaPool === undefined) continue;
+    const key = `${row.provider}\u0000${quotaPool}`;
+    const current = spend.get(key) ?? { provider: row.provider, quotaPool, tokens: 0 };
+    current.tokens += row.value;
+    spend.set(key, current);
+  }
+  if (spend.size === 0) return;
+  const store = new GlobalQuotaStore(state.globalDir);
+  try {
+    recordPoolSpend(store, [...spend.values()]);
+    recordPoolLoad(store);
   } finally { store.close(); }
 }
 
@@ -712,6 +746,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           mergePerformed: result.mergePerformed,
           usage: result.taskReceipt?.usage ?? [],
         };
+        recordSpendFromReceipt(state, result.taskReceipt?.usage ?? [], new ModelCatalog(state.modelCatalogPath).configured());
         const reviewText = result.review === null ? "review=disabled" : `review=${result.review.providerId}/${result.review.modelId}:${result.review.verdict}`;
         emit(json, data, `Task ${result.taskId} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\n${reviewText}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
         return Object.freeze({ exitCode: result.readyForApproval ? 0 : 1, data });
@@ -788,6 +823,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           answer: result.workflow?.finalOutput ?? null,
           usage: result.taskReceipt.usage,
         };
+        recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
         emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · outcome=${result.workflow?.outcome ?? "unknown"}`, stdout);
         return Object.freeze({ exitCode: 0, data });
       } finally { ledger.close(); }

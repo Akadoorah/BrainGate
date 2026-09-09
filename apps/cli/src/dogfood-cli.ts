@@ -22,10 +22,10 @@ import {
   type DogfoodReviewerVerdict,
   type DogfoodRole,
 } from "@braingate/dogfood";
-import { GlobalQuotaStore } from "@braingate/observability";
+import { GlobalQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
 import { ModelListCache, ProviderDiscovery, type ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter } from "@braingate/router";
+import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
   CodexIsolationVerifier,
   ShadowDogfoodRunner,
@@ -274,6 +274,40 @@ async function grokProof(
   });
 }
 
+
+/**
+ * Feeds what a task spent back into the pool-load signal.
+ *
+ * The receipt already says which model burned what, natively. Until this, that number was only
+ * ever read by a person: nothing turned it into a reason to route the next task differently,
+ * which is why every role went to the strongest model every time.
+ *
+ * Only the pool, the provider and a count leave the project. A pool is shared across every
+ * project on the machine, so its load has to be global — the ledger it comes from deliberately
+ * is not.
+ */
+function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { readonly provider: string; readonly model: string | null; readonly metric: string; readonly value: number | null; readonly evidence: string }[], models: readonly ModelDefinition[]): void {
+  const poolOf = new Map(models.map((definition) => [`${definition.providerId}\u0000${definition.modelId}`, definition.quotaPool]));
+  const spend = new Map<string, { provider: string; quotaPool: string; tokens: number }>();
+  for (const row of usage) {
+    // Only what a provider counted for itself. An estimate fed back into routing would become a
+    // reason to move work, and the reason would be a guess.
+    if (row.metric !== "provider_tokens" || row.evidence !== "native" || row.value === null || row.model === null) continue;
+    const quotaPool = poolOf.get(`${row.provider}\u0000${row.model}`);
+    if (quotaPool === undefined) continue;
+    const key = `${row.provider}\u0000${quotaPool}`;
+    const current = spend.get(key) ?? { provider: row.provider, quotaPool, tokens: 0 };
+    current.tokens += row.value;
+    spend.set(key, current);
+  }
+  if (spend.size === 0) return;
+  const store = new GlobalQuotaStore(state.globalDir);
+  try {
+    recordPoolSpend(store, [...spend.values()]);
+    recordPoolLoad(store);
+  } finally { store.close(); }
+}
+
 function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnapshot[]): { readonly router: CapabilityRouter; readonly runtimes: readonly unknown[] } {
   const entries = new ModelCatalog(state.modelCatalogPath).load();
   if (!entries.some((entry) => entry.configured)) throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Import/discover then add scored model definitions before dogfood execution.");
@@ -449,6 +483,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
+      recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, outcome: result.workflow?.outcome ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });
       emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · observed=${observation.sequence} · outcome=${result.workflow?.outcome ?? "unknown"}`, stdout);
       return Object.freeze({ exitCode: mapped.success ? 0 : 1, data });
@@ -505,6 +540,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       const mapped = writeOutcome(result);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "write", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
+      recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, worktree: result.worktree, changedFiles: result.changedFiles, diff: result.diff, verification: result.verification, review: result.review, readyForApproval: result.readyForApproval, approvalRequired: true, mergePerformed: false, usage: result.taskReceipt.usage });
       emit(json, data, `Task ${result.taskId} · observed=${observation.sequence} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
       return Object.freeze({ exitCode: result.readyForApproval ? 0 : 1, data });

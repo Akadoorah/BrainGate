@@ -51,6 +51,9 @@ interface QuotaRow {
 }
 
 const VALID_STATUS = new Set<QuotaStatus>(["healthy", "limited", "exhausted", "unknown"]);
+
+/** Metrics that describe how much of a pool is left, and so depend on its status being known. */
+const LEVEL_METRICS = new Set(["remaining", "limit", "used", "used_ratio", "pressure"]);
 const VALID_EVIDENCE = new Set<UsageEvidence>(["native", "measured", "estimated", "unknown"]);
 
 function clean(value: string, label: string, maxLength = 240): string {
@@ -111,8 +114,15 @@ export class GlobalQuotaStore {
     if (value !== null && (!Number.isFinite(value) || value < 0)) {
       throw new BrainGateInvariantError("QUOTA_VALUE_INVALID", "Quota value must be null or a non-negative finite number.");
     }
-    if (input.status === "unknown" && value !== null) {
-      throw new BrainGateInvariantError("QUOTA_UNKNOWN_VALUE", "Unknown quota status cannot carry a numeric value.");
+    // A pool's *level* — what is left, what the ceiling is, how close it is to either — cannot
+    // be stated while its status is unknown, because that is the pairing a reader turns into
+    // "unknown · 87%".
+    //
+    // Not every row is a level. What BrainGate itself spent is a fact whether or not the pool's
+    // health is known, and refusing it forced the choice between dropping the number and
+    // claiming a health reading nobody took. The rule now says what it always meant.
+    if (input.status === "unknown" && value !== null && LEVEL_METRICS.has(input.metric)) {
+      throw new BrainGateInvariantError("QUOTA_UNKNOWN_VALUE", `Unknown quota status cannot carry a ${input.metric} value.`);
     }
     if (input.evidence === "unknown" && value !== null) {
       throw new BrainGateInvariantError("QUOTA_UNKNOWN_VALUE", "Unknown quota evidence cannot carry a numeric value.");
@@ -152,6 +162,20 @@ export class GlobalQuotaStore {
       (a.window ?? "").localeCompare(b.window ?? ""),
     );
     return Object.freeze(latest);
+  }
+
+  /**
+   * Every row observed at or after `since`, oldest first.
+   *
+   * `latest()` answers "what is the current reading", which is the wrong question for anything
+   * that accumulates: a pool's recent spend is the sum of what was recorded, not the last row.
+   */
+  since(observedAt: string, metric?: string): readonly QuotaSnapshot[] {
+    const from = timestamp(observedAt, "since");
+    const rows = metric === undefined
+      ? this.#db.prepare("SELECT * FROM quota_snapshots WHERE observed_at >= ? ORDER BY sequence ASC").all(from) as QuotaRow[]
+      : this.#db.prepare("SELECT * FROM quota_snapshots WHERE observed_at >= ? AND metric = ? ORDER BY sequence ASC").all(from, metric) as QuotaRow[];
+    return Object.freeze(rows.map(mapRow));
   }
 
   history(limit = 200): readonly QuotaSnapshot[] {

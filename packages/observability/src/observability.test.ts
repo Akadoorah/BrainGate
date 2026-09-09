@@ -147,3 +147,28 @@ test("a task card totals each model's own token count, and refuses to guess the 
     assert.equal(byModel.get("gpt-6-astra")?.evidence, "unknown");
   } finally { ledger.close(); }
 });
+
+// The rule exists so a reader never sees "unknown · 87%". It is about a pool's *level*, not
+// about every number that can be attached to a pool.
+test("an unknown pool status still refuses a level, and still accepts a measurement", () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-quota-rule-"));
+  const store = new GlobalQuotaStore(root);
+  try {
+    for (const metric of ["remaining", "limit", "pressure", "used_ratio"]) {
+      assert.throws(
+        () => store.record({ provider: "anthropic", quotaPool: "claude-subscription", metric, value: 0.87, unit: "ratio", status: "unknown", evidence: "native" }),
+        /Unknown quota status cannot carry/,
+        `${metric} is a level and must stay refused`,
+      );
+    }
+    // What BrainGate spent is a fact whether or not the pool's health is known.
+    const recorded = store.record({ provider: "anthropic", quotaPool: "claude-subscription", metric: "tokens_spent", value: 4_200, unit: "tokens", status: "unknown", evidence: "native" });
+    assert.equal(recorded.value, 4_200);
+    // Provenance is a separate rule and is untouched: a number with unknown evidence is still
+    // a number from nowhere.
+    assert.throws(
+      () => store.record({ provider: "anthropic", quotaPool: "claude-subscription", metric: "tokens_spent", value: 1, unit: "tokens", status: "healthy", evidence: "unknown" }),
+      /Unknown quota evidence cannot carry/,
+    );
+  } finally { store.close(); }
+});

@@ -408,6 +408,32 @@ bytes, and merges only when you say so.
 where your project keeps it. Routing picks whichever configured model declares a `visual`
 capability, and says so if none does.
 
+## Spreading load across the pools you pay for
+
+Routing by capability alone sends every role to the strongest model every time, which is not
+what paying for several subscriptions is for. The signal that would move it — quota pressure —
+was always `unknown`, because no provider publishes a remaining balance and nothing else filled
+it in.
+
+BrainGate does know one thing about quota: what it spent itself. Provider token counts are
+recorded natively, so pools can be compared against each other. The busiest recent pool scores
+1, the quietest 0, and the router leans away from the busy one — enough to hand planning to a
+different subscription when one has been carrying the day, and to hand it back when the load
+evens out.
+
+It is a *relative* signal and is labelled as one. It does not claim to know any pool's limit,
+because nobody publishes one and a made-up ceiling would be a number pretending to be authority.
+Three rules keep it honest:
+
+- **A provider that reports a real balance outranks it.** The local reading is recorded under
+  its own metric name as `measured`, never as `pressure`, so a receipt can say which was used.
+- **A pool nobody measured has no signal, not a zero.** Codex and Copilot report no token counts.
+  Reading silence as "idle" would send them everything.
+- **One measured pool is not a comparison.** With nothing to be relative to, there is no signal.
+
+`braingate doctor --json` shows the reading per model. Deleting
+`~/.braingate/global/quota.sqlite` forgets the history and starts again.
+
 ## How memory reaches a task
 
 Canonical project memory is retrieved for every task and travels with it, so a decision you
