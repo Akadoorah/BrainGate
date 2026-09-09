@@ -473,7 +473,17 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason } };
-      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\nZero provider model calls executed.`, stdout);
+      emit(json, data, [
+        `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}`,
+        // What each role may do, and what it asked for and did not get. Read before the run,
+        // where "the planner wanted the network and nobody accepted it" is still actionable.
+        ...plan.roles.map((role) => {
+          const grant = role.invocation.grant;
+          const refused = grant.refused.map((item) => item.capability).join(", ");
+          return `  ${role.role}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`;
+        }),
+        "Zero provider model calls executed.",
+      ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 

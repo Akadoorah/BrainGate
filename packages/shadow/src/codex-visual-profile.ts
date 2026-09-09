@@ -1,4 +1,5 @@
 import { BrainGateInvariantError } from "@braingate/core";
+import { resolveToolGrant } from "./tool-grants.js";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ModelRef } from "@braingate/router";
 import {
@@ -105,6 +106,17 @@ export function planCodexVisualInvocation(input: {
     attachmentToken: null,
     allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
     envOverrides: Object.freeze({}),
+    // A visual pass reads its brief and produces a file outside the workspace. It asks for
+    // nothing beyond that, so the grant is the smallest one BrainGate issues.
+    grant: resolveToolGrant({
+      role: "primary",
+      providerId: "openai",
+      workspaceMode: "staged-clean",
+      writeMode: false,
+      surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true },
+      attested: true,
+      operatorAccepted: false,
+    }),
     // The workspace guarantees are unchanged from the reviewer: the image is produced outside
     // it, so nothing here is relaxed to make generation possible.
     guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),

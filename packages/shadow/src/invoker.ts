@@ -198,6 +198,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #ledger: TaskLedger | null;
   readonly #taskId: string | null;
   readonly #maxTurns: number | undefined;
+  readonly #fanOut: boolean;
   readonly #timeoutMs: number | undefined;
 
   constructor(input: {
@@ -216,6 +217,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly maxTurns?: number;
     /** Wall-clock allowance for one invocation; from the task's execution budget. */
     readonly timeoutMs?: number;
+    /**
+     * Whether this task's budget allows more than one agent at once.
+     *
+     * `ExecutionBudget.maxConcurrentAgents > 1`, passed through rather than re-derived: subagents
+     * are concurrent agents, so the number that already bounds concurrency decides whether a run
+     * may hand work to helpers. A cheap question does not fan out; a T3 audit may.
+     */
+    readonly fanOut?: boolean;
   }) {
     this.#project = input.project;
     this.#cwd = input.cwd;
@@ -229,6 +238,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#ledger = input.ledger ?? null;
     this.#taskId = input.taskId ?? null;
     this.#maxTurns = input.maxTurns;
+    this.#fanOut = input.fanOut ?? false;
     this.#timeoutMs = input.timeoutMs;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
@@ -257,6 +267,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       cwd: this.#cwd,
       payload,
       ...(this.#maxTurns === undefined ? {} : { maxTurns: this.#maxTurns }),
+      fanOut: this.#fanOut,
       ...(attestation === undefined ? {} : { attestation }),
       ...(acceptance === undefined ? {} : { acceptance }),
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),

@@ -10,6 +10,8 @@ import {
 } from "./codex-isolation.js";
 import { GROK_SANDBOX_PROFILE, validGrokIsolationAttestation, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
+import { subagentsArgument } from "./subagents.js";
+import { grants, guaranteesFor, resolveToolGrant, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
 import { STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -67,6 +69,13 @@ interface ProfileDefinition {
   readonly stagedRoles?: readonly WorkflowRole[];
   /** True when project access is reachable only through an operator acceptance. */
   readonly needsOperatorAcceptance?: boolean;
+  /**
+   * What this CLI can be asked for, from the flags it actually exposes (ADR 0010).
+   *
+   * Not a judgement about the provider: a CLI with no way to deny a tool cannot be granted one,
+   * because the grant would describe an intention instead of a boundary.
+   */
+  readonly surface: ProviderGrantSurface;
 }
 
 /**
@@ -90,16 +99,18 @@ const ARGUMENT_PAYLOAD_LIMIT = 100_000;
 export const STAGED_REQUEST_FILE = "braingate-request.txt";
 
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
-  anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null },
-  "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null },
-  openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation." },
+  anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false } },
+  // `--agent` selects an agent Copilot already has; it does not accept one BrainGate wrote, so
+  // there is nothing here to bound and subagents stay closed.
+  "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false } },
+  openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
   // Grok was blocked for two reasons, and grok 1.0.13 ended both (ADR 0009). `GROK_HOME` now
   // carries configuration and credentials together, so an isolated HOME removes the other
   // tool's settings file — `grok inspect` reports `Permissions: (none)` — while authentication
   // survives; and a custom sandbox profile that cannot be applied now aborts the run instead of
   // warning. What remains is proven per invocation by a self-test rather than assumed, so Grok
   // is enabled for staged roles and still closed for anything that reads the real checkout.
-  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation." },
+  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true } },
   // Headless `agy` is fail-closed about tools — one needing permission is auto-denied, because
   // there is nobody to prompt, and the denial is reported in `denied_actions`. What is still
   // missing is any way to scope it per invocation: permissions and credentials share HOME, and
@@ -107,7 +118,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // one an isolated home the way it does for Codex and Grok. A staged run therefore keeps the
   // operator's real home, and what agy may reach elsewhere on the machine is unchecked — which
   // is the residual only the operator can accept (ADR 0008).
-  google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project." },
+  google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
 });
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
@@ -198,6 +209,14 @@ export function planShadowInvocation(input: {
   /** The operator's recorded decision, for a provider BrainGate cannot isolate (ADR 0008). */
   readonly acceptance?: OperatorProviderAcceptance;
   readonly maxTurns?: number;
+  /**
+   * Whether this task's budget allows more than one agent at once.
+   *
+   * Taken from `ExecutionBudget.maxConcurrentAgents` rather than invented here: subagents are
+   * concurrent agents, so the budget that already bounds concurrency is the thing that decides
+   * whether a run may fan out. T0-T2 do not; T3 and T4 do.
+   */
+  readonly fanOut?: boolean;
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
@@ -206,6 +225,25 @@ export function planShadowInvocation(input: {
   // The shape the provider must answer in, as a constraint it applies rather than a paragraph
   // it may ignore. Every CLI here except Copilot accepts one; Copilot keeps the long prompt.
   const schema = jsonSchemaArgument(input.payload.responseContract);
+  const attested = input.snapshot.providerId === "openai"
+    ? validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })
+    : input.snapshot.providerId === "xai"
+      ? validGrokIsolationAttestation(input.grokIsolation, input.snapshot, { now })
+      : profile.surface.isolatedPerInvocation;
+  const grant = resolveToolGrant({
+    role: input.payload.role,
+    providerId: input.snapshot.providerId,
+    // Every shadow role reads; nothing here edits, which is what keeps `edit` and `shell` out of
+    // reach on this path however generous a provider's surface is.
+    workspaceMode: input.snapshot.providerId === "anthropic" || input.snapshot.providerId === "github-copilot" ? "project" : "staged-clean",
+    writeMode: false,
+    surface: profile.surface,
+    attested,
+    operatorAccepted: validOperatorAcceptance(input.acceptance, input.snapshot.providerId, now),
+  });
+  // Two independent conditions, and both have to hold: the grant says this provider and role may
+  // have helpers at all, and the budget says this task may run more than one agent at once.
+  const subagents = grants(grant, "subagents") && input.fanOut === true ? subagentsArgument(input.payload.role) : null;
   // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
   // lower than the budget asks for would silently reimpose the limit this stopped being.
   const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
@@ -218,7 +256,10 @@ export function planShadowInvocation(input: {
       "--no-session-persistence",
       "--no-chrome",
       "--disable-slash-commands",
-      "--tools", "Read,Glob,Grep",
+      // The Agent tool appears only when the grant and the budget both allow helpers, and the
+      // helpers themselves are the ones BrainGate defined — read-only, named, and bounded.
+      "--tools", subagents === null ? "Read,Glob,Grep" : "Read,Glob,Grep,Agent",
+      ...(subagents === null ? [] : ["--agents", subagents]),
       "--disallowedTools", "mcp__*",
       "--max-turns", String(maxTurns),
       "--model", input.model.modelId,
@@ -241,7 +282,8 @@ export function planShadowInvocation(input: {
       attachmentToken: null,
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      grant,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -289,7 +331,8 @@ export function planShadowInvocation(input: {
       stagedFiles: Object.freeze({ [STAGED_SCHEMA_FILE]: JSON.stringify(jsonSchemaFor(input.payload.responseContract), null, 2) }),
       allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
       envOverrides: Object.freeze({}),
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      grant,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -316,8 +359,11 @@ export function planShadowInvocation(input: {
       "--max-turns", String(maxTurns),
       "--json-schema", schema,
       "--verbatim",
-      "--disable-web-search",
-      "--no-subagents",
+      ...(grants(grant, "web") ? [] : ["--disable-web-search"]),
+      // Grok's own subagents are banned unless BrainGate supplied the definitions. The flag is
+      // the difference between helpers whose reach nobody declared and helpers that are part of
+      // the grant.
+      ...(subagents === null ? ["--no-subagents"] : ["--agents", subagents]),
       "--no-plan",
       "--no-alt-screen",
     ]);
@@ -353,7 +399,8 @@ export function planShadowInvocation(input: {
       // the kernel, not a flag: an outside `cat` inside this profile fails with "Operation not
       // permitted". Network blocking is real on Linux and a documented no-op on macOS, so
       // noNetworkTools claims only the tools BrainGate actually disabled.
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true }),
+      grant,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -394,7 +441,8 @@ export function planShadowInvocation(input: {
       // nothing but the run, and headless agy auto-denies any tool it lacks permission for —
       // but its home is the operator's own, so `isolatedUserConfig` is false and this profile
       // is reachable only through a recorded acceptance of exactly that.
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false, noSessionPersistence: false, isolatedUserConfig: false }),
+      grant,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false, noSessionPersistence: false, isolatedUserConfig: false })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -436,7 +484,8 @@ export function planShadowInvocation(input: {
       attachmentToken: ATTACHMENT_TOKEN,
       allowedEnvKeys: Object.freeze(["COPILOT_HOME"]),
       envOverrides: Object.freeze({}),
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      grant,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -454,6 +503,7 @@ export function previewShadowInvocation(plan: ShadowInvocationPlan): ShadowInvoc
     modelId: plan.modelId,
     quotaPool: plan.quotaPool,
     inputMode: plan.inputMode,
+    grant: plan.grant,
     guarantees: plan.guarantees,
     minimumVersion: plan.minimumVersion,
   });

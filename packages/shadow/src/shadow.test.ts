@@ -41,6 +41,8 @@ import {
   grokIsolationProfileHash,
   grokSandboxProfileToml,
   jsonSchemaFor,
+  resolveToolGrant,
+  type ToolGrant,
   STAGED_SCHEMA_FILE,
   latestProfileApplied,
   unexpectedRoots,
@@ -132,6 +134,14 @@ function codexIsolation(values: Partial<CodexIsolationAttestation> = {}, referen
     expiresAt: new Date(reference + 60 * 60 * 1000).toISOString(),
     ...values,
   };
+}
+
+function readOnlyGrant(providerId: ProviderId, workspaceMode: "project" | "staged-clean" = "project"): ToolGrant {
+  return resolveToolGrant({
+    role: "primary", providerId, workspaceMode, writeMode: false,
+    surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false },
+    attested: true, operatorAccepted: false,
+  });
 }
 
 test("Claude profile is restricted/read-only and keeps task/context out of argv", () => {
@@ -407,7 +417,7 @@ test("node executor blocks cwd escapes, scrubs API env overrides and stages clea
     providerId: "anthropic", executable: process.execPath,
     args: ["-e", "process.stdout.write(String(process.env.OPENAI_API_KEY)+' sk-abcdefghijklmnopqrstuvwxyz012345')"],
     cwd: repo, workspaceMode: "project", modelId: "test", quotaPool: "test", inputMode: "stdin", stdin: "{}", attachmentContent: null, attachmentToken: null,
-    allowedEnvKeys: [], envOverrides: {}, guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("anthropic"), guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
   };
   const executor = new NodeShadowProcessExecutor();
   const result = await executor.run({ project, plan: basePlan, env: { PATH: process.env.PATH, OPENAI_API_KEY: "should-not-pass" } });
@@ -643,7 +653,7 @@ test("a staged Grok run gets its sandbox profile and its prompt, and neither sur
     args: ["-e", "const fs=require('node:fs');process.stdout.write([process.cwd(),fs.readFileSync('.grok/sandbox.toml','utf8'),fs.readFileSync(process.argv[1],'utf8'),String(process.env.GROK_HOME),String(process.env.HOME)].join('\\u0000'))", `${STAGE_PATH_TOKEN}/braingate-request.txt`],
     cwd: repo, workspaceMode: "staged-clean", modelId: "grok-4.6", quotaPool: "grok-subscription",
     inputMode: "staged-file", stdin: null, attachmentContent: "REQUEST BODY", attachmentToken: "braingate-request.txt",
-    allowedEnvKeys: [], envOverrides: {},
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"),
     guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
     minimumVersion: null,
   };
@@ -664,7 +674,7 @@ test("a staged request file cannot be aimed anywhere but the staged workspace", 
     providerId: "xai", executable: process.execPath, args: ["-e", "0"],
     cwd: repo, workspaceMode: "staged-clean", modelId: "m", quotaPool: "q",
     inputMode: "staged-file", stdin: null, attachmentContent: "body", attachmentToken: "../escaped.txt",
-    allowedEnvKeys: [], envOverrides: {},
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"),
     guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
     minimumVersion: null,
   };
@@ -827,4 +837,44 @@ test("Codex receives its schema as a file inside the only directory it can open"
   const staged = plan.stagedFiles?.[STAGED_SCHEMA_FILE];
   assert.ok(staged !== undefined, "the schema must travel with the plan");
   assert.deepEqual(JSON.parse(staged), jsonSchemaFor(reviewPayload.responseContract));
+});
+
+test("helpers appear only when the grant and the budget both allow them, and they are BrainGate's own", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const withoutFanOut = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: reference });
+  assert.ok(!withoutFanOut.args.includes("--agents"), "a budget that allows one agent gets no helpers");
+  assert.equal(withoutFanOut.args[withoutFanOut.args.indexOf("--tools") + 1], "Read,Glob,Grep");
+
+  const withFanOut = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, fanOut: true, now: reference });
+  assert.equal(withFanOut.args[withFanOut.args.indexOf("--tools") + 1], "Read,Glob,Grep,Agent");
+  const definitions = JSON.parse(withFanOut.args[withFanOut.args.indexOf("--agents") + 1]!) as Record<string, { tools: string[] }>;
+  assert.deepEqual(Object.keys(definitions), ["braingate-explorer"]);
+  for (const definition of Object.values(definitions)) {
+    assert.deepEqual(definition.tools, ["Read", "Grep", "Glob"], "a helper may never hold a tool its lead was not granted");
+  }
+});
+
+test("Grok's own subagents stay banned unless BrainGate wrote the definitions", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const grokModel: ModelRef = { providerId: "xai", modelId: "grok-4.6", quotaPool: "grok-subscription" };
+  const base = { snapshot: snapshot("xai", { version: "1.0.24" }), model: grokModel, cwd: repo, payload: { ...payload, role: "planner" as const }, grokIsolation: grokIsolation({ version: "1.0.24" }, reference.getTime()), now: reference };
+  const alone = planShadowInvocation(base);
+  assert.ok(alone.args.includes("--no-subagents"));
+  const fannedOut = planShadowInvocation({ ...base, fanOut: true });
+  assert.ok(!fannedOut.args.includes("--no-subagents"));
+  // Measured against grok 1.0.24: an array is refused with "expected a map".
+  const definitions = JSON.parse(fannedOut.args[fannedOut.args.indexOf("--agents") + 1]!) as Record<string, unknown>;
+  assert.equal(Array.isArray(definitions), false);
+  assert.ok(Object.keys(definitions).length > 0);
+});
+
+test("a plan carries what it was refused, so the operator reads it before the run rather than after", () => {
+  const { repo } = setupProject();
+  const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload: { ...payload, role: "planner" }, now: new Date("2026-09-07T01:00:00Z") });
+  const web = plan.grant.refused.find((item) => item.capability === "web");
+  assert.ok(web !== undefined, "a planner asks for the network");
+  assert.match(web.reason, /recorded acceptance/);
+  assert.equal(plan.guarantees.noNetworkTools, true);
 });

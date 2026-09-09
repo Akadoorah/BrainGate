@@ -135,6 +135,7 @@ export function buildShadowTaskPlan(input: {
     model: primaryModel,
     cwd,
     payload: payload("primary", input.task, input.context),
+    fanOut: input.budget.maxConcurrentAgents > 1,
     ...attestationFor(attestations, primaryModel.providerId),
     ...proofFor(proof, primaryModel.providerId),
   });
@@ -162,6 +163,7 @@ export function buildShadowTaskPlan(input: {
           model: plannerModel,
           cwd,
           payload: payload("planner", input.task, input.context),
+          fanOut: input.budget.maxConcurrentAgents > 1,
           ...attestationFor(attestations, plannerModel.providerId),
           ...proofFor(proof, plannerModel.providerId),
         })),
@@ -194,6 +196,7 @@ export function buildShadowTaskPlan(input: {
       model: reviewerModel,
       cwd,
       payload: payload("reviewer", input.task, input.context),
+      fanOut: input.budget.maxConcurrentAgents > 1,
       ...attestationFor(attestations, reviewerModel.providerId),
       ...proofFor(proof, reviewerModel.providerId),
     });

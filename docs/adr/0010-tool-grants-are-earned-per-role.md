@@ -1,6 +1,6 @@
 # ADR 0010: A tool grant is earned per role, not decided per provider
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -24,6 +24,12 @@ without anyone remembering to invalidate it. ADR 0006 established that pattern f
 ADR 0009 used it to reopen Grok after re-measurement.
 
 What is missing is not a safety mechanism. It is a vocabulary.
+
+The operator's direction settles the question this ADR was drafted to ask. BrainGate is to spend
+every subscription they pay for, each on the work it is best at, with the tools and subagents
+those CLIs actually have — and to stay trustworthy while doing it. A vocabulary for saying what a
+run may do is the prerequisite for both halves of that, so this decision is accepted rather than
+left pending.
 
 ## Decision
 

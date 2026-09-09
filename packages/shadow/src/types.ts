@@ -1,6 +1,7 @@
 import type { RegisteredProject } from "@braingate/core";
 import type { ProviderId } from "@braingate/providers";
 import type { WorkflowRole } from "@braingate/workflows";
+import type { ToolGrant } from "./tool-grants.js";
 
 /**
  * Placeholder for the staged workspace path, substituted at spawn time.
@@ -92,6 +93,14 @@ export interface ShadowInvocationPlan {
   readonly stagedFiles?: Readonly<Record<string, string>>;
   readonly allowedEnvKeys: readonly string[];
   readonly envOverrides: Readonly<Record<string, string>>;
+  /**
+   * What this run was permitted to do, and what it asked for and did not get (ADR 0010).
+   *
+   * On the plan rather than only in the executor, because the operator reads the plan before
+   * committing to the run — and "the planner asked for web search and did not get it, because
+   * nobody accepted network access" is exactly the sentence that used to be missing.
+   */
+  readonly grant: ToolGrant;
   readonly guarantees: ShadowGuarantees;
   readonly minimumVersion: string | null;
 }
@@ -105,6 +114,8 @@ export interface ShadowInvocationPreview {
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;
+  /** What the run may do, and what it asked for and was refused (ADR 0010). */
+  readonly grant: ToolGrant;
   readonly guarantees: ShadowGuarantees;
   readonly minimumVersion: string | null;
 }
