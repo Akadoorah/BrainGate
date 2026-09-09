@@ -1,6 +1,19 @@
+import { resolve } from "node:path";
 import { ProviderAcceptanceStore, type OperatorStatePaths } from "@braingate/operator";
 import { isProviderId, type ProviderSnapshot } from "@braingate/providers";
-import { GrokIsolationVerifier, type GrokIsolationAttestation, type OperatorProviderAcceptance, type SubscriptionAttestation } from "@braingate/shadow";
+import {
+  CodexIsolationVerifier,
+  GrokIsolationVerifier,
+  IsolationAttestationCache,
+  codexIsolationFingerprint,
+  grokIsolationFingerprint,
+  validCodexIsolationAttestation,
+  validGrokIsolationAttestation,
+  type CodexIsolationAttestation,
+  type GrokIsolationAttestation,
+  type OperatorProviderAcceptance,
+  type SubscriptionAttestation,
+} from "@braingate/shadow";
 import type { RegisteredProject } from "@braingate/core";
 import { BrainGateInvariantError } from "@braingate/core";
 
@@ -28,7 +41,12 @@ function failed(reason: string): IsolationStatus<never> {
 
 function describe(error: unknown): string {
   if (error instanceof BrainGateInvariantError) return `${error.code}: ${error.message}`;
-  return "GROK_ISOLATION_UNEXPECTED: the Grok sandbox self-test failed for an unrecognised reason.";
+  return "ISOLATION_SELF_TEST_UNEXPECTED: a provider isolation self-test failed for an unrecognised reason.";
+}
+
+/** Where the proofs are remembered, beside the rest of BrainGate's own state. */
+export function isolationCacheFor(state: OperatorStatePaths): IsolationAttestationCache {
+  return new IsolationAttestationCache({ path: resolve(state.globalDir, "isolation-attestations.json") });
 }
 
 /**
@@ -44,20 +62,79 @@ export async function grokIsolationStatus(input: {
   readonly env: NodeJS.ProcessEnv;
   readonly shouldAttempt: boolean;
   readonly project?: RegisteredProject;
+  readonly cache?: IsolationAttestationCache;
   readonly verify?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
 }): Promise<IsolationStatus<GrokIsolationAttestation>> {
   const snapshot = input.snapshots.find((item) => item.providerId === "xai");
   if (snapshot === undefined || snapshot.available.value !== true) return failed("Grok CLI is unavailable.");
   if (snapshot.authState.value === "unauthenticated") return failed("Grok is not authenticated; run `grok login`.");
   if (!input.shouldAttempt) return failed("The Grok sandbox self-test was not needed for this command.");
+
+  // The stored proof is a candidate, not a verdict: it is put through the same validation that
+  // accepted it when it was earned, against the snapshot taken moments ago. A CLI that has been
+  // updated, a policy whose hash has moved, or an entry past its own expiry falls through to a
+  // fresh self-test rather than being believed.
+  const fingerprint = input.cache === undefined ? null : safely(() => grokIsolationFingerprint(input.env, snapshot.binary));
+  if (input.cache !== undefined && fingerprint !== null) {
+    const remembered = input.cache.read<GrokIsolationAttestation>("xai", fingerprint);
+    if (remembered !== null && validGrokIsolationAttestation(remembered, snapshot)) {
+      return Object.freeze({ attempted: false, eligible: true, attestation: remembered, reason: null });
+    }
+  }
+
   try {
     const attestation = input.verify === undefined
       ? await new GrokIsolationVerifier({ env: input.env }).verify(snapshot, { projectPaths: input.project?.repositories ?? [] })
       : await input.verify(snapshot);
+    if (input.cache !== undefined && fingerprint !== null) input.cache.write("xai", fingerprint, attestation);
     return Object.freeze({ attempted: true, eligible: true, attestation, reason: null });
   } catch (error) {
     return Object.freeze({ attempted: true, eligible: false, attestation: null, reason: describe(error) });
   }
+}
+
+/**
+ * Codex's self-test, with the same treatment.
+ *
+ * Both CLIs grew their own copy of this and had started to differ; one place decides now.
+ */
+export async function codexIsolationStatusFor(input: {
+  readonly snapshots: readonly ProviderSnapshot[];
+  readonly env: NodeJS.ProcessEnv;
+  readonly shouldAttempt: boolean;
+  readonly cache?: IsolationAttestationCache;
+  readonly verify?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
+}): Promise<IsolationStatus<CodexIsolationAttestation>> {
+  const snapshot = input.snapshots.find((item) => item.providerId === "openai");
+  if (snapshot === undefined || snapshot.available.value !== true) return failed("Codex CLI is unavailable.");
+  if (snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription") {
+    return failed("ChatGPT subscription authentication is not proven by `codex login status`.");
+  }
+  if (!input.shouldAttempt) return failed("Codex isolation self-test was not needed for this command.");
+
+  const fingerprint = input.cache === undefined ? null : safely(() => codexIsolationFingerprint(input.env, snapshot.binary));
+  if (input.cache !== undefined && fingerprint !== null) {
+    const remembered = input.cache.read<CodexIsolationAttestation>("openai", fingerprint);
+    if (remembered !== null && validCodexIsolationAttestation(remembered, snapshot)) {
+      return Object.freeze({ attempted: false, eligible: true, attestation: remembered, reason: null });
+    }
+  }
+
+  try {
+    const attestation = input.verify === undefined
+      ? await new CodexIsolationVerifier({ env: input.env }).verify(snapshot)
+      : await input.verify(snapshot);
+    if (input.cache !== undefined && fingerprint !== null) input.cache.write("openai", fingerprint, attestation);
+    return Object.freeze({ attempted: true, eligible: true, attestation, reason: null });
+  } catch (error) {
+    return Object.freeze({ attempted: true, eligible: false, attestation: null, reason: describe(error) });
+  }
+}
+
+/** A fingerprint that cannot be taken is a cache miss, never a failed command. */
+function safely(compute: () => string): string | null {
+  try { return compute(); }
+  catch { return null; }
 }
 
 /** Every acceptance currently on record; staleness is judged where it is used, not here. */

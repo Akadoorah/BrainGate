@@ -1,6 +1,11 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ProviderSnapshot } from "@braingate/providers";
+import { IsolationAttestationCache, grokIsolationProfileHash, type GrokIsolationAttestation } from "@braingate/shadow";
+import { grokIsolationStatus } from "./provider-proof.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 
 function snapshots(label: string): readonly ProviderSnapshot[] {
@@ -85,4 +90,57 @@ test("invalidating forces the next request to measure again", async () => {
   h.cache.invalidate();
   await h.cache.lease()();
   assert.equal(h.calls(), 2);
+});
+
+// A remembered proof is a candidate, not a verdict. It is put through the same validation that
+// accepted it when it was earned — against a snapshot taken moments ago — so an updated CLI or a
+// changed policy falls through to a fresh self-test rather than being believed.
+test("a remembered Grok proof is re-validated against the machine as it is now", async () => {
+  const home = mkdtempSync(join(tmpdir(), "braingate-proof-home-"));
+  writeFileSync(join(home, "config.toml"), "[cli]\n", "utf8");
+  const binary = join(home, "grok");
+  writeFileSync(binary, "#!/bin/sh\n", "utf8");
+  const cache = new IsolationAttestationCache({ path: join(home, "isolation.json") });
+  const env = { GROK_HOME: home };
+
+  const grok = (version: string): ProviderSnapshot => {
+    const observedAt = "2026-09-09T00:00:00.000Z";
+    const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
+    return {
+      providerId: "xai", displayName: "Grok Build", binary,
+      available: obs(true), version: obs(version), authState: obs("authenticated" as const), authMode: obs("subscription" as const),
+      models: { value: null, evidence: "unknown", sourceCommand: null, observedAt },
+      capabilities: obs({ headless: true, structuredOutput: true, modelPinning: true, mcp: true }),
+      usage: { value: null, evidence: "unknown", sourceCommand: null, observedAt },
+      removedBillingOverrides: [], warnings: [],
+    };
+  };
+
+  let selfTests = 0;
+  const attestation = (version: string): GrokIsolationAttestation => ({
+    providerId: "xai", source: "sandbox-event-self-test", version,
+    platform: process.platform === "darwin" ? "darwin" : "linux",
+    profileHash: grokIsolationProfileHash(), readableRoots: [], networkRestricted: false, configSurfaces: [],
+    observedAt: new Date(Date.now() - 1_000).toISOString(),
+    expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+  const run = async (version: string) => await grokIsolationStatus({
+    snapshots: [grok(version)], env, shouldAttempt: true, cache,
+    verify: async () => { selfTests += 1; return attestation(version); },
+  });
+
+  const first = await run("grok 1.0.13");
+  assert.equal(first.eligible, true);
+  assert.equal(first.attempted, true, "the first command has to measure");
+
+  const second = await run("grok 1.0.13");
+  assert.equal(second.eligible, true);
+  assert.equal(second.attempted, false, "the second must reuse rather than spawn the CLI again");
+  assert.equal(selfTests, 1);
+
+  // The operator updated Grok. The stored proof describes a build that is no longer installed,
+  // so it says nothing about this one.
+  const updated = await run("grok 1.1.0");
+  assert.equal(updated.attempted, true, "an updated CLI must be measured again");
+  assert.equal(selfTests, 2);
 });

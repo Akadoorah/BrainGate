@@ -35,7 +35,7 @@ import {
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
-import { acceptedSubscriptions, configuredProvider, grokIsolationStatus, loadAcceptances } from "./provider-proof.js";
+import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
 import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
@@ -245,18 +245,15 @@ async function codexIsolationStatus(
   deps: DogfoodCliDependencies,
   env: NodeJS.ProcessEnv,
   shouldAttempt: boolean,
-): Promise<CodexIsolationStatus> {
-  const snapshot = snapshots.find((item) => item.providerId === "openai");
-  if (snapshot === undefined || snapshot.available.value !== true) return Object.freeze({ attempted: false, eligible: false, attestation: null, reason: "Codex CLI is unavailable." });
-  if (snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription") return Object.freeze({ attempted: false, eligible: false, attestation: null, reason: "ChatGPT subscription authentication is not proven by codex login status." });
-  if (!shouldAttempt) return Object.freeze({ attempted: false, eligible: false, attestation: null, reason: "Codex isolation self-test was not needed." });
-  try {
-    const value = deps.verifyCodexIsolation === undefined ? await new CodexIsolationVerifier({ env }).verify(snapshot) : await deps.verifyCodexIsolation(snapshot);
-    return Object.freeze({ attempted: true, eligible: true, attestation: value, reason: null });
-  } catch (error) {
-    const safe = safeError(error);
-    return Object.freeze({ attempted: true, eligible: false, attestation: null, reason: `${safe.code}: ${safe.message}` });
-  }
+  state: OperatorStatePaths,
+): Promise<IsolationStatus<CodexIsolationAttestation>> {
+  return await codexIsolationStatusFor({
+    snapshots,
+    env,
+    shouldAttempt,
+    cache: isolationCacheFor(state),
+    ...(deps.verifyCodexIsolation === undefined ? {} : { verify: deps.verifyCodexIsolation }),
+  });
 }
 
 /** Grok's sandbox, re-proved for this command; see apps/cli/src/provider-proof.ts. */
@@ -271,6 +268,7 @@ async function grokProof(
     snapshots,
     env,
     shouldAttempt: configuredProvider(new ModelCatalog(state.modelCatalogPath).load(), "xai"),
+    cache: isolationCacheFor(state),
     ...(project === undefined ? {} : { project }),
     ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
   });
@@ -335,7 +333,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const snapshots = await discovery(deps, state);
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
   const configured = catalog.filter((entry) => entry.configured);
-  const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"));
+  const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"), state);
   const grok = await grokProof(state, snapshots, deps, env, project);
   const acceptances = loadAcceptances(state);
   const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer") => {
@@ -430,7 +428,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
-    const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state));
+    const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state), state);
     const codexIsolation = isolation.attestation ?? undefined;
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;
@@ -485,7 +483,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const effective = adaptive.effective;
     const budget = budgetFor(effective, { writeRequested: true });
     const requiredContextTokens = contextTokens(task);
-    const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state));
+    const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state);
     const codexIsolation = isolation.attestation ?? undefined;
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;

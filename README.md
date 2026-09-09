@@ -88,6 +88,20 @@ Acceptance is per provider, recorded with a timestamp, expires after 30 days, an
 inferred from a provider being installed or signed in. A fresh installation routes to nothing
 that has neither proven itself nor been accepted.
 
+### How often a self-test runs
+
+Both self-tests are cheap in tokens and not in time, so a passing proof is remembered for a
+short while rather than re-earned on every command. It is never treated as more than it is: what
+comes back is re-validated against the provider snapshot taken moments ago, so a CLI that has
+been updated, a policy whose hash has moved, or an entry past its own expiry falls through to a
+fresh test. The provider's own configuration — the sandbox file, MCP servers, hooks — is re-read
+every time and folded into the key, because that is what goes stale fastest and a version string
+cannot see it. And reuse stops far short of the day an attestation claims to be valid, since the
+record sits in your own home.
+
+`braingate doctor` always measures. Delete `~/.braingate/global/isolation-attestations.json` to
+force the next command to measure too.
+
 ### What is still not scoped, even when a self-test passes
 
 Grok's credentials live in your own `~/.grok`, and BrainGate will not copy them out to get a
