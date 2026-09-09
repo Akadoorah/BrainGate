@@ -71,6 +71,28 @@ Official references:
 - https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference
 - https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli
 
+## What each build can be asked to do
+
+Discovery answers whether a CLI can be driven at all. A second, equally free question is what
+*this build* may be asked to do — whether it takes a JSON schema, reads a prompt from stdin,
+accepts subagent definitions, scopes a directory, sandboxes, or resumes a session.
+
+`braingate providers capabilities` answers it by reading help text and nothing else: no prompt,
+no model, no cost. Every command it issues is already on the discovery safe-command allowlist,
+and a test asserts that rather than trusting it.
+
+Two properties matter more than the list itself:
+
+- **A feature nobody looked for is `unknown`, never absent.** An unreadable help text leaves
+  every answer unknown, because recording "this build lacks it" from silence is how a stale
+  limitation outlives the release that removed it.
+- **Subcommand help is read too.** `codex --help` never mentions `--output-schema`; `codex exec
+  --help` does. Reading only the top level would have recorded a surface Codex has as one it
+  lacks.
+
+Each report carries the version it measured and the moment it was read, so a claim built on it
+can be checked against the build it came from.
+
 ## Why auth and usage can be `unknown`
 
 A truthful `unknown` is safer than spending quota, scraping provider credentials, or depending on an undocumented private endpoint. Future provider adapters may upgrade a field to `native` only when the installed official CLI exposes a stable, machine-readable, zero-prompt surface.

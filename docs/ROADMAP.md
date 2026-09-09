@@ -68,6 +68,27 @@ Pre-trial hardening for users with existing project history or only one AI subsc
 - critical tasks remain cross-provider fail-closed, while noncritical T4 same-provider review remains human-approval gated;
 - `braingate models profile` reports T0-T4 model coverage and reviewer independence.
 
+## Milestones 14-18 — Every subscription at its strongest (planned)
+
+Through M13 the control plane is complete, but four of the six router roles have exactly one
+provider that can fill them, `coder` among them. These milestones open the provider surface
+underneath the router so capability routing has something to choose between:
+
+- **M14 — Contracts and capability probes.** Native structured-output schemas per CLI, stdin for
+  Antigravity, and a dated zero-model-call capability probe so profile constants stop being
+  hand-written facts that rot.
+- **M15 — Tool grants earned per role.** Replace the fixed per-provider `guarantees` record with
+  a grant negotiated per role and proven by attestation. See ADR 0010 (proposed).
+- **M16 — More than one provider can write.** Grok and Codex coder roles behind the same
+  worktree/fingerprint/diff-guard/human-merge outcome checks that protect the Claude write path.
+- **M17 — Subagents as a routing primitive.** The router selects a team shape — a lead plus
+  BrainGate-defined subagents whose grants are a subset of the lead's — bounded by the existing
+  budget governor.
+- **M18 — Antigravity readmitted, and terminal parity.** Re-measured isolation, streaming output,
+  resumable per-project sessions, and a receipt naming which provider did which step.
+
+Full plan, measured provider evidence, and sequencing: [`MULTI_MODEL_PLAN.md`](MULTI_MODEL_PLAN.md).
+
 ## Immediate technical hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.
