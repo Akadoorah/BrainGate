@@ -55,6 +55,16 @@ function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
 }
 
+/** The per-role capability lines the plan prints under its summary. */
+export function grantLines(text: string): readonly string[] {
+  return Object.freeze(
+    text.split("\n")
+      .map((line) => line.trimEnd())
+      .filter((line) => /^\s{2}\w+: /.test(line))
+      .map((line) => line.trim()),
+  );
+}
+
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const captured: string[] = [];
@@ -69,10 +79,15 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns, discoverAll,
   });
   planning.stop();
-  const summary = firstLine(captured.join(""));
-  if (plan.exitCode !== 0) { deps.stderr(`${captured.join("")}\n`); return; }
+  const planText = captured.join("");
+  const summary = firstLine(planText);
+  if (plan.exitCode !== 0) { deps.stderr(`${planText}\n`); return; }
 
   deps.stdout(`\n  ${mode === "write" ? "write · isolated worktree" : "read-only"} · ${summary}\n`);
+  // What each role may do, and what it asked for and did not get. This is the half of the plan
+  // that used to be dropped, and it is the half that answers "why is this reading less than I
+  // expected" before the run rather than after it.
+  for (const line of grantLines(planText)) deps.stdout(`  ${line}\n`);
   const answer = await deps.ask(mode === "write" ? "  Run it? This changes a task worktree, never your checkout. [y/N] " : "  Run it? [y/N] ");
   if (answer === null || !/^y(es)?$/i.test(answer.trim())) { deps.stdout("  Skipped. Nothing was spent.\n\n"); return; }
 

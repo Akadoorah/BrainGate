@@ -80,10 +80,7 @@ this table. The first milestone below exists so the next one does not have to be
 Five milestones. Each keeps the pattern the repository was founded on — **prove, then enable**,
 never enable and hope — and each is useful on its own if the next one is delayed.
 
-### M14 — Contracts and capability probes *(foundation, no new provider power)*
-
-*Started: the capability probe below is implemented and verified against the installed CLIs;
-the schema and stdin changes are not.*
+### M14 — Contracts and capability probes ✅
 
 The cheapest milestone and the one everything else stands on.
 
@@ -97,7 +94,11 @@ The cheapest milestone and the one everything else stands on.
 - Exit condition: every provider fact used by a profile has a recorded measurement date and the
   build it was taken from.
 
-### M15 — Tool grants earned per role *(the architectural piece)*
+*Done. All four schema surfaces verified against the installed CLIs by pinning a model that
+cannot exist, so the flags are proven without spending a completion. Antigravity's stdin route
+is measured end to end, including the two shapes the first attempt got wrong.*
+
+### M15 — Tool grants earned per role ✅
 
 Today `guarantees` is a static record per provider: the union of what each profile happened to
 disable. It cannot express "this planner may search the web" or "this coder may run the test
@@ -109,9 +110,12 @@ requires a proof bound to version, platform and a hash of the policy it was earn
 proof mechanism already exists and works, twice: `codex-isolation.ts` and `grok-isolation.ts`.
 This generalises it instead of inventing anything.
 
-Requires a new ADR; drafted as **ADR 0010 (proposed)**.
+**ADR 0010, accepted.** `guarantees` is now derived from the grant and may only be narrowed by
+it, never widened — Grok keeps a shell no flag removes, and withholding the capability must not
+turn that honest `false` into a comfortable `true`. Refusals carry their reason, and the plan
+prints them per role before the run.
 
-### M16 — More than one provider can write
+### M16 — More than one provider can write ✅
 
 With grants in place, the coder role opens to the providers that can prove a bounded write:
 
@@ -128,7 +132,19 @@ apply identically to a second write provider.
 Unchanged: high/critical and T3/T4 writes stay human-gated, reviewer independence tiers stay as
 they are, and the source checkout stays untouchable.
 
-### M17 — Subagents as a routing primitive
+*Done, and re-measuring Grok first found two things worth the trip: its sandbox event log moved
+in 1.0.24, so the self-test had been failing on a file move rather than on a missing protection;
+and a custom profile that cannot be applied no longer aborts the run — it warns and continues.
+BrainGate reads that warning now, on the self-test and on every real run, and discards the output
+of a run that reports it. ADR 0009 records the weaker guarantee rather than restating the old
+one. Codex also stopped being reviewer-only: a planner and a judge run in the same staged
+workspace under the same attestation.*
+
+*What is left to the operator: the model catalogue still marks only Anthropic models
+`writeCapable`, and scores no `coder` capability for Grok or Codex. The code no longer stands in
+the way; which models may execute is their decision, recorded in their catalogue.*
+
+### M17 — Subagents as a routing primitive ◐
 
 The router stops selecting only a model and starts selecting a **team shape**: a lead plus a set
 of subagents that BrainGate itself defines and whose tool grants are a subset of the lead's.
@@ -136,10 +152,16 @@ of subagents that BrainGate itself defines and whose tool grants are a subset of
 
 Because BrainGate writes the definitions, fan-out is bounded by the same budget governor and
 loop caps that already bound everything else — the subagents are inside the grant, not an
-escape from it. This is where the goal's third pillar is actually paid: one task can spend four
-subscriptions in parallel, each on the part it is best at.
+escape from it.
 
-### M18 — Antigravity readmitted, and terminal parity
+*Half done. Claude and Grok take definitions BrainGate wrote — a read-only explorer, and a
+verifier for review — and get them whenever the grant allows and the budget already permits more
+than one agent at once (`maxConcurrentAgents > 1`, so T3 and T4). Grok's `--agents` takes a map,
+not an array; measured, not assumed. What is not built is the router selecting a team shape
+across providers: one task still runs its roles in sequence, each on the provider that suits it,
+rather than fanning one role out across four subscriptions at once.*
+
+### M18 — Antigravity readmitted, and terminal parity ◐
 
 - Re-measure Antigravity's isolation against 1.1.28 under the M14 probe. If HOME scoping is
   still impossible, it stays behind the ADR 0008 acceptance — but with stdin, `--add-dir`,
@@ -148,6 +170,12 @@ subscriptions in parallel, each on the part it is best at.
   resume), a visible tool-call timeline, and the plan-then-confirm gate the REPL already has.
   Parity with Claude Code is the floor here; the surplus is the receipt — which provider did
   which step, on which quota, and why the router chose it.
+
+*Antigravity is done and its block was re-measured rather than lifted: an isolated `HOME` still
+loses authentication on 1.1.28, so it still runs only on the operator's recorded acceptance —
+but it now reads from stdin, answers under an enforced schema, and reports its own token counts,
+so accepting it buys a real worker instead of a crippled one. The confirmation prompt shows each
+role's grant and refusals. Streaming output and resumable sessions are not built.*
 
 ## What does not change
 

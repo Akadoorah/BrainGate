@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ProjectRegistry } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
-import { looksLikeWriteRequest, runRepl } from "./repl.js";
+import { grantLines, looksLikeWriteRequest, runRepl } from "./repl.js";
 
 function git(cwd: string, args: readonly string[]): void {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -151,4 +151,18 @@ test("a subdirectory of a registered repository is not offered registration agai
   assert.equal(await s.run(), 0);
   assert.ok(!s.asked.some((q) => /Register this repository now/.test(q)), "registration was offered inside an already-registered repository");
   assert.match(s.text(), /Type a request, or \/help/);
+});
+
+test("the confirmation shows what each role may do, not only which model was chosen", () => {
+  const planned = [
+    "T4/medium · planner=anthropic/claude-fable-5-1 · reviewer=openai/gpt-6-astra",
+    "  planner: read, subagents · refused web",
+    "  reviewer: read · refused subagents",
+    "Zero provider model calls executed.",
+  ].join("\n");
+  assert.deepEqual([...grantLines(planned)], [
+    "planner: read, subagents · refused web",
+    "reviewer: read · refused subagents",
+  ]);
+  assert.deepEqual([...grantLines("T0/low · primary=anthropic/claude-haiku-4-5")], []);
 });
