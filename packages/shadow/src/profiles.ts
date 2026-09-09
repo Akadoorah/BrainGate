@@ -88,13 +88,6 @@ interface ProfileDefinition {
  */
 const INVOCABLE: ReadonlySet<ProviderId> = new Set<ProviderId>(["anthropic", "openai", "github-copilot", "xai", "google"]);
 
-/**
- * A prompt is one argument, and Linux caps a single argument at 128 KiB regardless of how much
- * room the whole command line has. A provider with no stdin route is therefore bounded well
- * below the payload cap, and saying so here beats an E2BIG from the kernel on a large context.
- */
-const ARGUMENT_PAYLOAD_LIMIT = 100_000;
-
 /** Where the staged request body is written for providers that read their prompt from a path. */
 export const STAGED_REQUEST_FILE = "braingate-request.txt";
 
@@ -406,16 +399,14 @@ export function planShadowInvocation(input: {
   }
 
   if (input.snapshot.providerId === "google") {
-    if (body.length > ARGUMENT_PAYLOAD_LIMIT) {
-      throw new BrainGateInvariantError("SHADOW_PAYLOAD_TOO_LARGE", `Antigravity takes its prompt as a command-line argument, which caps this request at ${String(ARGUMENT_PAYLOAD_LIMIT)} characters; this one is ${String(body.length)}. Route it to a provider that reads stdin, or narrow the context.`);
-    }
     const args = Object.freeze([
-      // agy rejects a detached `-p`, taking the next flag as the prompt, so the prompt is
-      // attached to the flag rather than following it.
-      `-p=${SCHEMA_PROMPT}\n\n${body}`,
-      "--output-format", "json",
-      "--model", input.model.modelId,
+      // Measured against agy 1.1.28: `--input-format stream-json` reads NDJSON from stdin, and
+      // refuses a prompt on the command line rather than silently ignoring it. The 100 KB cap
+      // that used to sit here was a property of an older build that had no stdin route at all.
+      "--input-format", "stream-json",
+      "--output-format", "stream-json",
       "--json-schema", schema,
+      "--model", input.model.modelId,
       "--disable-slash-commands",
       "--sandbox",
       "--print-timeout", `${String(Math.max(1, Math.ceil((input.maxTurns ?? 20) / 2)))}m`,
@@ -432,16 +423,21 @@ export function planShadowInvocation(input: {
       modelId: input.model.modelId,
       quotaPool: input.model.quotaPool,
       inputMode: "stdin",
-      stdin: "",
+      // Measured against agy 1.1.28: the envelope key is `event`, not `type`, and a `user` event
+      // must carry `message`. A wrong key is reported as an unknown event and silently produces
+      // no turn at all, which is the failure mode worth pinning in a test.
+      stdin: `${JSON.stringify({ event: "user", message: { role: "user", content: `${SCHEMA_PROMPT}\n\n${body}` } })}\n`,
       attachmentContent: null,
       attachmentToken: null,
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
+      grant,
       // Deliberately the weakest guarantee set BrainGate publishes. The staged workspace holds
       // nothing but the run, and headless agy auto-denies any tool it lacks permission for —
       // but its home is the operator's own, so `isolatedUserConfig` is false and this profile
-      // is reachable only through a recorded acceptance of exactly that.
-      grant,
+      // is reachable only through a recorded acceptance of exactly that. Re-measured on
+      // 2026-09-09 against agy 1.1.28: an isolated HOME still loses authentication
+      // (`agy models` answers "Please sign in"), so ADR 0008 stands for this provider.
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false, noSessionPersistence: false, isolatedUserConfig: false })),
       minimumVersion: profile.minimumVersion,
     });

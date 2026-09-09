@@ -40,6 +40,7 @@ import {
   validGrokIsolationAttestation,
   grokIsolationProfileHash,
   grokSandboxProfileToml,
+  extractAntigravityResult,
   jsonSchemaFor,
   resolveToolGrant,
   type ToolGrant,
@@ -877,4 +878,41 @@ test("a plan carries what it was refused, so the operator reads it before the ru
   assert.ok(web !== undefined, "a planner asks for the network");
   assert.match(web.reason, /recorded acceptance/);
   assert.equal(plan.guarantees.noNetworkTools, true);
+});
+
+test("Antigravity's request goes through stdin, so a large context is no longer refused", () => {
+  const { repo } = setupProject();
+  const large = { notes: "x".repeat(200_000) };
+  const plan = planShadowInvocation({
+    snapshot: snapshot("google"),
+    model: { providerId: "google", modelId: "gemini-3.8-flash-medium", quotaPool: "antigravity-subscription" },
+    cwd: repo,
+    payload: { ...payload, role: "planner", context: large },
+    acceptance: acceptance("google", { acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString() }),
+    now: new Date("2026-09-07T01:00:00Z"),
+  });
+  assert.equal(plan.inputMode, "stdin");
+  assert.equal(plan.args[plan.args.indexOf("--input-format") + 1], "stream-json");
+  assert.ok(!plan.args.some((argument) => argument.includes("x".repeat(1_000))), "the payload must not travel as an argument");
+  const line = JSON.parse(plan.stdin!.trim()) as { event: string; message: { role: string; content: string } };
+  // Measured: the key is `event`, and a `type` key is reported as an unknown event that
+  // silently produces no turn at all.
+  assert.equal(line.event, "user");
+  assert.ok(line.message.content.includes("x".repeat(1_000)));
+});
+
+test("an Antigravity stream is read from its final result, preferring the object the CLI enforced", () => {
+  const stream = [
+    '{"event":"init","conversation_id":"a"}',
+    '{"event":"result","result":{"status":"SUCCESS","response":"ready\\n{\\"kind\\":\\"work\\"}","structured_output":{"kind":"work","output":"ready"},"usage":{"input_tokens":43439,"output_tokens":73,"cache_read_tokens":0}}}',
+  ].join("\n");
+  assert.equal(extractAntigravityResult(stream), '{"kind":"work","output":"ready"}');
+  // The same run's accounting, which used to be recorded as unknown because only the outer
+  // object was read.
+  assert.deepEqual(providerTokenUsage("google", stream), { input: 43439, output: 73, cacheRead: 0 });
+
+  const withoutSchema = '{"event":"result","result":{"status":"SUCCESS","response":"plain answer"}}';
+  assert.equal(extractAntigravityResult(withoutSchema), "plain answer");
+  assert.equal(extractAntigravityResult('{"event":"init"}'), null, "a stream with no result is not an answer");
+  assert.equal(extractAntigravityResult("not json at all"), null);
 });

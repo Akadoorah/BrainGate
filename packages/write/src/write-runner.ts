@@ -124,6 +124,8 @@ export function buildWriteTaskPlan(input: {
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
   readonly acceptances?: readonly OperatorProviderAcceptance[];
+  /** The proof a Grok *write* needs, earned under the write sandbox profile rather than the read one. */
+  readonly grokWriteIsolation?: GrokIsolationAttestation;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
   readonly requiredContextTokens: number;
@@ -138,7 +140,7 @@ export function buildWriteTaskPlan(input: {
   // whoever is left, which is what makes the executing role something more than one subscription.
   const writeProof = {
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
-    ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+    ...(input.grokWriteIsolation === undefined ? {} : { grokIsolation: input.grokWriteIsolation }),
   };
   const primaryExcluded = input.providers
     .filter((snapshot) => {
@@ -195,6 +197,7 @@ export class WriteDogfoodRunner {
   readonly #attestations: readonly SubscriptionAttestation[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
+  readonly #grokWriteIsolation: GrokIsolationAttestation | undefined;
   readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #writer: WriteProviderExecutor;
   readonly #reviewExecutor: ShadowProcessExecutor | undefined;
@@ -209,6 +212,8 @@ export class WriteDogfoodRunner {
     readonly acceptances?: readonly OperatorProviderAcceptance[];
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly grokIsolation?: GrokIsolationAttestation;
+    /** The proof a Grok write needs, earned under the write sandbox profile. */
+    readonly grokWriteIsolation?: GrokIsolationAttestation;
     readonly writer?: WriteProviderExecutor;
     readonly reviewExecutor?: ShadowProcessExecutor;
     /** Executor for the artifact-producing pass; defaults to the real one. */
@@ -221,6 +226,7 @@ export class WriteDogfoodRunner {
     this.#attestations = input.attestations ?? [];
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
+    this.#grokWriteIsolation = input.grokWriteIsolation;
     this.#acceptances = input.acceptances ?? [];
     this.#writer = input.writer ?? new NodeClaudeWriteExecutor();
     this.#reviewExecutor = input.reviewExecutor;
@@ -249,6 +255,7 @@ export class WriteDogfoodRunner {
       acceptances: this.#acceptances,
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
       ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+      ...(this.#grokWriteIsolation === undefined ? {} : { grokWriteIsolation: this.#grokWriteIsolation }),
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
@@ -277,7 +284,8 @@ export class WriteDogfoodRunner {
         snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath,
         task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
         ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
-        ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+        // The write profile's proof, not the reviewer's: they are different policies.
+        ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
       });
       const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `${primary.model.providerId} write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);

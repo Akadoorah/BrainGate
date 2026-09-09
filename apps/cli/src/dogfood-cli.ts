@@ -28,10 +28,12 @@ import { ModelListCache, ProviderDiscovery, type ProviderSnapshot } from "@brain
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
   CodexIsolationVerifier,
+  GROK_WRITE_SANDBOX,
   ShadowDogfoodRunner,
   shadowProviderRoleStatus,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
+  type GrokSandboxPolicy,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
@@ -263,6 +265,8 @@ async function grokProof(
   deps: DogfoodCliDependencies,
   env: NodeJS.ProcessEnv,
   project?: RegisteredProject,
+  /** The write profile earns its own proof; the read-only staged profile is the default. */
+  policy?: GrokSandboxPolicy,
 ): Promise<Awaited<ReturnType<typeof grokIsolationStatus>>> {
   return await grokIsolationStatus({
     snapshots,
@@ -270,6 +274,7 @@ async function grokProof(
     shouldAttempt: configuredProvider(new ModelCatalog(state.modelCatalogPath).load(), "xai"),
     cache: isolationCacheFor(state),
     ...(project === undefined ? {} : { project }),
+    ...(policy === undefined ? {} : { policy }),
     ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
   });
 }
@@ -532,8 +537,12 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const codexIsolation = isolation.attestation ?? undefined;
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;
+    // A Grok write runs under a different sandbox profile than a Grok review, so it earns a
+    // different proof. Both self-tests are free; neither stands in for the other.
+    const grokWrite = await grokProof(state, snapshots, deps, env, project, GROK_WRITE_SANDBOX);
+    const grokWriteIsolation = grokWrite.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     const planData = Object.freeze({ classification: view, budget, repositoryPath, baseRef, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })), providerCallsOnPlan: 0, createsWorktree: false, mergeAvailable: false });
 
@@ -545,7 +554,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       const mapped = writeOutcome(result);

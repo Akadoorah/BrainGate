@@ -39,6 +39,13 @@ Official reference:
 
 - `agy models` is the documented model-slug listing surface.
 - Headless model prompts use `-p`; discovery explicitly forbids it.
+- Re-measured 2026-09-09 against agy 1.1.28: an isolated `HOME` still loses authentication —
+  `agy models` answers "Please sign in" — so this provider still cannot be scoped per
+  invocation, and ADR 0008's acceptance stands for it.
+- The same build does read a request from stdin (`--input-format stream-json`), as one NDJSON
+  object per line keyed `event`, and answers with an `event: "result"` object carrying
+  `response`, `structured_output`, and its own token counts. So Antigravity's payload is no
+  longer capped by the platform's argument limit, and its usage is `native` rather than unknown.
 - Cached account credentials live in the OS keyring. Antigravity can also be configured for `GEMINI_API_KEY`, so BrainGate strips API-key/base-URL overrides for subscription discovery.
 
 Official references:

@@ -44,6 +44,43 @@ export function extractCodexAgentMessage(stdout: string): string {
   return finalMessage;
 }
 
+
+/**
+ * The answer from an Antigravity stream-json run.
+ *
+ * One NDJSON object per line, and the reply is in the last line that carries one — as a
+ * `result`/`response` string, or as Anthropic-shaped `message.content`. Three shapes rather than
+ * one because the format is the CLI's, not BrainGate's, and a parser that knew only the shape it
+ * was written against would fail the whole run on a rename. A line that parses as nothing useful
+ * is skipped, never guessed at.
+ */
+/** The `result` object of an Antigravity stream-json run, or null when there is none. */
+export function antigravityResultRecord(stdout: string): Record<string, unknown> | null {
+  let latest: Record<string, unknown> | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    const result = event.result;
+    if (typeof result === "object" && result !== null) latest = result as Record<string, unknown>;
+  }
+  return latest;
+}
+
+export function extractAntigravityResult(stdout: string): string | null {
+  const record = antigravityResultRecord(stdout);
+  if (record === null) return null;
+  // The schema-conformant object the CLI enforced, when it is there. It is the same answer as
+  // `response`, minus the model's narration around it — measured: a run replying "ready" puts
+  // three lines in `response` and exactly the contracted object in `structured_output`.
+  const structured = record.structured_output;
+  if (typeof structured === "object" && structured !== null) return JSON.stringify(structured);
+  const response = record.response;
+  return typeof response === "string" && response.trim().length > 0 ? response : null;
+}
+
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   const trimmed = stdout.trim();
   if (providerId === "openai") return extractCodexAgentMessage(trimmed);
@@ -59,8 +96,10 @@ function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
     }
   }
   if (providerId === "google") {
-    // agy answers with a result envelope; a run whose tools were auto-denied still reports
-    // SUCCESS with an empty response, so an empty answer is a failure rather than a reply.
+    // agy answers a stream-json run with NDJSON, and a single-shot run with one envelope. Both
+    // shapes are read, because which one arrives depends on the build rather than on the request.
+    const streamed = extractAntigravityResult(trimmed);
+    if (streamed !== null) return streamed;
     try {
       const outer = JSON.parse(trimmed) as Record<string, unknown>;
       const response = outer.response;
@@ -132,10 +171,15 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
  * answer, and that question is the reason the router exists.
  */
 export function providerTokenUsage(providerId: string, stdout: string): { readonly input: number; readonly output: number; readonly cacheRead: number } | null {
-  let envelope: Record<string, unknown>;
-  try { envelope = JSON.parse(stdout.trim()) as Record<string, unknown>; }
-  catch { return null; }
   if (providerId !== "xai" && providerId !== "anthropic" && providerId !== "google") return null;
+  let envelope: Record<string, unknown> | null = null;
+  try { envelope = JSON.parse(stdout.trim()) as Record<string, unknown>; }
+  catch { envelope = null; }
+  // A stream reports its accounting inside the final result event rather than at the top level.
+  // Reading only the outer object recorded `unknown` for a provider that had told us exactly
+  // what it spent.
+  if (envelope === null && providerId === "google") envelope = antigravityResultRecord(stdout);
+  if (envelope === null) return null;
   const usage = envelope.usage;
   if (typeof usage !== "object" || usage === null) return null;
   const record = usage as Record<string, unknown>;
