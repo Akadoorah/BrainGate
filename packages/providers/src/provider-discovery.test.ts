@@ -151,3 +151,39 @@ test("discoverAll only issues commands from the explicit safe metadata probe set
     if (/\blogin\b/.test(command)) assert.equal(command, "codex login status");
   }
 });
+
+// Five providers probed one after another made the cost additive — seven and a half seconds
+// before a task had begun, and the interactive session paid it twice per question.
+test("providers are probed together, and the result keeps its declared order", async () => {
+  let live = 0;
+  let peak = 0;
+  const runner: ProbeRunner = {
+    async run(command) {
+      live += 1;
+      peak = Math.max(peak, live);
+      await new Promise((resolve) => setTimeout(resolve, 5));
+      live -= 1;
+      return { spawned: true, exitCode: 0, stdout: "1.0.0 --print --model json mcp", stderr: "", timedOut: false, observedAt: "2026-09-09T00:00:00.000Z", removedBillingOverrides: [], command: `${command.binary} ${command.args.join(" ")}` };
+    },
+  };
+  const snapshots = await new ProviderDiscovery(runner).discoverAll();
+  assert.ok(peak > 1, "probes ran one at a time");
+  // Order comes from the declaration, not from which process happened to finish first, so two
+  // runs of `braingate discover` stay comparable.
+  const second = await new ProviderDiscovery(runner).discoverAll();
+  assert.deepEqual(snapshots.map((item) => item.providerId), second.map((item) => item.providerId));
+});
+
+test("a command that answers two questions is run once, not raced against itself", async () => {
+  // `grok models` reports the model list and the signed-in account. Running it twice at the same
+  // instant would also put two processes into the same model cache file.
+  const seen: string[] = [];
+  const runner: ProbeRunner = {
+    async run(command) {
+      seen.push(`${command.binary} ${command.args.join(" ")}`);
+      return { spawned: true, exitCode: 0, stdout: "You are logged in with grok.com.", stderr: "", timedOut: false, observedAt: "2026-09-09T00:00:00.000Z", removedBillingOverrides: [], command: `${command.binary} ${command.args.join(" ")}` };
+    },
+  };
+  await new ProviderDiscovery(runner).discover("xai");
+  assert.equal(seen.filter((entry) => entry === "grok models").length, 1, `grok models ran ${String(seen.filter((e) => e === "grok models").length)} times`);
+});

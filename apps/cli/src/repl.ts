@@ -4,6 +4,7 @@ import { findManifest } from "./manifest-path.js";
 import { createInterface, type Interface } from "node:readline/promises";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
+import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext } from "./session-context.js";
 import { COLOURED, PLAIN, renderBanner } from "./banner.js";
 import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js";
@@ -53,15 +54,18 @@ function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
 }
 
-async function runPlanned(input: string, deps: ReplDeps, session: SessionContext): Promise<void> {
+async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const captured: string[] = [];
   const capture = (text: string): void => { captured.push(text); };
   const sessionTurns = (budget: number) => session.recent(budget);
+  // One probe for the whole request. Beyond the seconds it saves, it is what makes the plan the
+  // operator approved and the run that follows describe the same machine.
+  const discoverAll = providers.lease();
 
   const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });
   const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input], {
-    cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns,
+    cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns, discoverAll,
   });
   planning.stop();
   const summary = firstLine(captured.join(""));
@@ -80,6 +84,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     stdout: (text) => { working.stop(); spoken.push(text); deps.stdout(text); },
     stderr: (text) => { working.stop(); deps.stderr(text); },
     sessionTurns,
+    discoverAll,
   });
   working.stop();
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
@@ -193,6 +198,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   deps.stdout(`  ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
 
   const session = new SessionContext();
+  const providers = new ProviderSnapshotCache();
   for (;;) {
     const line = await deps.ask("> ");
     if (line === null) return 0;
@@ -202,7 +208,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
       if (await runSlash(input, deps, session) === "exit") return 0;
       continue;
     }
-    await runPlanned(input, deps, session);
+    await runPlanned(input, deps, session, providers);
   }
 }
 

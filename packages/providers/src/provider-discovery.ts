@@ -208,16 +208,46 @@ export class ProviderDiscovery {
 
   constructor(runner: ProbeRunner = new NodeProbeRunner()) { this.#runner = runner; }
 
+  /**
+   * Every provider, discovered at once.
+   *
+   * These probes are independent, read-only and mostly spent waiting on another process, and
+   * running them one after another made them additive: five providers at roughly a second and a
+   * half each is seven and a half seconds before a task has begun — and the interactive session
+   * pays it twice, once to plan and once to run. Nothing here needs the previous provider's
+   * answer, so nothing here should wait for it.
+   *
+   * The order of the result is the declared order, not the order they happened to finish, so a
+   * snapshot list stays comparable between runs.
+   */
   async discoverAll(): Promise<readonly ProviderSnapshot[]> {
-    const snapshots: ProviderSnapshot[] = [];
-    for (const spec of PROVIDERS) snapshots.push(await this.#discover(spec));
-    return Object.freeze(snapshots);
+    return Object.freeze(await Promise.all(PROVIDERS.map(async (spec) => await this.#discover(spec))));
   }
 
   async discover(providerId: ProviderId): Promise<ProviderSnapshot> {
     const spec = PROVIDERS.find((candidate) => candidate.providerId === providerId);
     if (spec === undefined) throw new Error(`Unknown provider: ${providerId}`);
     return await this.#discover(spec);
+  }
+
+  /**
+   * Runs a set of probes together, spawning each distinct command exactly once.
+   *
+   * Two entries naming the same command share one result rather than racing: a probe is
+   * read-only from BrainGate's side, but the CLI behind it may still write its own cache, and
+   * two copies doing that at the same instant is a bug waiting for a slow disk.
+   */
+  async #runOnce(commands: readonly (ProbeCommand | null)[]): Promise<readonly (ProbeResult | null)[]> {
+    const started = new Map<string, Promise<ProbeResult>>();
+    return await Promise.all(commands.map(async (command) => {
+      if (command === null) return null;
+      const key = formatProbeCommand(command);
+      const existing = started.get(key);
+      if (existing !== undefined) return await existing;
+      const pending = this.#runner.run(command);
+      started.set(key, pending);
+      return await pending;
+    }));
   }
 
   async #discover(spec: ProviderSpec): Promise<ProviderSnapshot> {
@@ -240,16 +270,22 @@ export class ProviderDiscovery {
       };
     }
 
+    // The remaining probes do not depend on each other either, and one of them is a network
+    // round trip. Identical commands are run once and shared: `grok models` reports both the
+    // model list and the signed-in account, and running it twice at the same moment would also
+    // have two processes writing the same model cache.
     const helpCommand: ProbeCommand = { binary: spec.binary, args: spec.helpArgs };
-    const helpResult = await this.#runner.run(helpCommand);
+    const modelCommand: ProbeCommand | null = spec.modelArgs === null ? null : { binary: spec.binary, args: spec.modelArgs, timeoutMs: 7_500 };
+    const authCommand: ProbeCommand | null = spec.authArgs === null ? null : { binary: spec.binary, args: spec.authArgs, timeoutMs: 5_000 };
+    const probes = await this.#runOnce([helpCommand, modelCommand, authCommand]);
+    const helpResult = probes[0]!;
+    const modelResult = probes[1] ?? null;
+    const authResult = probes[2] ?? null;
     const helpSource = formatProbeCommand(helpCommand);
     const warnings: string[] = [];
 
-    let modelResult: ProbeResult | null = null;
     let models: Observation<readonly string[] | null>;
-    if (spec.modelArgs !== null) {
-      const modelCommand: ProbeCommand = { binary: spec.binary, args: spec.modelArgs, timeoutMs: 7_500 };
-      modelResult = await this.#runner.run(modelCommand);
+    if (modelCommand !== null && modelResult !== null) {
       const source = formatProbeCommand(modelCommand);
       if (modelResult.spawned && modelResult.exitCode === 0 && !modelResult.timedOut) models = observation(parseModels(modelResult), "native", source, modelResult.observedAt);
       else {
@@ -261,12 +297,9 @@ export class ProviderDiscovery {
       warnings.push("No verified zero-prompt model-list command is configured for this provider.");
     }
 
-    let authResult: ProbeResult | null = null;
     let authState: Observation<ProviderAuthState>;
     let authMode: Observation<ProviderAuthMode>;
-    if (spec.authArgs !== null) {
-      const authCommand: ProbeCommand = { binary: spec.binary, args: spec.authArgs, timeoutMs: 5_000 };
-      authResult = await this.#runner.run(authCommand);
+    if (authCommand !== null && authResult !== null) {
       const source = formatProbeCommand(authCommand);
       const parsed = parseAuth(spec.providerId, authResult);
       authState = observation(parsed.state, parsed.evidence, source, authResult.observedAt);
