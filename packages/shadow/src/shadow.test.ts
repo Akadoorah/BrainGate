@@ -181,14 +181,18 @@ test("Copilot requires proven subscription or short-lived local attestation and 
   assert.doesNotMatch(command, /private task body|private context body/);
 });
 
-test("Codex is enabled only for reviewer role and requires current isolation attestation", { skip: process.platform === "win32" }, () => {
+test("Codex runs the staged roles and nothing that needs the checkout, with a current attestation", { skip: process.platform === "win32" }, () => {
   const { repo } = setupProject();
   const openai = snapshot("openai");
   const codexModel: ModelRef = { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription" };
   assert.equal(shadowProviderStatus("openai").enabled, true);
+  // `primary` is the one role a staged workspace cannot fill: it would have to read the real
+  // checkout, which the stage deliberately does not contain.
   assert.equal(shadowProviderRoleStatus("openai", "primary").enabled, false);
-  assert.equal(shadowProviderRoleStatus("openai", "reviewer").enabled, true);
-  assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload }), /reviewer-only/);
+  for (const role of ["planner", "reviewer", "judge"] as const) {
+    assert.equal(shadowProviderRoleStatus("openai", role).enabled, true, role);
+  }
+  assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload }), /staged roles only/);
   const reviewPayload: ShadowRolePayload = { ...payload, role: "reviewer", responseContract: { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" } };
   assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload }), /isolation/);
   const plan = planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload, codexIsolation: codexIsolation({}, new Date("2026-09-07T01:00:00Z").getTime()), now: new Date("2026-09-07T01:00:00Z") });

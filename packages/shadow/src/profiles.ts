@@ -96,7 +96,11 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // `--agent` selects an agent Copilot already has; it does not accept one BrainGate wrote, so
   // there is nothing here to bound and subagents stay closed.
   "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false } },
-  openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
+  // M10 opened Codex as a reviewer because that was the role the milestone needed, and the
+  // restriction outlived its reason: a planner and a judge run in the same staged workspace,
+  // under the same attestation, reading nothing the reviewer does not read. What stays closed is
+  // `primary`, which would need the real checkout.
+  openai: { providerId: "openai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: null, blockedReason: "Staged roles only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
   // Grok was blocked for two reasons, and grok 1.0.13 ended both (ADR 0009). `GROK_HOME` now
   // carries configuration and credentials together, so an isolated HOME removes the other
   // tool's settings file — `grok inspect` reports `Permissions: (none)` — while authentication
@@ -282,8 +286,9 @@ export function planShadowInvocation(input: {
   }
 
   if (input.snapshot.providerId === "openai") {
-    if (input.payload.role !== "reviewer") {
-      throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", "Codex is reviewer-only in this BrainGate milestone.");
+    const codexStaged = PROFILES.openai.stagedRoles ?? [];
+    if (!codexStaged.includes(input.payload.role)) {
+      throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", `Codex runs staged roles only (${codexStaged.join(", ")}); ${input.payload.role} would need the real checkout, which the staged workspace does not contain.`);
     }
     if (!validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })) {
       throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", "Codex reviewer isolation requires a current sandbox self-test attestation for this version/platform/profile.");
@@ -573,7 +578,6 @@ export function shadowProviderRoleStatus(
     });
   }
 
-  if (providerId === "openai" && role !== "reviewer") return Object.freeze({ enabled: false, reason: "Codex is reviewer-only in M10.", acceptedByOperator: false });
   // An enabled provider that declares staged roles is enabled for those and closed for the
   // rest. Grok's sandbox confines it to the staged workspace, which is what makes the staged
   // roles safe and, by the same fact, makes a role that must read the checkout impossible.
