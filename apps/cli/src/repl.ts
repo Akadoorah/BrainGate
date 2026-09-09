@@ -55,6 +55,17 @@ function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
 }
 
+/**
+ * How a working role reads in the indicator: what it is doing, on which model.
+ *
+ * The quota pool rather than the provider id, because that is the thing being spent, and two
+ * models from one subscription share it.
+ */
+export function activityLabel(activity: { readonly role: string; readonly model: string; readonly quotaPool: string }): string {
+  const verb = activity.role === "planner" ? "planning" : activity.role === "reviewer" ? "reviewing" : activity.role === "judge" ? "judging" : "working";
+  return `${verb} · ${activity.model} · ${activity.quotaPool}`;
+}
+
 /** The per-role capability lines the plan prints under its summary. */
 export function grantLines(text: string): readonly string[] {
   return Object.freeze(
@@ -99,6 +110,9 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     cwd: deps.cwd,
     stdout: (text) => { working.stop(); spoken.push(text); deps.stdout(text); },
     stderr: (text) => { working.stop(); deps.stderr(text); },
+    // Who is working, while they work. A task spends several roles across several
+    // subscriptions, and the indicator is the only place that is visible as it happens.
+    onRoleActivity: (activity) => { if (activity.stage === "started") working.label(activityLabel(activity)); },
     sessionTurns,
     discoverAll,
   });

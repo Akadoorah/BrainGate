@@ -12,7 +12,7 @@ import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/ro
 import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import type { GrokIsolationAttestation } from "./grok-isolation.js";
-import { SubscriptionShadowAgentInvoker } from "./invoker.js";
+import { SubscriptionShadowAgentInvoker, type RoleActivity } from "./invoker.js";
 import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import { assertSourceCheckoutUnchanged, sourceCheckoutFingerprint } from "./source-guard.js";
@@ -77,6 +77,7 @@ export class ShadowDogfoodRunner {
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
+  readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
 
   constructor(input: {
     readonly project: RegisteredProject;
@@ -88,6 +89,8 @@ export class ShadowDogfoodRunner {
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly grokIsolation?: GrokIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
+    /** Told which provider and model is working, as each role starts and finishes. */
+    readonly onRoleActivity?: (activity: RoleActivity) => void;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
@@ -98,6 +101,7 @@ export class ShadowDogfoodRunner {
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#executor = input.executor;
+    this.#onRoleActivity = input.onRoleActivity;
   }
 
   async run(input: {
@@ -172,7 +176,7 @@ export class ShadowDogfoodRunner {
 
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1 });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }) });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       assertSourceCheckoutUnchanged(cwd, sourceBefore);

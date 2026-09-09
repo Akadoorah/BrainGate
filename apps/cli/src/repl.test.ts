@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ProjectRegistry } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
-import { grantLines, looksLikeWriteRequest, runRepl } from "./repl.js";
+import { activityLabel, grantLines, looksLikeWriteRequest, runRepl } from "./repl.js";
 
 function git(cwd: string, args: readonly string[]): void {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -165,4 +165,17 @@ test("the confirmation shows what each role may do, not only which model was cho
     "reviewer: read · refused subagents",
   ]);
   assert.deepEqual([...grantLines("T0/low · primary=anthropic/claude-haiku-4-5")], []);
+});
+
+test("the indicator names the role, the model and the pool being spent", () => {
+  assert.equal(
+    activityLabel({ role: "planner", model: "grok-4.6", quotaPool: "grok-subscription" }),
+    "planning · grok-4.6 · grok-subscription",
+  );
+  assert.equal(
+    activityLabel({ role: "reviewer", model: "gpt-6-astra", quotaPool: "chatgpt-subscription" }),
+    "reviewing · gpt-6-astra · chatgpt-subscription",
+  );
+  // A role with no better verb still says which model is spending the time.
+  assert.match(activityLabel({ role: "primary", model: "claude-sonnet-5", quotaPool: "claude-subscription" }), /^working · claude-sonnet-5/);
 });

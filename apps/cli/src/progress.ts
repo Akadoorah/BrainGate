@@ -51,6 +51,14 @@ export interface ProgressOptions {
 export interface Progress {
   /** Erases the indicator. Safe to call more than once, and before the first frame. */
   readonly stop: () => void;
+  /**
+   * Renames what the indicator says is happening, without restarting the clock.
+   *
+   * A task runs several roles on several subscriptions, and "working" describes none of them.
+   * The elapsed count keeps running across the change because it measures the task, not the
+   * role — a run that spends forty seconds planning and twenty reviewing took a minute.
+   */
+  readonly label: (text: string) => void;
 }
 
 /**
@@ -61,7 +69,7 @@ export interface Progress {
  * call it without the caller tracking whether it already has.
  */
 export function startProgress(options: ProgressOptions): Progress {
-  if (options.animate === false) return Object.freeze({ stop: () => { /* nothing was drawn */ } });
+  if (options.animate === false) return Object.freeze({ stop: () => { /* nothing was drawn */ }, label: () => { /* nothing to rename */ } });
 
   const style = options.style ?? PLAIN_PROGRESS;
   const now = options.now ?? (() => Date.now());
@@ -72,11 +80,12 @@ export function startProgress(options: ProgressOptions): Progress {
   let tick = 0;
   let drawn = false;
   let stopped = false;
+  let label = options.label;
 
   const draw = (): void => {
     if (stopped) return;
     // Erase the previous frame before drawing the next, so the line replaces rather than grows.
-    options.write(`${drawn ? "\r[2K" : ""}${progressFrame(options.label, tick, now() - start, style)}`);
+    options.write(`${drawn ? "\r[2K" : ""}${progressFrame(label, tick, now() - start, style)}`);
     drawn = true;
     tick += 1;
   };
@@ -86,6 +95,7 @@ export function startProgress(options: ProgressOptions): Progress {
   handle.unref?.();
 
   return Object.freeze({
+    label: (text: string) => { label = text; },
     stop: () => {
       if (stopped) return;
       stopped = true;

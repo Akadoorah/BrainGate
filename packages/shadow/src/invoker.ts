@@ -8,6 +8,18 @@ import { planShadowInvocation } from "./profiles.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
+/** What a role is doing, as it happens. */
+export interface RoleActivity {
+  readonly stage: "started" | "completed";
+  readonly role: AgentRequest["role"];
+  readonly provider: string;
+  readonly model: string;
+  readonly quotaPool: string;
+  /** The capabilities this role actually received, so the line says what it may do. */
+  readonly grant: readonly string[];
+  readonly durationMs?: number;
+}
+
 function responseContract(role: AgentRequest["role"]): Readonly<Record<string, unknown>> {
   // A plan is work: it produces the approach the executor then follows. It is not a review, and
   // asking for a verdict here would get an opinion about the task instead of a way to do it.
@@ -243,6 +255,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #taskId: string | null;
   readonly #maxTurns: number | undefined;
   readonly #fanOut: boolean;
+  readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
   readonly #timeoutMs: number | undefined;
 
   constructor(input: {
@@ -269,6 +282,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
      * may hand work to helpers. A cheap question does not fan out; a T3 audit may.
      */
     readonly fanOut?: boolean;
+    /**
+     * Told, as each role starts and finishes, which provider and model is working.
+     *
+     * The ledger already records this, but only a reader who goes looking afterwards sees it.
+     * A terminal watching a task run has one question while it waits — who is doing this right
+     * now — and answering it is the whole difference between a spinner and a control plane.
+     */
+    readonly onRoleActivity?: (activity: RoleActivity) => void;
   }) {
     this.#project = input.project;
     this.#cwd = input.cwd;
@@ -283,6 +304,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#taskId = input.taskId ?? null;
     this.#maxTurns = input.maxTurns;
     this.#fanOut = input.fanOut ?? false;
+    this.#onRoleActivity = input.onRoleActivity;
     this.#timeoutMs = input.timeoutMs;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
@@ -319,6 +341,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     });
     const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
     this.#event("shadow.provider.started", safeMeta);
+    this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
     try {
       const result = await this.#executor.run({ project: this.#project, plan, ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }) });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
@@ -339,6 +362,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       }
       const response = parseRoleResponse(request.role, snapshot.providerId, result.stdout);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
+      this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
       this.#usage(request, result.durationMs, providerTokenUsage(snapshot.providerId, result.stdout));
       return response;
     } catch (error) {
@@ -347,6 +371,12 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       }
       throw error;
     }
+  }
+
+  #activity(activity: RoleActivity): void {
+    // Never allowed to end a task: a terminal that fails to draw is not a reason to discard a
+    // provider's answer.
+    try { this.#onRoleActivity?.(activity); } catch { /* the display is not the work */ }
   }
 
   #event(kind: string, payload: unknown): void {

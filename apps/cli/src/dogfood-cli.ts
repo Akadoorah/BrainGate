@@ -34,6 +34,7 @@ import {
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type GrokSandboxPolicy,
+  type RoleActivity,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
@@ -50,6 +51,14 @@ export interface DogfoodCliDependencies {
   readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
   readonly writeExecutor?: WriteProviderExecutor;
+  /**
+   * Told which provider and model is working, as each role starts and finishes.
+   *
+   * The terminal's one question while a task runs is who is doing this right now. A control
+   * plane that routes across four subscriptions and answers "working" has hidden the only thing
+   * that made it different from running one CLI by hand.
+   */
+  readonly onRoleActivity?: (activity: RoleActivity) => void;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   /**
@@ -494,7 +503,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }) });
+      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }) });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
