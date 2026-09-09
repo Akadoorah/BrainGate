@@ -91,6 +91,13 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           overrides.HOME = isolatedHome;
         }
 
+        for (const [name, content] of Object.entries(input.plan.stagedFiles ?? {})) {
+          if (name.includes("/") || name.includes("\\") || name.includes("..") || name.length === 0) {
+            throw new BrainGateInvariantError("SHADOW_STAGED_FILE_INVALID", "A staged file name must be a plain file name inside the workspace.");
+          }
+          writeFileSync(join(spawnCwd, name), content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        }
+
         if (input.plan.inputMode === "staged-file") {
           if (input.plan.attachmentContent === null || input.plan.attachmentToken === null) {
             throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "Staged-file plan requires request content and a file name.");
@@ -107,6 +114,10 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         }
       } else if (args.some((argument) => argument.includes(STAGE_PATH_TOKEN))) {
         throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Project-mode shadow invocation cannot contain a staged workspace token.");
+      }
+
+      if (Object.keys(input.plan.stagedFiles ?? {}).length > 0 && input.plan.workspaceMode !== "staged-clean") {
+        throw new BrainGateInvariantError("SHADOW_STAGED_FILE_INVALID", "Staged files have nowhere to go outside a staged workspace.");
       }
 
       if (input.plan.inputMode === "staged-file" && input.plan.workspaceMode !== "staged-clean") {

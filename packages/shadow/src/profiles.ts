@@ -9,6 +9,7 @@ import {
   type CodexIsolationAttestation,
 } from "./codex-isolation.js";
 import { GROK_SANDBOX_PROFILE, validGrokIsolationAttestation, type GrokIsolationAttestation } from "./grok-isolation.js";
+import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
 import { STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -16,6 +17,24 @@ const CLAUDE_MINIMUM = "2.1.248";
 // than warning and continuing. Below it, `--sandbox` is a request, not a guarantee.
 const GROK_MINIMUM = "1.0.13";
 const ATTACHMENT_TOKEN = "__BRAINGATE_SHADOW_INPUT__";
+/**
+ * The instruction for a CLI that enforces the response schema itself.
+ *
+ * Everything the long prompt spends on the shape of the reply — the keys, the literals, the no
+ * fences, the worked example — is a constraint the provider now applies. What is left is the
+ * part a schema cannot express: what the request is, and that this run analyses rather than acts.
+ */
+const SCHEMA_PROMPT = [
+  "You receive one JSON request object (appended below this instruction, or supplied as the attached file).",
+  "Use its `task` field as the request and its `context` field as supporting data.",
+  "Analyze only; do not modify files, run commands, access the network, or use external tools.",
+  "Answer with real values you produce; the response shape is enforced for you.",
+  "If you cannot complete the request, still answer in that shape and put the reason in the text field.",
+].join(" ");
+
+/** Where a staged response schema is written for a CLI that takes it as a path. */
+export const STAGED_SCHEMA_FILE = "braingate-response-schema.json";
+
 const GENERIC_PROMPT = [
   "You receive one JSON request object (appended below this instruction, or supplied as the attached file).",
   "Use its `task` field as the request and its `context` field as supporting data.",
@@ -184,6 +203,9 @@ export function planShadowInvocation(input: {
   const now = input.now ?? new Date();
   const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now);
   const body = serializedPayload(input.payload);
+  // The shape the provider must answer in, as a constraint it applies rather than a paragraph
+  // it may ignore. Every CLI here except Copilot accepts one; Copilot keeps the long prompt.
+  const schema = jsonSchemaArgument(input.payload.responseContract);
   // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
   // lower than the budget asks for would silently reimpose the limit this stopped being.
   const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
@@ -191,7 +213,7 @@ export function planShadowInvocation(input: {
   if (input.snapshot.providerId === "anthropic") {
     const args = Object.freeze([
       "--restricted",
-      "-p", GENERIC_PROMPT,
+      "-p", SCHEMA_PROMPT,
       "--output-format", "json",
       "--no-session-persistence",
       "--no-chrome",
@@ -200,6 +222,7 @@ export function planShadowInvocation(input: {
       "--disallowedTools", "mcp__*",
       "--max-turns", String(maxTurns),
       "--model", input.model.modelId,
+      "--json-schema", schema,
     ]);
     if (args.includes("--bare") || args.includes("--dangerously-skip-permissions") || args.includes("--allow-dangerously-skip-permissions")) {
       throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe Claude permission/profile flags are forbidden.");
@@ -243,6 +266,9 @@ export function planShadowInvocation(input: {
       // Only the keys this build proved it accepts during the self-test (ADR 0006). Sending a
       // key it does not know would abort the run under --strict-config.
       ...codexReviewerConfigArgs(STAGE_PATH_TOKEN, acceptedFeatureKeys(input.codexIsolation?.droppedFeatureKeys ?? [])),
+      // Codex takes its schema as a path. The staged workspace is the only directory this run
+      // can open, so that is where it goes.
+      "--output-schema", `${STAGE_PATH_TOKEN}/${STAGED_SCHEMA_FILE}`,
       "-",
     ]);
     if (args.includes("--sandbox") || args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--full-auto")) {
@@ -260,6 +286,7 @@ export function planShadowInvocation(input: {
       stdin: body,
       attachmentContent: null,
       attachmentToken: null,
+      stagedFiles: Object.freeze({ [STAGED_SCHEMA_FILE]: JSON.stringify(jsonSchemaFor(input.payload.responseContract), null, 2) }),
       allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
       envOverrides: Object.freeze({}),
       guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
@@ -287,6 +314,7 @@ export function planShadowInvocation(input: {
       "--output-format", "json",
       "--model", input.model.modelId,
       "--max-turns", String(maxTurns),
+      "--json-schema", schema,
       "--verbatim",
       "--disable-web-search",
       "--no-subagents",
@@ -309,7 +337,7 @@ export function planShadowInvocation(input: {
       // The instruction has to travel with the payload: `--prompt-file` is the whole prompt,
       // so a file holding only the request object arrives with nothing telling the model what
       // shape to answer in — and it answers in prose, which fails the contract on parse.
-      attachmentContent: `${GENERIC_PROMPT}\n\n${body}`,
+      attachmentContent: `${SCHEMA_PROMPT}\n\n${body}`,
       attachmentToken: STAGED_REQUEST_FILE,
       allowedEnvKeys: Object.freeze(["GROK_HOME", "GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "GROK_MANAGED_MCPS_ENABLED"]),
       envOverrides: Object.freeze({
@@ -337,9 +365,10 @@ export function planShadowInvocation(input: {
     const args = Object.freeze([
       // agy rejects a detached `-p`, taking the next flag as the prompt, so the prompt is
       // attached to the flag rather than following it.
-      `-p=${GENERIC_PROMPT}\n\n${body}`,
+      `-p=${SCHEMA_PROMPT}\n\n${body}`,
       "--output-format", "json",
       "--model", input.model.modelId,
+      "--json-schema", schema,
       "--disable-slash-commands",
       "--sandbox",
       "--print-timeout", `${String(Math.max(1, Math.ceil((input.maxTurns ?? 20) / 2)))}m`,

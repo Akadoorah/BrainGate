@@ -82,6 +82,14 @@ export interface ShadowInvocationPlan {
   readonly stdin: string | null;
   readonly attachmentContent: string | null;
   readonly attachmentToken: string | null;
+  /**
+   * Extra files written into the staged workspace before the run, by plain file name.
+   *
+   * A CLI that enforces a response schema wants it as a path, not a string, and the staged
+   * workspace is the one directory such a provider is confined to — so the schema goes there
+   * rather than into a temporary file the sandbox would refuse to open.
+   */
+  readonly stagedFiles?: Readonly<Record<string, string>>;
   readonly allowedEnvKeys: readonly string[];
   readonly envOverrides: Readonly<Record<string, string>>;
   readonly guarantees: ShadowGuarantees;

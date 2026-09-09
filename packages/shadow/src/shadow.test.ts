@@ -40,6 +40,8 @@ import {
   validGrokIsolationAttestation,
   grokIsolationProfileHash,
   grokSandboxProfileToml,
+  jsonSchemaFor,
+  STAGED_SCHEMA_FILE,
   latestProfileApplied,
   unexpectedRoots,
   GROK_SANDBOX_PROFILE,
@@ -386,14 +388,17 @@ test("the runner spends the budget's turns rather than a fixed ceiling", async (
   assert.equal(turns, String(budget.maxInspectionTurns));
 });
 
-test("the role prompt never carries task text and tells the provider not to echo the request", () => {
+test("the role prompt never carries task text, and the reply shape is enforced rather than requested", () => {
   const { repo } = setupProject();
   const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: new Date("2026-09-07T01:00:00Z") });
   const prompt = plan.args.join(" ");
   assert.doesNotMatch(prompt, /private task body|private context body/);
-  assert.match(prompt, /responseContract/);
-  assert.match(prompt, /Do not echo the request back/);
-  assert.match(prompt, /no markdown code fences/);
+  assert.match(prompt, /Analyze only/);
+  const schemaIndex = plan.args.indexOf("--json-schema");
+  assert.ok(schemaIndex > 0, "the plan must carry a response schema");
+  const schema = JSON.parse(plan.args[schemaIndex + 1]!) as { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+  assert.deepEqual(schema.required, Object.keys(payload.responseContract));
+  assert.equal(schema.additionalProperties, false);
 });
 
 test("node executor blocks cwd escapes, scrubs API env overrides and stages clean workspace", async () => {
@@ -802,4 +807,24 @@ test("a count that is absent, malformed or from a provider that reports none sta
   assert.equal(providerTokenUsage("anthropic", JSON.stringify({ usage: { input_tokens: -1, output_tokens: 1 } })), null);
   assert.equal(providerTokenUsage("openai", JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } })), null, "Codex reports usage in a JSONL stream this parser does not read");
   assert.equal(providerTokenUsage("anthropic", JSON.stringify({ result: "ok" })), null);
+});
+
+test("Codex receives its schema as a file inside the only directory it can open", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const reviewPayload: ShadowRolePayload = { ...payload, role: "reviewer", responseContract: { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" } };
+  const plan = planShadowInvocation({
+    snapshot: snapshot("openai"),
+    model: { providerId: "openai", modelId: "codex-model", quotaPool: "openai" },
+    cwd: repo,
+    payload: reviewPayload,
+    codexIsolation: codexIsolation({}, reference.getTime()),
+    now: reference,
+  });
+  const index = plan.args.indexOf("--output-schema");
+  assert.ok(index > 0);
+  assert.equal(plan.args[index + 1], `${STAGE_PATH_TOKEN}/${STAGED_SCHEMA_FILE}`);
+  const staged = plan.stagedFiles?.[STAGED_SCHEMA_FILE];
+  assert.ok(staged !== undefined, "the schema must travel with the plan");
+  assert.deepEqual(JSON.parse(staged), jsonSchemaFor(reviewPayload.responseContract));
 });
