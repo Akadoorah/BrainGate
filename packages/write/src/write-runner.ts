@@ -2,6 +2,7 @@ import { BrainGateInvariantError, type ExecutionBudget, type RegisteredProject, 
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
+import { taskTitleFor } from "@braingate/security";
 import { NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { assertClaudeWriteEligible, NodeClaudeWriteExecutor, planClaudeWriteInvocation } from "./claude-write-profile.js";
 import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
@@ -213,7 +214,7 @@ export class WriteDogfoodRunner {
     });
     if (input.dryRun ?? false) return Object.freeze({ dryRun: true, taskId: null, worktree: null, changedFiles: Object.freeze([]), diff: "", verification: Object.freeze([]), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: null });
 
-    const task = this.#ledger.createTask({ title: `Write ${input.classification.complexity} task`, complexity: input.classification.complexity, risk: input.classification.risk });
+    const task = this.#ledger.createTask({ title: taskTitleFor(input.task), complexity: input.classification.complexity, risk: input.classification.risk });
     this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: true, mergeAvailable: false });
     const worktrees = new WorktreeGuard(this.#project);
     let handle;

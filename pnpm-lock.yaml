@@ -37,6 +37,9 @@ importers:
       '@braingate/router':
         specifier: workspace:*
         version: link:../../packages/router
+      '@braingate/security':
+        specifier: workspace:*
+        version: link:../../packages/security
       '@braingate/shadow':
         specifier: workspace:*
         version: link:../../packages/shadow

@@ -206,7 +206,12 @@ test("high-risk shadow plan verifies Codex isolation but makes zero provider mod
   assert.doesNotMatch(output.out(), /UNIQUE_AUTH_PROMPT/);
 });
 
-test("shadow run requires explicit --execute to invoke and final answer is ephemeral from status", async () => {
+// Two different things were asserted together here, and only one of them is an invariant.
+//
+// Provider output must never persist: it can carry code, file contents and reasoning that the
+// operator never chose to write down. The operator's own request is not that — it is what they
+// typed — and keeping it out left BrainGate unable to say what any past task had been about.
+test("a provider's answer never reaches the ledger, and the operator's own request does", async () => {
   const f = fixture();
   const fake = new FakeExecutor();
   const executeOut = io();
@@ -219,7 +224,8 @@ test("shadow run requires explicit --execute to invoke and final answer is ephem
   const statusOut = io();
   const status = await runCli(["status", "--project", f.manifest, "--json"], { cwd: f.repo, env: f.env, stdout: statusOut.stdout, stderr: statusOut.stderr });
   assert.equal(status.exitCode, 0);
-  assert.doesNotMatch(statusOut.out(), /safe ephemeral answer|Where is the theme config/);
+  assert.doesNotMatch(statusOut.out(), /safe ephemeral answer/, "provider output must stay ephemeral");
+  assert.match(statusOut.out(), /Where is the theme config/, "the operator must be able to read their own history");
 });
 
 test("high-risk execute routes Claude primary then self-tested Codex reviewer and does not persist reasoning", async () => {
@@ -246,7 +252,10 @@ test("high-risk execute routes Claude primary then self-tested Codex reviewer an
 
   const statusOut = io();
   assert.equal((await runCli(["status", "--project", f.manifest, "--json"], { cwd: f.repo, env: f.env, stdout: statusOut.stdout, stderr: statusOut.stderr })).exitCode, 0);
-  assert.doesNotMatch(statusOut.out(), /safe ephemeral answer|PRIVATE_REASONING_MUST_NOT_PERSIST|Where is the auth session stored/);
+  // Neither the answer nor the model's private reasoning is written down. The request is, and
+  // deliberately: it is the operator's own text, and it is what makes the ledger readable.
+  assert.doesNotMatch(statusOut.out(), /safe ephemeral answer|PRIVATE_REASONING_MUST_NOT_PERSIST/);
+  assert.match(statusOut.out(), /Audit the auth session storage/);
 });
 
 test("failed Codex isolation removes it from reviewer routing before any provider model call", async () => {

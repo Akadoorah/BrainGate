@@ -36,6 +36,7 @@ import {
   type SubscriptionAttestation,
 } from "@braingate/shadow";
 import { acceptedSubscriptions, configuredProvider, grokIsolationStatus, loadAcceptances } from "./provider-proof.js";
+import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
 import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
 
@@ -444,7 +445,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const ledger = new TaskLedger(project);
     try {
       const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }) });
-      const result = await runner.run({ title: `Dogfood ask ${effective.complexity}`, task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
+      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, outcome: result.workflow?.outcome ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });

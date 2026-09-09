@@ -164,6 +164,13 @@ is ephemeral: it lives in the session process only, is never written to disk, an
 project memory — an unverified answer must not acquire the standing of a promoted record by
 passing through a conversation. `/forget` drops it; project memory is untouched.
 
+Closing the session ends that thread, so a new one cannot recall what you asked yesterday. What
+it *can* do is show you: `/status` lists your recent tasks by what you asked, with the models
+that ran and what each spent. The request is your own text and is recorded; the answer and the
+model's reasoning are not, and never leave the process. Nothing there is fed back to a model —
+if you want BrainGate to *know* something in later sessions, that is `braingate memory`, which
+takes evidence before a claim becomes canonical.
+
 `/help`, `/status`, `/models`, `/providers`, `/doctor`, `/feedback`, `/forget`, `/exit` cover
 the rest.
 
@@ -386,6 +393,13 @@ id, so one project's decisions are not reachable from another.
 An interactive session's thread is a separate, weaker thing: ephemeral, in-process, never
 written to disk, and never promoted. Keeping the two apart is what stops an unverified answer
 from acquiring the standing of a verified one.
+
+The task ledger is a third thing again, and neither of the first two: a project-local record of
+what you asked, which models took which role, what each reported spending, and how the task
+ended. It is history you can read, not context a model is given. Provider output stays out of
+it — an answer or a chain of reasoning can carry file contents nobody chose to write down —
+while your own request is kept, redacted of anything secret-shaped, because a history that
+cannot say what a task was about is not history.
 
 ## Memory bootstrap
 

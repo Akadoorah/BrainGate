@@ -34,6 +34,7 @@ import {
   type SubscriptionAttestation,
 } from "@braingate/shadow";
 import { acceptedSubscriptions, configuredProvider, grokIsolationStatus, loadAcceptances } from "./provider-proof.js";
+import { taskTitleFor } from "@braingate/security";
 import { WriteDogfoodRunner, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
 
 export interface CliDependencies {
@@ -564,7 +565,10 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           .filter((row) => row.tokens !== null && row.evidence === "native")
           .map((row) => `${row.modelId}=${String(row.tokens)}t`)
           .join(" · ");
-        lines.push(`  ${entry.complexity}/${entry.risk}  ${attribution.length === 0 ? "no route recorded" : attribution}`);
+        // The request first: this is the operator's own history, and until now it read as a
+        // list of tiers and model names with no way to tell one task from another.
+        lines.push(`  ${entry.title}`);
+        lines.push(`    ${entry.complexity}/${entry.risk} · ${attribution.length === 0 ? "no route recorded" : attribution}`);
         lines.push(`    ${entry.outcome ?? "unknown"}${calls == null ? "" : ` · ${String(calls)} provider call${calls === 1 ? "" : "s"}`}${spend.length === 0 ? "" : ` · ${spend}`} · ${entry.taskId.slice(0, 8)}`);
       }
       emit(json, data, lines.join("\n"), stdout);
@@ -729,7 +733,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           ...(deps.executor === undefined ? {} : { executor: deps.executor }),
         });
         const result = await runner.run({
-          title: `Shadow ${classification.complexity} task`,
+          title: taskTitleFor(task),
           task,
           cwd,
           classification,
