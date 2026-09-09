@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
-import { GROK_PROBE_MODEL, GROK_SANDBOX_PROFILE, GrokIsolationVerifier, grokConfigSurfaces, resolveGrokHome } from "./grok-isolation.js";
+import { GROK_PROBE_MODEL, GROK_SANDBOX_PROFILE, GROK_STAGED_SANDBOX, GROK_WRITE_SANDBOX, GrokIsolationVerifier, grokConfigSurfaces, resolveGrokHome } from "./grok-isolation.js";
 import type { CodexSandboxResult, CodexSandboxRunner } from "./codex-isolation.js";
 
 function snapshot(values: { version?: string; available?: boolean } = {}): ProviderSnapshot {
@@ -30,12 +30,19 @@ function snapshot(values: { version?: string; available?: boolean } = {}): Provi
  */
 class FakeGrok implements CodexSandboxRunner {
   readonly seen: string[][] = [];
-  constructor(private readonly event: ((workspace: string) => unknown) | null, private readonly stderr = "") {}
+  constructor(
+    private readonly event: ((workspace: string) => unknown) | null,
+    private readonly stderr = "",
+    /** Where this build keeps its log. 1.0.24 moved it under `sessions/`. */
+    private readonly logDirectory: "home" | "sessions" = "home",
+  ) {}
   async run(input: { readonly args: readonly string[]; readonly env: NodeJS.ProcessEnv }): Promise<CodexSandboxResult> {
     this.seen.push([...input.args]);
     const workspace = input.args[input.args.indexOf("--cwd") + 1]!;
     if (this.event !== null) {
-      appendFileSync(join(input.env.GROK_HOME!, "sandbox-events.jsonl"), `${JSON.stringify(this.event(workspace))}\n`);
+      const directory = this.logDirectory === "home" ? input.env.GROK_HOME! : join(input.env.GROK_HOME!, "sessions");
+      mkdirSync(directory, { recursive: true });
+      appendFileSync(join(directory, "sandbox-events.jsonl"), `${JSON.stringify(this.event(workspace))}\n`);
     }
     return { spawned: true, exitCode: 1, stdout: "", stderr: this.stderr, timedOut: false };
   }
@@ -169,4 +176,27 @@ test("an unavailable CLI is not attested", async () => {
     () => verifier(grokHome(), new FakeGrok(applied())).verify(snapshot({ available: false })),
     (error: unknown) => error instanceof BrainGateInvariantError && error.code === "GROK_ISOLATION_UNAVAILABLE",
   );
+});
+
+test("a build that keeps its record somewhere else is still read, rather than failing on a file move", async () => {
+  const home = grokHome();
+  // Measured against grok 1.0.24: the log moved to `$GROK_HOME/sessions/sandbox-events.jsonl`.
+  const attestation = await verifier(home, new FakeGrok(applied(), "", "sessions")).verify(snapshot());
+  assert.equal(attestation.source, "sandbox-event-self-test");
+});
+
+test("a profile that only warned instead of applying fails the self-test", async () => {
+  const home = grokHome();
+  // 1.0.24 no longer refuses to start: an unfound custom profile warns and continues with
+  // exit 0, which is why the words are read rather than the exit code trusted.
+  await assert.rejects(
+    verifier(home, new FakeGrok(applied(), "warning: sandbox could not be applied: Custom sandbox profile 'braingate-staged' not found.")).verify(snapshot()),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "GROK_ISOLATION_SELF_TEST_FAILED",
+  );
+});
+
+test("the write profile is a different policy, and earns a different proof", () => {
+  assert.notEqual(GROK_WRITE_SANDBOX.hash, GROK_STAGED_SANDBOX.hash);
+  assert.match(GROK_WRITE_SANDBOX.toml, /deny = \[/);
+  assert.doesNotMatch(GROK_STAGED_SANDBOX.toml, /deny = \[/);
 });

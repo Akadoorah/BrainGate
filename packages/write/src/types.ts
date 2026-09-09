@@ -1,8 +1,10 @@
 import type { ExecutionBudget, TaskClassification, TaskReceipt } from "@braingate/core";
+import type { ProviderId } from "@braingate/providers";
 import type { ModelRef, RouteResult } from "@braingate/router";
+import type { ToolGrant } from "@braingate/shadow";
 
 export interface WriteProviderPlan {
-  readonly providerId: "anthropic";
+  readonly providerId: ProviderId;
   readonly executable: string;
   readonly args: readonly string[];
   readonly cwd: string;
@@ -11,6 +13,21 @@ export interface WriteProviderPlan {
   readonly stdin: string;
   readonly allowedEnvKeys: readonly string[];
   readonly envOverrides: Readonly<Record<string, string>>;
+  /**
+   * What this run was permitted to do (ADR 0010), recorded on the plan the operator reads.
+   */
+  readonly grant: ToolGrant;
+  /**
+   * Files BrainGate writes into the worktree for the run and removes when it ends.
+   *
+   * Grok reads its sandbox profile from `.grok/sandbox.toml` inside the working directory, which
+   * for a write task is the worktree the change is collected from. The file is BrainGate's, not
+   * the task's, so it is removed before the diff is taken — by exact path, so anything else the
+   * run left under that directory still reaches the diff guard.
+   */
+  readonly runtimeFiles?: Readonly<Record<string, string>>;
+  /** A file the CLI reads but the model never sees, kept outside the worktree so it cannot join the diff. */
+  readonly externalFiles?: Readonly<Record<string, string>>;
 }
 
 export interface WriteProviderResult {

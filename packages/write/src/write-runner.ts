@@ -6,7 +6,8 @@ import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
-import { assertClaudeWriteEligible, NodeClaudeWriteExecutor, planClaudeWriteInvocation } from "./claude-write-profile.js";
+import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
+import { assertWriteEligible, planWriteInvocation } from "./write-profiles.js";
 import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
 import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
 import type { PlannedWriteRole, VisualRequest, WriteProviderExecutor, WriteRunResult, WriteTaskPlan, WriteVerificationResult } from "./types.js";
@@ -132,10 +133,28 @@ export function buildWriteTaskPlan(input: {
 }): WriteTaskPlan {
   assertM11Scope(input.classification);
   if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("WRITE_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
-  const primaryExcluded = input.providers.filter((snapshot) => snapshot.providerId !== "anthropic").map((snapshot) => snapshot.providerId);
+  // Every provider that cannot prove a bounded place to work is excluded here, rather than one
+  // provider being named as the only one allowed to. The router then picks on capability among
+  // whoever is left, which is what makes the executing role something more than one subscription.
+  const writeProof = {
+    ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
+    ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+  };
+  const primaryExcluded = input.providers
+    .filter((snapshot) => {
+      try {
+        assertWriteEligible(snapshot, { providerId: snapshot.providerId, modelId: "", quotaPool: "" }, writeProof);
+        return false;
+      } catch (error) {
+        // A model id this loop cannot know is checked per-model below; anything else disqualifies
+        // the provider for every model it has.
+        return !(error instanceof BrainGateInvariantError && error.code === "WRITE_MODEL_UNAVAILABLE");
+      }
+    })
+    .map((snapshot) => snapshot.providerId);
   const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: primaryExcluded });
   const primaryModel = modelRef(primaryRoute);
-  assertClaudeWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel);
+  assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProof);
   const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: "task-worktree" })];
 
   const wantsReview = input.review ?? true;
@@ -251,9 +270,17 @@ export class WriteDogfoodRunner {
       // Turns and wall clock come from the task's own budget rather than a fixed ceiling, for
       // the same reason maxContextTokens scales: a large repository costs turns to navigate
       // before the edit is even reached.
-      const invocation = planClaudeWriteInvocation({ snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath, task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns });
+      // A schema path outside the worktree, for a CLI that reads its schema from a file: inside
+      // it, the schema would arrive in the diff as part of the change.
+      const schemaPath = join(this.#project.storageDir, "write-schemas", `${task.taskId}.json`);
+      const invocation = planWriteInvocation({
+        snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath,
+        task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
+        ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+        ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+      });
       const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
-      if (!result.spawned || result.timedOut || result.exitCode !== 0) throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `Claude write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
+      if (!result.spawned || result.timedOut || result.exitCode !== 0) throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `${primary.model.providerId} write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });

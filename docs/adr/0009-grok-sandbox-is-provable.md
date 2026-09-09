@@ -82,3 +82,36 @@ configured there load with it, and on macOS a child process is not network-block
 reach the project. Both are visible in `braingate doctor`.
 
 This also closes ADR 0006's note about Grok. The upstream change it was waiting for happened.
+
+## Amendment, re-measured against grok 1.0.24 (2026-09-09)
+
+Two of the findings above are dated, and both were re-measured because a write profile was
+about to be built on them. One still holds. One does not.
+
+- **The event log moved.** Grok now records applied profiles to
+  `$GROK_HOME/sessions/sandbox-events.jsonl`, not `$GROK_HOME/sandbox-events.jsonl`. BrainGate
+  read only the old path, found nothing, and failed the self-test — fail-closed, but closed on a
+  file move rather than on a missing protection, which would have read as "Grok is unusable"
+  with nothing wrong. Both paths are read now.
+- **A profile that cannot be applied no longer aborts.** `--sandbox braingate-does-not-exist`
+  prints `warning: sandbox could not be applied: Custom sandbox profile ... not found` and
+  continues, exit 0. The property this ADR rested on — that a *custom* profile fails closed
+  where a built-in one only warns — is gone in this build.
+
+  So the guarantee is no longer bought by the CLI's own refusal. It is bought by reading what
+  Grok says: `grokSandboxNotApplied` treats that warning as a failure on the self-test *and* on
+  every real run, and a run that reports it has its output discarded rather than accepted. That
+  is weaker than an abort, and it is stated as weaker: the window between the warning and
+  BrainGate reading it is a window where an unconfined process ran. What keeps that narrow is
+  that BrainGate writes the profile into the workspace itself, with `wx`, so the file it names
+  is the file it wrote.
+
+- **What is new and useful.** A custom profile may carry a kernel-enforced `deny` list. Measured:
+  `deny_paths` appears in the applied-profile event, covering the shell and subagents, not just
+  the read tool. A write profile can therefore put `.env`, `*.pem`, `*.key` and `.git/config`
+  out of reach of the kernel rather than out of bounds by instruction — something no settings
+  file gives you.
+
+The self-test and the attestation are now bound to a named policy rather than to "the BrainGate
+profile", because there is more than one: a proof earned under the read-only staged profile does
+not cover the profile that grants writes.

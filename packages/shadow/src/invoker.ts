@@ -3,7 +3,7 @@ import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
-import type { GrokIsolationAttestation } from "./grok-isolation.js";
+import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
@@ -284,6 +284,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           "SHADOW_PROVIDER_FAILED",
           `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.${reason === null ? "" : ` The provider reported: ${reason}.`}${failureAdvice(reason)}`,
         );
+      }
+      // A Grok build that cannot apply the profile now warns and carries on (measured against
+      // 1.0.24), so a successful exit is not by itself evidence the sandbox was in force. The
+      // run is discarded rather than its answer accepted: an unsandboxed run is the one case the
+      // attestation exists to make impossible.
+      if (snapshot.providerId === "xai" && grokSandboxNotApplied(`${result.stdout}\n${result.stderr}`)) {
+        this.#event("shadow.provider.failed", { ...safeMeta, reason: "sandbox-not-applied" });
+        throw new BrainGateInvariantError("SHADOW_GROK_SANDBOX_NOT_APPLIED", "Grok reported that the BrainGate sandbox profile was not applied, so this run was not confined. Its output is discarded.");
       }
       const response = parseRoleResponse(request.role, snapshot.providerId, result.stdout);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
