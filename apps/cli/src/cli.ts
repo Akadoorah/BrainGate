@@ -21,8 +21,8 @@ import {
   resolveOperatorState,
   type OperatorStatePaths,
 } from "@braingate/operator";
-import { PROVIDER_IDS, ProviderDiscovery, isProviderId, type ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
+import { ModelListCache, PROVIDER_IDS, ProviderDiscovery, isProviderId, type ProviderSnapshot } from "@braingate/providers";
+import { CapabilityRouter, type ModelDefinition, type ModelRef } from "@braingate/router";
 import {
   CodexIsolationVerifier,
   ShadowDogfoodRunner,
@@ -35,7 +35,7 @@ import {
 } from "@braingate/shadow";
 import { acceptedSubscriptions, configuredProvider, grokIsolationStatus, loadAcceptances } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
-import { WriteDogfoodRunner, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, buildWriteTaskPlan, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
 
 export interface CliDependencies {
   readonly cwd?: string;
@@ -227,8 +227,16 @@ function resolveWriteRepository(project: RegisteredProject, cwd: string, request
   return candidate;
 }
 
-async function discovery(deps: CliDependencies): Promise<readonly ProviderSnapshot[]> {
-  return deps.discoverAll === undefined ? await new ProviderDiscovery().discoverAll() : await deps.discoverAll();
+/**
+ * Discovery for one command, with the model list remembered between commands.
+ *
+ * The cache lives beside the rest of BrainGate's own state, so it is per operator and goes away
+ * with `BRAINGATE_HOME`. It covers only the model list; authentication is measured every time.
+ */
+async function discovery(deps: CliDependencies, state: OperatorStatePaths): Promise<readonly ProviderSnapshot[]> {
+  if (deps.discoverAll !== undefined) return await deps.discoverAll();
+  const modelCache = new ModelListCache({ path: resolve(state.globalDir, "model-lists.json") });
+  return await new ProviderDiscovery(undefined, { modelCache }).discoverAll();
 }
 
 async function codexIsolationStatus(
@@ -361,7 +369,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
 
     if (command === "discover") {
       noExtraArgs(args);
-      const snapshots = await discovery(deps);
+      const snapshots = await discovery(deps, state);
       data = normalizedDiscovery(snapshots);
       emit(json, data, snapshots.map((item) => `${item.providerId}: ${item.available.value ? "available" : "missing"} · auth=${item.authMode.value}/${item.authState.value}`).join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -404,7 +412,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       }
       if (subcommand === "import-discovered") {
         noExtraArgs(args);
-        const snapshots = await discovery(deps);
+        const snapshots = await discovery(deps, state);
         const entries = catalog.importDiscovered(snapshots);
         data = { entries: entries.length, configured: entries.filter((entry) => entry.configured).length, unscored: entries.filter((entry) => !entry.configured).length };
         emit(json, data, `Catalog now has ${entries.length} entries; ${entries.filter((entry) => !entry.configured).length} remain unscored.`, stdout);
@@ -491,7 +499,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const manifest = takeOption(args, "--project", true)!;
       noExtraArgs(args);
       const project = projectFromManifest(state, manifest, cwd);
-      const snapshots = await discovery(deps);
+      const snapshots = await discovery(deps, state);
       const entries = new ModelCatalog(state.modelCatalogPath).load();
       const isolation = await codexIsolationStatus(snapshots, deps, env, true);
       const grok = await grokProof(state, snapshots, deps, env, project);
@@ -596,6 +604,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const task = takeOption(args, "--task", true)!;
       const requestedRepo = takeOption(args, "--repo");
       const baseRef = takeOption(args, "--base") ?? "HEAD";
+      const visualTask = takeOption(args, "--visual");
+      const visualTo = takeOption(args, "--visual-to");
       const execute = removeFlag(args, "--execute");
       const review = !removeFlag(args, "--no-review");
       const attestations = attestation(args, state);
@@ -604,12 +614,15 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
 
       const project = projectFromManifest(state, manifest, cwd);
       const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
-      const snapshots = await discovery(deps);
+      const snapshots = await discovery(deps, state);
       const hydrated = runtimeFor(state, snapshots);
       const classification = classifyTask({ text: task, mode: "write" });
       const budget = budgetFor(classification, { writeRequested: true });
       const requiredContextTokens = contextTokens(task);
-      const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state));
+      // The artifact pass runs under the same Codex sandbox profile as the reviewer, so it needs
+      // the same self-test — including when review is switched off, which is exactly the case
+      // that failed: `--visual --no-review` asked for an isolated run and skipped proving it.
+      const isolation = await codexIsolationStatus(snapshots, deps, env, (review || visualTask !== undefined) && configuredOpenAi(state));
       const codexIsolation = isolation.attestation ?? undefined;
       const grok = await grokProof(state, snapshots, deps, env, project);
       const grokIsolation = grok.attestation ?? undefined;
@@ -627,7 +640,40 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         baseRef,
         review,
       });
-      const planData = serializedWritePlan(plan);
+      // The artifact pass is routed like any other role rather than named by hand: the operator
+      // asks for an image, and the catalogue decides which model can make one (ADR 0007).
+      let visual: VisualRequest | undefined;
+      if (visualTask !== undefined) {
+        if (visualTask.trim().length === 0) throw new BrainGateInvariantError("CLI_OPTION_INVALID", "--visual needs a description of the image to produce.");
+        // The provider names the file it wrote; only the operator knows where it belongs.
+        if (visualTo === undefined || visualTo.trim().length === 0) {
+          throw new BrainGateInvariantError("CLI_OPTION_REQUIRED", "--visual also needs --visual-to <path within the repository>, because the provider cannot know where the image belongs.");
+        }
+        let routed;
+        try {
+          routed = hydrated.router.route({
+            role: "visual", classification, budget, requiredContextTokens, writeRequired: false,
+            excludeProviders: snapshots.filter((snapshot) => snapshot.providerId !== "openai").map((snapshot) => snapshot.providerId),
+          });
+        } catch (error) {
+          if (error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL") {
+            throw new BrainGateInvariantError(
+              "CLI_VISUAL_UNAVAILABLE",
+              "No configured model declares a `visual` capability. Add one with `braingate models add`, scoring `visual` on a model whose provider can generate images.",
+            );
+          }
+          throw error;
+        }
+        const definition = routed.selected.model.definition;
+        visual = {
+          model: { providerId: definition.providerId, modelId: definition.modelId, quotaPool: definition.quotaPool },
+          task: visualTask,
+          destination: visualTo,
+          context: writeTaskContext(project),
+        };
+      }
+
+      const planData = { ...serializedWritePlan(plan), ...(visual === undefined ? {} : { visual: { model: visual.model, task: visual.task, destination: visual.destination } }) };
 
       if (subcommand === "plan" || !execute) {
         data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason }, approvalRequired: true };
@@ -661,6 +707,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           review,
           dryRun: false,
           env,
+          ...(visual === undefined ? {} : { visual }),
         });
         data = {
           plan: planData,
@@ -692,7 +739,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `shadow run`.");
       const project = projectFromManifest(state, manifest, cwd);
-      const snapshots = await discovery(deps);
+      const snapshots = await discovery(deps, state);
       const hydrated = runtimeFor(state, snapshots);
       const classification = classifyTask({ text: task, mode: "ask" });
       const budget = budgetFor(classification, { writeRequested: false });

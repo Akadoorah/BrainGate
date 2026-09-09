@@ -136,3 +136,40 @@ if the MCP boundary is deliberately revisited.
 
 Until this is implemented, `"visual"` remains declared and unroutable, and this ADR is the
 record of why it is not simply switched on.
+
+## Amendment: BrainGate finds the file, because the provider cannot name it
+
+The declaration protocol above asks the provider for the absolute path it wrote. Running it
+against the real CLI showed that it cannot answer, and the reason is structural rather than a
+matter of prompting: Codex names generated images itself, under
+`$CODEX_HOME/generated_images/<session>/exec-<uuid>.png`, and the model is never told the path.
+
+Asked to declare one, it replied "Created the PNG with a blue circle centred on a white
+background." and the task failed with `VISUAL_NO_ARTIFACTS` — while three perfectly good PNGs,
+one per attempt, sat on disk. The pass had been working the whole time; only the reporting was
+impossible.
+
+So BrainGate finds them. The set of files under that directory is recorded before the run and
+compared after, which needs no cooperation from the model and cannot be talked into naming a
+file that was never made. Two consequences follow:
+
+- **The destination comes from the operator.** `--visual-to <path>` is required alongside
+  `--visual`, because the destination is the half of the answer the provider genuinely does not
+  have — it knows what it drew, not where the project keeps it. Several images from one request
+  are suffixed rather than overwriting each other.
+- **A declaration is still honoured when one is offered.** A provider that does know its own
+  paths should be believed about them, and the block remains the documented way to say so.
+
+Everything else in this ADR stands unchanged: the workspace is still read-only, generation still
+needs no write access to the worktree, and every collected file still passes containment,
+symlink, size and magic-byte checks before it reaches the reviewed diff.
+
+Two further things the first real run exposed, both fixed:
+
+- The executor refused the task worktree as "outside the registered project repositories". A
+  write task's artifact pass runs against the worktree by definition, so the boundary now
+  includes BrainGate's own task worktrees, which live under the project's private storage
+  directory.
+- `--visual --no-review` skipped the Codex sandbox self-test, because the attestation was only
+  fetched when a reviewer was needed. The artifact pass runs under the same profile and needs
+  the same proof.

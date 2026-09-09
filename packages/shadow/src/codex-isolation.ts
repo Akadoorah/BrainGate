@@ -1,7 +1,7 @@
 import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { homedir, tmpdir } from "node:os";
+import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
@@ -111,6 +111,22 @@ export function acceptedFeatureKeys(droppedFeatureKeys: readonly string[]): read
   const dropped = new Set(droppedFeatureKeys);
   return Object.freeze(CODEX_REVIEW_DISABLED_FEATURES.filter((key) => !dropped.has(key)));
 }
+
+/**
+ * Where Codex keeps its configuration, credentials and the files it produces.
+ *
+ * Generated images land under `generated_images/<session>/` inside it, named by the CLI rather
+ * than by the model — which is why BrainGate looks there instead of asking what path was used.
+ */
+export function resolveCodexHome(env: NodeJS.ProcessEnv): string {
+  const configured = env.CODEX_HOME?.trim();
+  if (configured !== undefined && configured.length > 0) return resolve(configured);
+  const home = env.HOME ?? homedir();
+  if (home.length === 0) throw new BrainGateInvariantError("CODEX_HOME_UNKNOWN", "Codex's home cannot be located without CODEX_HOME or HOME.");
+  return join(home, ".codex");
+}
+
+export const CODEX_GENERATED_IMAGES = "generated_images";
 
 export function codexPermissionInlineTable(stagePath: string): string {
   const name = tomlString(CODEX_REVIEW_PROFILE);

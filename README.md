@@ -355,9 +355,9 @@ The full command surface:
 - `braingate discover`
 - `braingate doctor --project <manifest>`
 - `braingate models list|validate|add|remove|import-discovered|profile`
-- `braingate memory preview|import|promote|list`
+- `braingate memory note|preview|import|promote|list|proposals`
 - `braingate shadow plan|run ...`
-- `braingate write plan|run ...`
+- `braingate write plan|run ...` — add `--visual "<description>" --visual-to <path>` to have an image generated alongside the change
 - `braingate dogfood preflight`
 - `braingate dogfood ask plan|run ...`
 - `braingate dogfood write plan|run ...`
@@ -372,6 +372,27 @@ The full command surface:
 `braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path.
 
 See [`docs/DOGFOOD.md`](docs/DOGFOOD.md) for the real-project trial workflow.
+
+## Asking for an image
+
+A write task can produce one, in the same worktree and behind the same review:
+
+```bash
+braingate write run --project .brain/project.json \
+  --task "reference the hero image in the README" \
+  --visual "a flat blue circle centred on a white background" \
+  --visual-to assets/hero.png --execute
+```
+
+The generating pass runs read-only against the worktree — the image is written into the
+provider's own directory and collected from there, so producing one needs no write access to
+your project at all. The file goes through the same containment, symlink, size and magic-byte
+checks as any other change, appears in the reviewed diff as a summary rather than as inlined
+bytes, and merges only when you say so.
+
+`--visual-to` is required because the provider cannot supply it: it knows what it drew, not
+where your project keeps it. Routing picks whichever configured model declares a `visual`
+capability, and says so if none does.
 
 ## How memory reaches a task
 

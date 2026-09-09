@@ -77,5 +77,12 @@ export interface WriteRunResult {
 export interface VisualRequest {
   readonly model: ModelRef;
   readonly task: string;
+  /**
+   * Where the image belongs in the project, relative to the worktree.
+   *
+   * Named by the operator, because it is the half of the answer the provider genuinely does not
+   * have: Codex chooses the file's own path and never learns the project's.
+   */
+  readonly destination: string;
   readonly context?: unknown;
 }

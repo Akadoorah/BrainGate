@@ -4,6 +4,7 @@ import { findManifest } from "./manifest-path.js";
 import { createInterface, type Interface } from "node:readline/promises";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
+import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext } from "./session-context.js";
 import { COLOURED, PLAIN, renderBanner } from "./banner.js";
@@ -110,6 +111,8 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
         "  Follow-ups resolve against earlier turns in this session. That thread lives in this",
         "  process only: it is never written to disk and never becomes project memory.",
         "",
+        "  /remember <text>  record something about this project, for later sessions",
+        "  /memory     what is remembered, and what is waiting for your evidence",
         "  /status     recent tasks in this project",
         "  /models     configured models and reviewer independence",
         "  /providers  which CLIs are installed, and which role each may take here",
@@ -119,6 +122,22 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
         "  /exit",
         "",
       ].join("\n"));
+      return "continue";
+    case "remember": {
+      const text = rest.join(" ").trim();
+      if (text.length === 0) {
+        deps.stderr("  Usage: /remember <what this project needs known>\n");
+        return "continue";
+      }
+      // The session thread ends with this process; this does not. It is recorded as a proposal
+      // rather than as fact, because what was typed is a claim about the project and the
+      // evidence gate is what tells the two apart.
+      await runMemoryCli(["memory", "note", "--text", text], io);
+      return "continue";
+    }
+    case "memory":
+      await runMemoryCli(["memory", "list"], io);
+      await runMemoryCli(["memory", "proposals"], io);
       return "continue";
     case "forget":
       session.clear();

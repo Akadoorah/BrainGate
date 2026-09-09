@@ -49,3 +49,53 @@ test("memory promote requires explicit evidence", async () => {
   assert.equal(result.exitCode, 1);
   assert.match(out.err(), /MEMORY_EVIDENCE_REQUIRED/);
 });
+
+// The memory model was complete and unusable. Making BrainGate know one sentence meant writing
+// a file, previewing it, importing it and promoting it, so nothing was ever recorded and the
+// store stayed empty — a gate nobody can reach is not a safeguard, it is an absence.
+test("a note the operator states is recorded, and is a proposal rather than memory", async () => {
+  const f = fixture(); const out = io();
+  const deps = { cwd: f.repo, env: f.env, stdout: out.stdout, stderr: out.stderr };
+
+  const noted = await runMemoryCli(["memory", "note", "--text", "Subscription state lives in Riverpod providers.", "--json"], deps);
+  assert.equal(noted.exitCode, 0);
+  const proposal = noted.data as { proposalId: string; kind: string; proposedBy: string; body: string };
+  assert.equal(proposal.kind, "verified_fact");
+  // Recorded as the operator's claim, never as BrainGate's: a model's own output must not be
+  // able to enter here, which is the boundary the ephemeral session thread exists to hold.
+  assert.equal(proposal.proposedBy, "operator");
+
+  // It is not memory yet. Tasks read canonical records only.
+  const listed = await runMemoryCli(["memory", "list", "--json"], deps);
+  assert.deepEqual(listed.data, []);
+
+  const waiting = await runMemoryCli(["memory", "proposals", "--json"], deps);
+  assert.equal((waiting.data as readonly unknown[]).length, 1);
+});
+
+test("a noted claim reaches memory only through the same evidence gate as everything else", async () => {
+  const f = fixture(); const out = io();
+  const deps = { cwd: f.repo, env: f.env, stdout: out.stdout, stderr: out.stderr };
+  const noted = await runMemoryCli(["memory", "note", "--text", "Auth uses email OTP, not OAuth.", "--json"], deps);
+  const { proposalId } = noted.data as { proposalId: string };
+
+  // Convenience must not become a way around the gate: promotion still demands evidence.
+  const withoutEvidence = await runMemoryCli(["memory", "promote", "--proposal", proposalId, "--confidence", "0.9", "--json"], deps);
+  assert.equal(withoutEvidence.exitCode, 1);
+  assert.match(out.err(), /MEMORY_EVIDENCE_REQUIRED/);
+
+  assert.equal((await runMemoryCli(["memory", "promote", "--proposal", proposalId, "--evidence", "lib/auth/otp.dart", "--confidence", "0.9", "--json"], deps)).exitCode, 0);
+  const canonical = await runMemoryCli(["memory", "list", "--json"], deps);
+  assert.equal((canonical.data as readonly { body: string }[])[0]?.body, "Auth uses email OTP, not OAuth.");
+  // Once decided, it stops waiting on the operator.
+  assert.deepEqual((await runMemoryCli(["memory", "proposals", "--json"], deps)).data, []);
+});
+
+test("an unrecognised memory kind is refused with the list of real ones", async () => {
+  const f = fixture(); const out = io();
+  const deps = { cwd: f.repo, env: f.env, stdout: out.stdout, stderr: out.stderr };
+  const result = await runMemoryCli(["memory", "note", "--text", "x", "--kind", "vibes", "--json"], deps);
+  assert.equal(result.exitCode, 1);
+  assert.match(out.err(), /MEMORY_KIND_INVALID/);
+  assert.match(out.err(), /architecture_decision/);
+});

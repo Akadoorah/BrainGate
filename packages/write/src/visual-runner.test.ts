@@ -94,7 +94,7 @@ class VisualProvider implements ShadowProcessExecutor {
   }
 }
 
-async function runVisual(reply?: (source: string) => string) {
+async function runVisual(reply?: (source: string) => string, options: { readonly codexHome?: string } = {}) {
   const f = fixture();
   const providerHome = join(f.root, "codex-home");
   const visual = new VisualProvider(providerHome, reply);
@@ -108,7 +108,8 @@ async function runVisual(reply?: (source: string) => string) {
   const result = await runner.run({
     task: "add a hero image to the landing page", repositoryPath: f.repo, classification, budget,
     requiredContextTokens: 500, context: {}, review: false,
-    visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image" },
+    ...(options.codexHome === undefined ? {} : { env: { PATH: process.env.PATH, CODEX_HOME: options.codexHome } }),
+    visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image", destination: "assets/hero.png" },
   });
   return { f, visual, result, providerHome };
 }
@@ -185,4 +186,93 @@ test("the plan for a visual task still creates no worktree and performs no merge
   assert.equal(plan.createsWorktree, false);
   assert.equal(plan.providerCallsOnPlan, 0);
   assert.equal(plan.mergeAvailable, false);
+});
+
+/**
+ * Stands in for Codex as it actually behaves: it writes the image into its own generated-images
+ * directory, under a name the CLI chose, and says so in prose. The model was never told the
+ * path, so it cannot declare one.
+ */
+class SilentVisualProvider implements ShadowProcessExecutor {
+  constructor(private readonly codexHome: string, private readonly writes = 1) {}
+  async run(): Promise<ShadowProcessResult> {
+    for (let index = 0; index < this.writes; index += 1) {
+      const session = join(this.codexHome, "generated_images", `session-${String(index)}`);
+      mkdirSync(session, { recursive: true });
+      writeFileSync(join(session, `exec-${String(index)}.png`), PNG);
+    }
+    return {
+      spawned: true, exitCode: 0, timedOut: false, durationMs: 11, removedEnvironmentKeys: [],
+      stdout: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: "Created the PNG with a blue circle centred on a white background." } }),
+      stderr: "",
+    };
+  }
+}
+
+// ADR 0007 asked the provider for the absolute path it wrote. Running it against the real CLI
+// showed that it cannot answer: Codex names generated files itself and never tells the model.
+// The task failed with "declared no artifacts" while a perfectly good PNG sat on disk.
+test("an image is collected from where the provider actually wrote it, not from what it said", async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "braingate-codex-home-"));
+  const f = fixture();
+  const classification = classifyTask({ text: "add a hero image to the landing page", mode: "write" });
+  const runner = new WriteDogfoodRunner({
+    project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
+    providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
+    writer: new TextWriter(), visualExecutor: new SilentVisualProvider(codexHome),
+  });
+  const result = await runner.run({
+    task: "add a hero image to the landing page", repositoryPath: f.repo, classification,
+    budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500,
+    context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
+    visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image", destination: "assets/hero.png" },
+  });
+
+  assert.ok(result.changedFiles.includes("assets/hero.png"));
+  assert.deepEqual(readFileSync(join(result.worktree!.path, "assets", "hero.png")), PNG);
+  assert.equal(git(f.repo, ["status", "--porcelain"]), "", "the real checkout never sees it");
+});
+
+test("only what this run produced is collected, never an image from an earlier one", async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "braingate-codex-home-prior-"));
+  // A previous task's output is already sitting there. Collecting it would attach someone
+  // else's image to this task and pass it through review as this task's work.
+  mkdirSync(join(codexHome, "generated_images", "old-session"), { recursive: true });
+  writeFileSync(join(codexHome, "generated_images", "old-session", "exec-old.png"), Buffer.concat([PNG, Buffer.from("OLD")]));
+
+  const f = fixture();
+  const classification = classifyTask({ text: "add a hero image to the landing page", mode: "write" });
+  const runner = new WriteDogfoodRunner({
+    project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
+    providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
+    writer: new TextWriter(), visualExecutor: new SilentVisualProvider(codexHome),
+  });
+  const result = await runner.run({
+    task: "add a hero image to the landing page", repositoryPath: f.repo, classification,
+    budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500,
+    context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
+    visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image", destination: "assets/hero.png" },
+  });
+
+  assert.deepEqual(result.changedFiles.filter((file) => file.startsWith("assets/")), ["assets/hero.png"]);
+  assert.deepEqual(readFileSync(join(result.worktree!.path, "assets", "hero.png")), PNG, "the earlier image must not be picked up");
+});
+
+test("several images from one request are kept apart rather than overwriting each other", async () => {
+  const codexHome = mkdtempSync(join(tmpdir(), "braingate-codex-home-many-"));
+  const f = fixture();
+  const classification = classifyTask({ text: "add hero images", mode: "write" });
+  const runner = new WriteDogfoodRunner({
+    project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
+    providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
+    writer: new TextWriter(), visualExecutor: new SilentVisualProvider(codexHome, 2),
+  });
+  const result = await runner.run({
+    task: "add hero images", repositoryPath: f.repo, classification,
+    budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500,
+    context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
+    visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "two hero images", destination: "assets/hero.png" },
+  });
+  assert.ok(result.changedFiles.includes("assets/hero.png"));
+  assert.ok(result.changedFiles.includes("assets/hero-2.png"), `got ${result.changedFiles.join(", ")}`);
 });

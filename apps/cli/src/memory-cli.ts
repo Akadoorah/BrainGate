@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { BrainGateInvariantError, ProjectRegistry } from "@braingate/core";
-import { ProjectMemory, importMemoryPreview, previewMemoryImport, type MemoryImportFormat } from "@braingate/memory";
+import { MEMORY_KINDS, ProjectMemory, importMemoryPreview, previewMemoryImport, type MemoryImportFormat, type MemoryKind } from "@braingate/memory";
 import { resolveOperatorState } from "@braingate/operator";
 
 export interface MemoryCliDependencies {
@@ -76,8 +76,8 @@ export async function runMemoryCli(argv: readonly string[], deps: MemoryCliDepen
     if (args.shift() !== "memory") throw new BrainGateInvariantError("CLI_COMMAND_INVALID", "Memory CLI requires the memory command.");
     const subcommand = args.shift();
     if (subcommand === undefined || subcommand === "help") {
-      data = { commands: ["preview", "import", "promote", "list"] };
-      emit(json, data, "Memory commands: preview, import, promote, list", stdout);
+      data = { commands: ["note", "preview", "import", "promote", "list", "proposals"] };
+      emit(json, data, "Memory commands: note, preview, import, promote, list, proposals", stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
@@ -99,6 +99,65 @@ export async function runMemoryCli(argv: readonly string[], deps: MemoryCliDepen
         const proposals = importMemoryPreview(memory, preview, { proposedBy: "cli-memory-import" });
         data = { projectId: project.projectId, sourceName: preview.sourceName, format: preview.format, proposals, skippedDuplicates: preview.duplicates, canonicalRecordsCreated: 0 };
         emit(json, data, `Imported ${proposals.length} proposal(s); skipped ${preview.duplicates} canonical duplicate(s). No canonical memory was created.`, stdout);
+        return Object.freeze({ exitCode: 0, data });
+      }
+
+      /**
+       * Records something the operator states themselves, as a proposal.
+       *
+       * The memory model was complete and unusable: making BrainGate know one sentence meant
+       * writing a file, previewing it, importing it and promoting it. Nothing gets recorded that
+       * way, which is why the store was empty — a gate nobody can reach is not a safeguard, it
+       * is an absence.
+       *
+       * It stays a proposal. What the operator typed is a claim about the project, not a
+       * verified one, and the evidence gate is what separates the two; this only removes the
+       * file-shuffling between having something to say and its being on record. The proposer is
+       * recorded as the operator rather than as BrainGate, because a model's own output must
+       * never enter here — that is the boundary the session thread exists to keep.
+       */
+      if (subcommand === "note") {
+        const body = takeOption(args, "--text", true)!;
+        const kindRaw = takeOption(args, "--kind") ?? "verified_fact";
+        if (!(MEMORY_KINDS as readonly string[]).includes(kindRaw)) {
+          throw new BrainGateInvariantError("MEMORY_KIND_INVALID", `--kind must be one of: ${MEMORY_KINDS.join(", ")}.`);
+        }
+        noExtra(args);
+        const proposal = memory.propose({
+          kind: kindRaw as MemoryKind,
+          body,
+          reason: "Stated by the operator in this project.",
+          sourceRefs: Object.freeze(["operator-note"]),
+          proposedBy: "operator",
+        });
+        data = proposal;
+        emit(
+          json,
+          data,
+          [
+            `Recorded proposal ${proposal.proposalId} (${proposal.kind}).`,
+            "",
+            "It is a proposal, not memory: tasks read canonical records only. Promote it when you",
+            "can point at what makes it true:",
+            `  braingate memory promote --proposal ${proposal.proposalId} --evidence <file-or-url> --confidence 0.9`,
+          ].join("\n"),
+          stdout,
+        );
+        return Object.freeze({ exitCode: 0, data });
+      }
+
+      if (subcommand === "proposals") {
+        noExtra(args);
+        data = memory.listProposals(20);
+        const proposals = data as readonly { proposalId: string; kind: string; body: string; proposedBy: string; proposedAt: string }[];
+        emit(
+          json,
+          data,
+          proposals.length === 0
+            ? "No proposals waiting. `braingate memory note --text \"...\"` records one."
+            : proposals.map((item) => `${item.proposalId} · ${item.kind} · ${item.proposedBy} · ${item.body.slice(0, 90)}`).join("\n"),
+          stdout,
+        );
         return Object.freeze({ exitCode: 0, data });
       }
 
@@ -129,7 +188,7 @@ export async function runMemoryCli(argv: readonly string[], deps: MemoryCliDepen
         return Object.freeze({ exitCode: 0, data });
       }
 
-      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "memory requires preview, import, promote, or list.");
+      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "memory requires note, preview, import, promote, list, or proposals.");
     } finally { memory.close(); }
   } catch (error) {
     const safe = safeError(error);

@@ -125,3 +125,46 @@ test("a model without a visual capability cannot take a visual task", () => {
   const routed = router.route({ role: "visual", classification, budget, requiredContextTokens: 500, writeRequired: true });
   assert.equal(routed.selected.model.definition.modelId, "visual-capable");
 });
+
+// "Route each task to the cheapest worker that can do it" is the premise of the project, and at
+// low complexity the capability floor has already settled the "can do it" half. The preference
+// for a fast model existed but was worth about ten points while marginal capability was worth
+// twelve, so a stronger, slower model won a one-line lookup by roughly two points.
+test("a lookup goes to the fastest model that clears the floor, not the strongest", () => {
+  const registry = new ModelRegistry();
+  const runtime = { available: true, quotaState: "healthy" as const, quotaPressure: null, observedAt: "2026-09-09T00:00:00Z" };
+  registry.register({ providerId: "anthropic", modelId: "fast-model", quotaPool: "pool", capabilities: { coder: 70 }, speed: "fast", contextCapacity: 200_000, writeCapable: false, reasoning: 78, underlyingFamily: null }, runtime);
+  registry.register({ providerId: "anthropic", modelId: "balanced-model", quotaPool: "pool", capabilities: { coder: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 85, underlyingFamily: null }, runtime);
+  registry.register({ providerId: "anthropic", modelId: "deep-model", quotaPool: "pool", capabilities: { coder: 95 }, speed: "deep", contextCapacity: 200_000, writeCapable: false, reasoning: 98, underlyingFamily: null }, runtime);
+
+  const route = (complexity: "T0" | "T1" | "T2" | "T3") => new CapabilityRouter(registry).route({
+    role: "coder",
+    classification: { complexity, risk: "low", confidence: 0.9, requiresScout: false, reasons: [], sensitiveDomains: [], ruleVersion: "test" },
+    budget: budgetFor({ complexity, risk: "low", confidence: 0.9, requiresScout: false, reasons: [], sensitiveDomains: [], ruleVersion: "test" }, { writeRequested: false }),
+    requiredContextTokens: 500,
+    writeRequired: false,
+  }).selected.model.definition.modelId;
+
+  assert.equal(route("T0"), "fast-model");
+  assert.equal(route("T1"), "fast-model");
+  // Above the cheap tiers the preference inverts, because there the work is what costs, not the
+  // waiting: a T2 change and a T3 audit get the model that is actually better at them.
+  assert.equal(route("T2"), "deep-model");
+  assert.equal(route("T3"), "deep-model");
+});
+
+test("speed does not outrank a model that cannot do the job at all", () => {
+  const registry = new ModelRegistry();
+  const runtime = { available: true, quotaState: "healthy" as const, quotaPressure: null, observedAt: "2026-09-09T00:00:00Z" };
+  // Below the floor is not a preference, it is a rejection: being quick about the wrong answer
+  // is not what "cheapest worker that can do it" means.
+  registry.register({ providerId: "anthropic", modelId: "too-weak", quotaPool: "pool", capabilities: { coder: 10 }, speed: "fast", contextCapacity: 200_000, writeCapable: false, reasoning: 20, underlyingFamily: null }, runtime);
+  registry.register({ providerId: "anthropic", modelId: "capable", quotaPool: "pool", capabilities: { coder: 80 }, speed: "deep", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null }, runtime);
+
+  const classification = { complexity: "T0" as const, risk: "low" as const, confidence: 0.9, requiresScout: false, reasons: [], sensitiveDomains: [], ruleVersion: "test" };
+  const result = new CapabilityRouter(registry).route({
+    role: "coder", classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 500, writeRequired: false,
+  });
+  assert.equal(result.selected.model.definition.modelId, "capable");
+  assert.ok(result.rejected.some((entry) => entry.model.modelId === "too-weak" && entry.reasons.some((reason) => reason.startsWith("capability-below-floor"))));
+});

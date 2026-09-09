@@ -1,12 +1,22 @@
-export type MemoryKind =
-  | "architecture_decision"
-  | "business_rule"
-  | "verified_fact"
-  | "task_summary"
-  | "known_bug"
-  | "incident"
-  | "code_reference"
-  | "temporary_observation";
+/**
+ * The memory kinds, as one list the type derives from.
+ *
+ * A bare string-literal union has no runtime form, so anything that needed to validate or
+ * enumerate a kind grew its own copy — the shape that already turned a valid role into an
+ * invalid one at a package boundary. Adding a kind here changes the type and the check together.
+ */
+export const MEMORY_KINDS = [
+  "architecture_decision",
+  "business_rule",
+  "verified_fact",
+  "task_summary",
+  "known_bug",
+  "incident",
+  "code_reference",
+  "temporary_observation",
+] as const;
+
+export type MemoryKind = (typeof MEMORY_KINDS)[number];
 
 export type MemoryReviewDecision = "approved" | "rejected";
 export type MemoryEffectiveStatus = "active" | "superseded" | "expired";

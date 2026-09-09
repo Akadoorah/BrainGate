@@ -256,6 +256,25 @@ export class ProjectMemory {
     return proposal;
   }
 
+  /**
+   * Proposals still waiting on a decision, newest first.
+   *
+   * A proposal nobody can see is a proposal nobody will promote, and the store had a way to
+   * record one and no way to list them. Reviewed proposals are left out: this answers "what is
+   * waiting on me", not "what has ever been said".
+   */
+  listProposals(limit = 20): readonly MemoryProposal[] {
+    const bounded = Math.max(1, Math.min(MAX_SEARCH_RESULTS, Math.floor(limit)));
+    const rows = this.#db.prepare(`
+      SELECT p.* FROM memory_proposals p
+      LEFT JOIN memory_reviews r ON r.proposal_id = p.proposal_id
+      WHERE p.project_id = ? AND r.proposal_id IS NULL
+      ORDER BY p.proposed_at DESC, p.proposal_id DESC
+      LIMIT ?
+    `).all(this.projectId, bounded) as ProposalRow[];
+    return Object.freeze(rows.map(mapProposal));
+  }
+
   getRecord(recordId: string): MemoryRecord | undefined {
     const row = this.#db.prepare(
       "SELECT * FROM memory_records WHERE record_id = ? AND project_id = ?",

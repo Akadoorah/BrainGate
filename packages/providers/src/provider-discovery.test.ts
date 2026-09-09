@@ -163,7 +163,7 @@ test("providers are probed together, and the result keeps its declared order", a
       peak = Math.max(peak, live);
       await new Promise((resolve) => setTimeout(resolve, 5));
       live -= 1;
-      return { spawned: true, exitCode: 0, stdout: "1.0.0 --print --model json mcp", stderr: "", timedOut: false, observedAt: "2026-09-09T00:00:00.000Z", removedBillingOverrides: [], command: `${command.binary} ${command.args.join(" ")}` };
+      return result(command, { stdout: "1.0.0 --print --model json mcp" });
     },
   };
   const snapshots = await new ProviderDiscovery(runner).discoverAll();
@@ -181,7 +181,7 @@ test("a command that answers two questions is run once, not raced against itself
   const runner: ProbeRunner = {
     async run(command) {
       seen.push(`${command.binary} ${command.args.join(" ")}`);
-      return { spawned: true, exitCode: 0, stdout: "You are logged in with grok.com.", stderr: "", timedOut: false, observedAt: "2026-09-09T00:00:00.000Z", removedBillingOverrides: [], command: `${command.binary} ${command.args.join(" ")}` };
+      return result(command, { stdout: "You are logged in with grok.com." });
     },
   };
   await new ProviderDiscovery(runner).discover("xai");

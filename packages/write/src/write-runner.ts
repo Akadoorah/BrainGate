@@ -2,8 +2,10 @@ import { BrainGateInvariantError, type ExecutionBudget, type RegisteredProject, 
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
+import { readdirSync, type Dirent } from "node:fs";
+import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
-import { NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
+import { CODEX_GENERATED_IMAGES, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { assertClaudeWriteEligible, NodeClaudeWriteExecutor, planClaudeWriteInvocation } from "./claude-write-profile.js";
 import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
 import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
@@ -89,6 +91,29 @@ function routeWriteReviewer(input: {
       return route({ mode: "preferred", level: "fresh-session", models: [input.primaryModel] });
     }
   }
+}
+
+/**
+ * Every file currently under Codex's generated-images directory, newest last.
+ *
+ * A missing or unreadable directory is an empty list rather than a failure: it simply means
+ * nothing has been generated, which is the ordinary state before the first visual task.
+ */
+function generatedImages(directory: string): readonly string[] {
+  const found: string[] = [];
+  const walk = (path: string, depth: number): void => {
+    if (depth > 3) return;
+    let entries: Dirent[];
+    try { entries = readdirSync(path, { withFileTypes: true }); }
+    catch { return; }
+    for (const entry of entries) {
+      const child = join(path, entry.name);
+      if (entry.isDirectory()) walk(child, depth + 1);
+      else if (entry.isFile()) found.push(child);
+    }
+  };
+  walk(directory, 0);
+  return Object.freeze(found.sort());
 }
 
 export function buildWriteTaskPlan(input: {
@@ -318,18 +343,41 @@ export class WriteDogfoodRunner {
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
     });
 
+    const imagesDir = join(resolveCodexHome(input.input.env ?? process.env), CODEX_GENERATED_IMAGES);
+    const before = new Set(generatedImages(imagesDir));
+
     const executor = this.#visualExecutor ?? new NodeShadowProcessExecutor();
     const result = await executor.run({ project: this.#project, plan, timeoutMs: input.input.budget.maxInspectionMs });
+    const generatedAfter = generatedImages(imagesDir);
     if (!result.spawned || result.timedOut || result.exitCode !== 0) {
       throw new BrainGateInvariantError("VISUAL_PROVIDER_FAILED", `Codex visual provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
     }
     this.#ledger.recordUsage({ taskId: input.task.taskId, provider: plan.providerId, model: plan.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
 
-    const declarations = parseArtifactDeclarations(extractCodexAgentMessage(result.stdout));
-    if (declarations.length === 0) {
-      throw new BrainGateInvariantError("VISUAL_NO_ARTIFACTS", "The visual provider declared no artifacts, so the task produced nothing to review.");
+    // Where the image actually is, rather than where the provider says it is.
+    //
+    // ADR 0007 asked the provider to declare the absolute path it wrote. Running it showed that
+    // it cannot: Codex names generated files itself, under `generated_images/<session>/` in its
+    // own home, and the model is never told the path. It answered in prose and the task failed
+    // with "declared no artifacts" while three perfectly good PNGs sat on disk.
+    //
+    // So BrainGate finds them. The set of files under that directory is recorded before the run
+    // and compared after, which needs no cooperation from the model and cannot be talked into
+    // naming a file that was never made. A declaration is still honoured when one is offered,
+    // because a provider that does know its own paths should be believed about them.
+    const declared = parseArtifactDeclarations(extractCodexAgentMessage(result.stdout));
+    const produced = declared.length > 0
+      ? declared
+      : [...before].length === 0 && generatedAfter.length === 0
+        ? []
+        : generatedAfter.filter((path) => !before.has(path)).map((sourcePath, index) => Object.freeze({
+          sourcePath,
+          destination: input.visual.destination.replace(/(\.[^./]+)?$/, (extension) => `${index === 0 ? "" : `-${String(index + 1)}`}${extension}`),
+        }));
+    if (produced.length === 0) {
+      throw new BrainGateInvariantError("VISUAL_NO_ARTIFACTS", "The visual provider produced no image, so the task produced nothing to review.");
     }
-    return collectArtifacts({ worktreePath: input.handle.worktreePath, declarations });
+    return collectArtifacts({ worktreePath: input.handle.worktreePath, declarations: produced });
   }
 
 }

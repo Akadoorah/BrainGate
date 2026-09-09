@@ -3,7 +3,17 @@ import type { IndependenceLevel, ModelRef, RegisteredModel, RouteCandidate, Rout
 import { ModelRegistry } from "./model-registry.js";
 
 const MIN_CAPABILITY: Readonly<Record<TaskComplexity, number>> = Object.freeze({ T0: 25, T1: 35, T2: 55, T3: 72, T4: 84 });
-const SPEED_BONUS_LOW: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 22, balanced: 12, deep: 0 });
+/**
+ * At T0/T1 the capability floor has already answered "can this model do it". What remains is
+ * which qualifying model to spend, and the answer is the cheapest one — that is the whole
+ * premise of routing across subscriptions rather than always asking the strongest.
+ *
+ * The gap used to be ten points while marginal capability and reasoning were worth about
+ * twelve, so a stronger model won a lookup by roughly two points: the preference existed but
+ * decided nothing. It is now wide enough to be the deciding term, and still finite, so a model
+ * that only barely clears the floor does not beat a far better one on speed alone.
+ */
+const SPEED_BONUS_LOW: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 45, balanced: 18, deep: 0 });
 const SPEED_BONUS_HIGH: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 0, balanced: 6, deep: 12 });
 const QUOTA_PENALTY = Object.freeze({ healthy: 0, limited: 30, unknown: 14, exhausted: Number.POSITIVE_INFINITY });
 

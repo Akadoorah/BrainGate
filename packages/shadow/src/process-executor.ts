@@ -16,11 +16,19 @@ export function assertShadowProjectCwd(project: RegisteredProject, cwdInput: str
   let cwd: string;
   try { cwd = realpathSync.native(resolve(cwdInput)); }
   catch { throw new BrainGateInvariantError("SHADOW_CWD_INVALID", "Shadow working directory does not exist or cannot be resolved."); }
-  const approved = project.repositories.some((repository) => {
-    try { return inside(realpathSync.native(repository), cwd); }
+  // A registered repository, or a task worktree BrainGate made for this project.
+  //
+  // The worktree was missing, and it is where a write task's work actually happens: a pass that
+  // produces an artifact runs against the worktree, not the checkout, and was refused for being
+  // "outside the project" when it was the one place it was supposed to be. Worktrees live under
+  // the project's own private storage directory, so this widens the boundary to a directory
+  // BrainGate created, not to the filesystem.
+  const roots = [...project.repositories, join(project.storageDir, "worktrees")];
+  const approved = roots.some((root) => {
+    try { return inside(realpathSync.native(root), cwd); }
     catch { return false; }
   });
-  if (!approved) throw new BrainGateInvariantError("SHADOW_CWD_ESCAPE", "Shadow working directory is outside the registered project repositories.");
+  if (!approved) throw new BrainGateInvariantError("SHADOW_CWD_ESCAPE", "Shadow working directory is outside the registered project repositories and BrainGate's own task worktrees.");
   return cwd;
 }
 

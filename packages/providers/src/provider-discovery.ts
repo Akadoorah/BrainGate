@@ -1,3 +1,4 @@
+import { ModelListCache, modelCacheKey } from "./model-cache.js";
 import type {
   Observation,
   ProbeCommand,
@@ -205,8 +206,12 @@ function parseAuth(providerId: ProviderId, result: ProbeResult): ParsedAuth {
 
 export class ProviderDiscovery {
   readonly #runner: ProbeRunner;
+  readonly #modelCache: ModelListCache | null;
 
-  constructor(runner: ProbeRunner = new NodeProbeRunner()) { this.#runner = runner; }
+  constructor(runner: ProbeRunner = new NodeProbeRunner(), options: { readonly modelCache?: ModelListCache } = {}) {
+    this.#runner = runner;
+    this.#modelCache = options.modelCache ?? null;
+  }
 
   /**
    * Every provider, discovered at once.
@@ -277,7 +282,18 @@ export class ProviderDiscovery {
     const helpCommand: ProbeCommand = { binary: spec.binary, args: spec.helpArgs };
     const modelCommand: ProbeCommand | null = spec.modelArgs === null ? null : { binary: spec.binary, args: spec.modelArgs, timeoutMs: 7_500 };
     const authCommand: ProbeCommand | null = spec.authArgs === null ? null : { binary: spec.binary, args: spec.authArgs, timeoutMs: 5_000 };
-    const probes = await this.#runOnce([helpCommand, modelCommand, authCommand]);
+    // Listing models is the slowest probe and the one that changes least, so a remembered list
+    // is used when there is one — but never when the same command also reports authentication,
+    // because a cached "signed in" that outlives a sign-out routes work to a provider that will
+    // refuse it. Correctness is not traded for a second.
+    const version = versionResult.exitCode === 0 && !versionResult.timedOut ? firstUsefulLine(versionResult) : null;
+    const modelsAlsoReportAuth = modelCommand !== null && authCommand !== null && formatProbeCommand(modelCommand) === formatProbeCommand(authCommand);
+    const cacheKey = modelCommand === null || modelsAlsoReportAuth || this.#modelCache === null
+      ? null
+      : modelCacheKey({ providerId: spec.providerId, version, command: formatProbeCommand(modelCommand) });
+    const remembered = cacheKey === null ? null : this.#modelCache?.read(cacheKey) ?? null;
+
+    const probes = await this.#runOnce([helpCommand, remembered === null ? modelCommand : null, authCommand]);
     const helpResult = probes[0]!;
     const modelResult = probes[1] ?? null;
     const authResult = probes[2] ?? null;
@@ -285,10 +301,18 @@ export class ProviderDiscovery {
     const warnings: string[] = [];
 
     let models: Observation<readonly string[] | null>;
-    if (modelCommand !== null && modelResult !== null) {
+    if (modelCommand !== null && remembered !== null) {
+      // Still `native`: it is the provider's own answer to its own command, read back rather
+      // than asked again. The timestamp is this observation, and the entry aged out on its own
+      // if it were older than the window.
+      models = observation(remembered, "native", formatProbeCommand(modelCommand), new Date().toISOString());
+    } else if (modelCommand !== null && modelResult !== null) {
       const source = formatProbeCommand(modelCommand);
-      if (modelResult.spawned && modelResult.exitCode === 0 && !modelResult.timedOut) models = observation(parseModels(modelResult), "native", source, modelResult.observedAt);
-      else {
+      if (modelResult.spawned && modelResult.exitCode === 0 && !modelResult.timedOut) {
+        const listed = parseModels(modelResult);
+        models = observation(listed, "native", source, modelResult.observedAt);
+        if (cacheKey !== null) this.#modelCache?.write(cacheKey, listed);
+      } else {
         models = observation(null, "unknown", source, modelResult.observedAt);
         warnings.push("Model metadata probe did not complete successfully; availability was left unknown.");
       }
@@ -310,7 +334,6 @@ export class ProviderDiscovery {
       authMode = observation("unknown", "unknown", null, helpResult.observedAt);
     }
 
-    const version = versionResult.exitCode === 0 && !versionResult.timedOut ? firstUsefulLine(versionResult) : null;
     if (version === null) warnings.push("CLI version could not be parsed from the local version command.");
     const capabilities: ProviderCapabilities = {
       headless: capabilityFromHelp(helpResult, spec.headlessPatterns),

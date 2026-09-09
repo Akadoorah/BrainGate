@@ -24,7 +24,7 @@ import {
 } from "@braingate/dogfood";
 import { GlobalQuotaStore } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
-import { ProviderDiscovery, type ProviderSnapshot } from "@braingate/providers";
+import { ModelListCache, ProviderDiscovery, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter } from "@braingate/router";
 import {
   CodexIsolationVerifier,
@@ -229,8 +229,11 @@ function attestations(copilotOauth: boolean, state: OperatorStatePaths): readonl
   })]);
 }
 
-async function discovery(deps: DogfoodCliDependencies): Promise<readonly ProviderSnapshot[]> {
-  return deps.discoverAll === undefined ? await new ProviderDiscovery().discoverAll() : await deps.discoverAll();
+/** Discovery for one command; see the note on the same helper in cli.ts. */
+async function discovery(deps: DogfoodCliDependencies, state: OperatorStatePaths): Promise<readonly ProviderSnapshot[]> {
+  if (deps.discoverAll !== undefined) return await deps.discoverAll();
+  const modelCache = new ModelListCache({ path: resolve(state.globalDir, "model-lists.json") });
+  return await new ProviderDiscovery(undefined, { modelCache }).discoverAll();
 }
 
 function configuredOpenAi(state: OperatorStatePaths): boolean {
@@ -329,7 +332,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   noExtraArgs(args);
   const project = projectFromManifest(state, manifest, cwd);
   const repositories = project.repositories.map(inspectGitRepository);
-  const snapshots = await discovery(deps);
+  const snapshots = await discovery(deps, state);
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
   const configured = catalog.filter((entry) => entry.configured);
   const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"));
@@ -405,7 +408,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
   const state = resolveOperatorState(env);
   const oauth = attestations(copilotOauth, state);
   const project = projectFromManifest(state, manifest, cwd);
-  const snapshots = await discovery(deps);
+  const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
   const store = new DogfoodStore(project);
   try {
@@ -472,7 +475,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
   const oauth = attestations(copilotOauth, state);
   const project = projectFromManifest(state, manifest, cwd);
   const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
-  const snapshots = await discovery(deps);
+  const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
   const store = new DogfoodStore(project);
   try {
