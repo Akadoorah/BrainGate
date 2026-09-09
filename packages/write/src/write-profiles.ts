@@ -126,6 +126,8 @@ function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
     },
     attested,
     operatorAccepted: false,
+    // A write is T0-T2 work, which is budgeted for one agent at a time.
+    fanOutAllowed: false,
   });
 }
 

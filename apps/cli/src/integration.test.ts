@@ -160,3 +160,80 @@ test("a write task changes the task worktree and leaves the source checkout byte
     cli.cleanup();
   }
 });
+
+/**
+ * Every staged provider, answering a real role contract.
+ *
+ * The fakes prove BrainGate builds the command it meant to build. Only this proves the provider
+ * on the other side accepts it — the schema flag, the staged workspace, the input route, and the
+ * envelope the answer comes back in. Each of those changed under BrainGate at least once without
+ * a single test going red.
+ */
+test("each staged provider satisfies the role contract from its own CLI", { skip: SKIP }, async () => {
+  const { ProviderDiscovery } = await import("@braingate/providers");
+  const { NodeShadowProcessExecutor, SubscriptionShadowAgentInvoker, GrokIsolationVerifier, CodexIsolationVerifier } = await import("@braingate/shadow");
+  const { ProjectRegistry } = await import("@braingate/core");
+
+  const cli = makeCli();
+  try {
+    register(cli);
+
+    const registry = new ProjectRegistry(cli.home);
+    const project = registry.loadFile(join(cli.repo, ".brain", "project.json"));
+
+    const snapshots = await new ProviderDiscovery().discoverAll();
+    const catalogue = JSON.parse(readFileSync(join(cli.home, "global", "models.json"), "utf8")) as {
+      entries: readonly { readonly definition: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly capabilities: Record<string, number> } }[];
+    };
+
+    const answered: string[] = [];
+    for (const providerId of ["xai", "google", "openai"] as const) {
+      const snapshot = snapshots.find((item) => item.providerId === providerId);
+      if (snapshot?.available.value !== true || snapshot.authState.value === "unauthenticated") continue;
+      // The cheapest model the operator scored for this role, so the check costs as little as it can.
+      const entry = catalogue.entries
+        .map((item) => item.definition)
+        .filter((definition) => definition.providerId === providerId && typeof definition.capabilities.reviewer === "number")
+        .sort((a, b) => (a.capabilities.reviewer ?? 0) - (b.capabilities.reviewer ?? 0))[0];
+      if (entry === undefined) continue;
+
+      // No projectPaths here, and deliberately: this test's repository lives in the temp
+      // directory, which every Grok profile grants, so the real "can this sandbox still reach
+      // the checkout" check would refuse before the provider boundary was ever exercised. That
+      // check is covered by its own unit test; what this one is for is the CLI on the far side.
+      const grokIsolation = providerId === "xai" ? await new GrokIsolationVerifier().verify(snapshot) : undefined;
+      const codexIsolation = providerId === "openai" ? await new CodexIsolationVerifier().verify(snapshot) : undefined;
+      const invoker: InstanceType<typeof SubscriptionShadowAgentInvoker> = new SubscriptionShadowAgentInvoker({
+        project, cwd: cli.repo, snapshots: [snapshot],
+        ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        ...(codexIsolation === undefined ? {} : { codexIsolation }),
+        acceptances: [{ providerId, source: "operator-accepted-unscoped-provider", acceptedAt: new Date(Date.now() - 60_000).toISOString() }],
+        // Antigravity's CLI reports no machine-readable auth mode, so discovery says `unknown`
+        // and the operator's own confirmation is what stands in for it — the same record
+        // `braingate providers accept` writes.
+        attestations: [{ providerId, mode: "subscription", source: "user-confirmed-oauth", observedAt: new Date(Date.now() - 60_000).toISOString() }],
+        context: { note: "The reviewed change renames a label and touches nothing else." },
+        executor: new NodeShadowProcessExecutor(),
+        maxTurns: 8,
+      });
+
+      const response: Awaited<ReturnType<typeof invoker.invoke>> = await invoker.invoke({
+        role: "reviewer",
+        model: { providerId, modelId: entry.modelId, quotaPool: entry.quotaPool },
+        phase: "integration",
+        task: "A one-line label change. Reply approve.",
+        findings: [],
+        candidateOutput: "labels.txt: empty-state label reworded.",
+      });
+
+      // The contract, satisfied by the provider rather than repaired by the parser.
+      assert.equal(response.kind, "review", `${providerId} answered as the wrong role`);
+      assert.ok(["approve", "request_changes", "disagree"].includes(response.verdict), `${providerId} returned verdict ${response.verdict}`);
+      answered.push(providerId);
+    }
+
+    assert.ok(answered.length > 0, "no staged provider was installed and authenticated, so nothing was proven");
+  } finally {
+    cli.cleanup();
+  }
+});

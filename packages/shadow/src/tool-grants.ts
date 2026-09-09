@@ -93,6 +93,15 @@ export interface GrantRequest {
   readonly attested: boolean;
   /** The operator's recorded acceptance for capabilities BrainGate cannot bound on its own. */
   readonly operatorAccepted: boolean;
+  /**
+   * Whether this task's budget allows more than one agent at once
+   * (`ExecutionBudget.maxConcurrentAgents > 1`). Subagents are concurrent agents, so the number
+   * that already bounds concurrency decides this rather than a new one invented here.
+   *
+   * It belongs in the grant rather than beside it: a plan that listed `subagents` as granted and
+   * then ran without them would be describing a run that never happens.
+   */
+  readonly fanOutAllowed?: boolean;
 }
 
 function refusal(capability: ToolCapability, reason: string): GrantRefusal {
@@ -156,6 +165,10 @@ export function resolveToolGrant(request: GrantRequest): ToolGrant {
     }
 
     if (capability === "subagents") {
+      if (request.fanOutAllowed !== true) {
+        refused.push(refusal(capability, "This task's budget allows one agent at a time; helpers are for work that was budgeted for more."));
+        continue;
+      }
       if (!request.surface.declaredSubagents) {
         refused.push(refusal(capability, "This CLI does not accept subagent definitions, so BrainGate could not bound what they may do."));
         continue;

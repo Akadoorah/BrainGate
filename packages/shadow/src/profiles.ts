@@ -237,10 +237,9 @@ export function planShadowInvocation(input: {
     surface: profile.surface,
     attested,
     operatorAccepted: validOperatorAcceptance(input.acceptance, input.snapshot.providerId, now),
+    fanOutAllowed: input.fanOut === true,
   });
-  // Two independent conditions, and both have to hold: the grant says this provider and role may
-  // have helpers at all, and the budget says this task may run more than one agent at once.
-  const subagents = grants(grant, "subagents") && input.fanOut === true ? subagentsArgument(input.payload.role) : null;
+  const subagents = grants(grant, "subagents") ? subagentsArgument(input.payload.role) : null;
   // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
   // lower than the budget asks for would silently reimpose the limit this stopped being.
   const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));

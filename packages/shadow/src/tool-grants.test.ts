@@ -9,7 +9,7 @@ const BARE: ProviderGrantSurface = { isolatedPerInvocation: false, toolDenial: f
 function grant(overrides: Partial<Parameters<typeof resolveToolGrant>[0]> = {}) {
   return resolveToolGrant({
     role: "planner", providerId: "xai", workspaceMode: "staged-clean", writeMode: false,
-    surface: PROVEN, attested: true, operatorAccepted: false, ...overrides,
+    surface: PROVEN, attested: true, operatorAccepted: false, fanOutAllowed: true, ...overrides,
   });
 }
 
@@ -104,4 +104,10 @@ test("only the executing role asks to change anything", () => {
   }
   assert.ok(requestedCapabilities({ role: "primary", writeMode: true }).includes("edit"));
   assert.ok(!requestedCapabilities({ role: "primary", writeMode: false }).includes("edit"));
+});
+
+test("a budget that allows one agent at a time gets no helpers, and is told why", () => {
+  const cheap = grant({ role: "reviewer", fanOutAllowed: false });
+  assert.equal(grants(cheap, "subagents"), false);
+  assert.match(cheap.refused.find((item) => item.capability === "subagents")!.reason, /one agent at a time/);
 });
