@@ -23,6 +23,16 @@ reject    approve
      immutable canonical record
 ```
 
+An observation reaches that first box from an import, or from `braingate memory note` — and in
+an interactive session, `/remember`. A note is the operator stating something about their own
+project in one step, because the alternative was writing a file, previewing it, importing it and
+promoting it, which meant nothing was ever recorded and the store stayed empty. A gate nobody can
+reach is not a safeguard.
+
+It changes nothing about the gate. A note is a proposal, attributed to the operator rather than
+to BrainGate so a model's own output cannot enter this way, and it becomes canonical only through
+`memory promote` with explicit evidence. `braingate memory proposals` lists what is waiting.
+
 Approved records cannot be edited in place. A correction is a new verified record with `supersedesId` pointing to the older record. Retrieval automatically excludes expired and superseded records.
 
 ## Retention defaults

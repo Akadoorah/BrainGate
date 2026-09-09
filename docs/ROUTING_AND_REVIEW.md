@@ -32,3 +32,27 @@ Reviewer findings are bounded before being returned to the primary. If the task 
 ## Security gate
 
 This milestone only plans/routes and orchestrates abstract agents. Real provider CLI invokers remain disconnected from write-capable execution until the isolation gate defined in `SAFE_EXECUTION.md` is satisfied.
+
+## Where quota pressure comes from
+
+No provider publishes a remaining balance, so for a long time pressure was `unknown` for every
+pool and routing never moved: the strongest model won every role until its pool ran out for real.
+
+BrainGate knows one thing about quota — what it spent itself — and provider token counts are
+recorded natively. Pools are therefore compared against each other: the busiest recent pool
+scores 1, the quietest 0, and the router leans away from the busy one.
+
+This is a relative signal and is labelled as one. It claims to know no pool's limit.
+
+- A provider that reports a real balance outranks it. The local reading lives under its own
+  metric name as `measured`, never as `pressure`, so a receipt can say which was used.
+- A pool nobody measured scores `null`, not 0. Codex and Copilot report no token counts, and
+  reading silence as "idle" would send them everything.
+- One measured pool is not a comparison and produces no signal.
+
+## Which model gets a cheap question
+
+At T0 and T1 the capability floor has already answered "can this model do it". What remains is
+which qualifying model to spend, and the answer is the cheapest one — so speed is the deciding
+term there, not a tiebreak. Above those tiers the preference inverts: a T2 change and a T3 audit
+get the model that is actually better at them, because there the work is what costs.

@@ -49,7 +49,11 @@ Official references:
 
 - `grok version` and `grok models` are documented metadata commands.
 - `grok -p` is headless inference and is forbidden during discovery.
-- `XAI_API_KEY` is stripped from subscription discovery. Config-file BYOK cannot be safely inferred without inspecting secrets, so auth mode remains unknown in Milestone 3.
+- `XAI_API_KEY` is stripped from subscription discovery.
+- Authentication is `native`. `grok models` names the signed-in account before it lists anything,
+  and it neither prompts nor mutates — which is the bar. It was recorded as `unknown` only
+  because nothing read its output; the same run answers both questions, so the command is issued
+  once rather than twice.
 
 Official references:
 - https://docs.x.ai/build/cli/reference
@@ -70,3 +74,20 @@ Official references:
 ## Why auth and usage can be `unknown`
 
 A truthful `unknown` is safer than spending quota, scraping provider credentials, or depending on an undocumented private endpoint. Future provider adapters may upgrade a field to `native` only when the installed official CLI exposes a stable, machine-readable, zero-prompt surface.
+
+That upgrade is expected to happen, and did: Grok's authentication moved from `unknown` to
+`native` once its existing zero-prompt command was actually read. A field left `unknown` because
+nobody looked is a different thing from one that is genuinely unavailable, and it is worth
+re-checking when a provider ships.
+
+## What discovery costs, and what is remembered
+
+Probes run together rather than one after another, and a command that answers two questions is
+issued once — `grok models` reports the model list and the signed-in account, and two concurrent
+copies would also write the same model cache.
+
+The model list is the only probe that leaves the machine, and the only one remembered: for an
+hour, keyed by the CLI's own version so an update invalidates it. It is never remembered for a
+provider whose model command also reports sign-in, because a cached "signed in" that outlives a
+sign-out would route work to a provider that will refuse it. Authentication is measured every
+time.
