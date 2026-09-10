@@ -109,6 +109,14 @@ export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef,
   }
 }
 
+/**
+ * The grant a write runs under.
+ *
+ * `attested` is derived from the same check that decided eligibility rather than written as a
+ * literal beside it. They cannot disagree that way, and the ADR's sentence — nothing above read
+ * without a current proof — is enforced by the code that reads the proof instead of by a
+ * constant that happens to match it today.
+ */
 function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
   return resolveToolGrant({
     role: "primary",
@@ -176,9 +184,12 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
     now,
   });
 
+  // Claude's write boundary is its settings file and tool allowlist, not a kernel sandbox, so
+  // there is no sandbox attestation to hold and none is claimed: the grant withholds `shell` on
+  // exactly that ground.
   if (input.snapshot.providerId === "anthropic") {
     const plan = planClaudeWriteInvocation(input);
-    return Object.freeze({ ...plan, grant: writeGrant("anthropic", true) });
+    return Object.freeze({ ...plan, grant: writeGrant("anthropic", false) });
   }
 
   const body = brief(input);
@@ -186,7 +197,7 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
   const schema = jsonSchemaFor(WRITE_SCHEMA);
 
   if (input.snapshot.providerId === "xai") {
-    const grant = writeGrant("xai", true);
+    const grant = writeGrant("xai", validGrokIsolationAttestation(input.grokIsolation, input.snapshot, { now, policy: GROK_WRITE_SANDBOX }));
     const args = Object.freeze([
       "-p", `${WRITE_INSTRUCTION}\n\n${body}`,
       "--cwd", input.cwd,
@@ -254,7 +265,7 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
     stdin: `${WRITE_INSTRUCTION}\n\n${body}`,
     allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
     envOverrides: Object.freeze({}),
-    grant: writeGrant("openai", true),
+    grant: writeGrant("openai", validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })),
     externalFiles: Object.freeze({ [schemaPath]: JSON.stringify(schema, null, 2) }),
   });
 }

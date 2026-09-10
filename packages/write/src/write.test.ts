@@ -4,11 +4,11 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
-import { codexIsolationProfileHash, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
-import { WriteDogfoodRunner, buildWriteTaskPlan, planClaudeWriteInvocation, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
+import { assertSourceCheckoutUnchanged, codexIsolationProfileHash, sourceCheckoutFingerprint, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
+import { WriteDogfoodRunner, assertSourceCheckoutClean, buildWriteTaskPlan, planClaudeWriteInvocation, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -141,4 +141,34 @@ test("write plan is deterministic, zero-call and has no merge surface", () => {
   const classification = classifyTask({ text: "change the button label", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   const plan = buildWriteTaskPlan({ router: router(), providers: [snapshot("anthropic")], classification, budget, requiredContextTokens: 500, repositoryPath: "/repo", baseRef: "HEAD", review: false });
   assert.equal(plan.providerCallsOnPlan, 0); assert.equal(plan.createsWorktree, false); assert.equal(plan.mergeAvailable, false); assert.equal(plan.roles[0]?.model.providerId, "anthropic");
+});
+
+test("a write task compares the checkout against a fingerprint, not against being clean", async () => {
+  // The distinction that matters: an ignored file rewritten during a run leaves `git status`
+  // empty and the file changed. Only a fingerprint over content notices.
+  const repo = mkdtempSync(join(tmpdir(), "braingate-fingerprint-"));
+  const run = (...args: readonly string[]): void => {
+    const result = spawnSync("git", [...args], { cwd: repo, encoding: "utf8" });
+    if (result.status !== 0) throw new Error(`git ${args.join(" ")}: ${result.stderr}`);
+  };
+  run("init", "-b", "main");
+  run("config", "user.email", "t@example.invalid");
+  run("config", "user.name", "T");
+  writeFileSync(join(repo, ".gitignore"), ".env\n");
+  writeFileSync(join(repo, ".env"), "TOKEN=first\n");
+  writeFileSync(join(repo, "app.ts"), "export const a = 1;\n");
+  run("add", ".gitignore", "app.ts");
+  run("commit", "-m", "initial");
+
+  const before = sourceCheckoutFingerprint(repo);
+  assert.doesNotThrow(() => assertSourceCheckoutClean(repo), "an ignored file does not make a tree dirty");
+
+  writeFileSync(join(repo, ".env"), "TOKEN=second\n");
+  // `git status` still sees nothing, which is exactly why it was the wrong guard.
+  assert.doesNotThrow(() => assertSourceCheckoutClean(repo));
+  assert.throws(
+    () => assertSourceCheckoutUnchanged(repo, before),
+    (error: unknown) => error instanceof BrainGateInvariantError,
+    "the fingerprint must notice a rewritten ignored file",
+  );
 });

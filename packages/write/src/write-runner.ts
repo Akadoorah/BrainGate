@@ -5,10 +5,10 @@ import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type Rout
 import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
-import { CODEX_GENERATED_IMAGES, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
+import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
 import { assertWriteEligible, planWriteInvocation } from "./write-profiles.js";
-import { assertSourceCheckoutClean, collectGuardedDiff } from "./diff-guard.js";
+import { collectGuardedDiff } from "./diff-guard.js";
 import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
 import type { PlannedWriteRole, VisualRequest, WriteProviderExecutor, WriteRunResult, WriteTaskPlan, WriteVerificationResult } from "./types.js";
 
@@ -271,6 +271,12 @@ export class WriteDogfoodRunner {
     let handle;
     try {
       handle = worktrees.prepare({ taskId: task.taskId, repositoryPath: input.repositoryPath, baseRef: plan.baseRef });
+      // The state of the source checkout before anything ran, as a hash of everything a provider
+      // could touch: HEAD, the index, tracked changes, and the *content* of untracked and
+      // ignored files — which is where a `.env` lives, and where `git status` alone sees nothing.
+      // Every check below compares against this rather than merely asking whether the tree is
+      // clean, because a run that rewrote an ignored file would leave it clean and changed.
+      const sourceBefore = sourceCheckoutFingerprint(handle.repositoryPath);
       this.#ledger.transition(task.taskId, "running", { write: true, branch: handle.branch, workspace: "task-worktree" });
       const primary = plan.roles[0]!;
       const primarySnapshot = snapshotFor(this.#providers, primary.model.providerId);
@@ -302,7 +308,7 @@ export class WriteDogfoodRunner {
       }
 
       const guarded = collectGuardedDiff(handle.worktreePath, artifacts);
-      assertSourceCheckoutClean(handle.repositoryPath);
+      assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
       this.#ledger.appendEvent(task.taskId, "write.changes_collected", { changedFiles: guarded.changedFiles, changedFileCount: guarded.changedFiles.length, diffBytes: Buffer.byteLength(guarded.diff, "utf8") });
       if (artifacts.length > 0) {
         // Path, media type, size and hash: what a reviewer needs to judge a file they cannot read.
@@ -341,7 +347,7 @@ export class WriteDogfoodRunner {
         this.#ledger.appendEvent(task.taskId, `write.review.${response.verdict}`, { provider: reviewerRole.model.providerId, model: reviewerRole.model.modelId, findingCount: response.findings.length });
       }
 
-      assertSourceCheckoutClean(handle.repositoryPath);
+      assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
       const readyForApproval = review === null || review.verdict === "approve";
       if (readyForApproval) this.#ledger.transition(task.taskId, "completed", { write: true, readyForApproval: true, approvalRequired: true, mergePerformed: false, branch: handle.branch });
       else this.#ledger.transition(task.taskId, "failed", { write: true, reason: "review", reviewVerdict: review?.verdict ?? "unknown", readyForApproval: false, approvalRequired: true, mergePerformed: false, branch: handle.branch });

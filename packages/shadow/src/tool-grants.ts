@@ -72,6 +72,64 @@ export function requestedCapabilities(input: { readonly role: WorkflowRole; read
  * with no way to deny a tool cannot be granted one safely, because the grant would describe an
  * intention rather than a boundary.
  */
+/**
+ * Narrows a declared surface to what a measured capability report actually found.
+ *
+ * The surface in a profile is a claim about a CLI; the report is a reading of the build that is
+ * installed. Where they disagree the reading wins, and it can only ever take a capability away:
+ * a probe that could not read the help text answers `unknown`, and an unknown must not be able
+ * to grant anything the profile did not already declare.
+ *
+ * This is what makes "prove then enable" a wire rather than a slogan. Before it, a profile could
+ * declare `declaredSubagents` for a build that had dropped the flag, and the run would fail at
+ * the provider with a flag error instead of being refused here with a reason.
+ */
+export function measuredSurface(declared: ProviderGrantSurface, measured: MeasuredCapabilities | null): ProviderGrantSurface {
+  if (measured === null) return declared;
+  const found = (feature: keyof MeasuredCapabilities): boolean => measured[feature] === true;
+  const unknown = (feature: keyof MeasuredCapabilities): boolean => measured[feature] === "unknown";
+  // An unreadable probe leaves the declaration standing; a probe that read the help and did not
+  // find the flag removes it.
+  const keep = (declaredValue: boolean, feature: keyof MeasuredCapabilities): boolean =>
+    declaredValue && (found(feature) || unknown(feature));
+  return Object.freeze({
+    isolatedPerInvocation: declared.isolatedPerInvocation,
+    toolDenial: keep(declared.toolDenial, "toolDenial"),
+    declaredSubagents: keep(declared.declaredSubagents, "declaredSubagents"),
+    enforcedSandbox: keep(declared.enforcedSandbox, "sandbox"),
+  });
+}
+
+/**
+ * What a capability probe found, in the vocabulary a grant needs.
+ *
+ * Deliberately the same three names the surface uses, so the two cannot drift into describing
+ * different things under one word.
+ */
+export interface MeasuredCapabilities {
+  readonly toolDenial: boolean | "unknown";
+  readonly declaredSubagents: boolean | "unknown";
+  readonly sandbox: boolean | "unknown";
+}
+
+/**
+ * A capability report, in the three terms a grant reasons about.
+ *
+ * The report carries more than this — a schema flag, a prompt route, session resume — and those
+ * shape how a provider is *driven* rather than what it is *allowed*. Only what bounds a
+ * capability belongs here.
+ */
+export function measuredFrom(report: {
+  readonly features: Readonly<Record<string, { readonly supported: boolean | "unknown" }>>;
+}): MeasuredCapabilities {
+  const read = (feature: string): boolean | "unknown" => report.features[feature]?.supported ?? "unknown";
+  return Object.freeze({
+    toolDenial: read("toolDenial"),
+    declaredSubagents: read("declaredSubagents"),
+    sandbox: read("sandbox"),
+  });
+}
+
 export interface ProviderGrantSurface {
   /** Proven per-invocation isolation — an isolated config home, or a sandbox that aborts when unapplied. */
   readonly isolatedPerInvocation: boolean;

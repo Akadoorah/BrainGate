@@ -11,7 +11,7 @@ import {
 import { GROK_SANDBOX_PROFILE, validGrokIsolationAttestation, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
 import { subagentsArgument } from "./subagents.js";
-import { grants, guaranteesFor, resolveToolGrant, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
+import { grants, guaranteesFor, measuredSurface, resolveToolGrant, type MeasuredCapabilities, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
 import { STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -216,6 +216,15 @@ export function planShadowInvocation(input: {
    * whether a run may fan out. T0-T2 do not; T3 and T4 do.
    */
   readonly fanOut?: boolean;
+  /**
+   * What a capability probe found for this build, when one has been run.
+   *
+   * It can only narrow the profile's declared surface, never widen it: the profile says what
+   * BrainGate is willing to ask of a CLI, and the probe says what this installed build actually
+   * accepts. A flag the build has dropped is refused here, with a reason, instead of failing at
+   * the provider.
+   */
+  readonly measured?: MeasuredCapabilities;
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
@@ -236,7 +245,7 @@ export function planShadowInvocation(input: {
     // reach on this path however generous a provider's surface is.
     workspaceMode: input.snapshot.providerId === "anthropic" || input.snapshot.providerId === "github-copilot" ? "project" : "staged-clean",
     writeMode: false,
-    surface: profile.surface,
+    surface: measuredSurface(profile.surface, input.measured ?? null),
     attested,
     operatorAccepted: validOperatorAcceptance(input.acceptance, input.snapshot.providerId, now),
     networkAccepted: validOperatorAcceptance(input.networkAcceptance, input.snapshot.providerId, now, "operator-accepted-network-access"),

@@ -94,3 +94,44 @@ export function bindingQuotaReading(readings: readonly QuotaReading[]): QuotaRea
   if (readings.length === 0) return null;
   return [...readings].sort((a, b) => b.utilization - a.utilization)[0]!;
 }
+
+/**
+ * How many helpers a run actually spawned inside the provider, by the provider's own count.
+ *
+ * BrainGate records one `provider_call` per CLI invocation, which is what it pays for and what
+ * the budget bounds. A lead that spawns helpers of its own spends agent executions the budget
+ * never saw: `maxConcurrentAgents` decided whether fan-out was allowed at all, and then nothing
+ * counted it. That gap is how an orchestrator becomes a swarm nobody asked for.
+ *
+ * Claude reports it — `subagent_stats.{spawned,completed}` in the final envelope, measured
+ * 2026-09-10. Where a provider reports nothing, the answer is `null`, which is recorded as
+ * `unknown` rather than as zero: "nobody counted" and "none ran" are different facts, and
+ * reading the first as the second is exactly how a limit stops being a limit.
+ */
+export interface SubagentUsage {
+  readonly spawned: number;
+  readonly completed: number;
+}
+
+export function subagentUsage(providerId: ProviderId, stdout: string): SubagentUsage | null {
+  if (providerId !== "anthropic") return null;
+  let latest: SubagentUsage | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    const stats = event.subagent_stats;
+    if (typeof stats !== "object" || stats === null) continue;
+    const record = stats as Record<string, unknown>;
+    const spawned = record.spawned;
+    const completed = record.completed;
+    if (typeof spawned !== "number" || !Number.isInteger(spawned) || spawned < 0) continue;
+    latest = Object.freeze({
+      spawned,
+      completed: typeof completed === "number" && Number.isInteger(completed) && completed >= 0 ? completed : 0,
+    });
+  }
+  return latest;
+}

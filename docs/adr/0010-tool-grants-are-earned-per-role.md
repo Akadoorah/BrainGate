@@ -41,11 +41,32 @@ Replace the fixed per-provider `guarantees` record with a **tool grant** negotia
 2. Each provider adapter maps a requested grant onto its own CLI's flags, and returns what it
    can actually enforce. An adapter that cannot honour a requested capability says so; it never
    silently returns less than was asked for.
-3. Anything above `read` requires a current attestation bound to version, platform, and a hash
-   of the granted policy — the existing `validCodexIsolationAttestation` /
-   `validGrokIsolationAttestation` shape, generalised.
+3. Anything above `read` requires proof — and proof comes in three kinds, because the risks do.
+   Naming one mechanism for all of them would be tidier and would misdescribe what actually
+   holds:
+
+   - **Structural.** `edit` is bounded by a task worktree BrainGate created, and by the
+     fingerprint taken of the source checkout before anything ran. Nothing is attested because
+     nothing needs to be: the boundary is a fact about where the work happens, it does not
+     expire, and it holds for a provider that lies about everything else.
+   - **Attested.** `shell` needs a current self-test bound to version, platform and a hash of the
+     policy it was earned under — the `validCodexIsolationAttestation` /
+     `validGrokIsolationAttestation` shape. A kernel sandbox is a claim until something reads
+     back what the kernel actually applied, and a claim is what an attestation converts.
+   - **Accepted.** `web` needs the operator's recorded decision, separate from every other
+     acceptance. What leaves the machine is the one thing no local check can measure and no
+     downstream guard can see: the diff, the worktree and the reviewer all inspect what came
+     back.
+
+   `subagents` sits across two of these: the provider must accept definitions BrainGate wrote,
+   and its per-invocation isolation must be proven or accepted, because a helper inherits the
+   run's reach.
 4. The effective grant is the intersection of what the role asked for, what the adapter proved,
-   and what the operator has accepted. It is recorded on the plan and on the receipt, so the
+   what a capability probe found in the installed build, and what the operator has accepted. The
+   probe can only narrow: a profile says what BrainGate is willing to ask of a CLI, the probe
+   says what this build accepts, and a flag the build has dropped is refused here with a reason
+   instead of failing at the provider. A probe that could not read the help answers `unknown`,
+   which changes nothing — an unreadable terminal is not a missing feature. It is recorded on the plan and on the receipt, so the
    operator sees what a run was permitted *before* it runs and what it used afterwards.
 5. `guarantees` remains in the emitted plan as the derived, honest description of the granted
    result. It stops being the place where capability is decided.
@@ -57,6 +78,14 @@ bounded write, which is what lets more than one subscription carry the work. A r
 its provider's subagents without that being an all-or-nothing decision about the provider. And
 the reason a capability was refused becomes legible: not "this provider is blocked" but "this
 role asked for `shell`, and no current attestation proves this build scopes it".
+
+**What this amendment corrects.** The decision above was first written as "anything above read
+requires a current attestation", and the implementation never matched it — `edit` rested on a
+worktree, `web` on an operator decision, and only `shell` on an attestation. The gap was in the
+sentence rather than in the code: forcing an attestation onto a structural boundary would have
+added ceremony without adding safety, and would have made a guarantee that does not expire look
+like one that does. The three kinds are now named, and the `attested` flag a write grant carries
+is derived from the check that decided eligibility rather than passed as a literal beside it.
 
 **What it costs.** More attestations to earn, and more to invalidate. Every capability above
 read is now a thing that can go stale, and staleness is the failure mode this repository has hit

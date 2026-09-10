@@ -40,10 +40,10 @@ Provider support today:
 | Provider | CLI | Status |
 |---|---|---|
 | Anthropic Claude Code | `claude` | read and write |
-| OpenAI Codex | `codex` | independent reviewer only, after an isolation self-test |
+| OpenAI Codex | `codex` | planning, review and judging, after an isolation self-test; writes once you score it for the role |
 | GitHub Copilot | `copilot` | read only, subscription attested by you |
 | Google Antigravity | `agy` | planning, review and judging — after you accept the risk below |
-| xAI Grok Build | `grok` | planning, review and judging, after a sandbox self-test |
+| xAI Grok Build | `grok` | planning, review and judging, after a sandbox self-test; writes once you score it for the role |
 
 Run `braingate providers list` to see which roles each provider may take on your machine, and
 why the closed ones are closed.
@@ -174,12 +174,18 @@ intent is guessed wrongly, the line says `write · isolated worktree` before you
 wrong guess costs a keystroke rather than a change.
 
 Follow-ups resolve against earlier turns, so `and the other one?` means something. That thread
-is ephemeral: it lives in the session process only, is never written to disk, and never becomes
-project memory — an unverified answer must not acquire the standing of a promoted record by
-passing through a conversation. `/forget` drops it; project memory is untouched.
+never becomes project memory — an unverified answer must not acquire the standing of a promoted
+record by passing through a conversation. `/forget` drops it; project memory is untouched.
 
-Closing the session ends that thread, so a new one cannot recall what you asked yesterday. What
-it *can* do is show you: `/status` lists your recent tasks by what you asked, with the models
+**The thread is written to disk**, because closing a terminal is not the same as changing the
+subject. It is kept with the project's own state, so two projects cannot see each other's; it
+holds the last six exchanges with each answer truncated to 1,200 characters; it is passed through
+the secret redactor before it is written; and it expires eight hours after the last turn. Come
+back within that window and the session says how many turns it is continuing. `/forget` deletes
+the file, not merely the memory of it. Nothing else about the boundary changed: a turn is still
+not memory, and still reaches canonical status only through the same proposal gate.
+
+Beyond that window, `/status` lists your recent tasks by what you asked, with the models
 that ran and what each spent. The request is your own text and is recorded; the answer and the
 model's reasoning are not, and never leave the process. Nothing there is fed back to a model —
 if you want BrainGate to *know* something in later sessions, that is `braingate memory`, which
@@ -451,9 +457,11 @@ Memory is per project, not shared between them. Each registered project gets its
 database under its own storage directory, and every query is additionally filtered by project
 id, so one project's decisions are not reachable from another.
 
-An interactive session's thread is a separate, weaker thing: ephemeral, in-process, never
-written to disk, and never promoted. Keeping the two apart is what stops an unverified answer
-from acquiring the standing of a verified one.
+An interactive session's thread is a separate, weaker thing: project-local, redacted, bounded to
+six turns, expiring after eight hours, and never promoted. It is written to disk so a session
+survives a closed terminal — see the interactive session section above for exactly what is kept.
+Keeping the two apart is what stops an unverified answer from acquiring the standing of a
+verified one.
 
 The task ledger is a third thing again, and neither of the first two: a project-local record of
 what you asked, which models took which role, what each reported spending, and how the task
@@ -506,9 +514,9 @@ Provider model names are not hard-coded into BrainGate. A persistent local model
 Current hardened execution paths:
 
 - **Anthropic Claude Code:** restricted read-only shadow path and M11 small-write primary path inside guarded task worktrees.
-- **OpenAI Codex CLI:** independent **reviewer-only** path when `codex login status` proves ChatGPT authentication and a local zero-model-call sandbox self-test proves the required filesystem policy for the installed Codex version.
+- **OpenAI Codex CLI:** planning, review and judging from a staged workspace when `codex login status` proves ChatGPT authentication and a local zero-model-call sandbox self-test proves the required filesystem policy for the installed Codex version. It may also hold the executing role, in a task worktree under `workspace-write`, once you score a Codex model for it.
 - **GitHub Copilot CLI:** bounded read-only path when subscription authentication is explicitly attested where safe native discovery is unavailable.
-- **xAI Grok Build:** planning, review and judging, in a kernel-sandboxed staged workspace proven per run; never the project checkout.
+- **xAI Grok Build:** planning, review and judging, in a kernel-sandboxed staged workspace proven per run; never the project checkout. It may also hold the executing role, in a task worktree under a custom kernel profile whose deny list puts secrets out of reach, once you score a Grok model for it.
 - **Google Antigravity:** the same three roles, reachable only after `braingate providers accept google`, because its isolation cannot be proven.
 
 Codex review runs from a fresh staged workspace rather than the real repository. Native Windows Codex review is blocked in this milestone; WSL uses the Linux path and must still pass the self-test.

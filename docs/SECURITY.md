@@ -28,11 +28,11 @@ Write agents operate in task-specific Git worktrees. Review-only agents receive 
 
 For the Codex reviewer path, BrainGate validates that the source CWD belongs to the registered project, but Codex itself is **not** started from that repository. BrainGate creates a fresh private staged workspace, substitutes that path into the verified permission profile, runs Codex there, and deletes the stage after the call. The real project repository is never granted as a Codex workspace root in this path.
 
-M11/M12 Claude writes use a restricted provider profile inside a task worktree. The source checkout is checked for mutation after the provider call and again after review. Sensitive files, Git/control-plane configuration, and agent instruction files are rejected by the guarded diff boundary. Current write scope is limited to T0-T2 low/medium-risk changes; high/critical-risk or T3/T4 writes fail closed before worktree/provider execution.
+Writes use a restricted provider profile inside a task worktree. The source checkout is fingerprinted before anything runs and compared after the provider call and again after review. The fingerprint covers `HEAD`, the index, tracked changes, and the *content* of untracked and ignored files — so a rewritten `.env`, which leaves `git status` empty, is caught. Claude, Grok and Codex may each hold the executing role; each has its own bounded workspace and its own proof, and all three pass through the same worktree, fingerprint, diff-guard and human-merge checks. Sensitive files, Git/control-plane configuration, and agent instruction files are rejected by the guarded diff boundary. Current write scope is limited to T0-T2 low/medium-risk changes; high/critical-risk or T3/T4 writes fail closed before worktree/provider execution.
 
-### Codex reviewer self-test
+### Codex isolation self-test
 
-Codex is reviewer-only in the hardened shadow path. Before it becomes eligible, a zero-model-call local self-test must prove the filesystem contract for the installed Codex version and platform:
+Codex fills planning, review and judging from a staged workspace, and may hold the executing role in a task worktree once a Codex model is scored for it. Before any of those becomes eligible, a zero-model-call local self-test must prove the filesystem contract for the installed Codex version and platform:
 
 1. a canary inside the staged workspace is readable;
 2. a canary outside that workspace is not readable;
@@ -41,6 +41,44 @@ Codex is reviewer-only in the hardened shadow path. Before it becomes eligible, 
 The resulting isolation attestation is bound to the Codex version, platform, and BrainGate permission-profile hash and expires after a short period. A version/profile/platform change requires a new self-test. Native Windows remains fail-closed in this milestone; WSL follows the Linux sandbox path and must pass the same test.
 
 Codex execution additionally uses ephemeral mode, ignores user exec-policy rules and user config, uses a clean non-repository CWD, pins the routed model, and explicitly disables unnecessary model-visible surfaces such as shell/code execution, web search, apps/plugins, browser/computer use, memory, worktrees, and multi-agent/collaboration features. If required configuration is rejected by the installed CLI, strict configuration causes the run to fail rather than silently broaden permissions.
+
+### What a role is allowed to do
+
+Capabilities are granted per role rather than per provider, and each kind above `read` is earned
+by proof of a different kind (ADR 0010):
+
+- **Structural** — `edit` is bounded by a task worktree BrainGate created and by the source
+  fingerprint. It does not expire and does not depend on the provider behaving.
+- **Attested** — `shell` needs a current sandbox self-test bound to the CLI version, the
+  platform, and a hash of the policy it was earned under.
+- **Accepted** — `web` needs your explicit, separate decision (`braingate providers allow-web`),
+  because what leaves this machine is the one thing no local check can see. Accepting an
+  unscoped provider does **not** grant it.
+
+MCP is refused for every role: BrainGate has no per-invocation way to prove what an MCP server
+reaches. Read profiles pass an empty MCP configuration under strict mode, so the servers are not
+loaded rather than merely denied.
+
+A capability probe reads each installed CLI's own help text — no prompt, no model, no cost — and
+can only narrow what a profile declares. A flag this build has dropped is refused with a reason
+instead of failing at the provider.
+
+### Helpers a provider runs on its own
+
+Where a provider accepts subagent definitions BrainGate wrote, a run may fan out to read-only
+helpers whose tools are a subset of the lead's. That is bounded twice: the budget must already
+allow more than one agent at once (T3 and T4 only), and the task carries a cumulative ceiling on
+agent executions inside providers. Where a provider reports its own count — Claude does — it is
+recorded as `native`; where it reports nothing, the run is charged the ceiling rather than
+credited with zero, because an uncounted helper must not be a free one.
+
+### The interactive session thread
+
+An interactive session keeps the last six exchanges so a follow-up resolves. It is written to
+disk, and treated as such: kept under the project's own storage directory, redacted through the
+secret guard before writing, each answer truncated to 1,200 characters, expiring eight hours
+after the last turn, and deleted by `/forget`. It is never memory and cannot become memory except
+by the operator writing something down through the ordinary proposal gate.
 
 ### Reviewer independence
 

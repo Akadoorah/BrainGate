@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { BrainGateInvariantError } from "@braingate/core";
-import { TOOL_CAPABILITIES, assertGrantCovers, grants, guaranteesFor, isToolCapability, requestedCapabilities, resolveToolGrant, type ProviderGrantSurface } from "./tool-grants.js";
+import { TOOL_CAPABILITIES, assertGrantCovers, grants, guaranteesFor, isToolCapability, measuredFrom, measuredSurface, requestedCapabilities, resolveToolGrant, type ProviderGrantSurface } from "./tool-grants.js";
 
 const PROVEN: ProviderGrantSurface = { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true };
 const BARE: ProviderGrantSurface = { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false };
@@ -115,4 +115,42 @@ test("a budget that allows one agent at a time gets no helpers, and is told why"
   const cheap = grant({ role: "reviewer", fanOutAllowed: false });
   assert.equal(grants(cheap, "subagents"), false);
   assert.match(cheap.refused.find((item) => item.capability === "subagents")!.reason, /one agent at a time/);
+});
+
+test("a build that dropped a flag loses the capability, whatever the profile declares", () => {
+  const declared: ProviderGrantSurface = PROVEN;
+  // What the probe read from this build's own help text.
+  const narrowed = measuredSurface(declared, { toolDenial: true, declaredSubagents: false, sandbox: true });
+  assert.equal(narrowed.declaredSubagents, false, "the reading wins over the declaration");
+  assert.equal(narrowed.toolDenial, true);
+  assert.equal(grants(grant({ role: "reviewer", surface: narrowed }), "subagents"), false);
+});
+
+test("a probe that could not read the help leaves the declaration standing", () => {
+  // Unknown is not a finding. Refusing on it would make an unreadable terminal look like a
+  // missing feature, which is the mistake the probe exists to avoid.
+  const narrowed = measuredSurface(PROVEN, { toolDenial: "unknown", declaredSubagents: "unknown", sandbox: "unknown" });
+  assert.deepEqual(narrowed, PROVEN);
+  assert.deepEqual(measuredSurface(PROVEN, null), PROVEN);
+});
+
+test("a measurement can never grant what the profile withheld", () => {
+  const narrowed = measuredSurface(BARE, { toolDenial: true, declaredSubagents: true, sandbox: true });
+  assert.equal(narrowed.declaredSubagents, false);
+  assert.equal(narrowed.enforcedSandbox, false);
+  assert.equal(narrowed.toolDenial, false);
+});
+
+test("the report speaks the grant's vocabulary without the grant learning the report's", () => {
+  const measured = measuredFrom({
+    features: {
+      toolDenial: { supported: true },
+      declaredSubagents: { supported: false },
+      sandbox: { supported: "unknown" },
+      structuredSchema: { supported: true },
+    },
+  });
+  assert.deepEqual(measured, { toolDenial: true, declaredSubagents: false, sandbox: "unknown" });
+  // A feature the report never mentions is unknown, not absent.
+  assert.equal(measuredFrom({ features: {} }).toolDenial, "unknown");
 });

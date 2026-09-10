@@ -9,6 +9,7 @@ import {
   shadowProviderRoleStatus,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
+  type MeasuredCapabilities,
   type OperatorProviderAcceptance,
   type ShadowInvocationPreview,
   type ShadowRolePayload,
@@ -69,6 +70,11 @@ interface ProviderProof {
   readonly acceptances?: readonly OperatorProviderAcceptance[];
 }
 
+function measuredFor(input: { readonly measured?: Readonly<Record<string, MeasuredCapabilities>> }, providerId: string): Readonly<{ measured?: MeasuredCapabilities }> {
+  const measured = input.measured?.[providerId];
+  return measured === undefined ? Object.freeze({}) : Object.freeze({ measured });
+}
+
 function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIsolation?: CodexIsolationAttestation; grokIsolation?: GrokIsolationAttestation; acceptance?: OperatorProviderAcceptance; networkAcceptance?: OperatorProviderAcceptance }> {
   const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId && item.source === "operator-accepted-unscoped-provider");
   const networkAcceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId && item.source === "operator-accepted-network-access");
@@ -105,6 +111,13 @@ export function buildShadowTaskPlan(input: {
   readonly cwd: string;
   readonly router: CapabilityRouter;
   readonly providers: readonly ProviderSnapshot[];
+  /**
+   * What a capability probe read from each installed build, keyed by provider.
+   *
+   * Optional, because a plan is still a plan without it — but supplied, it is what stops a
+   * profile from declaring a flag this build no longer has.
+   */
+  readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
   readonly attestations?: readonly SubscriptionAttestation[];
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
@@ -138,6 +151,7 @@ export function buildShadowTaskPlan(input: {
     cwd,
     payload: payload("primary", input.task, input.context),
     fanOut: input.budget.maxConcurrentAgents > 1,
+    ...measuredFor(input, primaryModel.providerId),
     ...attestationFor(attestations, primaryModel.providerId),
     ...proofFor(proof, primaryModel.providerId),
   });
@@ -166,6 +180,7 @@ export function buildShadowTaskPlan(input: {
         cwd,
         payload: payload("planner", input.task, input.context),
         fanOut: input.budget.maxConcurrentAgents > 1,
+        ...measuredFor(input, model.providerId),
         ...attestationFor(attestations, model.providerId),
         ...proofFor(proof, model.providerId),
       })),
@@ -216,6 +231,7 @@ export function buildShadowTaskPlan(input: {
       cwd,
       payload: payload("reviewer", input.task, input.context),
       fanOut: input.budget.maxConcurrentAgents > 1,
+      ...measuredFor(input, reviewerModel.providerId),
       ...attestationFor(attestations, reviewerModel.providerId),
       ...proofFor(proof, reviewerModel.providerId),
     });

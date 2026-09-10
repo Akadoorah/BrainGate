@@ -5,7 +5,8 @@ import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workf
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
-import { quotaReadings, type QuotaReading } from "./quota-readings.js";
+import { quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
+import { grants } from "./tool-grants.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
@@ -362,6 +363,8 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #taskId: string | null;
   readonly #maxTurns: number | undefined;
   readonly #fanOut: boolean;
+  readonly #maxSubagents: number;
+  #subagentsSpent = 0;
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
   readonly #onText: ((text: string) => void) | undefined;
   readonly #onThinking: (() => void) | undefined;
@@ -392,6 +395,15 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
      * may hand work to helpers. A cheap question does not fan out; a T3 audit may.
      */
     readonly fanOut?: boolean;
+    /**
+     * Agent executions inside providers this whole task may spend, across every role.
+     *
+     * `maxConcurrentAgents` decided whether a run could have helpers at all; nothing counted
+     * them once it did. This is the ceiling, and it is cumulative for the task rather than per
+     * call — otherwise a task with four roles quietly gets four times the fan-out its budget
+     * granted once.
+     */
+    readonly maxSubagents?: number;
     /**
      * Told, as each role starts and finishes, which provider and model is working.
      *
@@ -425,6 +437,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#taskId = input.taskId ?? null;
     this.#maxTurns = input.maxTurns;
     this.#fanOut = input.fanOut ?? false;
+    this.#maxSubagents = Math.max(0, Math.floor(input.maxSubagents ?? 0));
     this.#onRoleActivity = input.onRoleActivity;
     this.#onText = input.onText;
     this.#onThinking = input.onThinking;
@@ -458,7 +471,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       cwd: this.#cwd,
       payload,
       ...(this.#maxTurns === undefined ? {} : { maxTurns: this.#maxTurns }),
-      fanOut: this.#fanOut,
+      // Closed once the task has spent what it was granted. Enforced before the call rather
+      // than reported after it, so the ceiling costs nothing to hold.
+      fanOut: this.#fanOut && this.#subagentsSpent < this.#maxSubagents,
       ...(attestation === undefined ? {} : { attestation }),
       ...(acceptance === undefined ? {} : { acceptance }),
       ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
@@ -501,10 +516,26 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       // The retained output first, because a provider that fills the schema through a tool puts
       // the contract in its final envelope and streams only prose. When there is no envelope —
       // a stream whose answer exists solely in its pieces — the assembled text is the answer.
+      // Counted before the answer is returned, so the next role in this task sees what this one
+      // spent. A provider that reports nothing is charged the ceiling for having been allowed to
+      // fan out at all: an uncounted helper must not be a free one.
+      const spawned = subagentUsage(snapshot.providerId, result.stdout);
+      if (grants(plan.grant, "subagents")) {
+        this.#subagentsSpent += spawned === null ? this.#maxSubagents : spawned.spawned;
+        if (spawned !== null && spawned.spawned > this.#maxSubagents) {
+          this.#event("shadow.provider.fanout_exceeded", { ...safeMeta, spawned: spawned.spawned, ceiling: this.#maxSubagents });
+        }
+      }
       const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
       this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
-      this.#usage(request, result.durationMs, providerTokenUsage(snapshot.providerId, result.stdout));
+      this.#usage(
+        request,
+        result.durationMs,
+        providerTokenUsage(snapshot.providerId, result.stdout),
+        spawned,
+        grants(plan.grant, "subagents"),
+      );
       return response;
     } catch (error) {
       if (!(error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_FAILED")) {
@@ -524,11 +555,29 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     if (this.#ledger !== null && this.#taskId !== null) this.#ledger.appendEvent(this.#taskId, kind, payload);
   }
 
-  #usage(request: AgentRequest, durationMs: number, tokens: { readonly input: number; readonly output: number; readonly cacheRead: number } | null): void {
+  #usage(
+    request: AgentRequest,
+    durationMs: number,
+    tokens: { readonly input: number; readonly output: number; readonly cacheRead: number } | null,
+    subagents: SubagentUsage | null,
+    fanOutGranted: boolean,
+  ): void {
     if (this.#ledger === null || this.#taskId === null) return;
     const row = { taskId: this.#taskId, provider: request.model.providerId, model: request.model.modelId } as const;
     this.#ledger.recordUsage({ ...row, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
     this.#ledger.recordUsage({ ...row, evidence: "measured", metric: "duration_ms", value: durationMs, unit: "ms" });
+    // Agent executions that happened inside the provider, which `provider_call` never counted.
+    // The budget decided whether fan-out was allowed; this is what it cost. A provider that
+    // reports nothing is `unknown`, not zero — and a run that was never granted helpers records
+    // a hard zero, because there the absence is BrainGate's own doing and is worth asserting.
+    if (subagents !== null) {
+      this.#ledger.recordUsage({ ...row, evidence: "native", metric: "provider_subagents", value: subagents.spawned, unit: "agents" });
+      this.#ledger.recordUsage({ ...row, evidence: "native", metric: "provider_subagents_completed", value: subagents.completed, unit: "agents" });
+    } else if (!fanOutGranted) {
+      this.#ledger.recordUsage({ ...row, evidence: "measured", metric: "provider_subagents", value: 0, unit: "agents" });
+    } else {
+      this.#ledger.recordUsage({ ...row, evidence: "unknown", metric: "provider_subagents", value: null, unit: "agents" });
+    }
     // `native` only when the provider counted them itself. A total assembled from anything
     // else stays `unknown` rather than becoming a number the operator would read as authority.
     if (tokens === null) {
