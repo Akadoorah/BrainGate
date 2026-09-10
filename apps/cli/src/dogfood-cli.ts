@@ -24,17 +24,19 @@ import {
 } from "@braingate/dogfood";
 import { GlobalQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
-import { ModelListCache, ProviderDiscovery, type ProviderSnapshot } from "@braingate/providers";
+import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
   CodexIsolationVerifier,
   GROK_WRITE_SANDBOX,
   ShadowDogfoodRunner,
+  measuredFrom,
   shadowProviderRoleStatus,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type GrokSandboxPolicy,
   bindingQuotaReading,
+  type MeasuredCapabilities,
   type QuotaReading,
   type RoleActivity,
   type ShadowProcessExecutor,
@@ -70,6 +72,8 @@ export interface DogfoodCliDependencies {
   readonly onText?: (text: string) => void;
   /** Told once per role, when the model starts reasoning before it says anything. */
   readonly onThinking?: () => void;
+  /** What each installed build accepts, for tests that must not spawn probes. */
+  readonly measureCapabilities?: () => Promise<Readonly<Record<string, MeasuredCapabilities>>>;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   /**
@@ -437,6 +441,29 @@ function recordQuotaReading(state: OperatorStatePaths, readings: readonly (Quota
   } finally { store.close(); }
 }
 
+/**
+ * What each installed CLI's own help says it accepts, in the terms a grant reasons about.
+ *
+ * Free: help text, no prompt, no model. It runs alongside discovery so a profile's declaration
+ * about a flag can be narrowed by what this build actually has — the difference between a run
+ * that is refused here with a reason and one that fails at the provider with a flag error.
+ */
+async function measuredCapabilities(deps: DogfoodCliDependencies): Promise<Readonly<Record<string, MeasuredCapabilities>>> {
+  if (deps.measureCapabilities !== undefined) return await deps.measureCapabilities();
+  const runner = new NodeProbeRunner();
+  const entries = await Promise.all(PROVIDER_IDS.map(async (providerId) => {
+    try {
+      const report = await probeCliCapabilities({ providerId, runner });
+      return [providerId, measuredFrom(report)] as const;
+    } catch {
+      // A probe that could not run leaves the profile's declaration standing, which is what
+      // `unknown` already means everywhere else here.
+      return null;
+    }
+  }));
+  return Object.freeze(Object.fromEntries(entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null)));
+}
+
 async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: string, env: NodeJS.ProcessEnv, json: boolean, stdout: (text: string) => void): Promise<DogfoodCliResult> {
   const state = resolveOperatorState(env);
   const manifest = manifestOption(args);
@@ -547,7 +574,8 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }) });
+    const measured = await measuredCapabilities(deps);
+    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     const planData = Object.freeze({ classification: view, budget, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })), providerCallsOnPlan: 0 });
 

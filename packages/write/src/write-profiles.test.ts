@@ -187,3 +187,32 @@ test("a file BrainGate places for the run can never be aimed into the worktree f
     }),
   );
 });
+
+test("Claude's write grant claims no sandbox attestation, because it holds none", () => {
+  const plan = planWriteInvocation({
+    snapshot: snapshot("anthropic", "2.1.266"), model: model("anthropic", "claude-opus-5"), cwd: worktree(),
+    task: "t", context: {}, now: NOW,
+  });
+  // Derived from the proof, not asserted beside it: no kernel sandbox, so no shell.
+  assert.equal(plan.grant.granted.includes("shell"), false);
+  assert.equal(plan.grant.granted.includes("edit"), true, "the worktree is a structural boundary and needs no attestation");
+});
+
+test("a Grok write's shell is granted by the attestation it actually holds", () => {
+  const cwd = worktree();
+  const withProof = planWriteInvocation({
+    snapshot: snapshot("xai", "1.0.24"), model: model("xai", "grok-4.6"), cwd,
+    task: "t", context: {}, grokIsolation: grokProof(), now: NOW,
+  });
+  assert.equal(withProof.grant.granted.includes("shell"), true);
+
+  // Eligibility refuses a stale proof outright, which is the layer above. What this asserts is
+  // that the grant reads the same proof rather than a literal that happens to agree with it.
+  assert.throws(
+    () => planWriteInvocation({
+      snapshot: snapshot("xai", "1.0.24"), model: model("xai", "grok-4.6"), cwd,
+      task: "t", context: {}, grokIsolation: grokProof({ profileHash: "some-other-policy" }), now: NOW,
+    }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_GROK_ISOLATION_REQUIRED",
+  );
+});

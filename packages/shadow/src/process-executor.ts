@@ -5,7 +5,7 @@ import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import { grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
-import { ContractTextStream, LineBuffer, readStreamLine } from "./streaming.js";
+import { ContractTextStream, LineBuffer, ProviderStreamReader } from "./streaming.js";
 import { STAGE_PATH_TOKEN, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "./types.js";
 
 /**
@@ -189,6 +189,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         // actually needs are retained. Without that last part a token stream spends the whole
         // output cap on thinking and signature deltas nobody reads.
         const dialect = input.plan.streamDialect;
+        const reader = dialect === null ? null : new ProviderStreamReader(dialect);
         const lines = new LineBuffer();
         let prose = new ContractTextStream();
         let assembled = "";
@@ -204,7 +205,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         let shape: "unknown" | "contract-json" | "prose" = "unknown";
 
         const consume = (line: string): void => {
-          const verdict = readStreamLine(dialect!, line);
+          const verdict = reader!.read(line);
           if (verdict.restart === true && assembled.length > 0) {
             // A fresh block is a fresh answer. The prose reader starts again with it, so a
             // narrated run does not stream the same field twice.

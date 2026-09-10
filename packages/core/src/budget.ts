@@ -51,17 +51,26 @@ export interface ExecutionBudget {
    * must not acquire one because the concurrency ceiling happened to allow it.
    */
   readonly maxPlanners: number;
+  /**
+   * Agent executions a task may spend *inside* providers, across every role.
+   *
+   * `maxConcurrentAgents` bounds what BrainGate runs; this bounds what a provider runs on its
+   * own behalf once it has been handed helpers. Without it the two are not the same number and
+   * only one of them is enforced, which is how an orchestrator turns into a swarm nobody
+   * authorised — the fan-out was granted once and then never counted again.
+   */
+  readonly maxProviderSubagents: number;
   readonly reviewerPolicy: ReviewerPolicy;
   readonly councilPolicy: CouncilPolicy;
   readonly humanApprovalBeforeWrite: boolean;
 }
 
 const BASE_BUDGETS: Readonly<Record<TaskComplexity, ExecutionBudget>> = {
-  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 15, maxInspectionMs: 180000, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 20, maxInspectionMs: 300000, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 25, maxInspectionMs: 420000, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 35, maxInspectionMs: 600000, maxPlanners: 1, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 50, maxInspectionMs: 900000, maxPlanners: 2, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
+  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 15, maxInspectionMs: 180000, maxProviderSubagents: 0, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 20, maxInspectionMs: 300000, maxProviderSubagents: 0, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 25, maxInspectionMs: 420000, maxProviderSubagents: 0, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 35, maxInspectionMs: 600000, maxProviderSubagents: 2, maxPlanners: 1, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 50, maxInspectionMs: 900000, maxProviderSubagents: 4, maxPlanners: 2, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
 };
 
 export function budgetFor(classification: TaskClassification, options: { writeRequested: boolean }): ExecutionBudget {
@@ -97,6 +106,7 @@ export function budgetFor(classification: TaskClassification, options: { writeRe
       maxConcurrentAgents: Math.max(budget.maxConcurrentAgents, 2),
       // Critical work gets the second opinion whatever tier it was classified as.
       maxPlanners: Math.max(budget.maxPlanners, 2),
+      maxProviderSubagents: Math.max(budget.maxProviderSubagents, 4),
       maxReviewers: Math.max(budget.maxReviewers, 2),
       maxRepairRounds: Math.max(budget.maxRepairRounds, 2),
       maxCouncilRounds: Math.max(budget.maxCouncilRounds, 1),

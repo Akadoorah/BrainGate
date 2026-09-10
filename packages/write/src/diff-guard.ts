@@ -113,6 +113,15 @@ export function collectGuardedDiff(worktreePathInput: string, collectedArtifacts
   return Object.freeze({ changedFiles: Object.freeze(changedFiles), diff });
 }
 
+/**
+ * Whether the source checkout has no visible changes at all.
+ *
+ * Kept for the one thing it is right for — refusing to *start* a write task on a dirty tree —
+ * and deliberately not used to prove the checkout survived one. A run that rewrote an ignored
+ * file would leave `git status` empty and the file changed, so what a task compares against is a
+ * fingerprint of everything a provider could touch (`sourceCheckoutFingerprint`), taken before
+ * anything ran.
+ */
 export function assertSourceCheckoutClean(repositoryPath: string): void {
   if (git(repositoryPath, ["status", "--porcelain"]).trim().length !== 0) throw new BrainGateInvariantError("WRITE_SOURCE_MUTATED", "Source checkout changed during a worktree-only write task.");
 }

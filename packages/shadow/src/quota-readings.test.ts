@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { bindingQuotaReading, quotaReadings } from "./quota-readings.js";
+import { bindingQuotaReading, quotaReadings, subagentUsage } from "./quota-readings.js";
 
 /** Copied from a real `claude --output-format stream-json` run on 2026-09-10. */
 const EVENT = JSON.stringify({
@@ -64,4 +64,34 @@ test("an older build that reports only the closest window is still read", () => 
   assert.equal(readings.length, 1);
   assert.equal(readings[0]!.window, "five_hour");
   assert.equal(readings[0]!.utilization, 0.61);
+});
+
+/** Copied from a real Claude result envelope on 2026-09-10. */
+const SUBAGENT_ENVELOPE = JSON.stringify({
+  type: "result",
+  subagent_stats: {
+    spawned: 3, completed: 2,
+    requested: { background: 0, foreground: 3, unset: 0 },
+    refused: { depth_limit: 0, concurrency_limit: 0, budget: 0 },
+  },
+});
+
+test("helpers a provider ran inside itself are counted, by its own number", () => {
+  const usage = subagentUsage("anthropic", `{"type":"system"}\n${SUBAGENT_ENVELOPE}`);
+  assert.deepEqual(usage, { spawned: 3, completed: 2 });
+});
+
+test("a provider that counts nothing is unknown, never zero", () => {
+  // The distinction the whole ledger rests on: "nobody counted" and "none ran" are different
+  // facts, and reading the first as the second is how a ceiling stops being one.
+  assert.equal(subagentUsage("anthropic", '{"type":"result","usage":{"input_tokens":1,"output_tokens":1}}'), null);
+  assert.equal(subagentUsage("xai", SUBAGENT_ENVELOPE), null, "only the provider whose shape was measured is read");
+  assert.equal(subagentUsage("anthropic", "not json"), null);
+});
+
+test("a nonsense count is not a count", () => {
+  assert.equal(subagentUsage("anthropic", '{"subagent_stats":{"spawned":-1}}'), null);
+  assert.equal(subagentUsage("anthropic", '{"subagent_stats":{"spawned":1.5}}'), null);
+  // A missing `completed` is zero rather than a reason to discard the spawn count.
+  assert.deepEqual(subagentUsage("anthropic", '{"subagent_stats":{"spawned":2}}'), { spawned: 2, completed: 0 });
 });
