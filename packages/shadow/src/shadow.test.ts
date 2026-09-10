@@ -950,3 +950,27 @@ test("a new text block starts the answer again, so narration is not part of it",
   const thinkingBlock = '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}';
   assert.notEqual(readStreamLine("anthropic", thinkingBlock).restart, true);
 });
+
+test("search reaches a provider only where the operator granted the network", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const base = { snapshot: snapshot("anthropic"), model, cwd: repo, payload: { ...payload, role: "planner" as const }, now: reference };
+
+  const withoutWeb = planShadowInvocation(base);
+  assert.equal(withoutWeb.args[withoutWeb.args.indexOf("--tools") + 1], "Read,Glob,Grep");
+  assert.equal(withoutWeb.guarantees.noNetworkTools, true);
+
+  const networkAcceptance = acceptance("anthropic", {
+    source: "operator-accepted-network-access",
+    acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString(),
+  });
+  const withWeb = planShadowInvocation({ ...base, networkAcceptance });
+  assert.equal(withWeb.args[withWeb.args.indexOf("--tools") + 1], "Read,Glob,Grep,WebSearch,WebFetch");
+  assert.ok(withWeb.grant.granted.includes("web"));
+  // The guarantee stops claiming what is no longer true.
+  assert.equal(withWeb.guarantees.noNetworkTools, false);
+
+  // The other decision is not this decision.
+  const unscopedOnly = planShadowInvocation({ ...base, acceptance: acceptance("anthropic", { acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString() }) });
+  assert.equal(unscopedOnly.args[unscopedOnly.args.indexOf("--tools") + 1], "Read,Glob,Grep");
+});

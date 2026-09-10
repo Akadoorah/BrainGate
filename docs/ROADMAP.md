@@ -81,15 +81,17 @@ underneath the router so capability routing has something to choose between:
   a grant negotiated per role and proven by attestation. See ADR 0010 (proposed).
 - **M16 — More than one provider can write.** ✅ Grok and Codex coder roles behind the same
   worktree/fingerprint/diff-guard/human-merge outcome checks that protect the Claude write path.
-- **M17 — Subagents as a routing primitive.** ◐ The router selects a team shape — a lead plus
+- **M17 — Subagents as a routing primitive.** ✅ The router selects a team shape — a lead plus
   BrainGate-defined subagents whose grants are a subset of the lead's — bounded by the existing
   budget governor.
-- **M18 — Antigravity readmitted, and terminal parity.** ◐ Re-measured isolation, streaming output,
+- **M18 — Antigravity readmitted, and terminal parity.** ✅ Re-measured isolation, streaming output,
   resumable per-project sessions, and a receipt naming which provider did which step.
 
-All four subscriptions now fill planning, review and judging; Grok and Codex can hold the
-executing role once the operator scores them for it. What remains open is cross-provider fan-out
-within one role, streaming output, and resumable sessions.
+All four subscriptions fill planning, review and judging; Grok and Codex can hold the executing
+role once the operator scores them for it; a T4 task plans on two independent subscriptions at
+once; and the terminal writes the answer as the model writes it. What is not built is streaming
+for the two providers whose stream shape has not been watched, and a review contract has no prose
+field to stream.
 
 Full plan, measured provider evidence, and sequencing: [`MULTI_MODEL_PLAN.md`](MULTI_MODEL_PLAN.md).
 

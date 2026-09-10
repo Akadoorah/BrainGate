@@ -260,9 +260,15 @@ export function planShadowInvocation(input: {
       "--no-session-persistence",
       "--no-chrome",
       "--disable-slash-commands",
-      // The Agent tool appears only when the grant and the budget both allow helpers, and the
-      // helpers themselves are the ones BrainGate defined — read-only, named, and bounded.
-      "--tools", subagents === null ? "Read,Glob,Grep" : "Read,Glob,Grep,Agent",
+      // Exactly what the grant allows, and nothing standing by in case. The Agent tool appears
+      // only when the grant and the budget both permit helpers — and the helpers are the ones
+      // BrainGate defined, read-only and named. Search appears only where the operator has said
+      // this provider may reach the network.
+      "--tools", [
+        "Read", "Glob", "Grep",
+        ...(subagents === null ? [] : ["Agent"]),
+        ...(grants(grant, "web") ? ["WebSearch", "WebFetch"] : []),
+      ].join(","),
       ...(subagents === null ? [] : ["--agents", subagents]),
       "--disallowedTools", "mcp__*",
       // Denying the tools is not the same as not loading the servers: a run's own init event

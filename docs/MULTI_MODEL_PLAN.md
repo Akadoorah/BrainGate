@@ -144,7 +144,7 @@ workspace under the same attestation.*
 `writeCapable`, and scores no `coder` capability for Grok or Codex. The code no longer stands in
 the way; which models may execute is their decision, recorded in their catalogue.*
 
-### M17 — Subagents as a routing primitive ◐
+### M17 — Subagents as a routing primitive ✅
 
 The router stops selecting only a model and starts selecting a **team shape**: a lead plus a set
 of subagents that BrainGate itself defines and whose tool grants are a subset of the lead's.
@@ -154,14 +154,22 @@ Because BrainGate writes the definitions, fan-out is bounded by the same budget 
 loop caps that already bound everything else — the subagents are inside the grant, not an
 escape from it.
 
-*Half done. Claude and Grok take definitions BrainGate wrote — a read-only explorer, and a
-verifier for review — and get them whenever the grant allows and the budget already permits more
-than one agent at once (`maxConcurrentAgents > 1`, so T3 and T4). Grok's `--agents` takes a map,
-not an array; measured, not assumed. What is not built is the router selecting a team shape
-across providers: one task still runs its roles in sequence, each on the provider that suits it,
-rather than fanning one role out across four subscriptions at once.*
+*Done, in two halves. Within a provider: Claude and Grok take definitions BrainGate wrote — a
+read-only explorer, and a verifier for review — whenever the grant allows and the budget already
+permits more than one agent at once. Grok's `--agents` takes a map, not an array; measured.
 
-### M18 — Antigravity readmitted, and terminal parity ◐
+Across providers: a task that is worth planning is planned twice, by subscriptions that share no
+pool, at the same time. `maxPlanners` is explicit policy rather than a consequence of the
+concurrency ceiling, because multi-agent execution is opt-in by rule here — two at T4 and at
+critical risk, one at T3, none below. Both approaches reach the executor whole and labelled, with
+reconciling them stated as part of the work: summarising would need a third model, and voting
+would discard the half that was right about the part the other missed.
+
+Verified against the real CLIs: a T4 task planned by Anthropic and Google in parallel, executed
+by Anthropic, reviewed by Codex, with the receipt showing more than one subscription spending a
+call.*
+
+### M18 — Antigravity readmitted, and terminal parity ✅
 
 - Re-measure Antigravity's isolation against 1.1.28 under the M14 probe. If HOME scoping is
   still impossible, it stays behind the ADR 0008 acceptance — but with stdin, `--add-dir`,
@@ -171,11 +179,23 @@ rather than fanning one role out across four subscriptions at once.*
   Parity with Claude Code is the floor here; the surplus is the receipt — which provider did
   which step, on which quota, and why the router chose it.
 
-*Antigravity is done and its block was re-measured rather than lifted: an isolated `HOME` still
-loses authentication on 1.1.28, so it still runs only on the operator's recorded acceptance —
-but it now reads from stdin, answers under an enforced schema, and reports its own token counts,
-so accepting it buys a real worker instead of a crippled one. The confirmation prompt shows each
-role's grant and refusals. Streaming output and resumable sessions are not built.*
+*Done. Antigravity's block was re-measured rather than lifted: an isolated `HOME` still loses
+authentication on 1.1.28, so it still runs only on the operator's recorded acceptance — but it
+reads from stdin, answers under an enforced schema, and reports its own token counts, so
+accepting it buys a real worker instead of a crippled one.
+
+The terminal writes the answer as the model writes it, for the two providers whose stream shape
+has been measured. The subtlety is that a provider under a schema does not stream prose: Claude
+fills the contract through a tool and streams the human answer, Grok streams the contract JSON
+itself, so the readable field is decoded out of it as it arrives. The indicator names the role,
+the model and the pool being spent. The thread survives closing the terminal — kept with the
+project, redacted, expiring after eight hours, and still not memory.
+
+Two things arrived with the measurements rather than from the plan. Claude publishes a real
+remaining balance on every run, which routing now believes in preference to its own account of
+its traffic. And letting a role search the web became its own operator decision, because reading
+it off the unscoped-provider acceptance granted the network to a provider accepted for an
+unrelated reason and withheld it from one that never needed accepting.*
 
 ## What does not change
 

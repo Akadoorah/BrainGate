@@ -385,3 +385,91 @@ test("a streamed provider writes its answer while it is still working", { skip: 
     cli.cleanup();
   }
 });
+
+/**
+ * A tool that only exists once the operator says so.
+ *
+ * Every other capability BrainGate grants is proven by a self-test that costs nothing. The
+ * network cannot be: what leaves the machine is the one thing no check downstream can see, so
+ * the only evidence that the grant works is a run that actually searched.
+ *
+ * The acceptance is written into this test's own isolated home. The operator's own state is
+ * never touched by it.
+ */
+test("a planner granted the network can search, and one without it cannot", { skip: SKIP }, async () => {
+  const cli = makeCli();
+  try {
+    register(cli);
+
+    const denied = cli.run(["providers", "list", "--json"], 120_000);
+    assert.equal(denied.status, 0, `${denied.stdout}${denied.stderr}`);
+
+    const grant = cli.run(["providers", "allow-web", "anthropic"], 60_000);
+    assert.equal(grant.status, 0, `allow-web failed: ${grant.stdout}${grant.stderr}`);
+    assert.match(grant.stdout, /may search the web until/);
+
+    const { ProviderDiscovery } = await import("@braingate/providers");
+    const { NodeShadowProcessExecutor, planShadowInvocation } = await import("@braingate/shadow");
+    const { ProjectRegistry } = await import("@braingate/core");
+    const { resolveOperatorState } = await import("@braingate/operator");
+    const { loadAcceptances } = await import("./provider-proof.js");
+
+    const state = resolveOperatorState({ ...process.env, BRAINGATE_HOME: cli.home });
+    const project = new ProjectRegistry(cli.home).loadFile(join(cli.repo, ".brain", "project.json"));
+    const snapshots = await new ProviderDiscovery().discoverAll();
+    const snapshot = snapshots.find((item) => item.providerId === "anthropic");
+    assert.ok(snapshot?.available.value === true, "Claude must be installed for this test");
+
+    const acceptances = loadAcceptances(state);
+    const networkAcceptance = acceptances.find((item) => item.providerId === "anthropic" && item.source === "operator-accepted-network-access");
+    assert.ok(networkAcceptance !== undefined, "the command wrote no network acceptance");
+
+    // A trivial prompt: what is under test is which tools the session was given, not what the
+    // model chose to do with them. BrainGate grants a capability; using it is the model's call.
+    const payload = {
+      schemaVersion: 1 as const,
+      role: "planner" as const,
+      phase: "integration",
+      task: "Reply with the single word: ready.",
+      findings: [],
+      candidateOutput: null,
+      context: {},
+      responseContract: { kind: "work", output: "string" },
+    };
+    const model = { providerId: "anthropic" as const, modelId: "claude-haiku-4-5", quotaPool: "claude-subscription" };
+    const executor = new NodeShadowProcessExecutor();
+
+    /** The tools the provider itself says the session was given, from its own init event. */
+    const sessionTools = (stdout: string): readonly string[] => {
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!line.includes('"subtype":"init"')) continue;
+        try {
+          const event = JSON.parse(line.trim()) as { tools?: unknown };
+          if (Array.isArray(event.tools)) return event.tools.filter((tool): tool is string => typeof tool === "string");
+        } catch { continue; }
+      }
+      return [];
+    };
+
+    const withWeb = planShadowInvocation({ snapshot, model, cwd: cli.repo, payload, networkAcceptance, maxTurns: 4 });
+    assert.ok(withWeb.args[withWeb.args.indexOf("--tools") + 1]?.includes("WebSearch"), "the granted plan must carry the search tool");
+    assert.equal(withWeb.guarantees.noNetworkTools, false, "a plan that can search must not claim it cannot");
+    const granted = await executor.run({ project, plan: withWeb, timeoutMs: 240_000 });
+    assert.equal(granted.timedOut, false, "the granted run timed out");
+    const grantedTools = sessionTools(granted.stdout);
+    assert.ok(grantedTools.includes("WebSearch"), `the session was not given the search tool: ${grantedTools.join(", ")}`);
+
+    // Without the grant the tool is not there to be used, by the provider's own account.
+    const withoutWeb = planShadowInvocation({ snapshot, model, cwd: cli.repo, payload, maxTurns: 4 });
+    assert.ok(!withoutWeb.args[withoutWeb.args.indexOf("--tools") + 1]?.includes("WebSearch"));
+    assert.equal(withoutWeb.guarantees.noNetworkTools, true);
+    assert.match(withoutWeb.grant.refused.find((item) => item.capability === "web")!.reason, /allow-web/);
+    const ungranted = await executor.run({ project, plan: withoutWeb, timeoutMs: 240_000 });
+    const ungrantedTools = sessionTools(ungranted.stdout);
+    assert.ok(ungrantedTools.length > 0, "the ungranted run reported no tools at all, so nothing was compared");
+    assert.ok(!ungrantedTools.includes("WebSearch"), `the ungranted session was given the search tool anyway: ${ungrantedTools.join(", ")}`);
+    assert.ok(!ungrantedTools.includes("WebFetch"));
+  } finally {
+    cli.cleanup();
+  }
+});
