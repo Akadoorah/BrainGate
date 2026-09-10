@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ProjectRegistry } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
-import { looksLikeWriteRequest, runRepl } from "./repl.js";
+import { activityLabel, grantLines, looksLikeWriteRequest, runRepl, withoutStreamedAnswer } from "./repl.js";
 
 function git(cwd: string, args: readonly string[]): void {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -151,4 +151,38 @@ test("a subdirectory of a registered repository is not offered registration agai
   assert.equal(await s.run(), 0);
   assert.ok(!s.asked.some((q) => /Register this repository now/.test(q)), "registration was offered inside an already-registered repository");
   assert.match(s.text(), /Type a request, or \/help/);
+});
+
+test("the confirmation shows what each role may do, not only which model was chosen", () => {
+  const planned = [
+    "T4/medium · planner=anthropic/claude-fable-5-1 · reviewer=openai/gpt-6-astra",
+    "  planner: read, subagents · refused web",
+    "  reviewer: read · refused subagents",
+    "Zero provider model calls executed.",
+  ].join("\n");
+  assert.deepEqual([...grantLines(planned)], [
+    "planner: read, subagents · refused web",
+    "reviewer: read · refused subagents",
+  ]);
+  assert.deepEqual([...grantLines("T0/low · primary=anthropic/claude-haiku-4-5")], []);
+});
+
+test("the indicator names the role, the model and the pool being spent", () => {
+  assert.equal(
+    activityLabel({ role: "planner", model: "grok-4.6", quotaPool: "grok-subscription" }),
+    "planning · grok-4.6 · grok-subscription",
+  );
+  assert.equal(
+    activityLabel({ role: "reviewer", model: "gpt-6-astra", quotaPool: "chatgpt-subscription" }),
+    "reviewing · gpt-6-astra · chatgpt-subscription",
+  );
+  // A role with no better verb still says which model is spending the time.
+  assert.match(activityLabel({ role: "primary", model: "claude-sonnet-5", quotaPool: "claude-subscription" }), /^working · claude-sonnet-5/);
+});
+
+test("an answer that was streamed live is not printed a second time", () => {
+  const finished = "The service reports failures through a shared handler.\n\nTask 8fbc9645 · observed=1 · outcome=approved";
+  assert.equal(withoutStreamedAnswer(finished), "\nTask 8fbc9645 · observed=1 · outcome=approved");
+  // Nothing recognisable to keep is better than repeating the whole answer.
+  assert.equal(withoutStreamedAnswer("just an answer with no receipt"), "");
 });

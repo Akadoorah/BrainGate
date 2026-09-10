@@ -28,6 +28,10 @@ const SAFE_PROBE_COMMANDS = new Set([
   "claude\0auth\0status",
   "codex\0--version",
   "codex\0--help",
+  // Codex keeps its execution flags under the subcommand: `codex --help` never mentions
+  // `--output-schema`. Reading only the top level would record a surface this build has as one
+  // it lacks, which is the drift the capability report exists to stop.
+  "codex\0exec\0--help",
   "codex\0login\0status",
   "agy\0--version",
   "agy\0--help",

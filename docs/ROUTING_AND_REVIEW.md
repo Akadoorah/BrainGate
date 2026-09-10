@@ -35,8 +35,21 @@ This milestone only plans/routes and orchestrates abstract agents. Real provider
 
 ## Where quota pressure comes from
 
-No provider publishes a remaining balance, so for a long time pressure was `unknown` for every
+For a long time no provider published a remaining balance, so pressure was `unknown` for every
 pool and routing never moved: the strongest model won every role until its pool ran out for real.
+
+**One does now.** Measured 2026-09-10 against claude 2.1.266: every headless run emits a
+`rate_limit_event` before its answer, carrying `unifiedWindows.five_hour.utilization` and
+`seven_day.utilization` with the time each rolls over. That is a real reading rather than a
+comparison, it costs nothing to obtain, and it is recorded as `pressure` with `native` evidence —
+which the rule below already said outranks the local signal.
+
+Where a provider reports more than one window, the fullest decides, because that is the window
+that will refuse first: a five-hour window at 0.9 is a pool to route away from now, whatever the
+weekly figure says. The other windows are kept under their own metric so a receipt can say what
+was reported without them competing for the routing decision. A run the provider refuses marks
+the pool exhausted; utilization alone never does — it decides where work goes, not whether the
+pool is up.
 
 BrainGate knows one thing about quota — what it spent itself — and provider token counts are
 recorded natively. Pools are therefore compared against each other: the busiest recent pool

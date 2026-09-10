@@ -3,10 +3,23 @@ import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
-import type { GrokIsolationAttestation } from "./grok-isolation.js";
+import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
+import { quotaReadings, type QuotaReading } from "./quota-readings.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
+
+/** What a role is doing, as it happens. */
+export interface RoleActivity {
+  readonly stage: "started" | "completed";
+  readonly role: AgentRequest["role"];
+  readonly provider: string;
+  readonly model: string;
+  readonly quotaPool: string;
+  /** The capabilities this role actually received, so the line says what it may do. */
+  readonly grant: readonly string[];
+  readonly durationMs?: number;
+}
 
 function responseContract(role: AgentRequest["role"]): Readonly<Record<string, unknown>> {
   // A plan is work: it produces the approach the executor then follows. It is not a review, and
@@ -44,12 +57,84 @@ export function extractCodexAgentMessage(stdout: string): string {
   return finalMessage;
 }
 
+
+/**
+ * The answer from an Antigravity stream-json run.
+ *
+ * One NDJSON object per line, and the reply is in the last line that carries one — as a
+ * `result`/`response` string, or as Anthropic-shaped `message.content`. Three shapes rather than
+ * one because the format is the CLI's, not BrainGate's, and a parser that knew only the shape it
+ * was written against would fail the whole run on a rename. A line that parses as nothing useful
+ * is skipped, never guessed at.
+ */
+/** The `result` object of an Antigravity stream-json run, or null when there is none. */
+export function antigravityResultRecord(stdout: string): Record<string, unknown> | null {
+  let latest: Record<string, unknown> | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    const result = event.result;
+    if (typeof result === "object" && result !== null) latest = result as Record<string, unknown>;
+  }
+  return latest;
+}
+
+export function extractAntigravityResult(stdout: string): string | null {
+  const record = antigravityResultRecord(stdout);
+  if (record === null) return null;
+  // The schema-conformant object the CLI enforced, when it is there. It is the same answer as
+  // `response`, minus the model's narration around it — measured: a run replying "ready" puts
+  // three lines in `response` and exactly the contracted object in `structured_output`.
+  const structured = record.structured_output;
+  if (typeof structured === "object" && structured !== null) return JSON.stringify(structured);
+  const response = record.response;
+  return typeof response === "string" && response.trim().length > 0 ? response : null;
+}
+
+/**
+ * The last NDJSON line that yields something, by whatever rule the caller supplies.
+ *
+ * A streamed run's envelope is its final line; scanning from the end and taking the last hit is
+ * what makes this work whether the provider emits one line or a thousand.
+ */
+/** The last NDJSON line that carries a `usage` object: the run's own accounting. */
+function lastStreamEnvelope(stdout: string): Record<string, unknown> | null {
+  let latest: Record<string, unknown> | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    if (typeof event.usage === "object" && event.usage !== null) latest = event;
+  }
+  return latest;
+}
+
+export function lastJsonLine(stdout: string, pick: (event: Record<string, unknown>) => string | null): string | null {
+  let latest: string | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    const picked = pick(event);
+    if (picked !== null) latest = picked;
+  }
+  return latest;
+}
+
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   const trimmed = stdout.trim();
   if (providerId === "openai") return extractCodexAgentMessage(trimmed);
   if (providerId === "xai") {
-    // Grok's `--output-format json` wraps the reply in an envelope carrying the text, the stop
-    // reason and native token counts. The contract JSON is the `text` field.
+    // A streamed run has no envelope: its answer is assembled from the pieces before this is
+    // reached. What is left here is an error line, or an older non-streamed envelope whose
+    // contract JSON is the `text` field.
     try {
       const outer = JSON.parse(trimmed) as Record<string, unknown>;
       if (typeof outer.text === "string") return outer.text;
@@ -57,10 +142,14 @@ function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
     } catch (error) {
       if (error instanceof BrainGateInvariantError) throw error;
     }
+    const streamed = lastJsonLine(trimmed, (event) => (typeof event.message === "string" ? event.message : null));
+    if (streamed !== null) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", `Grok reported: ${boundedText(streamed, 300)}`);
   }
   if (providerId === "google") {
-    // agy answers with a result envelope; a run whose tools were auto-denied still reports
-    // SUCCESS with an empty response, so an empty answer is a failure rather than a reply.
+    // agy answers a stream-json run with NDJSON, and a single-shot run with one envelope. Both
+    // shapes are read, because which one arrives depends on the build rather than on the request.
+    const streamed = extractAntigravityResult(trimmed);
+    if (streamed !== null) return streamed;
     try {
       const outer = JSON.parse(trimmed) as Record<string, unknown>;
       const response = outer.response;
@@ -82,9 +171,71 @@ function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
       if (typeof outer.result === "string") return outer.result;
       const structured = outer.structured_output;
       if (structured !== undefined) return JSON.stringify(structured);
-    } catch { /* parse role JSON below */ }
+    } catch { /* a streamed run is many lines, not one object */ }
+    // The final envelope of a stream-json run, which is the last line rather than the whole
+    // output. Reached only when the assembled answer was empty.
+    const streamed = lastJsonLine(trimmed, (event) => {
+      if (typeof event.result === "string") return event.result;
+      return event.structured_output === undefined ? null : JSON.stringify(event.structured_output);
+    });
+    if (streamed !== null) return streamed;
   }
   return trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
+}
+
+/**
+ * The last complete JSON object in a string, or null.
+ *
+ * Walks backwards from each closing brace to its match, ignoring braces inside strings and
+ * respecting escapes, and returns the first one that parses. That is the answer, because the
+ * contract object is what a role emits last.
+ */
+export function lastBalancedJsonObject(text: string): Record<string, unknown> | null {
+  for (let end = text.lastIndexOf("}"); end >= 0; end = text.lastIndexOf("}", end - 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let start = end; start >= 0; start -= 1) {
+      const character = text[start]!;
+      if (inString) {
+        // Walking backwards, a quote ends the string only when it is not itself escaped, which
+        // is decided by how many backslashes precede it.
+        if (character === '"') {
+          let slashes = 0;
+          for (let back = start - 1; back >= 0 && text[back] === "\\"; back -= 1) slashes += 1;
+          if (slashes % 2 === 0) inString = false;
+        }
+        continue;
+      }
+      if (character === '"') { inString = true; continue; }
+      if (character === "}") depth += 1;
+      else if (character === "{") {
+        depth -= 1;
+        if (depth === 0) {
+          try { return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>; }
+          catch { break; }
+        }
+      }
+    }
+    if (escaped) break;
+  }
+  return null;
+}
+
+/**
+ * Parses the role contract from whichever of the two places this run put it.
+ *
+ * Both are tried rather than chosen by provider, because which one holds the answer is a
+ * property of the run — whether the model filled the schema through a tool or wrote it out —
+ * and not of the CLI's name.
+ */
+function parseRoleResponseWithFallback(role: AgentRequest["role"], providerId: ProviderId, stdout: string, assembled: string | null): AgentResponse {
+  try {
+    return parseRoleResponse(role, providerId, stdout);
+  } catch (error) {
+    if (assembled === null || assembled.trim().length === 0) throw error;
+    return parseRoleResponse(role, providerId, assembled);
+  }
 }
 
 function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, stdout: string): AgentResponse {
@@ -93,11 +244,12 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
   try {
     parsed = JSON.parse(candidate) as Record<string, unknown>;
   } catch {
-    const start = candidate.indexOf("{");
-    const end = candidate.lastIndexOf("}");
-    if (start < 0 || end <= start) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider did not return parseable JSON for the role contract.");
-    try { parsed = JSON.parse(candidate.slice(start, end + 1)) as Record<string, unknown>; }
-    catch { throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider returned malformed JSON for the role contract."); }
+    // The last complete object in the text, not everything between the first brace and the last.
+    // A model that narrates before it answers puts braces in its prose — a code snippet, a JSON
+    // example — and taking the outermost span then fails on a run that actually succeeded.
+    const object = lastBalancedJsonObject(candidate);
+    if (object === null) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider did not return parseable JSON for the role contract.");
+    parsed = object;
   }
 
   // `kind` only restates the role BrainGate already routed, so a provider that omits it has not
@@ -132,10 +284,19 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
  * answer, and that question is the reason the router exists.
  */
 export function providerTokenUsage(providerId: string, stdout: string): { readonly input: number; readonly output: number; readonly cacheRead: number } | null {
-  let envelope: Record<string, unknown>;
-  try { envelope = JSON.parse(stdout.trim()) as Record<string, unknown>; }
-  catch { return null; }
   if (providerId !== "xai" && providerId !== "anthropic" && providerId !== "google") return null;
+  let envelope: Record<string, unknown> | null = null;
+  try { envelope = JSON.parse(stdout.trim()) as Record<string, unknown>; }
+  catch { envelope = null; }
+  // A stream reports its accounting inside the final result event rather than at the top level.
+  // Reading only the outer object recorded `unknown` for a provider that had told us exactly
+  // what it spent.
+  if (envelope === null && providerId === "google") envelope = antigravityResultRecord(stdout);
+  // A streamed run's accounting is in its last line — Claude's result envelope, Grok's `end`
+  // event. Reading only the outer object recorded `unknown` for a provider that had said
+  // exactly what it spent.
+  if (envelope === null) envelope = lastStreamEnvelope(stdout);
+  if (envelope === null) return null;
   const usage = envelope.usage;
   if (typeof usage !== "object" || usage === null) return null;
   const record = usage as Record<string, unknown>;
@@ -190,7 +351,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #cwd: string;
   readonly #snapshots: ReadonlyMap<string, ProviderSnapshot>;
   readonly #attestations: ReadonlyMap<string, SubscriptionAttestation>;
-  readonly #acceptances: ReadonlyMap<string, OperatorProviderAcceptance>;
+  // A list rather than a map, because one provider can carry two different decisions and a map
+  // keyed by provider silently kept whichever was written last.
+  readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #context: unknown;
@@ -198,6 +361,11 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #ledger: TaskLedger | null;
   readonly #taskId: string | null;
   readonly #maxTurns: number | undefined;
+  readonly #fanOut: boolean;
+  readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
+  readonly #onText: ((text: string) => void) | undefined;
+  readonly #onThinking: (() => void) | undefined;
+  readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
   readonly #timeoutMs: number | undefined;
 
   constructor(input: {
@@ -216,12 +384,39 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly maxTurns?: number;
     /** Wall-clock allowance for one invocation; from the task's execution budget. */
     readonly timeoutMs?: number;
+    /**
+     * Whether this task's budget allows more than one agent at once.
+     *
+     * `ExecutionBudget.maxConcurrentAgents > 1`, passed through rather than re-derived: subagents
+     * are concurrent agents, so the number that already bounds concurrency decides whether a run
+     * may hand work to helpers. A cheap question does not fan out; a T3 audit may.
+     */
+    readonly fanOut?: boolean;
+    /**
+     * Told, as each role starts and finishes, which provider and model is working.
+     *
+     * The ledger already records this, but only a reader who goes looking afterwards sees it.
+     * A terminal watching a task run has one question while it waits — who is doing this right
+     * now — and answering it is the whole difference between a spinner and a control plane.
+     */
+    readonly onRoleActivity?: (activity: RoleActivity) => void;
+    /** Told the model's prose as it is written, for a provider whose stream shape is known. */
+    readonly onText?: (text: string) => void;
+    /** Told once per role, when the model starts reasoning before it says anything. */
+    readonly onThinking?: () => void;
+    /**
+     * Told what the provider said about its own remaining window, when it says anything.
+     *
+     * Free: the reading arrives on its own alongside the answer. Routing has been comparing
+     * pools against each other for want of exactly this.
+     */
+    readonly onQuotaReading?: (reading: QuotaReading & { readonly quotaPool: string }) => void;
   }) {
     this.#project = input.project;
     this.#cwd = input.cwd;
     this.#snapshots = new Map(input.snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
     this.#attestations = new Map((input.attestations ?? []).map((attestation) => [attestation.providerId, attestation]));
-    this.#acceptances = new Map((input.acceptances ?? []).map((acceptance) => [acceptance.providerId, acceptance]));
+    this.#acceptances = Object.freeze([...(input.acceptances ?? [])]);
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#context = input.context;
@@ -229,6 +424,11 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#ledger = input.ledger ?? null;
     this.#taskId = input.taskId ?? null;
     this.#maxTurns = input.maxTurns;
+    this.#fanOut = input.fanOut ?? false;
+    this.#onRoleActivity = input.onRoleActivity;
+    this.#onText = input.onText;
+    this.#onThinking = input.onThinking;
+    this.#onQuotaReading = input.onQuotaReading;
     this.#timeoutMs = input.timeoutMs;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
@@ -250,22 +450,32 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       responseContract: responseContract(request.role),
     });
     const attestation = this.#attestations.get(request.model.providerId);
-    const acceptance = this.#acceptances.get(request.model.providerId);
+    const acceptance = this.#acceptances.find((item) => item.providerId === request.model.providerId && item.source === "operator-accepted-unscoped-provider");
+    const networkAcceptance = this.#acceptances.find((item) => item.providerId === request.model.providerId && item.source === "operator-accepted-network-access");
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
       cwd: this.#cwd,
       payload,
       ...(this.#maxTurns === undefined ? {} : { maxTurns: this.#maxTurns }),
+      fanOut: this.#fanOut,
       ...(attestation === undefined ? {} : { attestation }),
       ...(acceptance === undefined ? {} : { acceptance }),
+      ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
       ...(request.model.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
     });
     const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
     this.#event("shadow.provider.started", safeMeta);
+    this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
     try {
-      const result = await this.#executor.run({ project: this.#project, plan, ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }) });
+      const result = await this.#executor.run({
+        project: this.#project,
+        plan,
+        ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
+        ...(this.#onText === undefined ? {} : { onText: this.#onText }),
+        ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }),
+      });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         this.#event("shadow.provider.failed", { ...safeMeta, timedOut: result.timedOut, exitCode: result.exitCode, error: redactSecrets(result.stderr).slice(0, 500) });
         const reason = providerFailureReason(request.model.providerId, result.stdout, result.stderr);
@@ -274,8 +484,26 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.${reason === null ? "" : ` The provider reported: ${reason}.`}${failureAdvice(reason)}`,
         );
       }
-      const response = parseRoleResponse(request.role, snapshot.providerId, result.stdout);
+      // A Grok build that cannot apply the profile now warns and carries on (measured against
+      // 1.0.24), so a successful exit is not by itself evidence the sandbox was in force. The
+      // run is discarded rather than its answer accepted: an unsandboxed run is the one case the
+      // attestation exists to make impossible.
+      if (snapshot.providerId === "xai" && grokSandboxNotApplied(`${result.stdout}\n${result.stderr}`)) {
+        this.#event("shadow.provider.failed", { ...safeMeta, reason: "sandbox-not-applied" });
+        throw new BrainGateInvariantError("SHADOW_GROK_SANDBOX_NOT_APPLIED", "Grok reported that the BrainGate sandbox profile was not applied, so this run was not confined. Its output is discarded.");
+      }
+      // A streamed run's answer is what was assembled from its pieces; the retained output no
+      // longer holds it, by design.
+      for (const reading of quotaReadings(snapshot.providerId, result.stdout)) {
+        try { this.#onQuotaReading?.({ ...reading, quotaPool: request.model.quotaPool }); }
+        catch { /* a reading nobody could record is not a reason to lose the answer */ }
+      }
+      // The retained output first, because a provider that fills the schema through a tool puts
+      // the contract in its final envelope and streams only prose. When there is no envelope —
+      // a stream whose answer exists solely in its pieces — the assembled text is the answer.
+      const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
+      this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
       this.#usage(request, result.durationMs, providerTokenUsage(snapshot.providerId, result.stdout));
       return response;
     } catch (error) {
@@ -284,6 +512,12 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       }
       throw error;
     }
+  }
+
+  #activity(activity: RoleActivity): void {
+    // Never allowed to end a task: a terminal that fails to draw is not a reason to discard a
+    // provider's answer.
+    try { this.#onRoleActivity?.(activity); } catch { /* the display is not the work */ }
   }
 
   #event(kind: string, payload: unknown): void {

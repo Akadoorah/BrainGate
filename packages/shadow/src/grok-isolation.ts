@@ -37,7 +37,36 @@ import { NodeCodexSandboxRunner, type CodexSandboxResult, type CodexSandboxRunne
 export const GROK_SANDBOX_PROFILE = "braingate-staged";
 
 /**
- * The `.grok/sandbox.toml` BrainGate writes into the staged workspace.
+ * A sandbox profile BrainGate defines, with the hash an attestation is bound to.
+ *
+ * There is more than one because a read and a write want different things from the kernel, and
+ * an attestation earned under one must not silently cover the other: the hash is over the
+ * policy, so a run under a different profile has no valid proof until its own self-test runs.
+ */
+export interface GrokSandboxPolicy {
+  readonly name: string;
+  readonly toml: string;
+  readonly hash: string;
+}
+
+function sandboxPolicy(input: { readonly name: string; readonly extends: string; readonly restrictNetwork: boolean; readonly deny?: readonly string[] }): GrokSandboxPolicy {
+  const definition = Object.freeze({ schemaVersion: 1, profile: input.name, extends: input.extends, restrictNetwork: input.restrictNetwork, ...(input.deny === undefined ? {} : { deny: input.deny }) });
+  const lines = [
+    `[profiles.${input.name}]`,
+    `extends = "${input.extends}"`,
+    `restrict_network = ${String(input.restrictNetwork)}`,
+    ...(input.deny === undefined ? [] : [`deny = [${input.deny.map((pattern) => JSON.stringify(pattern)).join(", ")}]`]),
+    "",
+  ];
+  return Object.freeze({
+    name: input.name,
+    toml: lines.join("\n"),
+    hash: createHash("sha256").update(JSON.stringify(definition)).digest("hex"),
+  });
+}
+
+/**
+ * The `.grok/sandbox.toml` BrainGate writes into a staged workspace.
  *
  * `strict` is the narrowest base: reads are confined to the working directory and system paths,
  * so the project checkout and the operator's home are unreachable without naming them.
@@ -45,24 +74,29 @@ export const GROK_SANDBOX_PROFILE = "braingate-staged";
  * which is why the attestation records the platform rather than claiming the same guarantee
  * everywhere.
  */
-const SANDBOX_POLICY = Object.freeze({
-  schemaVersion: 1,
-  profile: GROK_SANDBOX_PROFILE,
+export const GROK_STAGED_SANDBOX: GrokSandboxPolicy = sandboxPolicy({ name: GROK_SANDBOX_PROFILE, extends: "strict", restrictNetwork: true });
+
+/**
+ * The profile a Grok write runs under, in the task worktree.
+ *
+ * `strict` already writes only to the working directory, which is the worktree and nothing else
+ * on the machine. The deny list is what a settings file cannot give you: kernel-enforced for the
+ * process and everything it spawns, so a secret is unreadable rather than off-limits by
+ * instruction.
+ */
+export const GROK_WRITE_SANDBOX: GrokSandboxPolicy = sandboxPolicy({
+  name: "braingate-write",
   extends: "strict",
   restrictNetwork: true,
+  deny: Object.freeze(["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/credentials*", "**/.git/config"]),
 });
 
 export function grokSandboxProfileToml(): string {
-  return [
-    `[profiles.${GROK_SANDBOX_PROFILE}]`,
-    `extends = "${SANDBOX_POLICY.extends}"`,
-    `restrict_network = ${String(SANDBOX_POLICY.restrictNetwork)}`,
-    "",
-  ].join("\n");
+  return GROK_STAGED_SANDBOX.toml;
 }
 
 export function grokIsolationProfileHash(): string {
-  return createHash("sha256").update(JSON.stringify(SANDBOX_POLICY)).digest("hex");
+  return GROK_STAGED_SANDBOX.hash;
 }
 
 /**
@@ -139,11 +173,14 @@ function normalizedVersion(snapshot: ProviderSnapshot): string {
 export function validGrokIsolationAttestation(
   value: GrokIsolationAttestation | undefined,
   snapshot: ProviderSnapshot,
-  options: { readonly platform?: NodeJS.Platform; readonly now?: Date } = {},
+  options: { readonly platform?: NodeJS.Platform; readonly now?: Date; readonly policy?: GrokSandboxPolicy } = {},
 ): boolean {
   if (value === undefined || value.providerId !== "xai" || value.source !== "sandbox-event-self-test") return false;
   const platform = platformGate(options.platform ?? process.platform);
-  if (value.platform !== platform || value.version !== normalizedVersion(snapshot) || value.profileHash !== grokIsolationProfileHash()) return false;
+  // An attestation earned under the read profile does not cover a write: the hash is over the
+  // policy, so asking for the wrong one has no proof rather than the nearest available one.
+  const policy = options.policy ?? GROK_STAGED_SANDBOX;
+  if (value.platform !== platform || value.version !== normalizedVersion(snapshot) || value.profileHash !== policy.hash) return false;
   const now = options.now ?? new Date();
   const observed = new Date(value.observedAt);
   const expires = new Date(value.expiresAt);
@@ -221,23 +258,25 @@ export class GrokIsolationVerifier {
    */
   async verify(
     snapshot: ProviderSnapshot,
-    options: { readonly projectPaths?: readonly string[]; readonly now?: Date } = {},
+    options: { readonly projectPaths?: readonly string[]; readonly now?: Date; readonly policy?: GrokSandboxPolicy } = {},
   ): Promise<GrokIsolationAttestation> {
     if (snapshot.providerId !== "xai") throw new BrainGateInvariantError("GROK_ISOLATION_PROVIDER_INVALID", "The Grok isolation verifier accepts only the xAI provider.");
     if (snapshot.available.value !== true) throw new BrainGateInvariantError("GROK_ISOLATION_UNAVAILABLE", "Grok CLI is unavailable.");
     const platform = platformGate(this.#platform);
     const version = normalizedVersion(snapshot);
     const now = options.now ?? new Date();
+    const policy = options.policy ?? GROK_STAGED_SANDBOX;
     const grokHome = resolveGrokHome(this.#baseEnv);
     const root = mkdtempSync(join(tmpdir(), "braingate-grok-verify-"));
     const workspace = join(root, "workspace");
     const isolatedHome = join(root, "home");
     mkdirSync(join(workspace, ".grok"), { recursive: true, mode: 0o700 });
     mkdirSync(isolatedHome, { mode: 0o700 });
-    writeFileSync(join(workspace, ".grok", "sandbox.toml"), grokSandboxProfileToml(), { encoding: "utf8", mode: 0o600 });
+    writeFileSync(join(workspace, ".grok", "sandbox.toml"), policy.toml, { encoding: "utf8", mode: 0o600 });
 
-    const eventLog = join(grokHome, "sandbox-events.jsonl");
-    const before = readIfPresent(eventLog).length;
+    // Per file, because either one may be the one this build writes and a mark taken across
+    // both would shift the moment the other grows.
+    const before = grokSandboxEventLogs(grokHome).map((log) => log.length);
 
     try {
       const environment = this.#secretGuard.buildEnvironment(this.#baseEnv, {
@@ -248,21 +287,24 @@ export class GrokIsolationVerifier {
       environment.env.TERM = "dumb";
       const result = await this.#runner.run({
         binary: snapshot.binary,
-        args: ["-p", "probe", "--cwd", workspace, "--sandbox", GROK_SANDBOX_PROFILE, "--model", GROK_PROBE_MODEL, "--output-format", "json"],
+        args: ["-p", "probe", "--cwd", workspace, "--sandbox", policy.name, "--model", GROK_PROBE_MODEL, "--output-format", "json"],
         cwd: workspace,
         env: environment.env,
       });
       if (!result.spawned) throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "The Grok CLI could not be started for the sandbox self-test.");
-      if (/refusing to start/i.test(`${result.stdout}\n${result.stderr}`)) {
-        throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "Grok refused to start with the BrainGate sandbox profile, so its protections were not applied.");
+      if (grokSandboxNotApplied(`${result.stdout}\n${result.stderr}`)) {
+        throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "Grok did not apply the BrainGate sandbox profile, so its protections were not in force.");
       }
 
-      const appended = readIfPresent(eventLog).slice(before);
+      // Read from wherever this build writes it. grok 1.0.24 moved the log into
+      // `$GROK_HOME/sessions/`, and reading only the old path found nothing — which fails
+      // closed, but fails closed on a file move rather than on a missing protection.
+      const appended = grokSandboxEventsSince(grokHome, before);
       const event = latestProfileApplied(appended, workspace);
       if (event === null) {
         throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "Grok recorded no applied sandbox profile for the staged workspace, so nothing proves the profile took effect.");
       }
-      if (event.profile !== GROK_SANDBOX_PROFILE || event.enforced !== true) {
+      if (event.profile !== policy.name || event.enforced !== true) {
         throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", `Grok applied profile ${event.profile} with enforced=${String(event.enforced)}, not an enforced BrainGate profile.`);
       }
       const surfaces = grokConfigSurfaces(grokHome);
@@ -276,7 +318,7 @@ export class GrokIsolationVerifier {
       if (unexpected.length > 0) {
         throw new BrainGateInvariantError(
           "GROK_ISOLATION_SELF_TEST_FAILED",
-          `The sandbox profile in force grants paths BrainGate did not define (${unexpected.slice(0, 3).join(", ")}). A profile named ${GROK_SANDBOX_PROFILE} in your own sandbox.toml takes precedence over BrainGate's; rename or remove it.`,
+          `The sandbox profile in force grants paths BrainGate did not define (${unexpected.slice(0, 3).join(", ")}). A profile named ${policy.name} in your own sandbox.toml takes precedence over BrainGate's; rename or remove it.`,
         );
       }
       // Whatever the roots say in general, the concrete claim is about this operator's project.
@@ -291,7 +333,7 @@ export class GrokIsolationVerifier {
         source: "sandbox-event-self-test",
         version,
         platform,
-        profileHash: grokIsolationProfileHash(),
+        profileHash: policy.hash,
         readableRoots: Object.freeze([...(event.read_only_paths ?? [])]),
         // Recorded rather than claimed: on macOS Grok reports the request but the kernel does
         // not block child-process network, and an attestation that said otherwise would be a
@@ -327,6 +369,36 @@ export function resolveGrokHome(env: NodeJS.ProcessEnv): string {
 function readIfPresent(path: string): string {
   try { return readFileSync(path, "utf8"); }
   catch { return ""; }
+}
+
+/**
+ * Grok's own record of the policies it applied, from wherever this build keeps it.
+ *
+ * Measured 2026-09-09 against grok 1.0.24: the log moved from `$GROK_HOME/sandbox-events.jsonl`
+ * to `$GROK_HOME/sessions/sandbox-events.jsonl`. Both are read, newest last, so an older build
+ * and a current one both answer the same question. A missing file is an empty log, never an
+ * error: absence of evidence fails the self-test on its own.
+ */
+export function grokSandboxEventLogs(grokHome: string): readonly string[] {
+  return Object.freeze([readIfPresent(join(grokHome, "sandbox-events.jsonl")), readIfPresent(join(grokHome, "sessions", "sandbox-events.jsonl"))]);
+}
+
+/** What each log gained since the marks were taken, as one text. */
+export function grokSandboxEventsSince(grokHome: string, marks: readonly number[]): string {
+  return grokSandboxEventLogs(grokHome).map((log, index) => log.slice(marks[index] ?? 0)).join("\n");
+}
+
+/**
+ * Whether Grok told us, in its own words, that the sandbox is not in force.
+ *
+ * ADR 0009 rested on a custom profile that cannot be applied aborting the run. Re-measured
+ * against grok 1.0.24, it does not: a profile it cannot find now prints "sandbox could not be
+ * applied" and continues with exit 0. So the words are read rather than trusted, on the
+ * self-test and on every real run — because a run that continues unsandboxed is precisely the
+ * case the attestation was supposed to have made impossible.
+ */
+export function grokSandboxNotApplied(output: string): boolean {
+  return /refusing to start/i.test(output) || /sandbox could not be applied/i.test(output);
 }
 
 export type { CodexSandboxResult as GrokSandboxResult, CodexSandboxRunner as GrokSandboxRunner };

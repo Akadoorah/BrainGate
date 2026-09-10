@@ -69,12 +69,14 @@ interface ProviderProof {
   readonly acceptances?: readonly OperatorProviderAcceptance[];
 }
 
-function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIsolation?: CodexIsolationAttestation; grokIsolation?: GrokIsolationAttestation; acceptance?: OperatorProviderAcceptance }> {
-  const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId);
+function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIsolation?: CodexIsolationAttestation; grokIsolation?: GrokIsolationAttestation; acceptance?: OperatorProviderAcceptance; networkAcceptance?: OperatorProviderAcceptance }> {
+  const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId && item.source === "operator-accepted-unscoped-provider");
+  const networkAcceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId && item.source === "operator-accepted-network-access");
   return Object.freeze({
     ...(providerId === "openai" && proof.codexIsolation !== undefined ? { codexIsolation: proof.codexIsolation } : {}),
     ...(providerId === "xai" && proof.grokIsolation !== undefined ? { grokIsolation: proof.grokIsolation } : {}),
     ...(acceptance === undefined ? {} : { acceptance }),
+    ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
   });
 }
 
@@ -90,7 +92,7 @@ function excludedProviders(input: {
   readonly proof: ProviderProof;
 }): readonly string[] {
   return Object.freeze(input.providers.filter((snapshot) => {
-    const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
+    const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
     if (!shadowProviderRoleStatus(snapshot.providerId, input.role, acceptance === undefined ? {} : { acceptance }).enabled) return true;
     if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
     if (snapshot.providerId === "xai" && input.proof.grokIsolation === undefined) return true;
@@ -135,6 +137,7 @@ export function buildShadowTaskPlan(input: {
     model: primaryModel,
     cwd,
     payload: payload("primary", input.task, input.context),
+    fanOut: input.budget.maxConcurrentAgents > 1,
     ...attestationFor(attestations, primaryModel.providerId),
     ...proofFor(proof, primaryModel.providerId),
   });
@@ -142,30 +145,48 @@ export function buildShadowTaskPlan(input: {
 
   // The planning pass, previewed before it is spent. A plan that showed only the executor would
   // hide the model the task actually leads with, which is the routing decision worth seeing.
-  if (input.budget.separatePlanningPass) {
+  if (input.budget.separatePlanningPass && input.budget.maxPlanners > 0) {
+    const plannerExclusions = excludedProviders({ providers: input.providers, role: "planner", proof });
+    const routePlanner = (independence?: { readonly mode: "required"; readonly level: "cross-provider"; readonly models: readonly ModelRef[] }) => input.router.route({
+      role: "planner",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
+      writeRequired: false,
+      ...(independence === undefined ? {} : { independence }),
+      excludeProviders: plannerExclusions,
+    });
+    const previewPlanner = (route: ReturnType<typeof routePlanner>, model: ModelRef): PlannedShadowRole => Object.freeze({
+      role: "planner",
+      model,
+      route,
+      invocation: previewShadowInvocation(planShadowInvocation({
+        snapshot: snapshotFor(input.providers, model.providerId),
+        model,
+        cwd,
+        payload: payload("planner", input.task, input.context),
+        fanOut: input.budget.maxConcurrentAgents > 1,
+        ...attestationFor(attestations, model.providerId),
+        ...proofFor(proof, model.providerId),
+      })),
+    });
+
     try {
-      const plannerRoute = input.router.route({
-        role: "planner",
-        classification: input.classification,
-        budget: input.budget,
-        requiredContextTokens: input.requiredContextTokens,
-        writeRequired: false,
-        excludeProviders: excludedProviders({ providers: input.providers, role: "planner", proof }),
-      });
+      const plannerRoute = routePlanner();
       const plannerModel = modelRef(plannerRoute);
-      roles.push(Object.freeze({
-        role: "planner",
-        model: plannerModel,
-        route: plannerRoute,
-        invocation: previewShadowInvocation(planShadowInvocation({
-          snapshot: snapshotFor(input.providers, plannerModel.providerId),
-          model: plannerModel,
-          cwd,
-          payload: payload("planner", input.task, input.context),
-          ...attestationFor(attestations, plannerModel.providerId),
-          ...proofFor(proof, plannerModel.providerId),
-        })),
-      }));
+      roles.push(previewPlanner(plannerRoute, plannerModel));
+
+      // The second approach, from a provider that shares no pool with the first. Previewed here
+      // rather than discovered at run time, because a plan that showed one planner and then
+      // spent two would be describing a task the operator did not approve.
+      if (input.budget.maxPlanners > 1) {
+        try {
+          const secondRoute = routePlanner({ mode: "required", level: "cross-provider", models: [plannerModel] });
+          roles.push(previewPlanner(secondRoute, modelRef(secondRoute)));
+        } catch (error) {
+          if (!(error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL")) throw error;
+        }
+      }
     } catch (error) {
       // No model declares a planner capability; the task plans and executes in one pass.
       if (!(error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL")) throw error;
@@ -194,6 +215,7 @@ export function buildShadowTaskPlan(input: {
       model: reviewerModel,
       cwd,
       payload: payload("reviewer", input.task, input.context),
+      fanOut: input.budget.maxConcurrentAgents > 1,
       ...attestationFor(attestations, reviewerModel.providerId),
       ...proofFor(proof, reviewerModel.providerId),
     });

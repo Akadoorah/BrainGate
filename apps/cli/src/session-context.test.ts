@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { SessionContext } from "./session-context.js";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import { SessionContext, sessionThreadPath } from "./session-context.js";
 
 test("a follow-up can see what was already asked and answered", () => {
   const session = new SessionContext();
@@ -53,4 +56,57 @@ test("a very long answer is truncated rather than carried whole", () => {
   const answer = session.recent(160_000)[0]!.answer;
   assert.ok(answer.length < 2_000, "a session carries the thread of the conversation, not its transcript");
   assert.match(answer, /…$/);
+});
+
+test("a thread outlives the process, and comes back to the same project", () => {
+  const home = mkdtempSync(join(tmpdir(), "braingate-thread-"));
+  const path = sessionThreadPath(home);
+
+  const first = new SessionContext({ path });
+  first.record("where is the logo?", "in assets/logo.svg");
+  assert.equal(first.resumed, 0, "a new thread resumes nothing");
+
+  const second = new SessionContext({ path });
+  assert.equal(second.resumed, 1);
+  assert.deepEqual([...second.recent(24_000)], [{ request: "where is the logo?", answer: "in assets/logo.svg" }]);
+
+  // A different project has its own file and cannot see this one.
+  const elsewhere = new SessionContext({ path: sessionThreadPath(mkdtempSync(join(tmpdir(), "braingate-thread-other-"))) });
+  assert.equal(elsewhere.size, 0);
+});
+
+test("a thread old enough to have changed subject is not resumed", () => {
+  const path = sessionThreadPath(mkdtempSync(join(tmpdir(), "braingate-thread-age-")));
+  let clock = Date.parse("2026-09-10T09:00:00.000Z");
+  new SessionContext({ path, now: () => clock }).record("what does the parser do?", "it reads NDJSON");
+
+  clock += 7 * 60 * 60 * 1000;
+  assert.equal(new SessionContext({ path, now: () => clock }).resumed, 1, "a few hours later is still the same thread");
+
+  clock += 2 * 60 * 60 * 1000;
+  assert.equal(new SessionContext({ path, now: () => clock }).resumed, 0, "the next day is not");
+});
+
+test("a secret in an answer never reaches the file", () => {
+  const path = sessionThreadPath(mkdtempSync(join(tmpdir(), "braingate-thread-secret-")));
+  const session = new SessionContext({ path });
+  session.record("what is the key?", "the token is sk-abcdefghijklmnopqrstuvwxyz012345");
+  const written = readFileSync(path, "utf8");
+  assert.doesNotMatch(written, /sk-abcdefghijklmnopqrstuvwxyz012345/, "a thread that outlives the process is where a secret would settle");
+});
+
+test("forget deletes the thread rather than only forgetting it here", () => {
+  const path = sessionThreadPath(mkdtempSync(join(tmpdir(), "braingate-thread-forget-")));
+  const session = new SessionContext({ path });
+  session.record("a", "b");
+  session.clear();
+  assert.equal(existsSync(path), false);
+  assert.equal(new SessionContext({ path }).size, 0);
+});
+
+test("an unreadable thread starts a fresh session rather than failing one", () => {
+  const path = sessionThreadPath(mkdtempSync(join(tmpdir(), "braingate-thread-broken-")));
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, "{not json", "utf8");
+  assert.equal(new SessionContext({ path }).size, 0);
 });

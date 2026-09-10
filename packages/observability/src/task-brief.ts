@@ -216,7 +216,7 @@ export function recordTaskBrief(ledger: TaskLedger, brief: TaskBrief): void {
 export interface WorkflowReceiptSummary {
   readonly outcome: WorkflowReceipt["outcome"];
   readonly roles: readonly {
-    readonly role: "planner" | "primary" | "reviewer" | "judge";
+    readonly role: "planner" | "planner-2" | "primary" | "reviewer" | "judge";
     readonly providerId: string;
     readonly modelId: string;
     readonly quotaPool: string;
@@ -225,7 +225,7 @@ export interface WorkflowReceiptSummary {
   readonly budget: BudgetSnapshot;
 }
 
-function roleSummary(role: "planner" | "primary" | "reviewer" | "judge", candidate: WorkflowReceipt["primary"] | null) {
+function roleSummary(role: "planner" | "planner-2" | "primary" | "reviewer" | "judge", candidate: WorkflowReceipt["primary"] | null) {
   if (candidate === null) return null;
   const definition = candidate.model.definition;
   return Object.freeze({
@@ -240,6 +240,9 @@ export function summarizeWorkflowReceipt(receipt: WorkflowReceipt): WorkflowRece
   const roles = [
     // First, because it is the decision the rest of the task follows from.
     roleSummary("planner", receipt.planner),
+    // Named separately, so a receipt for a task that spent two subscriptions on the approach
+    // says both rather than one.
+    roleSummary("planner-2", receipt.secondPlanner),
     roleSummary("primary", receipt.primary),
     roleSummary("reviewer", receipt.reviewer),
     roleSummary("judge", receipt.judge),

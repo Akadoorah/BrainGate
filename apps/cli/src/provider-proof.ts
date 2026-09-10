@@ -7,10 +7,12 @@ import {
   IsolationAttestationCache,
   codexIsolationFingerprint,
   grokIsolationFingerprint,
+  GROK_STAGED_SANDBOX,
   validCodexIsolationAttestation,
   validGrokIsolationAttestation,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
+  type GrokSandboxPolicy,
   type OperatorProviderAcceptance,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
@@ -64,6 +66,13 @@ export async function grokIsolationStatus(input: {
   readonly project?: RegisteredProject;
   readonly cache?: IsolationAttestationCache;
   readonly verify?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
+  /**
+   * Which sandbox policy the proof is for. Defaults to the read-only staged profile.
+   *
+   * A write runs under a different profile, and its proof is a different proof: the hash covers
+   * the policy, so one earned here is not accepted there.
+   */
+  readonly policy?: GrokSandboxPolicy;
 }): Promise<IsolationStatus<GrokIsolationAttestation>> {
   const snapshot = input.snapshots.find((item) => item.providerId === "xai");
   if (snapshot === undefined || snapshot.available.value !== true) return failed("Grok CLI is unavailable.");
@@ -74,17 +83,20 @@ export async function grokIsolationStatus(input: {
   // accepted it when it was earned, against the snapshot taken moments ago. A CLI that has been
   // updated, a policy whose hash has moved, or an entry past its own expiry falls through to a
   // fresh self-test rather than being believed.
-  const fingerprint = input.cache === undefined ? null : safely(() => grokIsolationFingerprint(input.env, snapshot.binary));
+  const policy = input.policy ?? GROK_STAGED_SANDBOX;
+  // The policy is part of the key: two profiles earn two proofs, and a cache that conflated them
+  // would hand a write the answer a read-only run had earned.
+  const fingerprint = input.cache === undefined ? null : safely(() => `${grokIsolationFingerprint(input.env, snapshot.binary)}:${policy.hash}`);
   if (input.cache !== undefined && fingerprint !== null) {
     const remembered = input.cache.read<GrokIsolationAttestation>("xai", fingerprint);
-    if (remembered !== null && validGrokIsolationAttestation(remembered, snapshot)) {
+    if (remembered !== null && validGrokIsolationAttestation(remembered, snapshot, { policy })) {
       return Object.freeze({ attempted: false, eligible: true, attestation: remembered, reason: null });
     }
   }
 
   try {
     const attestation = input.verify === undefined
-      ? await new GrokIsolationVerifier({ env: input.env }).verify(snapshot, { projectPaths: input.project?.repositories ?? [] })
+      ? await new GrokIsolationVerifier({ env: input.env }).verify(snapshot, { projectPaths: input.project?.repositories ?? [], policy })
       : await input.verify(snapshot);
     if (input.cache !== undefined && fingerprint !== null) input.cache.write("xai", fingerprint, attestation);
     return Object.freeze({ attempted: true, eligible: true, attestation, reason: null });
@@ -146,7 +158,7 @@ export function loadAcceptances(state: OperatorStatePaths): readonly OperatorPro
     if (!isProviderId(record.providerId)) continue;
     accepted.push(Object.freeze({
       providerId: record.providerId,
-      source: "operator-accepted-unscoped-provider",
+      source: record.source,
       acceptedAt: record.acceptedAt,
       expiresAt: record.expiresAt,
     }));
@@ -165,6 +177,9 @@ export function loadAcceptances(state: OperatorStatePaths): readonly OperatorPro
 export function acceptedSubscriptions(state: OperatorStatePaths): readonly SubscriptionAttestation[] {
   const claims: SubscriptionAttestation[] = [];
   for (const acceptance of loadAcceptances(state)) {
+    // Only the unscoped-provider decision carries the subscription self-attestation with it.
+    // Allowing a role to search the web says nothing about how the account is billed.
+    if (acceptance.source !== "operator-accepted-unscoped-provider") continue;
     claims.push(Object.freeze({
       providerId: acceptance.providerId,
       mode: "subscription",

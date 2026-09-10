@@ -40,6 +40,13 @@ import {
   validGrokIsolationAttestation,
   grokIsolationProfileHash,
   grokSandboxProfileToml,
+  extractAntigravityResult,
+  jsonSchemaFor,
+  lastBalancedJsonObject,
+  readStreamLine,
+  resolveToolGrant,
+  type ToolGrant,
+  STAGED_SCHEMA_FILE,
   latestProfileApplied,
   unexpectedRoots,
   GROK_SANDBOX_PROFILE,
@@ -132,6 +139,14 @@ function codexIsolation(values: Partial<CodexIsolationAttestation> = {}, referen
   };
 }
 
+function readOnlyGrant(providerId: ProviderId, workspaceMode: "project" | "staged-clean" = "project"): ToolGrant {
+  return resolveToolGrant({
+    role: "primary", providerId, workspaceMode, writeMode: false,
+    surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false },
+    attested: true, operatorAccepted: false,
+  });
+}
+
 test("Claude profile is restricted/read-only and keeps task/context out of argv", () => {
   const { repo } = setupProject();
   const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: new Date("2026-09-07T01:00:00Z") });
@@ -168,14 +183,18 @@ test("Copilot requires proven subscription or short-lived local attestation and 
   assert.doesNotMatch(command, /private task body|private context body/);
 });
 
-test("Codex is enabled only for reviewer role and requires current isolation attestation", { skip: process.platform === "win32" }, () => {
+test("Codex runs the staged roles and nothing that needs the checkout, with a current attestation", { skip: process.platform === "win32" }, () => {
   const { repo } = setupProject();
   const openai = snapshot("openai");
   const codexModel: ModelRef = { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription" };
   assert.equal(shadowProviderStatus("openai").enabled, true);
+  // `primary` is the one role a staged workspace cannot fill: it would have to read the real
+  // checkout, which the stage deliberately does not contain.
   assert.equal(shadowProviderRoleStatus("openai", "primary").enabled, false);
-  assert.equal(shadowProviderRoleStatus("openai", "reviewer").enabled, true);
-  assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload }), /reviewer-only/);
+  for (const role of ["planner", "reviewer", "judge"] as const) {
+    assert.equal(shadowProviderRoleStatus("openai", role).enabled, true, role);
+  }
+  assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload }), /staged roles only/);
   const reviewPayload: ShadowRolePayload = { ...payload, role: "reviewer", responseContract: { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" } };
   assert.throws(() => planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload }), /isolation/);
   const plan = planShadowInvocation({ snapshot: openai, model: codexModel, cwd: repo, payload: reviewPayload, codexIsolation: codexIsolation({}, new Date("2026-09-07T01:00:00Z").getTime()), now: new Date("2026-09-07T01:00:00Z") });
@@ -386,14 +405,17 @@ test("the runner spends the budget's turns rather than a fixed ceiling", async (
   assert.equal(turns, String(budget.maxInspectionTurns));
 });
 
-test("the role prompt never carries task text and tells the provider not to echo the request", () => {
+test("the role prompt never carries task text, and the reply shape is enforced rather than requested", () => {
   const { repo } = setupProject();
   const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: new Date("2026-09-07T01:00:00Z") });
   const prompt = plan.args.join(" ");
   assert.doesNotMatch(prompt, /private task body|private context body/);
-  assert.match(prompt, /responseContract/);
-  assert.match(prompt, /Do not echo the request back/);
-  assert.match(prompt, /no markdown code fences/);
+  assert.match(prompt, /Analyze only/);
+  const schemaIndex = plan.args.indexOf("--json-schema");
+  assert.ok(schemaIndex > 0, "the plan must carry a response schema");
+  const schema = JSON.parse(plan.args[schemaIndex + 1]!) as { properties: Record<string, unknown>; required: string[]; additionalProperties: boolean };
+  assert.deepEqual(schema.required, Object.keys(payload.responseContract));
+  assert.equal(schema.additionalProperties, false);
 });
 
 test("node executor blocks cwd escapes, scrubs API env overrides and stages clean workspace", async () => {
@@ -402,7 +424,7 @@ test("node executor blocks cwd escapes, scrubs API env overrides and stages clea
     providerId: "anthropic", executable: process.execPath,
     args: ["-e", "process.stdout.write(String(process.env.OPENAI_API_KEY)+' sk-abcdefghijklmnopqrstuvwxyz012345')"],
     cwd: repo, workspaceMode: "project", modelId: "test", quotaPool: "test", inputMode: "stdin", stdin: "{}", attachmentContent: null, attachmentToken: null,
-    allowedEnvKeys: [], envOverrides: {}, guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("anthropic"), streamDialect: null, guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
   };
   const executor = new NodeShadowProcessExecutor();
   const result = await executor.run({ project, plan: basePlan, env: { PATH: process.env.PATH, OPENAI_API_KEY: "should-not-pass" } });
@@ -638,7 +660,7 @@ test("a staged Grok run gets its sandbox profile and its prompt, and neither sur
     args: ["-e", "const fs=require('node:fs');process.stdout.write([process.cwd(),fs.readFileSync('.grok/sandbox.toml','utf8'),fs.readFileSync(process.argv[1],'utf8'),String(process.env.GROK_HOME),String(process.env.HOME)].join('\\u0000'))", `${STAGE_PATH_TOKEN}/braingate-request.txt`],
     cwd: repo, workspaceMode: "staged-clean", modelId: "grok-4.6", quotaPool: "grok-subscription",
     inputMode: "staged-file", stdin: null, attachmentContent: "REQUEST BODY", attachmentToken: "braingate-request.txt",
-    allowedEnvKeys: [], envOverrides: {},
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"), streamDialect: null,
     guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
     minimumVersion: null,
   };
@@ -659,7 +681,7 @@ test("a staged request file cannot be aimed anywhere but the staged workspace", 
     providerId: "xai", executable: process.execPath, args: ["-e", "0"],
     cwd: repo, workspaceMode: "staged-clean", modelId: "m", quotaPool: "q",
     inputMode: "staged-file", stdin: null, attachmentContent: "body", attachmentToken: "../escaped.txt",
-    allowedEnvKeys: [], envOverrides: {},
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"), streamDialect: null,
     guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
     minimumVersion: null,
   };
@@ -802,4 +824,153 @@ test("a count that is absent, malformed or from a provider that reports none sta
   assert.equal(providerTokenUsage("anthropic", JSON.stringify({ usage: { input_tokens: -1, output_tokens: 1 } })), null);
   assert.equal(providerTokenUsage("openai", JSON.stringify({ usage: { input_tokens: 1, output_tokens: 1 } })), null, "Codex reports usage in a JSONL stream this parser does not read");
   assert.equal(providerTokenUsage("anthropic", JSON.stringify({ result: "ok" })), null);
+});
+
+test("Codex receives its schema as a file inside the only directory it can open", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const reviewPayload: ShadowRolePayload = { ...payload, role: "reviewer", responseContract: { kind: "review", verdict: ["approve", "request_changes", "disagree"], findings: "string[]" } };
+  const plan = planShadowInvocation({
+    snapshot: snapshot("openai"),
+    model: { providerId: "openai", modelId: "codex-model", quotaPool: "openai" },
+    cwd: repo,
+    payload: reviewPayload,
+    codexIsolation: codexIsolation({}, reference.getTime()),
+    now: reference,
+  });
+  const index = plan.args.indexOf("--output-schema");
+  assert.ok(index > 0);
+  assert.equal(plan.args[index + 1], `${STAGE_PATH_TOKEN}/${STAGED_SCHEMA_FILE}`);
+  const staged = plan.stagedFiles?.[STAGED_SCHEMA_FILE];
+  assert.ok(staged !== undefined, "the schema must travel with the plan");
+  assert.deepEqual(JSON.parse(staged), jsonSchemaFor(reviewPayload.responseContract));
+});
+
+test("helpers appear only when the grant and the budget both allow them, and they are BrainGate's own", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const withoutFanOut = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, now: reference });
+  assert.ok(!withoutFanOut.args.includes("--agents"), "a budget that allows one agent gets no helpers");
+  assert.equal(withoutFanOut.args[withoutFanOut.args.indexOf("--tools") + 1], "Read,Glob,Grep");
+
+  const withFanOut = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload, fanOut: true, now: reference });
+  assert.equal(withFanOut.args[withFanOut.args.indexOf("--tools") + 1], "Read,Glob,Grep,Agent");
+  const definitions = JSON.parse(withFanOut.args[withFanOut.args.indexOf("--agents") + 1]!) as Record<string, { tools: string[] }>;
+  assert.deepEqual(Object.keys(definitions), ["braingate-explorer"]);
+  for (const definition of Object.values(definitions)) {
+    assert.deepEqual(definition.tools, ["Read", "Grep", "Glob"], "a helper may never hold a tool its lead was not granted");
+  }
+});
+
+test("Grok's own subagents stay banned unless BrainGate wrote the definitions", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const grokModel: ModelRef = { providerId: "xai", modelId: "grok-4.6", quotaPool: "grok-subscription" };
+  const base = { snapshot: snapshot("xai", { version: "1.0.24" }), model: grokModel, cwd: repo, payload: { ...payload, role: "planner" as const }, grokIsolation: grokIsolation({ version: "1.0.24" }, reference.getTime()), now: reference };
+  const alone = planShadowInvocation(base);
+  assert.ok(alone.args.includes("--no-subagents"));
+  const fannedOut = planShadowInvocation({ ...base, fanOut: true });
+  assert.ok(!fannedOut.args.includes("--no-subagents"));
+  // Measured against grok 1.0.24: an array is refused with "expected a map".
+  const definitions = JSON.parse(fannedOut.args[fannedOut.args.indexOf("--agents") + 1]!) as Record<string, unknown>;
+  assert.equal(Array.isArray(definitions), false);
+  assert.ok(Object.keys(definitions).length > 0);
+});
+
+test("a plan carries what it was refused, so the operator reads it before the run rather than after", () => {
+  const { repo } = setupProject();
+  const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload: { ...payload, role: "planner" }, now: new Date("2026-09-07T01:00:00Z") });
+  const web = plan.grant.refused.find((item) => item.capability === "web");
+  assert.ok(web !== undefined, "a planner asks for the network");
+  assert.match(web.reason, /allow-web/);
+  assert.equal(plan.guarantees.noNetworkTools, true);
+});
+
+test("Antigravity's request goes through stdin, so a large context is no longer refused", () => {
+  const { repo } = setupProject();
+  const large = { notes: "x".repeat(200_000) };
+  const plan = planShadowInvocation({
+    snapshot: snapshot("google"),
+    model: { providerId: "google", modelId: "gemini-3.8-flash-medium", quotaPool: "antigravity-subscription" },
+    cwd: repo,
+    payload: { ...payload, role: "planner", context: large },
+    acceptance: acceptance("google", { acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString() }),
+    now: new Date("2026-09-07T01:00:00Z"),
+  });
+  assert.equal(plan.inputMode, "stdin");
+  assert.equal(plan.args[plan.args.indexOf("--input-format") + 1], "stream-json");
+  assert.ok(!plan.args.some((argument) => argument.includes("x".repeat(1_000))), "the payload must not travel as an argument");
+  const line = JSON.parse(plan.stdin!.trim()) as { event: string; message: { role: string; content: string } };
+  // Measured: the key is `event`, and a `type` key is reported as an unknown event that
+  // silently produces no turn at all.
+  assert.equal(line.event, "user");
+  assert.ok(line.message.content.includes("x".repeat(1_000)));
+});
+
+test("an Antigravity stream is read from its final result, preferring the object the CLI enforced", () => {
+  const stream = [
+    '{"event":"init","conversation_id":"a"}',
+    '{"event":"result","result":{"status":"SUCCESS","response":"ready\\n{\\"kind\\":\\"work\\"}","structured_output":{"kind":"work","output":"ready"},"usage":{"input_tokens":43439,"output_tokens":73,"cache_read_tokens":0}}}',
+  ].join("\n");
+  assert.equal(extractAntigravityResult(stream), '{"kind":"work","output":"ready"}');
+  // The same run's accounting, which used to be recorded as unknown because only the outer
+  // object was read.
+  assert.deepEqual(providerTokenUsage("google", stream), { input: 43439, output: 73, cacheRead: 0 });
+
+  const withoutSchema = '{"event":"result","result":{"status":"SUCCESS","response":"plain answer"}}';
+  assert.equal(extractAntigravityResult(withoutSchema), "plain answer");
+  assert.equal(extractAntigravityResult('{"event":"init"}'), null, "a stream with no result is not an answer");
+  assert.equal(extractAntigravityResult("not json at all"), null);
+});
+
+test("a narrated answer is parsed from its own object, not from the braces in the prose", () => {
+  // What a tool-using provider actually streams: an explanation with code in it, then the answer.
+  const narrated = 'Let me look. The handler is `if (x) { return {ok: false}; }` in router.ts.\n{"kind":"work","output":"the router decides which model fills a role"}';
+  assert.deepEqual(
+    lastBalancedJsonObject(narrated),
+    { kind: "work", output: "the router decides which model fills a role" },
+  );
+  // The outermost span would have started at the snippet's brace and parsed as nothing.
+  assert.throws(() => JSON.parse(narrated.slice(narrated.indexOf("{"), narrated.lastIndexOf("}") + 1)));
+});
+
+test("a brace inside a string is not a brace", () => {
+  assert.deepEqual(lastBalancedJsonObject('{"kind":"work","output":"use {} for an empty set"}'), { kind: "work", output: "use {} for an empty set" });
+  assert.deepEqual(lastBalancedJsonObject('{"kind":"work","output":"a quote \\" and a brace }"}'), { kind: "work", output: 'a quote " and a brace }' });
+});
+
+test("text with no complete object yields nothing rather than a guess", () => {
+  assert.equal(lastBalancedJsonObject("no object here"), null);
+  assert.equal(lastBalancedJsonObject('{"kind":"work"'), null);
+});
+
+test("a new text block starts the answer again, so narration is not part of it", () => {
+  const start = '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}';
+  assert.equal(readStreamLine("anthropic", start).restart, true);
+  const thinkingBlock = '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}';
+  assert.notEqual(readStreamLine("anthropic", thinkingBlock).restart, true);
+});
+
+test("search reaches a provider only where the operator granted the network", () => {
+  const { repo } = setupProject();
+  const reference = new Date("2026-09-07T01:00:00Z");
+  const base = { snapshot: snapshot("anthropic"), model, cwd: repo, payload: { ...payload, role: "planner" as const }, now: reference };
+
+  const withoutWeb = planShadowInvocation(base);
+  assert.equal(withoutWeb.args[withoutWeb.args.indexOf("--tools") + 1], "Read,Glob,Grep");
+  assert.equal(withoutWeb.guarantees.noNetworkTools, true);
+
+  const networkAcceptance = acceptance("anthropic", {
+    source: "operator-accepted-network-access",
+    acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString(),
+  });
+  const withWeb = planShadowInvocation({ ...base, networkAcceptance });
+  assert.equal(withWeb.args[withWeb.args.indexOf("--tools") + 1], "Read,Glob,Grep,WebSearch,WebFetch");
+  assert.ok(withWeb.grant.granted.includes("web"));
+  // The guarantee stops claiming what is no longer true.
+  assert.equal(withWeb.guarantees.noNetworkTools, false);
+
+  // The other decision is not this decision.
+  const unscopedOnly = planShadowInvocation({ ...base, acceptance: acceptance("anthropic", { acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString() }) });
+  assert.equal(unscopedOnly.args[unscopedOnly.args.indexOf("--tools") + 1], "Read,Glob,Grep");
 });

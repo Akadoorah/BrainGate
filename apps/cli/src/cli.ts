@@ -14,6 +14,7 @@ import { startDashboardServer } from "@braingate/dashboard";
 import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot } from "@braingate/observability";
 import {
   ModelCatalog,
+  NETWORK_ACCESS_RISK,
   ProviderAcceptanceStore,
   UNSCOPED_PROVIDER_RISK,
   buildShadowTaskPlan,
@@ -21,7 +22,7 @@ import {
   resolveOperatorState,
   type OperatorStatePaths,
 } from "@braingate/operator";
-import { ModelListCache, PROVIDER_IDS, ProviderDiscovery, isProviderId, type ProviderSnapshot } from "@braingate/providers";
+import { CLI_FEATURES, ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, isProviderId, probeCliCapabilities, type CliCapabilityReport, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition, type ModelRef } from "@braingate/router";
 import {
   CodexIsolationVerifier,
@@ -41,6 +42,7 @@ export interface CliDependencies {
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly discoverAll?: () => Promise<readonly ProviderSnapshot[]>;
+  readonly probeCapabilities?: () => Promise<readonly CliCapabilityReport[]>;
   readonly verifyCodexIsolation?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
   readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
@@ -239,6 +241,22 @@ async function discovery(deps: CliDependencies, state: OperatorStatePaths): Prom
   return await new ProviderDiscovery(undefined, { modelCache }).discoverAll();
 }
 
+/**
+ * What each installed CLI's own help says this build can be asked to do.
+ *
+ * Reads help text and nothing else: no prompt, no model, no cost. It exists because the
+ * alternative is what the repository has been doing — writing a provider's limitations into a
+ * constant and discovering months later that the release which removed them shipped in a week.
+ */
+async function capabilityReports(deps: CliDependencies, state: OperatorStatePaths): Promise<readonly CliCapabilityReport[]> {
+  if (deps.probeCapabilities !== undefined) return await deps.probeCapabilities();
+  const snapshots = await discovery(deps, state);
+  const runner = new NodeProbeRunner();
+  return await Promise.all(PROVIDER_IDS.map(async (providerId) =>
+    probeCliCapabilities({ providerId, runner, version: snapshots.find((item) => item.providerId === providerId)?.version.value ?? null }),
+  ));
+}
+
 async function codexIsolationStatus(
   snapshots: readonly ProviderSnapshot[],
   deps: CliDependencies,
@@ -374,7 +392,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "",
           "Everything else",
           "  discover     which provider CLIs are installed and how they are authenticated",
-          "  providers    list | accept | revoke — which roles each provider may take, and why",
+          "  providers    list | capabilities | accept | revoke | allow-web | deny-web",
           "  doctor       validate the project, models and reviewer isolation",
           "  models       list | validate | add | remove | import-discovered | profile",
           "  memory       preview | import | promote | list",
@@ -476,6 +494,49 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         return Object.freeze({ exitCode: 0, data });
       }
 
+      if (subcommand === "capabilities") {
+        noExtraArgs(args);
+        const reports = await capabilityReports(deps, state);
+        data = reports;
+        emit(json, data, reports.map((report) => {
+          const supported = CLI_FEATURES.filter((feature) => report.features[feature].supported === true);
+          const unknown = CLI_FEATURES.some((feature) => report.features[feature].supported === "unknown");
+          const line = unknown ? "help unreadable — nothing measured" : supported.length === 0 ? "none of the surfaces BrainGate looks for" : supported.join(", ");
+          return `${report.providerId} (${report.binary} ${report.version ?? "version unknown"}, read ${report.observedAt})\n    ${line}`;
+        }).join("\n"), stdout);
+        return Object.freeze({ exitCode: 0, data });
+      }
+
+      if (subcommand === "allow-web" || subcommand === "deny-web") {
+        const providerId = args.shift();
+        noExtraArgs(args);
+        if (providerId === undefined || !isProviderId(providerId)) {
+          throw new BrainGateInvariantError("CLI_PROVIDER_INVALID", `providers ${subcommand} needs one of: ${PROVIDER_IDS.join(", ")}.`);
+        }
+        if (subcommand === "deny-web") {
+          const removed = store.revoke(providerId, "operator-accepted-network-access");
+          data = { providerId, revoked: removed };
+          emit(json, data, removed ? `${providerId} can no longer search the web.` : `${providerId} had no web access on record.`, stdout);
+          return Object.freeze({ exitCode: 0, data });
+        }
+        const record = store.accept(providerId, { source: "operator-accepted-network-access" });
+        data = { providerId, acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, acknowledged: record.acknowledged };
+        emit(
+          json,
+          data,
+          [
+            `${providerId} may search the web until ${record.expiresAt}.`,
+            "",
+            NETWORK_ACCESS_RISK,
+            "",
+            "Only the planning role asks for it: deciding an approach is the one job where a current answer beats a confident one.",
+            `Undo at any time with \`braingate providers deny-web ${providerId}\`.`,
+          ].join("\n"),
+          stdout,
+        );
+        return Object.freeze({ exitCode: 0, data });
+      }
+
       if (subcommand === "accept" || subcommand === "revoke") {
         const providerId = args.shift();
         noExtraArgs(args);
@@ -516,7 +577,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         return Object.freeze({ exitCode: 0, data });
       }
 
-      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "providers requires list, accept, or revoke.");
+      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "providers requires list, capabilities, accept, revoke, allow-web, or deny-web.");
     }
 
     if (command === "doctor") {

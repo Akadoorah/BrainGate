@@ -39,6 +39,13 @@ Official reference:
 
 - `agy models` is the documented model-slug listing surface.
 - Headless model prompts use `-p`; discovery explicitly forbids it.
+- Re-measured 2026-09-09 against agy 1.1.28: an isolated `HOME` still loses authentication —
+  `agy models` answers "Please sign in" — so this provider still cannot be scoped per
+  invocation, and ADR 0008's acceptance stands for it.
+- The same build does read a request from stdin (`--input-format stream-json`), as one NDJSON
+  object per line keyed `event`, and answers with an `event: "result"` object carrying
+  `response`, `structured_output`, and its own token counts. So Antigravity's payload is no
+  longer capped by the platform's argument limit, and its usage is `native` rather than unknown.
 - Cached account credentials live in the OS keyring. Antigravity can also be configured for `GEMINI_API_KEY`, so BrainGate strips API-key/base-URL overrides for subscription discovery.
 
 Official references:
@@ -70,6 +77,28 @@ Official references:
 - https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-command-reference
 - https://docs.github.com/en/copilot/reference/copilot-cli-reference/cli-programmatic-reference
 - https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/authenticate-copilot-cli
+
+## What each build can be asked to do
+
+Discovery answers whether a CLI can be driven at all. A second, equally free question is what
+*this build* may be asked to do — whether it takes a JSON schema, reads a prompt from stdin,
+accepts subagent definitions, scopes a directory, sandboxes, or resumes a session.
+
+`braingate providers capabilities` answers it by reading help text and nothing else: no prompt,
+no model, no cost. Every command it issues is already on the discovery safe-command allowlist,
+and a test asserts that rather than trusting it.
+
+Two properties matter more than the list itself:
+
+- **A feature nobody looked for is `unknown`, never absent.** An unreadable help text leaves
+  every answer unknown, because recording "this build lacks it" from silence is how a stale
+  limitation outlives the release that removed it.
+- **Subcommand help is read too.** `codex --help` never mentions `--output-schema`; `codex exec
+  --help` does. Reading only the top level would have recorded a surface Codex has as one it
+  lacks.
+
+Each report carries the version it measured and the moment it was read, so a claim built on it
+can be checked against the build it came from.
 
 ## Why auth and usage can be `unknown`
 

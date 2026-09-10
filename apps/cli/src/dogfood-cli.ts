@@ -28,10 +28,15 @@ import { ModelListCache, ProviderDiscovery, type ProviderSnapshot } from "@brain
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
   CodexIsolationVerifier,
+  GROK_WRITE_SANDBOX,
   ShadowDogfoodRunner,
   shadowProviderRoleStatus,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
+  type GrokSandboxPolicy,
+  bindingQuotaReading,
+  type QuotaReading,
+  type RoleActivity,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
@@ -48,6 +53,23 @@ export interface DogfoodCliDependencies {
   readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
   readonly writeExecutor?: WriteProviderExecutor;
+  /**
+   * Told which provider and model is working, as each role starts and finishes.
+   *
+   * The terminal's one question while a task runs is who is doing this right now. A control
+   * plane that routes across four subscriptions and answers "working" has hidden the only thing
+   * that made it different from running one CLI by hand.
+   */
+  readonly onRoleActivity?: (activity: RoleActivity) => void;
+  /**
+   * Told the model's prose as it is written.
+   *
+   * Only for the providers whose stream shape has been measured, and only the readable field
+   * inside a schema-enforced answer — the fragments themselves are JSON.
+   */
+  readonly onText?: (text: string) => void;
+  /** Told once per role, when the model starts reasoning before it says anything. */
+  readonly onThinking?: () => void;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   /**
@@ -263,6 +285,8 @@ async function grokProof(
   deps: DogfoodCliDependencies,
   env: NodeJS.ProcessEnv,
   project?: RegisteredProject,
+  /** The write profile earns its own proof; the read-only staged profile is the default. */
+  policy?: GrokSandboxPolicy,
 ): Promise<Awaited<ReturnType<typeof grokIsolationStatus>>> {
   return await grokIsolationStatus({
     snapshots,
@@ -270,6 +294,7 @@ async function grokProof(
     shouldAttempt: configuredProvider(new ModelCatalog(state.modelCatalogPath).load(), "xai"),
     cache: isolationCacheFor(state),
     ...(project === undefined ? {} : { project }),
+    ...(policy === undefined ? {} : { policy }),
     ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
   });
 }
@@ -356,6 +381,60 @@ function writeOutcome(input: { readonly readyForApproval: boolean; readonly revi
 
 function classificationView(predicted: TaskClassification, effective: TaskClassification, prior: ReturnType<DogfoodStore["derivePrior"]>, applied: boolean) {
   return Object.freeze({ predicted: { complexity: predicted.complexity, risk: predicted.risk, confidence: predicted.confidence, ruleVersion: predicted.ruleVersion }, effective: { complexity: effective.complexity, risk: effective.risk, confidence: effective.confidence, ruleVersion: effective.ruleVersion }, prior, applied });
+}
+
+/**
+ * The routed roles, as one line.
+ *
+ * A role that appears twice is numbered rather than printed twice under the same name: a task
+ * can now spend two subscriptions on the approach, and "planner=x · planner=y" reads like a
+ * rendering bug rather than the point.
+ */
+export function roleLine(roles: readonly { readonly role: string; readonly model: { readonly providerId: string; readonly modelId: string } }[]): string {
+  const counts = new Map<string, number>();
+  for (const role of roles) counts.set(role.role, (counts.get(role.role) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return roles.map((role) => {
+    const index = (seen.get(role.role) ?? 0) + 1;
+    seen.set(role.role, index);
+    const name = (counts.get(role.role) ?? 0) > 1 ? `${role.role}-${String(index)}` : role.role;
+    return `${name}=${role.model.providerId}/${role.model.modelId}`;
+  }).join(" · ");
+}
+
+/**
+ * Records what a provider said about its own remaining window.
+ *
+ * Written as a `pressure` ratio with `native` evidence, which is the shape routing already
+ * prefers over BrainGate's account of its own traffic — the rule was written down for the day a
+ * provider started reporting one, and Claude does.
+ */
+function recordQuotaReading(state: OperatorStatePaths, readings: readonly (QuotaReading & { readonly quotaPool: string })[]): void {
+  if (readings.length === 0) return;
+  // Every window is kept, because a receipt should be able to say what the provider reported.
+  // Only one of them decides routing: the fullest, because that is the window that will refuse
+  // first. A five-hour window at 0.9 is a pool to route away from now, whatever the weekly
+  // figure says — and `pressure` is the metric routing reads.
+  const binding = bindingQuotaReading(readings);
+  const store = new GlobalQuotaStore(state.globalDir);
+  try {
+    for (const reading of readings) {
+      store.record({
+        provider: reading.providerId,
+        quotaPool: reading.quotaPool,
+        metric: reading === binding ? "pressure" : "window_utilization",
+        window: reading.window,
+        value: reading.utilization,
+        unit: "ratio",
+        resetAt: reading.resetAt,
+        // A window the provider refused is exhausted; one it served is usable however full it
+        // is. Utilization decides where work goes, never whether the pool is up.
+        status: reading.blocked ? "exhausted" : "healthy",
+        evidence: "native",
+        source: "provider-rate-limit-event",
+      });
+    }
+  } finally { store.close(); }
 }
 
 async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: string, env: NodeJS.ProcessEnv, json: boolean, stdout: (text: string) => void): Promise<DogfoodCliResult> {
@@ -458,7 +537,8 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       // Canonical memory only. Proposals become canonical through `memory promote`, which
       // requires explicit evidence; surfacing them here would route around that gate.
       memory: memory.records,
-      // Ephemeral: this session's earlier turns, never written to disk and never promoted.
+      // The session's earlier turns: kept with the project for a few hours, redacted, and never
+      // promoted to memory.
       session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
@@ -473,17 +553,32 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason } };
-      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\nZero provider model calls executed.`, stdout);
+      emit(json, data, [
+        `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+        // What each role may do, and what it asked for and did not get. Read before the run,
+        // where "the planner wanted the network and nobody accepted it" is still actionable.
+        ...plan.roles.map((role, index) => {
+          const grant = role.invocation.grant;
+          const refused = grant.refused.map((item) => item.capability).join(", ");
+          const name = roleLine(plan.roles).split(" · ")[index]?.split("=")[0] ?? role.role;
+          return `  ${name}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`;
+        }),
+        "Zero provider model calls executed.",
+      ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
+    // Collected during the run and written once it ends: a provider reports every window on
+    // every call, and only the fullest of them should decide where the next task goes.
+    const pendingQuotaReadings: (QuotaReading & { readonly quotaPool: string })[] = [];
     const ledger = new TaskLedger(project);
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }) });
+      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
+      recordQuotaReading(state, pendingQuotaReadings);
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, outcome: result.workflow?.outcome ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });
       emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · observed=${observation.sequence} · outcome=${result.workflow?.outcome ?? "unknown"}`, stdout);
       return Object.freeze({ exitCode: mapped.success ? 0 : 1, data });
@@ -522,20 +617,24 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const codexIsolation = isolation.attestation ?? undefined;
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;
+    // A Grok write runs under a different sandbox profile than a Grok review, so it earns a
+    // different proof. Both self-tests are free; neither stands in for the other.
+    const grokWrite = await grokProof(state, snapshots, deps, env, project, GROK_WRITE_SANDBOX);
+    const grokWriteIsolation = grokWrite.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     const planData = Object.freeze({ classification: view, budget, repositoryPath, baseRef, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })), providerCallsOnPlan: 0, createsWorktree: false, mergeAvailable: false });
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason }, approvalRequired: true };
-      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
+      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       const mapped = writeOutcome(result);

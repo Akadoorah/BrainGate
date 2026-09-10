@@ -74,3 +74,27 @@ test("a corrupt or hand-edited store fails loudly instead of reading as 'nothing
   writeFileSync(acceptance.path, JSON.stringify({ schemaVersion: 1, records: [{ providerId: "google", source: "assumed", acceptedAt: "x", expiresAt: "y" }] }), "utf8");
   assert.throws(() => acceptance.load(), (error: unknown) => error instanceof BrainGateInvariantError && error.code === "PROVIDER_ACCEPTANCE_INVALID");
 });
+
+test("allowing the web is a different decision from accepting an unscoped provider", () => {
+  const store = new ProviderAcceptanceStore(join(mkdtempSync(join(tmpdir(), "braingate-acceptance-web-")), "acceptance.json"));
+  store.accept("google");
+  store.accept("xai", { source: "operator-accepted-network-access" });
+
+  // Neither answers for the other, for the same provider or across providers.
+  assert.notEqual(store.find("google", "operator-accepted-unscoped-provider"), null);
+  assert.equal(store.find("google", "operator-accepted-network-access"), null);
+  assert.notEqual(store.find("xai", "operator-accepted-network-access"), null);
+  assert.equal(store.find("xai"), null);
+
+  // One provider can hold both, and they are revoked separately.
+  store.accept("google", { source: "operator-accepted-network-access" });
+  assert.equal(store.load().filter((record) => record.providerId === "google").length, 2);
+  assert.equal(store.revoke("google", "operator-accepted-network-access"), true);
+  assert.notEqual(store.find("google"), null, "revoking the web must not revoke the provider");
+});
+
+test("the risk each decision records is the risk that decision carries", () => {
+  const store = new ProviderAcceptanceStore(join(mkdtempSync(join(tmpdir(), "braingate-acceptance-risk-")), "acceptance.json"));
+  assert.match(store.accept("google").acknowledged, /cannot be scoped per invocation/);
+  assert.match(store.accept("google", { source: "operator-accepted-network-access" }).acknowledged, /sends the task and the context/);
+});

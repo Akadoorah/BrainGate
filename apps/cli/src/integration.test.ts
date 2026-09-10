@@ -93,8 +93,25 @@ function useRealCatalog(home: string): void {
   copyFileSync(source, join(globalDir, "models.json"));
 }
 
+/**
+ * Copies the operator's recorded provider acceptances into the isolated home.
+ *
+ * A provider BrainGate cannot scope per invocation runs only on the operator's own recorded
+ * decision (ADR 0008). An isolated home starts with none, so a test that did not carry them
+ * across would prove that provider unreachable rather than that it works. Copied, never
+ * written: this reads their decision, it does not make one.
+ */
+function useRealAcceptances(home: string): void {
+  const source = join(homedir(), ".braingate", "global", "provider-acceptance.json");
+  if (!existsSync(source)) return;
+  const globalDir = join(home, "global");
+  mkdirSync(globalDir, { recursive: true, mode: 0o700 });
+  copyFileSync(source, join(globalDir, "provider-acceptance.json"));
+}
+
 function register(cli: Cli): void {
   useRealCatalog(cli.home);
+  useRealAcceptances(cli.home);
   const init = cli.run(["init", "--project-id", "integration-sample", "--name", "Integration Sample"], 60_000);
   assert.equal(init.status, 0, `init failed: ${init.stdout}${init.stderr}`);
 }
@@ -156,6 +173,302 @@ test("a write task changes the task worktree and leaves the source checkout byte
     const edited = readFileSync(join(worktreePath, "labels.txt"), "utf8");
     assert.notEqual(edited, before, "the worktree copy is unchanged, so no edit was actually made");
     assert.match(edited, /add your first item/);
+  } finally {
+    cli.cleanup();
+  }
+});
+
+/**
+ * Every staged provider, answering a real role contract.
+ *
+ * The fakes prove BrainGate builds the command it meant to build. Only this proves the provider
+ * on the other side accepts it — the schema flag, the staged workspace, the input route, and the
+ * envelope the answer comes back in. Each of those changed under BrainGate at least once without
+ * a single test going red.
+ */
+test("each staged provider satisfies the role contract from its own CLI", { skip: SKIP }, async () => {
+  const { ProviderDiscovery } = await import("@braingate/providers");
+  const { NodeShadowProcessExecutor, SubscriptionShadowAgentInvoker, GrokIsolationVerifier, CodexIsolationVerifier } = await import("@braingate/shadow");
+  const { ProjectRegistry } = await import("@braingate/core");
+
+  const cli = makeCli();
+  try {
+    register(cli);
+
+    const registry = new ProjectRegistry(cli.home);
+    const project = registry.loadFile(join(cli.repo, ".brain", "project.json"));
+
+    const snapshots = await new ProviderDiscovery().discoverAll();
+    const catalogue = JSON.parse(readFileSync(join(cli.home, "global", "models.json"), "utf8")) as {
+      entries: readonly { readonly definition: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly capabilities: Record<string, number> } }[];
+    };
+
+    const answered: string[] = [];
+    for (const providerId of ["xai", "google", "openai"] as const) {
+      const snapshot = snapshots.find((item) => item.providerId === providerId);
+      if (snapshot?.available.value !== true || snapshot.authState.value === "unauthenticated") continue;
+      // The cheapest model the operator scored for this role, so the check costs as little as it can.
+      const entry = catalogue.entries
+        .map((item) => item.definition)
+        .filter((definition) => definition.providerId === providerId && typeof definition.capabilities.reviewer === "number")
+        .sort((a, b) => (a.capabilities.reviewer ?? 0) - (b.capabilities.reviewer ?? 0))[0];
+      if (entry === undefined) continue;
+
+      // No projectPaths here, and deliberately: this test's repository lives in the temp
+      // directory, which every Grok profile grants, so the real "can this sandbox still reach
+      // the checkout" check would refuse before the provider boundary was ever exercised. That
+      // check is covered by its own unit test; what this one is for is the CLI on the far side.
+      const grokIsolation = providerId === "xai" ? await new GrokIsolationVerifier().verify(snapshot) : undefined;
+      const codexIsolation = providerId === "openai" ? await new CodexIsolationVerifier().verify(snapshot) : undefined;
+      const invoker: InstanceType<typeof SubscriptionShadowAgentInvoker> = new SubscriptionShadowAgentInvoker({
+        project, cwd: cli.repo, snapshots: [snapshot],
+        ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        ...(codexIsolation === undefined ? {} : { codexIsolation }),
+        acceptances: [{ providerId, source: "operator-accepted-unscoped-provider", acceptedAt: new Date(Date.now() - 60_000).toISOString() }],
+        // Antigravity's CLI reports no machine-readable auth mode, so discovery says `unknown`
+        // and the operator's own confirmation is what stands in for it — the same record
+        // `braingate providers accept` writes.
+        attestations: [{ providerId, mode: "subscription", source: "user-confirmed-oauth", observedAt: new Date(Date.now() - 60_000).toISOString() }],
+        context: { note: "The reviewed change renames a label and touches nothing else." },
+        executor: new NodeShadowProcessExecutor(),
+        maxTurns: 8,
+      });
+
+      const response: Awaited<ReturnType<typeof invoker.invoke>> = await invoker.invoke({
+        role: "reviewer",
+        model: { providerId, modelId: entry.modelId, quotaPool: entry.quotaPool },
+        phase: "integration",
+        task: "A one-line label change. Reply approve.",
+        findings: [],
+        candidateOutput: "labels.txt: empty-state label reworded.",
+      });
+
+      // The contract, satisfied by the provider rather than repaired by the parser.
+      assert.equal(response.kind, "review", `${providerId} answered as the wrong role`);
+      assert.ok(["approve", "request_changes", "disagree"].includes(response.verdict), `${providerId} returned verdict ${response.verdict}`);
+      answered.push(providerId);
+    }
+
+    assert.ok(answered.length > 0, "no staged provider was installed and authenticated, so nothing was proven");
+  } finally {
+    cli.cleanup();
+  }
+});
+
+/**
+ * One task, three subscriptions, and a receipt that says so.
+ *
+ * The unit tests prove the engine asks for two approaches when the budget allows two. Only this
+ * proves two real providers produce them, in parallel, and that an executor on a third can act
+ * on both — which is the whole argument for owning several subscriptions rather than the best
+ * one.
+ */
+test("a task the budget allows two approaches for spends two independent subscriptions on them", { skip: SKIP }, async () => {
+  const cli = makeCli();
+  try {
+    register(cli);
+
+    const task = "Redesign how this service reports authentication failures so a caller can tell a expired credential from a revoked one, covering rollback and the security review of each change.";
+    const plan = cli.run(["dogfood", "ask", "plan", "--task", task], 180_000);
+    assert.equal(plan.status, 0, `plan failed: ${plan.stdout}${plan.stderr}`);
+    // T4 is where the budget grants a second approach. If classification lands lower, the rest
+    // of this test would silently prove nothing.
+    assert.match(plan.stdout, /^T4\//m, `expected a T4 classification, got: ${plan.stdout}`);
+    // Grok is legitimately out of reach here: this repository lives in the temp directory, which
+    // every Grok sandbox profile grants, so its checkout-reachability self-test refuses. The
+    // second approach therefore comes from whichever other independent provider is available.
+    assert.match(plan.stdout, /planner-1=/, `the plan must name both planners before the run, not after: ${plan.stdout}`);
+    const planners = [...plan.stdout.matchAll(/planner-\d=([a-z-]+)\//g)].map((match) => match[1]);
+    assert.equal(planners.length, 2, `expected two planners in the plan, got: ${plan.stdout}`);
+    assert.notEqual(planners[0], planners[1], "a second approach from the same provider is not a second approach");
+
+    // JSON, because the receipt is the evidence: which providers actually spent a call, taken
+    // from the run itself rather than from a second command reading a shared history.
+    const run = cli.run(["dogfood", "ask", "run", "--task", task, "--execute", "--json"]);
+    // Exit 1 is a real outcome here, not a failure: a T4 reviewer that asks for changes ends the
+    // task at "completed but needs your eyes". What must not happen is a crash or no receipt.
+    assert.ok(run.status === 0 || run.status === 1, `run failed: ${run.stdout}${run.stderr}`);
+
+    const receipt = JSON.parse(run.stdout) as {
+      readonly outcome: string | null;
+      readonly answer: string | null;
+      readonly usage: readonly { readonly provider: string; readonly model: string | null; readonly metric: string }[];
+    };
+    assert.ok(receipt.outcome !== null, `no outcome in the receipt: ${run.stdout.slice(0, 500)}`);
+    assert.ok((receipt.answer ?? "").length > 0, "the task produced no answer");
+
+    const spenders = new Set(receipt.usage.filter((row) => row.metric === "provider_call").map((row) => row.provider));
+    assert.ok(
+      spenders.size >= 2,
+      `expected more than one subscription to have spent a call, saw: ${[...spenders].join(", ") || "none"}`,
+    );
+  } finally {
+    cli.cleanup();
+  }
+});
+
+/**
+ * Streaming, proven by when the text arrives rather than by what it says.
+ *
+ * A run that hands over its answer at the end and a run that writes it as it goes produce the
+ * same string. The only difference a terminal cares about is timing, so that is what this
+ * asserts: prose reached the callback while the provider was still running.
+ */
+test("a streamed provider writes its answer while it is still working", { skip: SKIP }, async () => {
+  const { ProviderDiscovery } = await import("@braingate/providers");
+  const { NodeShadowProcessExecutor, SubscriptionShadowAgentInvoker, GrokIsolationVerifier, streamDialectFor } = await import("@braingate/shadow");
+  const { ProjectRegistry } = await import("@braingate/core");
+
+  const cli = makeCli();
+  try {
+    register(cli);
+    const registry = new ProjectRegistry(cli.home);
+    const project = registry.loadFile(join(cli.repo, ".brain", "project.json"));
+    const snapshots = await new ProviderDiscovery().discoverAll();
+    const catalogue = JSON.parse(readFileSync(join(cli.home, "global", "models.json"), "utf8")) as {
+      entries: readonly { readonly definition: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly capabilities: Record<string, number> } }[];
+    };
+
+    const streamed: string[] = [];
+    let finished = false;
+    let sawTextBeforeTheEnd = false;
+    let proven = 0;
+
+    for (const providerId of ["anthropic", "xai"] as const) {
+      assert.notEqual(streamDialectFor(providerId), null, `${providerId} must have a measured stream shape`);
+      const snapshot = snapshots.find((item) => item.providerId === providerId);
+      if (snapshot?.available.value !== true || snapshot.authState.value === "unauthenticated") continue;
+      const entry = catalogue.entries
+        .map((item) => item.definition)
+        .filter((definition) => definition.providerId === providerId && typeof definition.capabilities.planner === "number")
+        .sort((a, b) => (a.capabilities.planner ?? 0) - (b.capabilities.planner ?? 0))[0];
+      if (entry === undefined) continue;
+
+      // The temp directory is granted by every Grok profile, so the checkout-reachability check
+      // is not the thing under test here.
+      const grokIsolation = providerId === "xai" ? await new GrokIsolationVerifier().verify(snapshot) : undefined;
+      finished = false;
+      const invoker: InstanceType<typeof SubscriptionShadowAgentInvoker> = new SubscriptionShadowAgentInvoker({
+        project, cwd: cli.repo, snapshots: [snapshot],
+        ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        context: { note: "The reviewed change renames a label and touches nothing else." },
+        executor: new NodeShadowProcessExecutor(),
+        maxTurns: 6,
+        onText: (text) => {
+          streamed.push(text);
+          if (!finished && text.trim().length > 0) sawTextBeforeTheEnd = true;
+        },
+      });
+
+      // A planner, because only a contract with a prose field has prose to stream: a review
+      // answers with a verdict and a list, and there is nothing there to write out live.
+      const response: Awaited<ReturnType<typeof invoker.invoke>> = await invoker.invoke({
+        role: "planner",
+        model: { providerId, modelId: entry.modelId, quotaPool: entry.quotaPool },
+        phase: "integration",
+        task: "In two or three sentences, describe how you would rename a label in a small service without breaking callers.",
+        findings: [],
+        candidateOutput: null,
+      });
+      finished = true;
+      assert.equal(response.kind, "work", `${providerId} answered as the wrong role`);
+      proven += 1;
+    }
+
+    assert.ok(proven > 0, "neither streamed provider was installed and authenticated, so nothing was proven");
+    assert.ok(sawTextBeforeTheEnd, "no prose arrived before the run ended, so nothing actually streamed");
+    // What reached the terminal is readable text, not the JSON the contract is carried in.
+    const joined = streamed.join("");
+    assert.ok(joined.trim().length > 0, "the stream produced no readable text");
+    assert.doesNotMatch(joined, /"kind"\s*:/, "the contract's JSON reached the terminal instead of the prose inside it");
+  } finally {
+    cli.cleanup();
+  }
+});
+
+/**
+ * A tool that only exists once the operator says so.
+ *
+ * Every other capability BrainGate grants is proven by a self-test that costs nothing. The
+ * network cannot be: what leaves the machine is the one thing no check downstream can see, so
+ * the only evidence that the grant works is a run that actually searched.
+ *
+ * The acceptance is written into this test's own isolated home. The operator's own state is
+ * never touched by it.
+ */
+test("a planner granted the network can search, and one without it cannot", { skip: SKIP }, async () => {
+  const cli = makeCli();
+  try {
+    register(cli);
+
+    const denied = cli.run(["providers", "list", "--json"], 120_000);
+    assert.equal(denied.status, 0, `${denied.stdout}${denied.stderr}`);
+
+    const grant = cli.run(["providers", "allow-web", "anthropic"], 60_000);
+    assert.equal(grant.status, 0, `allow-web failed: ${grant.stdout}${grant.stderr}`);
+    assert.match(grant.stdout, /may search the web until/);
+
+    const { ProviderDiscovery } = await import("@braingate/providers");
+    const { NodeShadowProcessExecutor, planShadowInvocation } = await import("@braingate/shadow");
+    const { ProjectRegistry } = await import("@braingate/core");
+    const { resolveOperatorState } = await import("@braingate/operator");
+    const { loadAcceptances } = await import("./provider-proof.js");
+
+    const state = resolveOperatorState({ ...process.env, BRAINGATE_HOME: cli.home });
+    const project = new ProjectRegistry(cli.home).loadFile(join(cli.repo, ".brain", "project.json"));
+    const snapshots = await new ProviderDiscovery().discoverAll();
+    const snapshot = snapshots.find((item) => item.providerId === "anthropic");
+    assert.ok(snapshot?.available.value === true, "Claude must be installed for this test");
+
+    const acceptances = loadAcceptances(state);
+    const networkAcceptance = acceptances.find((item) => item.providerId === "anthropic" && item.source === "operator-accepted-network-access");
+    assert.ok(networkAcceptance !== undefined, "the command wrote no network acceptance");
+
+    // A trivial prompt: what is under test is which tools the session was given, not what the
+    // model chose to do with them. BrainGate grants a capability; using it is the model's call.
+    const payload = {
+      schemaVersion: 1 as const,
+      role: "planner" as const,
+      phase: "integration",
+      task: "Reply with the single word: ready.",
+      findings: [],
+      candidateOutput: null,
+      context: {},
+      responseContract: { kind: "work", output: "string" },
+    };
+    const model = { providerId: "anthropic" as const, modelId: "claude-haiku-4-5", quotaPool: "claude-subscription" };
+    const executor = new NodeShadowProcessExecutor();
+
+    /** The tools the provider itself says the session was given, from its own init event. */
+    const sessionTools = (stdout: string): readonly string[] => {
+      for (const line of stdout.split(/\r?\n/)) {
+        if (!line.includes('"subtype":"init"')) continue;
+        try {
+          const event = JSON.parse(line.trim()) as { tools?: unknown };
+          if (Array.isArray(event.tools)) return event.tools.filter((tool): tool is string => typeof tool === "string");
+        } catch { continue; }
+      }
+      return [];
+    };
+
+    const withWeb = planShadowInvocation({ snapshot, model, cwd: cli.repo, payload, networkAcceptance, maxTurns: 4 });
+    assert.ok(withWeb.args[withWeb.args.indexOf("--tools") + 1]?.includes("WebSearch"), "the granted plan must carry the search tool");
+    assert.equal(withWeb.guarantees.noNetworkTools, false, "a plan that can search must not claim it cannot");
+    const granted = await executor.run({ project, plan: withWeb, timeoutMs: 240_000 });
+    assert.equal(granted.timedOut, false, "the granted run timed out");
+    const grantedTools = sessionTools(granted.stdout);
+    assert.ok(grantedTools.includes("WebSearch"), `the session was not given the search tool: ${grantedTools.join(", ")}`);
+
+    // Without the grant the tool is not there to be used, by the provider's own account.
+    const withoutWeb = planShadowInvocation({ snapshot, model, cwd: cli.repo, payload, maxTurns: 4 });
+    assert.ok(!withoutWeb.args[withoutWeb.args.indexOf("--tools") + 1]?.includes("WebSearch"));
+    assert.equal(withoutWeb.guarantees.noNetworkTools, true);
+    assert.match(withoutWeb.grant.refused.find((item) => item.capability === "web")!.reason, /allow-web/);
+    const ungranted = await executor.run({ project, plan: withoutWeb, timeoutMs: 240_000 });
+    const ungrantedTools = sessionTools(ungranted.stdout);
+    assert.ok(ungrantedTools.length > 0, "the ungranted run reported no tools at all, so nothing was compared");
+    assert.ok(!ungrantedTools.includes("WebSearch"), `the ungranted session was given the search tool anyway: ${ungrantedTools.join(", ")}`);
+    assert.ok(!ungrantedTools.includes("WebFetch"));
   } finally {
     cli.cleanup();
   }

@@ -59,6 +59,13 @@ export interface WorkflowReceipt {
   readonly outcome: WorkflowOutcome;
   /** The model that decided the approach, when the task had a separate planning pass. */
   readonly planner: RouteCandidate | null;
+  /**
+   * The second, independent planner, when the budget allowed two approaches at once.
+   *
+   * Recorded separately rather than folded into `planner`, because a receipt that named one of
+   * two providers would be describing a task that did not happen.
+   */
+  readonly secondPlanner: RouteCandidate | null;
   readonly primary: RouteCandidate;
   readonly reviewer: RouteCandidate | null;
   readonly judge: RouteCandidate | null;

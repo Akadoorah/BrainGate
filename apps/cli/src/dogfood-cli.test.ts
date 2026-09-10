@@ -10,7 +10,7 @@ import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "@braingate/write";
-import { runDogfoodCli, suggestedProjectId } from "./dogfood-cli.js";
+import { runDogfoodCli, suggestedProjectId, roleLine } from "./dogfood-cli.js";
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -349,4 +349,20 @@ test("with no terminal to ask, nothing is created on a guess", async () => {
   });
   assert.equal(explicit.exitCode, 0);
   assert.equal(existsSync(join(bare, ".git")), true);
+});
+
+test("a role that appears twice is numbered, so two approaches read as two", () => {
+  const line = roleLine([
+    { role: "planner", model: { providerId: "anthropic", modelId: "opus" } },
+    { role: "planner", model: { providerId: "google", modelId: "gemini" } },
+    { role: "primary", model: { providerId: "anthropic", modelId: "sonnet" } },
+  ]);
+  assert.equal(line, "planner-1=anthropic/opus · planner-2=google/gemini · primary=anthropic/sonnet");
+});
+
+test("a role that appears once keeps its plain name", () => {
+  assert.equal(
+    roleLine([{ role: "primary", model: { providerId: "anthropic", modelId: "haiku" } }]),
+    "primary=anthropic/haiku",
+  );
 });

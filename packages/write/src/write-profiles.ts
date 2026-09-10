@@ -1,0 +1,260 @@
+import { BrainGateInvariantError } from "@braingate/core";
+import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
+import type { ModelRef } from "@braingate/router";
+import {
+  GROK_SANDBOX_PROFILE,
+  GROK_WRITE_SANDBOX,
+  jsonSchemaFor,
+  resolveToolGrant,
+  validCodexIsolationAttestation,
+  validGrokIsolationAttestation,
+  type CodexIsolationAttestation,
+  type GrokIsolationAttestation,
+  type ToolGrant,
+} from "@braingate/shadow";
+import { assertClaudeWriteEligible, planClaudeWriteInvocation } from "./claude-write-profile.js";
+import type { WriteProviderPlan } from "./types.js";
+
+/**
+ * The providers that may hold the executing role, and what each has to prove first.
+ *
+ * Until now this was one provider, because M11 opened the write path with the one CLI whose
+ * boundary had been measured. That was scope, not a finding — and leaving it in place is what
+ * concentrated every change on a single subscription while three others sat idle.
+ *
+ * What protects the checkout was never the provider's good behaviour. It is BrainGate's own
+ * checks on the outcome: work happens in a task worktree, the source checkout is fingerprinted
+ * before and after, every changed path passes the diff guard, and no merge happens without a
+ * human. Those apply identically whoever did the typing (ADR 0008). What a second provider has
+ * to add is a bounded place to work — which is exactly what a grant now expresses (ADR 0010).
+ */
+export const WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["anthropic", "xai", "openai"]);
+
+export function isWriteProvider(providerId: string): providerId is ProviderId {
+  return (WRITE_PROVIDERS as readonly string[]).includes(providerId);
+}
+
+/** Where Grok reads a project sandbox profile from, relative to the working directory. */
+export const GROK_WRITE_SANDBOX_FILE = ".grok/sandbox.toml";
+export const GROK_WRITE_PROFILE = GROK_WRITE_SANDBOX.name;
+
+const GROK_MINIMUM = "1.0.13";
+
+const WRITE_SCHEMA = Object.freeze({ kind: "work", summary: "string" });
+
+const WRITE_INSTRUCTION = [
+  "The JSON you receive is the complete BrainGate task brief.",
+  "Make only the requested change, inside the current working directory.",
+  "Do not touch secrets, agent or control-plane configuration, or version-control internals.",
+  "Finish with the structured summary you were asked for.",
+].join(" ");
+
+function tuple(value: string | null): readonly [number, number, number] | null {
+  const match = value?.match(/(\d+)\.(\d+)\.(\d+)/) ?? null;
+  return match === null ? null : [Number(match[1]), Number(match[2]), Number(match[3])] as const;
+}
+
+function versionAtLeast(actual: string | null, minimum: string): boolean {
+  const a = tuple(actual); const m = tuple(minimum);
+  if (a === null || m === null) return false;
+  for (let index = 0; index < 3; index += 1) { if (a[index]! > m[index]!) return true; if (a[index]! < m[index]!) return false; }
+  return true;
+}
+
+function assertCommonEligibility(snapshot: ProviderSnapshot, model: ModelRef): void {
+  if (snapshot.providerId !== model.providerId) throw new BrainGateInvariantError("WRITE_PROVIDER_MISMATCH", "Provider snapshot and routed model do not match.");
+  if (!isWriteProvider(snapshot.providerId)) throw new BrainGateInvariantError("WRITE_PROVIDER_BLOCKED", `${snapshot.displayName} has no write profile: BrainGate cannot bound where a change it makes would land.`);
+  if (snapshot.available.value !== true) throw new BrainGateInvariantError("WRITE_PROVIDER_UNAVAILABLE", `${snapshot.displayName} CLI is unavailable.`);
+  if (snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription") {
+    throw new BrainGateInvariantError("WRITE_SUBSCRIPTION_REQUIRED", `${snapshot.displayName} write mode requires proven subscription authentication; API/unknown auth is refused.`);
+  }
+  if (snapshot.capabilities.value.headless !== true || snapshot.capabilities.value.modelPinning !== true) {
+    throw new BrainGateInvariantError("WRITE_CAPABILITY_UNPROVEN", `${snapshot.displayName} headless/model-pinning capability is not proven by discovery.`);
+  }
+  if (snapshot.models.value !== null && snapshot.models.value.length > 0 && !snapshot.models.value.includes(model.modelId)) {
+    throw new BrainGateInvariantError("WRITE_MODEL_UNAVAILABLE", `Routed model ${model.modelId} is not in ${snapshot.displayName}'s discovered model list.`);
+  }
+}
+
+export interface WriteEligibilityProof {
+  readonly codexIsolation?: CodexIsolationAttestation;
+  readonly grokIsolation?: GrokIsolationAttestation;
+  readonly now?: Date;
+}
+
+/**
+ * Whether this provider may hold the executing role at all.
+ *
+ * Grok and Codex both work inside a sandbox, and a sandbox nobody checked is a claim rather than
+ * a boundary — so each needs the same self-test attestation the read path already requires,
+ * bound to this build, this platform, and the policy it was earned under.
+ */
+export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef, proof: WriteEligibilityProof = {}): void {
+  if (snapshot.providerId === "anthropic") { assertClaudeWriteEligible(snapshot, model); return; }
+  assertCommonEligibility(snapshot, model);
+  const now = proof.now ?? new Date();
+  if (snapshot.providerId === "xai") {
+    if (!versionAtLeast(snapshot.version.value, GROK_MINIMUM)) {
+      throw new BrainGateInvariantError("WRITE_VERSION_TOO_OLD", `Grok must be at least ${GROK_MINIMUM}: below it a sandbox profile that cannot be applied warns and continues.`);
+    }
+    // Bound to the write profile's own hash: a proof earned under the read-only staged profile
+    // says nothing about the one that grants writes.
+    if (!validGrokIsolationAttestation(proof.grokIsolation, snapshot, { now, policy: GROK_WRITE_SANDBOX })) {
+      throw new BrainGateInvariantError("WRITE_GROK_ISOLATION_REQUIRED", "A Grok write requires a current sandbox self-test attestation for this version/platform, earned under the write profile.");
+    }
+    return;
+  }
+  if (!validCodexIsolationAttestation(proof.codexIsolation, snapshot, { now })) {
+    throw new BrainGateInvariantError("WRITE_CODEX_ISOLATION_REQUIRED", "A Codex write requires a current sandbox self-test attestation for this version/platform/profile.");
+  }
+}
+
+function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
+  return resolveToolGrant({
+    role: "primary",
+    providerId,
+    workspaceMode: "task-worktree",
+    writeMode: true,
+    surface: {
+      isolatedPerInvocation: true,
+      toolDenial: true,
+      // Only the two CLIs that take definitions BrainGate wrote; Codex has none to bound.
+      declaredSubagents: providerId === "anthropic" || providerId === "xai",
+      // Claude's write profile is bounded by its settings file, not by the kernel — which is
+      // enough to withhold a shell and not enough to grant one.
+      enforcedSandbox: providerId === "xai" || providerId === "openai",
+    },
+    attested,
+    operatorAccepted: false,
+    // A write is T0-T2 work, which is budgeted for one agent at a time.
+    fanOutAllowed: false,
+  });
+}
+
+export interface WriteInvocationInput {
+  readonly snapshot: ProviderSnapshot;
+  readonly model: ModelRef;
+  /** The task worktree. Never the registered checkout. */
+  readonly cwd: string;
+  readonly task: string;
+  readonly context: unknown;
+  readonly findings?: readonly string[];
+  readonly candidateOutput?: string | null;
+  readonly maxTurns?: number;
+  readonly schemaPath?: string;
+  readonly codexIsolation?: CodexIsolationAttestation;
+  readonly grokIsolation?: GrokIsolationAttestation;
+  readonly now?: Date;
+}
+
+function brief(input: WriteInvocationInput): string {
+  const body = JSON.stringify(Object.freeze({
+    schemaVersion: 1,
+    task: input.task,
+    context: input.context,
+    findings: Object.freeze([...(input.findings ?? [])]),
+    candidateOutput: input.candidateOutput ?? null,
+    constraints: Object.freeze({ smallChangeOnly: true, worktreeOnly: true, noSecrets: true, noAgentConfigChanges: true }),
+    responseContract: WRITE_SCHEMA,
+  }));
+  if (body.length === 0 || body.length > 2_000_000) throw new BrainGateInvariantError("WRITE_PAYLOAD_INVALID", "Write payload must be between 1 and 2,000,000 characters.");
+  return body;
+}
+
+/**
+ * The executing role's invocation, for whichever provider was routed to it.
+ *
+ * Claude keeps its own profile unchanged. The two additions work the same way as each other: a
+ * bounded working directory, a kernel-enforced sandbox, a schema the CLI applies, and no route
+ * to anything outside the worktree.
+ */
+export function planWriteInvocation(input: WriteInvocationInput): WriteProviderPlan {
+  const now = input.now ?? new Date();
+  assertWriteEligible(input.snapshot, input.model, {
+    ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
+    ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+    now,
+  });
+
+  if (input.snapshot.providerId === "anthropic") {
+    const plan = planClaudeWriteInvocation(input);
+    return Object.freeze({ ...plan, grant: writeGrant("anthropic", true) });
+  }
+
+  const body = brief(input);
+  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
+  const schema = jsonSchemaFor(WRITE_SCHEMA);
+
+  if (input.snapshot.providerId === "xai") {
+    const grant = writeGrant("xai", true);
+    const args = Object.freeze([
+      "-p", `${WRITE_INSTRUCTION}\n\n${body}`,
+      "--cwd", input.cwd,
+      // A custom profile, never a built-in one: only a custom profile that fails to apply aborts
+      // the run (ADR 0009). `strict` confines writes to this worktree; the deny list puts secrets
+      // out of reach of the kernel rather than out of bounds by instruction.
+      "--sandbox", GROK_WRITE_PROFILE,
+      "--output-format", "json",
+      "--json-schema", JSON.stringify(schema),
+      "--model", input.model.modelId,
+      "--max-turns", String(maxTurns),
+      "--verbatim",
+      "--permission-mode", "acceptEdits",
+      "--disable-web-search",
+      "--no-subagents",
+      "--no-plan",
+      "--no-alt-screen",
+      "--deny", "WebFetch",
+      "--deny", "WebSearch",
+    ]);
+    if (args.some((argument) => argument === "--always-approve" || argument === "bypassPermissions" || argument === "--dangerously-skip-permissions" || argument === GROK_SANDBOX_PROFILE)) {
+      throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe Grok approval flags, or the read-only staged profile, are forbidden for a write.");
+    }
+    return Object.freeze({
+      providerId: "xai",
+      executable: input.snapshot.binary,
+      args,
+      cwd: input.cwd,
+      modelId: input.model.modelId,
+      quotaPool: input.model.quotaPool,
+      stdin: "",
+      allowedEnvKeys: Object.freeze(["GROK_HOME", "GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "GROK_MANAGED_MCPS_ENABLED"]),
+      envOverrides: Object.freeze({ GROK_CLAUDE_MCPS_ENABLED: "false", GROK_CURSOR_MCPS_ENABLED: "false", GROK_MANAGED_MCPS_ENABLED: "false" }),
+      grant,
+      runtimeFiles: Object.freeze({ [GROK_WRITE_SANDBOX_FILE]: GROK_WRITE_SANDBOX.toml }),
+    });
+  }
+
+  const schemaPath = input.schemaPath;
+  if (schemaPath === undefined) throw new BrainGateInvariantError("WRITE_SCHEMA_PATH_REQUIRED", "A Codex write needs a schema path outside the worktree, so the schema cannot join the diff.");
+  const args = Object.freeze([
+    "exec",
+    "--ephemeral",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--json",
+    "--model", input.model.modelId,
+    "-C", input.cwd,
+    // Writes are confined to the working root by the sandbox, which is the worktree and nothing
+    // else. `--add-dir` would widen exactly that, so it is never passed.
+    "--sandbox", "workspace-write",
+    "--output-schema", schemaPath,
+    "-",
+  ]);
+  if (args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--full-auto") || args.includes("--add-dir") || args.includes("--approve-for-me")) {
+    throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe or workspace-widening Codex flags are forbidden for a write.");
+  }
+  return Object.freeze({
+    providerId: "openai",
+    executable: input.snapshot.binary,
+    args,
+    cwd: input.cwd,
+    modelId: input.model.modelId,
+    quotaPool: input.model.quotaPool,
+    stdin: `${WRITE_INSTRUCTION}\n\n${body}`,
+    allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
+    envOverrides: Object.freeze({}),
+    grant: writeGrant("openai", true),
+    externalFiles: Object.freeze({ [schemaPath]: JSON.stringify(schema, null, 2) }),
+  });
+}

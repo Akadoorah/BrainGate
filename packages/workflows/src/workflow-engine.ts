@@ -63,6 +63,29 @@ function isNoEligibleModel(error: unknown): boolean {
   return error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL";
 }
 
+/**
+ * Two independent approaches, as one brief the executor can act on.
+ *
+ * Not a summary and not a vote: summarising would need a third model, and voting would discard
+ * the half that was right about the part the other missed. They are labelled by provider and
+ * handed over whole, with the instruction that reconciling them is part of the work — which is
+ * what the executor is for.
+ */
+export function mergedApproaches(plans: readonly { readonly model: ModelRef; readonly output: string }[]): string {
+  const sections = plans.map((plan, index) => [
+    `## Approach ${String(index + 1)} — ${plan.model.providerId}/${plan.model.modelId}`,
+    "",
+    plan.output.trim(),
+  ].join("\n"));
+  return [
+    "Two independent approaches to this task were produced in parallel by different providers.",
+    "Where they agree, follow them. Where they differ, choose the one better supported by the",
+    "context you were given and say in your output which you followed and why.",
+    "",
+    ...sections,
+  ].join("\n");
+}
+
 export class WorkflowEngine {
   readonly #router: CapabilityRouter;
   readonly #invoker: AgentInvoker;
@@ -120,31 +143,61 @@ export class WorkflowEngine {
     // a cheaper one carries it out — which is the point of routing across a shared quota. Its
     // plan is handed to the executor as the candidate to work from, not as a suggestion.
     let plan: RouteCandidate | null = null;
+    let secondPlan: RouteCandidate | null = null;
     let approach: string | null = null;
-    if (input.budget.separatePlanningPass) {
+    if (input.budget.separatePlanningPass && input.budget.maxPlanners > 0) {
       // Planning has its own exclusion list. Reusing the executor's would tie the two together
       // exactly where they differ: a provider confined to a staged workspace can plan from the
       // task and the supplied context, and cannot execute against the checkout it never sees.
       const plannerExcluded = input.excludeProviders?.planner ?? primaryExcluded;
+      const routePlanner = (independence?: IndependenceConstraint): RouteCandidate => this.#router.route({
+        role: "planner",
+        classification: input.classification,
+        budget: input.budget,
+        requiredContextTokens: input.requiredContextTokens,
+        writeRequired: false,
+        ...(independence === undefined ? {} : { independence }),
+        ...(plannerExcluded === undefined ? {} : { excludeProviders: plannerExcluded }),
+      }).selected;
+
       try {
-        plan = this.#router.route({
-          role: "planner",
-          classification: input.classification,
-          budget: input.budget,
-          requiredContextTokens: input.requiredContextTokens,
-          writeRequired: false,
-          ...(plannerExcluded === undefined ? {} : { excludeProviders: plannerExcluded }),
-        }).selected;
+        plan = routePlanner();
       } catch (error) {
         // No model declares a planning capability. The task still runs; it simply plans and
         // executes in one pass, as it did before this stage existed.
         if (!isNoEligibleModel(error)) throw error;
         emit("planner.unavailable", "planner", null, "no model declares a planner capability");
       }
-      if (plan !== null) {
+
+      // A second opinion is worth having only from somewhere else. Two planners on one
+      // subscription share a pool, a model family and the same blind spot, and cost twice for
+      // the privilege — so this is cross-provider or it does not happen.
+      if (plan !== null && input.budget.maxPlanners > 1 && tracker.remainingProviderCalls() > 1) {
+        try {
+          secondPlan = routePlanner({ mode: "required", level: "cross-provider", models: [modelRef(plan)] });
+        } catch (error) {
+          if (!isNoEligibleModel(error)) throw error;
+          emit("planner.single", "planner", modelRef(plan), "no independent provider was available for a second approach");
+        }
+      }
+
+      if (plan !== null && secondPlan === null) {
         const planned = await invoke("planner", plan, "planning", [], null, false);
         if (planned.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Planner response was not work.");
         approach = planned.output;
+      } else if (plan !== null && secondPlan !== null) {
+        // Together, not in turn: the concurrency the budget already grants is what makes a
+        // second subscription free in wall-clock terms rather than twice as slow.
+        const [first, second] = await Promise.all([
+          invoke("planner", plan, "planning-a", [], null, false),
+          invoke("planner", secondPlan, "planning-b", [], null, false),
+        ]);
+        if (first.kind !== "work" || second.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Planner response was not work.");
+        approach = mergedApproaches([
+          { model: modelRef(plan), output: first.output },
+          { model: modelRef(secondPlan), output: second.output },
+        ]);
+        emit("planner.parallel", "planner", modelRef(secondPlan), `${modelRef(plan).providerId}+${modelRef(secondPlan).providerId}`);
       }
     }
 
@@ -153,7 +206,7 @@ export class WorkflowEngine {
     finalOutput = initial.output;
 
     const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && input.optionalReview);
-    if (!needsReview) return this.#receipt(input, "completed_without_review", plan, primary, null, null, events, tracker, finalOutput);
+    if (!needsReview) return this.#receipt(input, "completed_without_review", plan, primary, null, null, events, tracker, finalOutput, secondPlan);
 
     const primaryRef = modelRef(primary);
     const reviewerExcluded = input.excludeProviders?.reviewer;
@@ -191,13 +244,13 @@ export class WorkflowEngine {
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
 
-    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved", plan, primary, reviewer, null, events, tracker, finalOutput);
+    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
 
     if (reviewerResponse.verdict === "disagree") {
-      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke);
+      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke, secondPlan);
     }
 
-    if (input.budget.maxRepairRounds < 1) return this.#receipt(input, "blocked_changes_required", plan, primary, reviewer, null, events, tracker, finalOutput);
+    if (input.budget.maxRepairRounds < 1) return this.#receipt(input, "blocked_changes_required", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
     tracker.recordRepairRound();
     const findings = boundFindings(reviewerResponse.findings);
     const repair = await invoke("primary", primary, "repair-1", findings, finalOutput, false);
@@ -206,17 +259,17 @@ export class WorkflowEngine {
     emit("repair.completed", "primary", primaryRef, `findings:${findings.length}`);
 
     if (input.budget.maxReviewers < 2 || tracker.snapshot().providerCalls >= input.budget.maxProviderCalls) {
-      return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput);
+      return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
     }
 
     reviewerResponse = await invoke("reviewer", reviewer, "review-2", [], finalOutput, true);
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
-    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved_after_repair", plan, primary, reviewer, null, events, tracker, finalOutput);
+    if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved_after_repair", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
     if (reviewerResponse.verdict === "disagree") {
-      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke);
+      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke, secondPlan);
     }
-    return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput);
+    return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
   }
 
   async #resolveDisagreement(
@@ -229,12 +282,13 @@ export class WorkflowEngine {
     tracker: BudgetTracker,
     finalOutput: string,
     invoke: (role: AgentRequest["role"], candidate: RouteCandidate, phase: string, findings: readonly string[], candidateOutput: string | null, reviewerLike: boolean) => Promise<AgentResponse>,
+    secondPlanner: RouteCandidate | null = null,
   ): Promise<WorkflowReceipt> {
     if (input.budget.councilPolicy !== "disagreement-only" || input.budget.maxCouncilRounds < 1) {
-      return this.#receipt(input, "blocked_disagreement", plan, primary, reviewer, null, events, tracker, finalOutput);
+      return this.#receipt(input, "blocked_disagreement", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlanner);
     }
     if (tracker.snapshot().reviewers >= input.budget.maxReviewers || tracker.snapshot().providerCalls >= input.budget.maxProviderCalls) {
-      return this.#receipt(input, "blocked_disagreement", plan, primary, reviewer, null, events, tracker, finalOutput);
+      return this.#receipt(input, "blocked_disagreement", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlanner);
     }
     tracker.recordCouncilRound();
     const judgeExcluded = input.excludeProviders?.judge;
@@ -251,10 +305,10 @@ export class WorkflowEngine {
     const response = await invoke("judge", judge, "judge-1", bounded, finalOutput, true);
     if (response.kind !== "judge") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Judge response was not judge.");
     events.push(Object.freeze({ sequence: events.length + 1, kind: `judge.${response.verdict}`, role: "judge", model: modelRef(judge), detail: response.rationale.slice(0, 1_000) }));
-    return this.#receipt(input, response.verdict === "approve" ? "approved_by_judge" : "blocked_changes_required", plan, primary, reviewer, judge, events, tracker, finalOutput);
+    return this.#receipt(input, response.verdict === "approve" ? "approved_by_judge" : "blocked_changes_required", plan, primary, reviewer, judge, events, tracker, finalOutput, secondPlanner);
   }
 
-  #receipt(input: WorkflowInput, outcome: WorkflowOutcome, planner: RouteCandidate | null, primary: RouteCandidate, reviewer: RouteCandidate | null, judge: RouteCandidate | null, events: WorkflowEvent[], tracker: BudgetTracker, finalOutput: string): WorkflowReceipt {
-    return Object.freeze({ outcome, planner, primary, reviewer, judge, reviewIndependence: reviewIndependence(primary, reviewer, input), events: Object.freeze([...events]), budget: tracker.snapshot(), finalOutput });
+  #receipt(input: WorkflowInput, outcome: WorkflowOutcome, planner: RouteCandidate | null, primary: RouteCandidate, reviewer: RouteCandidate | null, judge: RouteCandidate | null, events: WorkflowEvent[], tracker: BudgetTracker, finalOutput: string, secondPlanner: RouteCandidate | null = null): WorkflowReceipt {
+    return Object.freeze({ outcome, planner, secondPlanner, primary, reviewer, judge, reviewIndependence: reviewIndependence(primary, reviewer, input), events: Object.freeze([...events]), budget: tracker.snapshot(), finalOutput });
   }
 }

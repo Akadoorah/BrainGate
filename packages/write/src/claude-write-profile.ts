@@ -1,8 +1,11 @@
 import { spawn } from "node:child_process";
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ModelRef } from "@braingate/router";
 import { SecretGuard, redactSecrets } from "@braingate/security";
+import { resolveToolGrant } from "@braingate/shadow";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -96,6 +99,13 @@ export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSn
   if (args.some((arg) => /dangerously-skip|allow-dangerously|--bare|--worktree|--add-dir/.test(arg))) throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe Claude write profile flag detected.");
   return Object.freeze({
     providerId: "anthropic",
+    grant: resolveToolGrant({
+      role: "primary", providerId: "anthropic", workspaceMode: "task-worktree", writeMode: true,
+      // Claude's boundary here is its settings file and its tool allowlist, not the kernel —
+      // which is enough to withhold a shell and not enough to grant one.
+      surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false },
+      attested: true, operatorAccepted: false,
+    }),
     executable: input.snapshot.binary,
     args,
     cwd: input.cwd,
@@ -107,6 +117,12 @@ export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSn
   });
 }
 
+/**
+ * Runs one executing-role invocation, for any provider that has a write profile.
+ *
+ * The name is historical: it ran only Claude when Claude was the only provider allowed to write.
+ * Nothing in it was ever Claude-specific.
+ */
 export class NodeClaudeWriteExecutor implements WriteProviderExecutor {
   readonly #guard = new SecretGuard();
 
@@ -114,7 +130,52 @@ export class NodeClaudeWriteExecutor implements WriteProviderExecutor {
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 5 * 60_000, 1_000), 20 * 60_000);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
     const environment = this.#guard.buildEnvironment(input.env ?? process.env, { allowedAdditionalKeys: input.plan.allowedEnvKeys, overrides: input.plan.envOverrides });
+    const placed = this.#placeFiles(input.plan);
     const started = Date.now();
+    try {
+      return await this.#spawn(input, environment, timeoutMs, maxOutput, started);
+    } finally {
+      // By exact path, and only the paths BrainGate wrote. Anything else the run left behind
+      // still reaches the diff guard, which is the point of removing these one at a time rather
+      // than clearing a directory.
+      for (const path of placed) rmSync(path, { force: true });
+    }
+  }
+
+  /**
+   * Puts a CLI's own configuration where that CLI looks for it.
+   *
+   * Grok reads its sandbox profile from `.grok/sandbox.toml` under the working directory, which
+   * for a write is the worktree the change is collected from — so the file has to be written
+   * there and taken away before the diff. `wx` refuses to overwrite: a repository that already
+   * has one fails the run rather than losing it.
+   */
+  #placeFiles(plan: WriteProviderPlan): readonly string[] {
+    const placed: string[] = [];
+    for (const [name, content] of Object.entries(plan.runtimeFiles ?? {})) {
+      if (isAbsolute(name) || name.split("/").includes("..")) throw new BrainGateInvariantError("WRITE_RUNTIME_FILE_INVALID", "A runtime file must be a relative path inside the worktree.");
+      const target = join(plan.cwd, name);
+      mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+      writeFileSync(target, content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+      placed.push(target);
+    }
+    for (const [path, content] of Object.entries(plan.externalFiles ?? {})) {
+      if (!isAbsolute(path)) throw new BrainGateInvariantError("WRITE_EXTERNAL_FILE_INVALID", "An external file must be an absolute path outside the worktree.");
+      if (!relative(plan.cwd, path).startsWith("..")) throw new BrainGateInvariantError("WRITE_EXTERNAL_FILE_INVALID", "An external file must not be inside the worktree, where it would join the diff.");
+      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      writeFileSync(path, content, { encoding: "utf8", mode: 0o600 });
+      placed.push(path);
+    }
+    return Object.freeze(placed);
+  }
+
+  async #spawn(
+    input: { readonly plan: WriteProviderPlan; readonly env?: NodeJS.ProcessEnv; readonly timeoutMs?: number; readonly maxOutputBytes?: number },
+    environment: { readonly env: NodeJS.ProcessEnv; readonly removed: readonly string[] },
+    timeoutMs: number,
+    maxOutput: number,
+    started: number,
+  ): Promise<WriteProviderResult> {
     return await new Promise<WriteProviderResult>((resolveResult) => {
       let stdout = ""; let stderr = ""; let timedOut = false; let overflow = false; let spawned = false; let settled = false;
       const child = spawn(input.plan.executable, [...input.plan.args], { cwd: input.plan.cwd, env: environment.env, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });

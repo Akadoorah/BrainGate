@@ -39,17 +39,29 @@ export interface ExecutionBudget {
    * Off for small tasks: a plan for a one-line change costs a provider call and decides nothing.
    */
   readonly separatePlanningPass: boolean;
+  /**
+   * How many independent subscriptions may decide the approach at once.
+   *
+   * One is a plan. Two is two plans from providers that do not share a pool, a training set or a
+   * blind spot, handed to the executor together — which is the only reason to own several
+   * subscriptions rather than the best one.
+   *
+   * It is explicit policy rather than a consequence of `maxConcurrentAgents`, because
+   * multi-agent execution is opt-in here by rule: a tier that has not asked for a second opinion
+   * must not acquire one because the concurrency ceiling happened to allow it.
+   */
+  readonly maxPlanners: number;
   readonly reviewerPolicy: ReviewerPolicy;
   readonly councilPolicy: CouncilPolicy;
   readonly humanApprovalBeforeWrite: boolean;
 }
 
 const BASE_BUDGETS: Readonly<Record<TaskComplexity, ExecutionBudget>> = {
-  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 15, maxInspectionMs: 180000, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 20, maxInspectionMs: 300000, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 25, maxInspectionMs: 420000, separatePlanningPass: false, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 35, maxInspectionMs: 600000, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
-  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 50, maxInspectionMs: 900000, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
+  T0: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 12_000, maxInspectionTurns: 15, maxInspectionMs: 180000, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T1: { maxProviderCalls: 1, maxConcurrentAgents: 1, maxReviewers: 0, maxRepairRounds: 0, maxAutomaticRetries: 0, maxCouncilRounds: 0, maxContextTokens: 24_000, maxInspectionTurns: 20, maxInspectionMs: 300000, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "none", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T2: { maxProviderCalls: 2, maxConcurrentAgents: 1, maxReviewers: 1, maxRepairRounds: 1, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 48_000, maxInspectionTurns: 25, maxInspectionMs: 420000, maxPlanners: 0, separatePlanningPass: false, reviewerPolicy: "optional", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T3: { maxProviderCalls: 4, maxConcurrentAgents: 2, maxReviewers: 1, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 0, maxContextTokens: 96_000, maxInspectionTurns: 35, maxInspectionMs: 600000, maxPlanners: 1, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disabled", humanApprovalBeforeWrite: false },
+  T4: { maxProviderCalls: 6, maxConcurrentAgents: 2, maxReviewers: 2, maxRepairRounds: 2, maxAutomaticRetries: 1, maxCouncilRounds: 1, maxContextTokens: 160_000, maxInspectionTurns: 50, maxInspectionMs: 900000, maxPlanners: 2, separatePlanningPass: true, reviewerPolicy: "required", councilPolicy: "disagreement-only", humanApprovalBeforeWrite: false },
 };
 
 export function budgetFor(classification: TaskClassification, options: { writeRequested: boolean }): ExecutionBudget {
@@ -83,6 +95,8 @@ export function budgetFor(classification: TaskClassification, options: { writeRe
       ...budget,
       maxProviderCalls: Math.max(budget.maxProviderCalls, 6),
       maxConcurrentAgents: Math.max(budget.maxConcurrentAgents, 2),
+      // Critical work gets the second opinion whatever tier it was classified as.
+      maxPlanners: Math.max(budget.maxPlanners, 2),
       maxReviewers: Math.max(budget.maxReviewers, 2),
       maxRepairRounds: Math.max(budget.maxRepairRounds, 2),
       maxCouncilRounds: Math.max(budget.maxCouncilRounds, 1),
@@ -120,6 +134,16 @@ export class BudgetTracker {
 
   constructor(budget: ExecutionBudget) {
     this.#budget = budget;
+  }
+
+  /**
+   * Provider calls still available.
+   *
+   * Asked before a fan-out rather than discovered inside one: two planners that start together
+   * and then fail the second reservation have spent a call for an answer nobody can use.
+   */
+  remainingProviderCalls(): number {
+    return Math.max(0, this.#budget.maxProviderCalls - this.#providerCalls);
   }
 
   reserveProviderCall(options: { reviewer?: boolean; contextTokens?: number } = {}): void {

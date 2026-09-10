@@ -6,7 +6,9 @@ import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
-import { SessionContext } from "./session-context.js";
+import { SessionContext, sessionThreadPath } from "./session-context.js";
+import { ProjectRegistry } from "@braingate/core";
+import { resolveOperatorState } from "@braingate/operator";
 import { COLOURED, PLAIN, renderBanner } from "./banner.js";
 import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js";
 
@@ -25,6 +27,8 @@ import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js"
 
 interface ReplDeps {
   readonly cwd: string;
+  /** Where operator state lives, for locating this project's thread. Defaults to the process env. */
+  readonly env?: NodeJS.ProcessEnv;
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
   readonly ask: (question: string) => Promise<string | null>;
@@ -55,6 +59,57 @@ function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
 }
 
+/**
+ * Where this directory's session thread belongs, or nowhere.
+ *
+ * A thread is project state, so it needs a registered project to belong to. Without one — or if
+ * anything about resolving it fails — the session simply keeps its thread in memory, which is
+ * what it always did.
+ */
+function threadOptions(cwd: string, env: NodeJS.ProcessEnv | undefined): { readonly path?: string } {
+  try {
+    const state = resolveOperatorState(env ?? process.env);
+    const manifest = findManifest(cwd);
+    if (!existsSync(manifest)) return {};
+    const project = new ProjectRegistry(state.home).loadFile(manifest);
+    return { path: sessionThreadPath(project.storageDir) };
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * The tail of a finished run, once its answer has already been streamed.
+ *
+ * `dogfood ask run` prints the answer and then the receipt line. When the answer arrived live,
+ * printing that whole block again would show it twice, so only the receipt survives.
+ */
+export function withoutStreamedAnswer(text: string): string {
+  const marker = text.lastIndexOf("\nTask ");
+  return marker < 0 ? "" : text.slice(marker);
+}
+
+/**
+ * How a working role reads in the indicator: what it is doing, on which model.
+ *
+ * The quota pool rather than the provider id, because that is the thing being spent, and two
+ * models from one subscription share it.
+ */
+export function activityLabel(activity: { readonly role: string; readonly model: string; readonly quotaPool: string }): string {
+  const verb = activity.role === "planner" ? "planning" : activity.role === "reviewer" ? "reviewing" : activity.role === "judge" ? "judging" : "working";
+  return `${verb} · ${activity.model} · ${activity.quotaPool}`;
+}
+
+/** The per-role capability lines the plan prints under its summary. */
+export function grantLines(text: string): readonly string[] {
+  return Object.freeze(
+    text.split("\n")
+      .map((line) => line.trimEnd())
+      .filter((line) => /^\s{2}\w+: /.test(line))
+      .map((line) => line.trim()),
+  );
+}
+
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const captured: string[] = [];
@@ -69,10 +124,15 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns, discoverAll,
   });
   planning.stop();
-  const summary = firstLine(captured.join(""));
-  if (plan.exitCode !== 0) { deps.stderr(`${captured.join("")}\n`); return; }
+  const planText = captured.join("");
+  const summary = firstLine(planText);
+  if (plan.exitCode !== 0) { deps.stderr(`${planText}\n`); return; }
 
   deps.stdout(`\n  ${mode === "write" ? "write · isolated worktree" : "read-only"} · ${summary}\n`);
+  // What each role may do, and what it asked for and did not get. This is the half of the plan
+  // that used to be dropped, and it is the half that answers "why is this reading less than I
+  // expected" before the run rather than after it.
+  for (const line of grantLines(planText)) deps.stdout(`  ${line}\n`);
   const answer = await deps.ask(mode === "write" ? "  Run it? This changes a task worktree, never your checkout. [y/N] " : "  Run it? [y/N] ");
   if (answer === null || !/^y(es)?$/i.test(answer.trim())) { deps.stdout("  Skipped. Nothing was spent.\n\n"); return; }
 
@@ -80,13 +140,32 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   const spoken: string[] = [];
   // The indicator has to be gone before the first byte of real output, or the two share a line.
   const working = startProgress({ write: deps.stdout, label: mode === "write" ? "writing" : "working", ...progressStyle(deps) });
+  // A streamed answer is written straight to the terminal as the model produces it, and the
+  // final print would then repeat every word of it. This tracks whether that happened.
+  let streamed = false;
   const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--execute"], {
     cwd: deps.cwd,
-    stdout: (text) => { working.stop(); spoken.push(text); deps.stdout(text); },
+    stdout: (text) => {
+      working.stop();
+      spoken.push(text);
+      // The answer is already on screen; what is left to print is the receipt after it.
+      deps.stdout(streamed ? withoutStreamedAnswer(text) : text);
+    },
     stderr: (text) => { working.stop(); deps.stderr(text); },
+    // Who is working, while they work. A task spends several roles across several
+    // subscriptions, and the indicator is the only place that is visible as it happens.
+    onRoleActivity: (activity) => { if (activity.stage === "started") working.label(activityLabel(activity)); },
+    onThinking: () => { working.label("thinking"); },
+    onText: (text) => {
+      // The first byte of an answer is the moment the wait ends. The indicator goes, and
+      // everything after this is the model writing.
+      if (!streamed) { working.stop(); streamed = true; }
+      deps.stdout(text);
+    },
     sessionTurns,
     discoverAll,
   });
+  if (streamed) deps.stdout("\n");
   working.stop();
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
   // premise of the next follow-up.
@@ -108,8 +187,8 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
         "  something is planned as a write into an isolated worktree. Either way you see the",
         "  plan and confirm before anything is spent.",
         "",
-        "  Follow-ups resolve against earlier turns in this session. That thread lives in this",
-        "  process only: it is never written to disk and never becomes project memory.",
+        "  Follow-ups resolve against earlier turns. That thread is kept with this project's own",
+        "  state for a few hours, redacted, and never becomes project memory. /forget deletes it.",
         "",
         "  /remember <text>  record something about this project, for later sessions",
         "  /memory     what is remembered, and what is waiting for your evidence",
@@ -141,7 +220,7 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
       return "continue";
     case "forget":
       session.clear();
-      deps.stdout("  Session thread cleared. Project memory is untouched.\n");
+      deps.stdout("  Session thread cleared, here and on disk. Project memory is untouched.\n");
       return "continue";
     case "status":
       await runCli(["status", "--project", ".brain/project.json"], io);
@@ -216,7 +295,12 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t) });
   deps.stdout(`  ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
 
-  const session = new SessionContext();
+  // The thread from earlier today, if there is one. It lives with the project's own state, so a
+  // different project in another terminal has its own and neither can see the other's.
+  const session = new SessionContext(threadOptions(deps.cwd, deps.env));
+  if (session.resumed > 0) {
+    deps.stdout(`  Continuing a thread of ${String(session.resumed)} earlier ${session.resumed === 1 ? "turn" : "turns"}. /forget starts fresh.\n\n`);
+  }
   const providers = new ProviderSnapshotCache();
   for (;;) {
     const line = await deps.ask("> ");

@@ -5,7 +5,18 @@ import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import { grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
+import { ContractTextStream, LineBuffer, readStreamLine } from "./streaming.js";
 import { STAGE_PATH_TOKEN, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "./types.js";
+
+/**
+ * Runs a display callback without letting it end the run.
+ *
+ * The terminal is downstream of the work. A drawing routine that throws must not discard a
+ * provider's answer.
+ */
+function safely(action: () => void): void {
+  try { action(); } catch { /* the display is not the work */ }
+}
 
 function inside(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
@@ -41,6 +52,8 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
+    readonly onText?: (text: string) => void;
+    readonly onThinking?: () => void;
   }): Promise<ShadowProcessResult> {
     const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 20 * 60_000);
@@ -91,6 +104,13 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           overrides.HOME = isolatedHome;
         }
 
+        for (const [name, content] of Object.entries(input.plan.stagedFiles ?? {})) {
+          if (name.includes("/") || name.includes("\\") || name.includes("..") || name.length === 0) {
+            throw new BrainGateInvariantError("SHADOW_STAGED_FILE_INVALID", "A staged file name must be a plain file name inside the workspace.");
+          }
+          writeFileSync(join(spawnCwd, name), content, { encoding: "utf8", mode: 0o600, flag: "wx" });
+        }
+
         if (input.plan.inputMode === "staged-file") {
           if (input.plan.attachmentContent === null || input.plan.attachmentToken === null) {
             throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "Staged-file plan requires request content and a file name.");
@@ -107,6 +127,10 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         }
       } else if (args.some((argument) => argument.includes(STAGE_PATH_TOKEN))) {
         throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Project-mode shadow invocation cannot contain a staged workspace token.");
+      }
+
+      if (Object.keys(input.plan.stagedFiles ?? {}).length > 0 && input.plan.workspaceMode !== "staged-clean") {
+        throw new BrainGateInvariantError("SHADOW_STAGED_FILE_INVALID", "Staged files have nowhere to go outside a staged workspace.");
       }
 
       if (input.plan.inputMode === "staged-file" && input.plan.workspaceMode !== "staged-clean") {
@@ -144,10 +168,75 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          resolveResult(Object.freeze({ spawned, exitCode: overflow ? null : exitCode, stdout: redactSecrets(stdout), stderr: redactSecrets(stderr), timedOut: timedOut || overflow, durationMs: Date.now() - started, removedEnvironmentKeys: environment.removed }));
+          if (dialect !== null) {
+            const rest = lines.flush();
+            if (rest.trim().length > 0) consume(rest);
+          }
+          resolveResult(Object.freeze({
+            spawned,
+            exitCode: overflow ? null : exitCode,
+            stdout: redactSecrets(stdout),
+            stderr: redactSecrets(stderr),
+            assembled: dialect === null || assembled.length === 0 ? null : redactSecrets(assembled),
+            timedOut: timedOut || overflow,
+            durationMs: Date.now() - started,
+            removedEnvironmentKeys: environment.removed,
+          }));
         };
         const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+        // A streamed run is read line by line: the answer is assembled from its pieces, the
+        // prose inside it is forwarded as it arrives, and only the lines the final parse
+        // actually needs are retained. Without that last part a token stream spends the whole
+        // output cap on thinking and signature deltas nobody reads.
+        const dialect = input.plan.streamDialect;
+        const lines = new LineBuffer();
+        let prose = new ContractTextStream();
+        let assembled = "";
+        let announcedThinking = false;
+        /**
+         * Whether this provider is streaming the contract's JSON or the prose itself.
+         *
+         * Measured: given a schema, Claude fills it through a `StructuredOutput` tool and streams
+         * the human answer as text, while Grok streams the schema-constrained JSON directly. So
+         * the first character of the answer decides which one this is, and guessing wrong either
+         * shows JSON to a person or shows them nothing at all.
+         */
+        let shape: "unknown" | "contract-json" | "prose" = "unknown";
+
+        const consume = (line: string): void => {
+          const verdict = readStreamLine(dialect!, line);
+          if (verdict.restart === true && assembled.length > 0) {
+            // A fresh block is a fresh answer. The prose reader starts again with it, so a
+            // narrated run does not stream the same field twice.
+            assembled = "";
+            prose = new ContractTextStream();
+            shape = "unknown";
+          }
+          if (verdict.retain) {
+            const next = `${stdout}${line}\n`;
+            if (Buffer.byteLength(next, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
+            stdout = next;
+          }
+          if (verdict.thinking && !announcedThinking) { announcedThinking = true; safely(() => input.onThinking?.()); }
+          if (verdict.answer === null) return;
+          assembled += verdict.answer;
+          if (Buffer.byteLength(assembled, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
+          if (shape === "unknown") {
+            const leading = assembled.trimStart();
+            if (leading.length > 0) shape = leading.startsWith("{") ? "contract-json" : "prose";
+          }
+          if (shape === "prose") { safely(() => input.onText?.(verdict.answer!)); return; }
+          if (shape === "contract-json") {
+            const readable = prose.push(verdict.answer);
+            if (readable.length > 0) safely(() => input.onText?.(readable));
+          }
+        };
+
         const append = (target: "stdout" | "stderr", chunk: Buffer) => {
+          if (target === "stdout" && dialect !== null) {
+            for (const line of lines.take(chunk.toString("utf8"))) consume(line);
+            return;
+          }
           const current = target === "stdout" ? stdout : stderr;
           const next = current + chunk.toString("utf8");
           if (Buffer.byteLength(next, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }

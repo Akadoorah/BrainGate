@@ -9,6 +9,21 @@
 
 Provider session history is never canonical project truth.
 
+## The interactive thread
+
+An interactive session keeps the last few turns so a follow-up like "and the other one?"
+resolves. That thread now survives closing the terminal, because closing a terminal is not the
+same as changing the subject — but it is not memory and never becomes memory:
+
+- it is kept with the project's own state, so two projects cannot see each other's;
+- it is redacted before it is written, because a file is the one place a secret in an answer
+  would settle;
+- it holds the same few, truncated turns it always did, and expires after a few hours, so
+  yesterday's follow-up cannot resolve against a question nobody remembers asking;
+- `/forget` deletes it;
+- nothing in it can reach canonical memory except by the operator writing it down through
+  `/remember`, which starts at the same proposal gate as everything else.
+
 ## Single-writer memory flow
 
 ```text

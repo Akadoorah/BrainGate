@@ -9,6 +9,9 @@ import {
   type CodexIsolationAttestation,
 } from "./codex-isolation.js";
 import { GROK_SANDBOX_PROFILE, validGrokIsolationAttestation, type GrokIsolationAttestation } from "./grok-isolation.js";
+import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
+import { subagentsArgument } from "./subagents.js";
+import { grants, guaranteesFor, resolveToolGrant, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
 import { STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -16,6 +19,24 @@ const CLAUDE_MINIMUM = "2.1.248";
 // than warning and continuing. Below it, `--sandbox` is a request, not a guarantee.
 const GROK_MINIMUM = "1.0.13";
 const ATTACHMENT_TOKEN = "__BRAINGATE_SHADOW_INPUT__";
+/**
+ * The instruction for a CLI that enforces the response schema itself.
+ *
+ * Everything the long prompt spends on the shape of the reply — the keys, the literals, the no
+ * fences, the worked example — is a constraint the provider now applies. What is left is the
+ * part a schema cannot express: what the request is, and that this run analyses rather than acts.
+ */
+const SCHEMA_PROMPT = [
+  "You receive one JSON request object (appended below this instruction, or supplied as the attached file).",
+  "Use its `task` field as the request and its `context` field as supporting data.",
+  "Analyze only; do not modify files, run commands, access the network, or use external tools.",
+  "Answer with real values you produce; the response shape is enforced for you.",
+  "If you cannot complete the request, still answer in that shape and put the reason in the text field.",
+].join(" ");
+
+/** Where a staged response schema is written for a CLI that takes it as a path. */
+export const STAGED_SCHEMA_FILE = "braingate-response-schema.json";
+
 const GENERIC_PROMPT = [
   "You receive one JSON request object (appended below this instruction, or supplied as the attached file).",
   "Use its `task` field as the request and its `context` field as supporting data.",
@@ -48,6 +69,13 @@ interface ProfileDefinition {
   readonly stagedRoles?: readonly WorkflowRole[];
   /** True when project access is reachable only through an operator acceptance. */
   readonly needsOperatorAcceptance?: boolean;
+  /**
+   * What this CLI can be asked for, from the flags it actually exposes (ADR 0010).
+   *
+   * Not a judgement about the provider: a CLI with no way to deny a tool cannot be granted one,
+   * because the grant would describe an intention instead of a boundary.
+   */
+  readonly surface: ProviderGrantSurface;
 }
 
 /**
@@ -60,27 +88,26 @@ interface ProfileDefinition {
  */
 const INVOCABLE: ReadonlySet<ProviderId> = new Set<ProviderId>(["anthropic", "openai", "github-copilot", "xai", "google"]);
 
-/**
- * A prompt is one argument, and Linux caps a single argument at 128 KiB regardless of how much
- * room the whole command line has. A provider with no stdin route is therefore bounded well
- * below the payload cap, and saying so here beats an E2BIG from the kernel on a large context.
- */
-const ARGUMENT_PAYLOAD_LIMIT = 100_000;
-
 /** Where the staged request body is written for providers that read their prompt from a path. */
 export const STAGED_REQUEST_FILE = "braingate-request.txt";
 
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
-  anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null },
-  "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null },
-  openai: { providerId: "openai", enabled: true, minimumVersion: null, blockedReason: "Reviewer-only; requires a current Codex sandbox self-test attestation." },
+  anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false } },
+  // `--agent` selects an agent Copilot already has; it does not accept one BrainGate wrote, so
+  // there is nothing here to bound and subagents stay closed.
+  "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false } },
+  // M10 opened Codex as a reviewer because that was the role the milestone needed, and the
+  // restriction outlived its reason: a planner and a judge run in the same staged workspace,
+  // under the same attestation, reading nothing the reviewer does not read. What stays closed is
+  // `primary`, which would need the real checkout.
+  openai: { providerId: "openai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: null, blockedReason: "Staged roles only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
   // Grok was blocked for two reasons, and grok 1.0.13 ended both (ADR 0009). `GROK_HOME` now
   // carries configuration and credentials together, so an isolated HOME removes the other
   // tool's settings file — `grok inspect` reports `Permissions: (none)` — while authentication
   // survives; and a custom sandbox profile that cannot be applied now aborts the run instead of
   // warning. What remains is proven per invocation by a self-test rather than assumed, so Grok
   // is enabled for staged roles and still closed for anything that reads the real checkout.
-  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation." },
+  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true } },
   // Headless `agy` is fail-closed about tools — one needing permission is auto-denied, because
   // there is nobody to prompt, and the denial is reported in `denied_actions`. What is still
   // missing is any way to scope it per invocation: permissions and credentials share HOME, and
@@ -88,7 +115,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // one an isolated home the way it does for Codex and Grok. A staged run therefore keeps the
   // operator's real home, and what agy may reach elsewhere on the machine is unchecked — which
   // is the residual only the operator can accept (ADR 0008).
-  google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project." },
+  google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
 });
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
@@ -178,12 +205,44 @@ export function planShadowInvocation(input: {
   readonly grokIsolation?: GrokIsolationAttestation;
   /** The operator's recorded decision, for a provider BrainGate cannot isolate (ADR 0008). */
   readonly acceptance?: OperatorProviderAcceptance;
+  /** The operator's separate decision to let a role on this provider reach the network. */
+  readonly networkAcceptance?: OperatorProviderAcceptance;
   readonly maxTurns?: number;
+  /**
+   * Whether this task's budget allows more than one agent at once.
+   *
+   * Taken from `ExecutionBudget.maxConcurrentAgents` rather than invented here: subagents are
+   * concurrent agents, so the budget that already bounds concurrency is the thing that decides
+   * whether a run may fan out. T0-T2 do not; T3 and T4 do.
+   */
+  readonly fanOut?: boolean;
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
   const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now);
   const body = serializedPayload(input.payload);
+  // The shape the provider must answer in, as a constraint it applies rather than a paragraph
+  // it may ignore. Every CLI here except Copilot accepts one; Copilot keeps the long prompt.
+  const schema = jsonSchemaArgument(input.payload.responseContract);
+  const attested = input.snapshot.providerId === "openai"
+    ? validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })
+    : input.snapshot.providerId === "xai"
+      ? validGrokIsolationAttestation(input.grokIsolation, input.snapshot, { now })
+      : profile.surface.isolatedPerInvocation;
+  const grant = resolveToolGrant({
+    role: input.payload.role,
+    providerId: input.snapshot.providerId,
+    // Every shadow role reads; nothing here edits, which is what keeps `edit` and `shell` out of
+    // reach on this path however generous a provider's surface is.
+    workspaceMode: input.snapshot.providerId === "anthropic" || input.snapshot.providerId === "github-copilot" ? "project" : "staged-clean",
+    writeMode: false,
+    surface: profile.surface,
+    attested,
+    operatorAccepted: validOperatorAcceptance(input.acceptance, input.snapshot.providerId, now),
+    networkAccepted: validOperatorAcceptance(input.networkAcceptance, input.snapshot.providerId, now, "operator-accepted-network-access"),
+    fanOutAllowed: input.fanOut === true,
+  });
+  const subagents = grants(grant, "subagents") ? subagentsArgument(input.payload.role) : null;
   // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
   // lower than the budget asks for would silently reimpose the limit this stopped being.
   const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
@@ -191,15 +250,35 @@ export function planShadowInvocation(input: {
   if (input.snapshot.providerId === "anthropic") {
     const args = Object.freeze([
       "--restricted",
-      "-p", GENERIC_PROMPT,
-      "--output-format", "json",
+      "-p", SCHEMA_PROMPT,
+      // A token stream, so a waiting terminal sees the answer being written rather than a
+      // spinner. `--verbose` is not optional here: this build refuses stream-json without it.
+      // The executor keeps only the lines the parse reads, so the extra events cost no cap.
+      "--output-format", "stream-json",
+      "--verbose",
+      "--include-partial-messages",
       "--no-session-persistence",
       "--no-chrome",
       "--disable-slash-commands",
-      "--tools", "Read,Glob,Grep",
+      // Exactly what the grant allows, and nothing standing by in case. The Agent tool appears
+      // only when the grant and the budget both permit helpers — and the helpers are the ones
+      // BrainGate defined, read-only and named. Search appears only where the operator has said
+      // this provider may reach the network.
+      "--tools", [
+        "Read", "Glob", "Grep",
+        ...(subagents === null ? [] : ["Agent"]),
+        ...(grants(grant, "web") ? ["WebSearch", "WebFetch"] : []),
+      ].join(","),
+      ...(subagents === null ? [] : ["--agents", subagents]),
       "--disallowedTools", "mcp__*",
+      // Denying the tools is not the same as not loading the servers: a run's own init event
+      // listed the operator's MCP servers as connected while every mcp__ tool was denied. The
+      // guarantee this profile publishes is `noMcp`, so the servers do not get to be there.
+      "--strict-mcp-config",
+      "--mcp-config", "{\"mcpServers\":{}}",
       "--max-turns", String(maxTurns),
       "--model", input.model.modelId,
+      "--json-schema", schema,
     ]);
     if (args.includes("--bare") || args.includes("--dangerously-skip-permissions") || args.includes("--allow-dangerously-skip-permissions")) {
       throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe Claude permission/profile flags are forbidden.");
@@ -218,14 +297,17 @@ export function planShadowInvocation(input: {
       attachmentToken: null,
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      grant,
+      streamDialect: "anthropic",
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
 
   if (input.snapshot.providerId === "openai") {
-    if (input.payload.role !== "reviewer") {
-      throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", "Codex is reviewer-only in this BrainGate milestone.");
+    const codexStaged = PROFILES.openai.stagedRoles ?? [];
+    if (!codexStaged.includes(input.payload.role)) {
+      throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", `Codex runs staged roles only (${codexStaged.join(", ")}); ${input.payload.role} would need the real checkout, which the staged workspace does not contain.`);
     }
     if (!validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })) {
       throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", "Codex reviewer isolation requires a current sandbox self-test attestation for this version/platform/profile.");
@@ -243,6 +325,9 @@ export function planShadowInvocation(input: {
       // Only the keys this build proved it accepts during the self-test (ADR 0006). Sending a
       // key it does not know would abort the run under --strict-config.
       ...codexReviewerConfigArgs(STAGE_PATH_TOKEN, acceptedFeatureKeys(input.codexIsolation?.droppedFeatureKeys ?? [])),
+      // Codex takes its schema as a path. The staged workspace is the only directory this run
+      // can open, so that is where it goes.
+      "--output-schema", `${STAGE_PATH_TOKEN}/${STAGED_SCHEMA_FILE}`,
       "-",
     ]);
     if (args.includes("--sandbox") || args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--full-auto")) {
@@ -260,9 +345,12 @@ export function planShadowInvocation(input: {
       stdin: body,
       attachmentContent: null,
       attachmentToken: null,
+      stagedFiles: Object.freeze({ [STAGED_SCHEMA_FILE]: JSON.stringify(jsonSchemaFor(input.payload.responseContract), null, 2) }),
       allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
       envOverrides: Object.freeze({}),
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      grant,
+      streamDialect: null,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -284,12 +372,18 @@ export function planShadowInvocation(input: {
       // A custom profile, never a built-in one: only a custom profile that fails to apply
       // aborts the run. `--sandbox strict` would warn and continue unprotected.
       "--sandbox", GROK_SANDBOX_PROFILE,
-      "--output-format", "json",
+      // Measured: with a schema in force the stream carries the contract's JSON in `text`
+      // pieces, so the answer is their concatenation and the readable part is extracted from it.
+      "--output-format", "streaming-json",
       "--model", input.model.modelId,
       "--max-turns", String(maxTurns),
+      "--json-schema", schema,
       "--verbatim",
-      "--disable-web-search",
-      "--no-subagents",
+      ...(grants(grant, "web") ? [] : ["--disable-web-search"]),
+      // Grok's own subagents are banned unless BrainGate supplied the definitions. The flag is
+      // the difference between helpers whose reach nobody declared and helpers that are part of
+      // the grant.
+      ...(subagents === null ? ["--no-subagents"] : ["--agents", subagents]),
       "--no-plan",
       "--no-alt-screen",
     ]);
@@ -309,7 +403,7 @@ export function planShadowInvocation(input: {
       // The instruction has to travel with the payload: `--prompt-file` is the whole prompt,
       // so a file holding only the request object arrives with nothing telling the model what
       // shape to answer in — and it answers in prose, which fails the contract on parse.
-      attachmentContent: `${GENERIC_PROMPT}\n\n${body}`,
+      attachmentContent: `${SCHEMA_PROMPT}\n\n${body}`,
       attachmentToken: STAGED_REQUEST_FILE,
       allowedEnvKeys: Object.freeze(["GROK_HOME", "GROK_CLAUDE_MCPS_ENABLED", "GROK_CURSOR_MCPS_ENABLED", "GROK_MANAGED_MCPS_ENABLED"]),
       envOverrides: Object.freeze({
@@ -325,20 +419,21 @@ export function planShadowInvocation(input: {
       // the kernel, not a flag: an outside `cat` inside this profile fails with "Operation not
       // permitted". Network blocking is real on Linux and a documented no-op on macOS, so
       // noNetworkTools claims only the tools BrainGate actually disabled.
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true }),
+      grant,
+      streamDialect: "xai",
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
 
   if (input.snapshot.providerId === "google") {
-    if (body.length > ARGUMENT_PAYLOAD_LIMIT) {
-      throw new BrainGateInvariantError("SHADOW_PAYLOAD_TOO_LARGE", `Antigravity takes its prompt as a command-line argument, which caps this request at ${String(ARGUMENT_PAYLOAD_LIMIT)} characters; this one is ${String(body.length)}. Route it to a provider that reads stdin, or narrow the context.`);
-    }
     const args = Object.freeze([
-      // agy rejects a detached `-p`, taking the next flag as the prompt, so the prompt is
-      // attached to the flag rather than following it.
-      `-p=${GENERIC_PROMPT}\n\n${body}`,
-      "--output-format", "json",
+      // Measured against agy 1.1.28: `--input-format stream-json` reads NDJSON from stdin, and
+      // refuses a prompt on the command line rather than silently ignoring it. The 100 KB cap
+      // that used to sit here was a property of an older build that had no stdin route at all.
+      "--input-format", "stream-json",
+      "--output-format", "stream-json",
+      "--json-schema", schema,
       "--model", input.model.modelId,
       "--disable-slash-commands",
       "--sandbox",
@@ -356,16 +451,25 @@ export function planShadowInvocation(input: {
       modelId: input.model.modelId,
       quotaPool: input.model.quotaPool,
       inputMode: "stdin",
-      stdin: "",
+      // Measured against agy 1.1.28: the envelope key is `event`, not `type`, and a `user` event
+      // must carry `message`. A wrong key is reported as an unknown event and silently produces
+      // no turn at all, which is the failure mode worth pinning in a test.
+      stdin: `${JSON.stringify({ event: "user", message: { role: "user", content: `${SCHEMA_PROMPT}\n\n${body}` } })}\n`,
       attachmentContent: null,
       attachmentToken: null,
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
+      grant,
+      // agy streams too, but its partial-event shape has not been watched on this build, and a
+      // dialect is added when someone has seen it rather than because the format shares a name.
+      streamDialect: null,
       // Deliberately the weakest guarantee set BrainGate publishes. The staged workspace holds
       // nothing but the run, and headless agy auto-denies any tool it lacks permission for —
       // but its home is the operator's own, so `isolatedUserConfig` is false and this profile
-      // is reachable only through a recorded acceptance of exactly that.
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false, noSessionPersistence: false, isolatedUserConfig: false }),
+      // is reachable only through a recorded acceptance of exactly that. Re-measured on
+      // 2026-09-09 against agy 1.1.28: an isolated HOME still loses authentication
+      // (`agy models` answers "Please sign in"), so ADR 0008 stands for this provider.
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false, noSessionPersistence: false, isolatedUserConfig: false })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -407,7 +511,9 @@ export function planShadowInvocation(input: {
       attachmentToken: ATTACHMENT_TOKEN,
       allowedEnvKeys: Object.freeze(["COPILOT_HOME"]),
       envOverrides: Object.freeze({}),
-      guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),
+      grant,
+      streamDialect: null,
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -425,6 +531,7 @@ export function previewShadowInvocation(plan: ShadowInvocationPlan): ShadowInvoc
     modelId: plan.modelId,
     quotaPool: plan.quotaPool,
     inputMode: plan.inputMode,
+    grant: plan.grant,
     guarantees: plan.guarantees,
     minimumVersion: plan.minimumVersion,
   });
@@ -441,8 +548,14 @@ export function shadowProviderStatus(providerId: ProviderId): Readonly<{ enabled
  * Stale acceptance is refused rather than honoured: a decision made months ago about a provider
  * that has since changed is not a decision about the provider in front of you.
  */
-export function validOperatorAcceptance(value: OperatorProviderAcceptance | undefined, providerId: ProviderId, now = new Date()): boolean {
-  if (value === undefined || value.providerId !== providerId || value.source !== "operator-accepted-unscoped-provider") return false;
+export function validOperatorAcceptance(
+  value: OperatorProviderAcceptance | undefined,
+  providerId: ProviderId,
+  now = new Date(),
+  // Which decision is being checked. A record of one kind never answers for the other.
+  source: OperatorProviderAcceptance["source"] = "operator-accepted-unscoped-provider",
+): boolean {
+  if (value === undefined || value.providerId !== providerId || value.source !== source) return false;
   const accepted = new Date(value.acceptedAt);
   if (Number.isNaN(accepted.getTime())) return false;
   if (accepted.getTime() > now.getTime() + 60_000) return false;
@@ -498,7 +611,6 @@ export function shadowProviderRoleStatus(
     });
   }
 
-  if (providerId === "openai" && role !== "reviewer") return Object.freeze({ enabled: false, reason: "Codex is reviewer-only in M10.", acceptedByOperator: false });
   // An enabled provider that declares staged roles is enabled for those and closed for the
   // rest. Grok's sandbox confines it to the staged workspace, which is what makes the staged
   // roles safe and, by the same fact, makes a role that must read the checkout impossible.

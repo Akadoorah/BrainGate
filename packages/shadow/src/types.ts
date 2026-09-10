@@ -1,6 +1,8 @@
 import type { RegisteredProject } from "@braingate/core";
 import type { ProviderId } from "@braingate/providers";
 import type { WorkflowRole } from "@braingate/workflows";
+import type { StreamDialect } from "./streaming.js";
+import type { ToolGrant } from "./tool-grants.js";
 
 /**
  * Placeholder for the staged workspace path, substituted at spawn time.
@@ -31,7 +33,13 @@ export interface SubscriptionAttestation {
  */
 export interface OperatorProviderAcceptance {
   readonly providerId: ProviderId;
-  readonly source: "operator-accepted-unscoped-provider";
+  /**
+   * Which decision this record is.
+   *
+   * Accepting an unscoped provider says what a CLI may reach on this machine; allowing network
+   * access says what may leave it. They expire separately and neither implies the other.
+   */
+  readonly source: "operator-accepted-unscoped-provider" | "operator-accepted-network-access";
   readonly acceptedAt: string;
   readonly expiresAt?: string | null;
 }
@@ -82,8 +90,26 @@ export interface ShadowInvocationPlan {
   readonly stdin: string | null;
   readonly attachmentContent: string | null;
   readonly attachmentToken: string | null;
+  /**
+   * Extra files written into the staged workspace before the run, by plain file name.
+   *
+   * A CLI that enforces a response schema wants it as a path, not a string, and the staged
+   * workspace is the one directory such a provider is confined to — so the schema goes there
+   * rather than into a temporary file the sandbox would refuse to open.
+   */
+  readonly stagedFiles?: Readonly<Record<string, string>>;
   readonly allowedEnvKeys: readonly string[];
   readonly envOverrides: Readonly<Record<string, string>>;
+  /**
+   * What this run was permitted to do, and what it asked for and did not get (ADR 0010).
+   *
+   * On the plan rather than only in the executor, because the operator reads the plan before
+   * committing to the run — and "the planner asked for web search and did not get it, because
+   * nobody accepted network access" is exactly the sentence that used to be missing.
+   */
+  readonly grant: ToolGrant;
+  /** The stream shape this invocation produces, for the providers whose shape was measured. */
+  readonly streamDialect: StreamDialect | null;
   readonly guarantees: ShadowGuarantees;
   readonly minimumVersion: string | null;
 }
@@ -97,11 +123,20 @@ export interface ShadowInvocationPreview {
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;
+  /** What the run may do, and what it asked for and was refused (ADR 0010). */
+  readonly grant: ToolGrant;
   readonly guarantees: ShadowGuarantees;
   readonly minimumVersion: string | null;
 }
 
 export interface ShadowProcessResult {
+  /**
+   * The answer assembled from a streamed run, when the plan was streamed.
+   *
+   * A token stream has no envelope to parse: the answer is the concatenation of its pieces, and
+   * the retained output deliberately no longer contains them.
+   */
+  readonly assembled?: string | null;
   readonly spawned: boolean;
   readonly exitCode: number | null;
   readonly stdout: string;
@@ -118,5 +153,14 @@ export interface ShadowProcessExecutor {
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
+    /**
+     * Told the model's prose as it arrives, when the provider streams and the plan asked for it.
+     *
+     * The answer under an enforced schema is JSON, so what reaches here is the readable field
+     * inside it rather than the fragments themselves.
+     */
+    readonly onText?: (text: string) => void;
+    /** Told once, when the provider starts reasoning and has not said anything yet. */
+    readonly onThinking?: () => void;
   }): Promise<ShadowProcessResult>;
 }
