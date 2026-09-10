@@ -188,3 +188,76 @@ export class LineBuffer {
     return rest;
   }
 }
+
+/** The tool a schema-constrained Claude run fills its contract through. */
+export const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
+
+/**
+ * Reads a provider's stream with the memory a stream needs.
+ *
+ * `readStreamLine` is stateless, and that is wrong for one case that turns out to be the common
+ * one. Under an enforced schema Claude often fills the contract through a `StructuredOutput`
+ * tool and emits no prose at all — the answer arrives as `input_json_delta` fragments of that
+ * tool's input. Those look identical to the fragments of every *other* tool's input, so telling
+ * them apart needs to know which block is open, which is exactly what a line on its own cannot
+ * say.
+ *
+ * Measured 2026-09-10: a Claude planning run answered entirely through the tool, streamed
+ * nothing, and still returned a valid contract. Without this the terminal watched a spinner for
+ * the whole run and then printed everything at once — the behaviour streaming was added to
+ * remove.
+ */
+export class ProviderStreamReader {
+  #block: "text" | "structured" | "other" | null = null;
+
+  constructor(private readonly dialect: StreamDialect) {}
+
+  read(line: string): StreamLineVerdict {
+    if (this.dialect !== "anthropic") return readStreamLine(this.dialect, line);
+    const trimmed = line.trim();
+    if (!trimmed.startsWith("{")) return readStreamLine("anthropic", line);
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(trimmed) as Record<string, unknown>; }
+    catch { return readStreamLine("anthropic", line); }
+    if (event.type !== "stream_event") return readStreamLine("anthropic", line);
+
+    const inner = event.event;
+    if (typeof inner !== "object" || inner === null) return NOTHING;
+    const record = inner as Record<string, unknown>;
+
+    if (record.type === "content_block_start") {
+      const block = record.content_block;
+      const blockRecord = typeof block === "object" && block !== null ? block as Record<string, unknown> : {};
+      if (blockRecord.type === "text") {
+        this.#block = "text";
+        return Object.freeze({ retain: false, answer: null, thinking: false, restart: true });
+      }
+      // The tool the schema is filled through carries the answer; every other tool's input does
+      // not, and both arrive as the same kind of delta.
+      if (blockRecord.type === "tool_use" && blockRecord.name === STRUCTURED_OUTPUT_TOOL) {
+        this.#block = "structured";
+        return Object.freeze({ retain: false, answer: null, thinking: false, restart: true });
+      }
+      this.#block = "other";
+      return NOTHING;
+    }
+
+    if (record.type === "content_block_stop") { this.#block = null; return NOTHING; }
+
+    if (record.type === "content_block_delta") {
+      const delta = record.delta;
+      if (typeof delta !== "object" || delta === null) return NOTHING;
+      const deltaRecord = delta as Record<string, unknown>;
+      if (deltaRecord.type === "thinking_delta") return Object.freeze({ retain: false, answer: null, thinking: true });
+      if (this.#block === "text" && deltaRecord.type === "text_delta" && typeof deltaRecord.text === "string") {
+        return Object.freeze({ retain: false, answer: deltaRecord.text, thinking: false });
+      }
+      if (this.#block === "structured" && deltaRecord.type === "input_json_delta" && typeof deltaRecord.partial_json === "string") {
+        return Object.freeze({ retain: false, answer: deltaRecord.partial_json, thinking: false });
+      }
+      return NOTHING;
+    }
+
+    return NOTHING;
+  }
+}

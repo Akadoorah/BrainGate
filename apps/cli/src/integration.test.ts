@@ -331,7 +331,8 @@ test("a streamed provider writes its answer while it is still working", { skip: 
 
     const streamed: string[] = [];
     let finished = false;
-    let sawTextBeforeTheEnd = false;
+    // Per provider, so a failure says which one went quiet instead of only that one did.
+    const live = new Map<string, { chars: number; beforeTheEnd: boolean }>();
     let proven = 0;
 
     for (const providerId of ["anthropic", "xai"] as const) {
@@ -356,7 +357,11 @@ test("a streamed provider writes its answer while it is still working", { skip: 
         maxTurns: 6,
         onText: (text) => {
           streamed.push(text);
-          if (!finished && text.trim().length > 0) sawTextBeforeTheEnd = true;
+          const seen = live.get(providerId) ?? { chars: 0, beforeTheEnd: false };
+          live.set(providerId, {
+            chars: seen.chars + text.length,
+            beforeTheEnd: seen.beforeTheEnd || (!finished && text.trim().length > 0),
+          });
         },
       });
 
@@ -376,7 +381,13 @@ test("a streamed provider writes its answer while it is still working", { skip: 
     }
 
     assert.ok(proven > 0, "neither streamed provider was installed and authenticated, so nothing was proven");
-    assert.ok(sawTextBeforeTheEnd, "no prose arrived before the run ended, so nothing actually streamed");
+    const report = [...live.entries()].map(([provider, seen]) => `${provider}=${String(seen.chars)}c${seen.beforeTheEnd ? " live" : " late"}`).join(", ");
+    // Every provider that ran must have streamed, not merely one of them: a shared flag would
+    // have let a silent provider hide behind a talkative one.
+    for (const providerId of live.keys()) {
+      assert.ok(live.get(providerId)!.beforeTheEnd, `${providerId} produced no prose before its run ended (${report})`);
+    }
+    assert.equal(live.size, proven, `a provider ran without streaming anything at all (${report})`);
     // What reached the terminal is readable text, not the JSON the contract is carried in.
     const joined = streamed.join("");
     assert.ok(joined.trim().length > 0, "the stream produced no readable text");

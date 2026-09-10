@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ContractTextStream, LineBuffer, readStreamLine, streamDialectFor } from "./streaming.js";
+import { ContractTextStream, LineBuffer, ProviderStreamReader, readStreamLine, streamDialectFor } from "./streaming.js";
 
 /** Lines copied from a real `claude --output-format stream-json --include-partial-messages` run. */
 const CLAUDE_DELTA = '{"type":"stream_event","event":{"type":"content_block_delta","index":1,"delta":{"type":"text_delta","text":"ok"}},"session_id":"x"}';
@@ -89,4 +89,46 @@ test("a final line with no newline is not dropped", () => {
   const buffer = new LineBuffer();
   assert.deepEqual([...buffer.take('{"a":1}')], []);
   assert.equal(buffer.flush(), '{"a":1}');
+});
+
+/**
+ * The shape a schema-constrained Claude run actually produces when it does not narrate: the
+ * contract arrives as the input of the tool the schema is filled through.
+ */
+const TOOL_START = '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"StructuredOutput","input":{}}}}';
+const TOOL_DELTA = (partial: string) => `{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":${JSON.stringify(partial)}}}}`;
+const OTHER_TOOL_START = '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t2","name":"Grep","input":{}}}}';
+const BLOCK_STOP = '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}';
+
+test("a run that answers through the schema tool still streams its answer", () => {
+  const reader = new ProviderStreamReader("anthropic");
+  assert.equal(reader.read(TOOL_START).restart, true);
+  assert.equal(reader.read(TOOL_DELTA('{"kind":"work","output":"He')).answer, '{"kind":"work","output":"He');
+  assert.equal(reader.read(TOOL_DELTA('llo"}')).answer, 'llo"}');
+});
+
+test("another tool's input is not the answer, though it arrives as the same kind of delta", () => {
+  const reader = new ProviderStreamReader("anthropic");
+  reader.read(OTHER_TOOL_START);
+  // A Grep pattern would otherwise be shown to the operator as if it were the reply.
+  assert.equal(reader.read(TOOL_DELTA('{"pattern":"TODO"}')).answer, null);
+  reader.read(BLOCK_STOP);
+  reader.read(TOOL_START);
+  assert.equal(reader.read(TOOL_DELTA('{"kind":"work"}')).answer, '{"kind":"work"}');
+});
+
+test("prose and tool fragments are both answers, and a block boundary separates them", () => {
+  const reader = new ProviderStreamReader("anthropic");
+  reader.read('{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}');
+  assert.equal(reader.read(CLAUDE_DELTA).answer, "ok");
+  assert.equal(reader.read(CLAUDE_THINKING).thinking, true);
+  // The envelope still reaches the retained output through the stateless path.
+  assert.equal(reader.read(CLAUDE_RESULT).retain, true);
+});
+
+test("the stateful reader leaves the other dialect exactly as it was", () => {
+  const reader = new ProviderStreamReader("xai");
+  assert.equal(reader.read(GROK_TEXT).answer, "ok");
+  assert.equal(reader.read(GROK_THOUGHT).thinking, true);
+  assert.equal(reader.read(GROK_END).retain, true);
 });
