@@ -6,7 +6,9 @@ import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
-import { SessionContext } from "./session-context.js";
+import { SessionContext, sessionThreadPath } from "./session-context.js";
+import { ProjectRegistry } from "@braingate/core";
+import { resolveOperatorState } from "@braingate/operator";
 import { COLOURED, PLAIN, renderBanner } from "./banner.js";
 import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js";
 
@@ -25,6 +27,8 @@ import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js"
 
 interface ReplDeps {
   readonly cwd: string;
+  /** Where operator state lives, for locating this project's thread. Defaults to the process env. */
+  readonly env?: NodeJS.ProcessEnv;
   readonly stdout: (text: string) => void;
   readonly stderr: (text: string) => void;
   readonly ask: (question: string) => Promise<string | null>;
@@ -53,6 +57,25 @@ function progressStyle(deps: ReplDeps): { style: typeof PLAIN_PROGRESS; animate:
 
 function firstLine(text: string): string {
   return text.split("\n").find((line) => line.trim().length > 0)?.trim() ?? "";
+}
+
+/**
+ * Where this directory's session thread belongs, or nowhere.
+ *
+ * A thread is project state, so it needs a registered project to belong to. Without one — or if
+ * anything about resolving it fails — the session simply keeps its thread in memory, which is
+ * what it always did.
+ */
+function threadOptions(cwd: string, env: NodeJS.ProcessEnv | undefined): { readonly path?: string } {
+  try {
+    const state = resolveOperatorState(env ?? process.env);
+    const manifest = findManifest(cwd);
+    if (!existsSync(manifest)) return {};
+    const project = new ProjectRegistry(state.home).loadFile(manifest);
+    return { path: sessionThreadPath(project.storageDir) };
+  } catch {
+    return {};
+  }
 }
 
 /**
@@ -164,8 +187,8 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
         "  something is planned as a write into an isolated worktree. Either way you see the",
         "  plan and confirm before anything is spent.",
         "",
-        "  Follow-ups resolve against earlier turns in this session. That thread lives in this",
-        "  process only: it is never written to disk and never becomes project memory.",
+        "  Follow-ups resolve against earlier turns. That thread is kept with this project's own",
+        "  state for a few hours, redacted, and never becomes project memory. /forget deletes it.",
         "",
         "  /remember <text>  record something about this project, for later sessions",
         "  /memory     what is remembered, and what is waiting for your evidence",
@@ -197,7 +220,7 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext): 
       return "continue";
     case "forget":
       session.clear();
-      deps.stdout("  Session thread cleared. Project memory is untouched.\n");
+      deps.stdout("  Session thread cleared, here and on disk. Project memory is untouched.\n");
       return "continue";
     case "status":
       await runCli(["status", "--project", ".brain/project.json"], io);
@@ -272,7 +295,12 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t) });
   deps.stdout(`  ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
 
-  const session = new SessionContext();
+  // The thread from earlier today, if there is one. It lives with the project's own state, so a
+  // different project in another terminal has its own and neither can see the other's.
+  const session = new SessionContext(threadOptions(deps.cwd, deps.env));
+  if (session.resumed > 0) {
+    deps.stdout(`  Continuing a thread of ${String(session.resumed)} earlier ${session.resumed === 1 ? "turn" : "turns"}. /forget starts fresh.\n\n`);
+  }
   const providers = new ProviderSnapshotCache();
   for (;;) {
     const line = await deps.ask("> ");

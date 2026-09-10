@@ -500,7 +500,8 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       // Canonical memory only. Proposals become canonical through `memory promote`, which
       // requires explicit evidence; surfacing them here would route around that gate.
       memory: memory.records,
-      // Ephemeral: this session's earlier turns, never written to disk and never promoted.
+      // The session's earlier turns: kept with the project for a few hours, redacted, and never
+      // promoted to memory.
       session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
