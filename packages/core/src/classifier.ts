@@ -51,12 +51,30 @@ const ARCHITECTURE_TERMS = ["architecture", "redesign", "rewrite", "multi-tenant
  * a lookup runs out of tool-use turns before it reaches an answer. The classifier had no signal
  * for this at all, so it rated a whole-application review below "where is X implemented".
  */
+/**
+ * Asking for a judgement rather than a fact: an opinion, an assessment, an audit.
+ *
+ * A named list because it was written inline, as a subset of the breadth terms with its own
+ * quiet drift — the English half had `audit` and the Arabic half had only opinion words, so the
+ * same audit request reached T3 in one language and T2 in the other. Two copies of a vocabulary
+ * are two vocabularies.
+ */
+const JUDGEMENT_TERMS = [
+  "what do you think", "your opinion", "assess", "evaluate", "tradeoff", "trade-off", "compare", "audit",
+  "ما رأيك", "رأيك", "رايك", "قيّم", "مقارنة", "افحص", "فحص", "تدقيق", "دقق", "راجع", "مراجعة", "تحليل",
+];
+
 const BREADTH_TERMS = [
   "across the", "throughout", "whole app", "whole application", "entire app", "entire codebase",
   "overall", "in general", "generally", "everywhere", "all the", "every ",
   "what do you think", "your opinion", "assess", "evaluate", "tradeoff", "trade-off",
   "approach to", "strategy", "compare", "audit",
   "بشكل عام", "عامة", "عموما", "عموماً", "بالتطبيق", "في التطبيق", "كل ال", "ما رأيك", "رايك", "رأيك", "قيّم", "قيم ", "استراتيجية", "مقارنة",
+  // Auditing words, which the English list has had from the start and the Arabic list did not.
+  // Measured on a real request: the same audit of a real API surface classified T3 in English
+  // and T1 in Arabic — the cheapest model, no planning pass, no reviewer. An operator who works
+  // in Arabic was being quietly under-budgeted for exactly the kind of task that needs the most.
+  "افحص", "فحص", "تدقيق", "دقق", "راجع", "مراجعة", "تغطية", "نقص", "تسلسل", "شامل", "شاملة", "بالكامل", "جميع ", "تحليل",
 ];
 
 const FEATURE_TERMS = ["feature", "refactor", "integration", "endpoint", "workflow", "ميزة", "خاصية", "تكامل", "واجهة"];
@@ -226,7 +244,7 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
 
   // A broad question that also asks for a judgement — an opinion, an assessment, a comparison —
   // has to survey before it can conclude, which is the most turn-hungry shape a read task takes.
-  if (broad && hasAny(text, ["what do you think", "your opinion", "assess", "evaluate", "tradeoff", "trade-off", "compare", "audit", "ما رأيك", "رأيك", "رايك", "قيّم", "مقارنة"])) {
+  if (broad && hasAny(text, JUDGEMENT_TERMS)) {
     complexity = maxComplexity(complexity, "T3");
     reasons.push("open-ended-judgement");
   }

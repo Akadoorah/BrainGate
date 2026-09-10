@@ -136,3 +136,34 @@ test("an ordinary lookup is not inflated by the breadth signal", () => {
     assert.ok(["T0", "T1"].includes(classification.complexity), `${text} became ${classification.complexity}`);
   }
 });
+
+test("the same audit is budgeted the same way in Arabic as in English", () => {
+  // Measured on a real request against a real API surface: this classified T3 in English and T1
+  // in Arabic, which bought the cheapest model, no planning pass and no reviewer for exactly the
+  // kind of task that needs all three. The lists had Arabic; they were missing its audit words.
+  const english = classifyTask({
+    text: "Audit the API surface end to end: enumerate every endpoint, establish the order they are called in, and identify coverage gaps against the features currently shipped.",
+    mode: "ask",
+  });
+  const arabic = classifyTask({
+    text: "افحص تسلسل الـ API: ما نقاط النهاية الموجودة، وما ترتيب استدعائها، وهل هناك نقص في التغطية مقابل الميزات المعلنة حالياً؟",
+    mode: "ask",
+  });
+  assert.equal(arabic.complexity, english.complexity, `Arabic ${arabic.complexity} vs English ${english.complexity}`);
+  assert.ok(arabic.reasons.includes("breadth-cue"), `Arabic reasons: ${arabic.reasons.join(", ")}`);
+  assert.ok(arabic.reasons.includes("open-ended-judgement"), "an audit asks for a judgement in either language");
+});
+
+test("an Arabic review or coverage request reads as broad, like its English counterpart", () => {
+  for (const text of [
+    "راجع تغطية الاختبارات في المشروع",
+    "دقق في تسلسل الاستدعاءات بين الواجهة والخادم",
+    "حلل النقص في معالجة الأخطاء بالكامل",
+  ]) {
+    const classification = classifyTask({ text, mode: "ask" });
+    assert.ok(
+      classification.reasons.includes("breadth-cue"),
+      `"${text}" read as ${classification.complexity} with reasons: ${classification.reasons.join(", ")}`,
+    );
+  }
+});
