@@ -143,31 +143,48 @@ export function buildShadowTaskPlan(input: {
 
   // The planning pass, previewed before it is spent. A plan that showed only the executor would
   // hide the model the task actually leads with, which is the routing decision worth seeing.
-  if (input.budget.separatePlanningPass) {
+  if (input.budget.separatePlanningPass && input.budget.maxPlanners > 0) {
+    const plannerExclusions = excludedProviders({ providers: input.providers, role: "planner", proof });
+    const routePlanner = (independence?: { readonly mode: "required"; readonly level: "cross-provider"; readonly models: readonly ModelRef[] }) => input.router.route({
+      role: "planner",
+      classification: input.classification,
+      budget: input.budget,
+      requiredContextTokens: input.requiredContextTokens,
+      writeRequired: false,
+      ...(independence === undefined ? {} : { independence }),
+      excludeProviders: plannerExclusions,
+    });
+    const previewPlanner = (route: ReturnType<typeof routePlanner>, model: ModelRef): PlannedShadowRole => Object.freeze({
+      role: "planner",
+      model,
+      route,
+      invocation: previewShadowInvocation(planShadowInvocation({
+        snapshot: snapshotFor(input.providers, model.providerId),
+        model,
+        cwd,
+        payload: payload("planner", input.task, input.context),
+        fanOut: input.budget.maxConcurrentAgents > 1,
+        ...attestationFor(attestations, model.providerId),
+        ...proofFor(proof, model.providerId),
+      })),
+    });
+
     try {
-      const plannerRoute = input.router.route({
-        role: "planner",
-        classification: input.classification,
-        budget: input.budget,
-        requiredContextTokens: input.requiredContextTokens,
-        writeRequired: false,
-        excludeProviders: excludedProviders({ providers: input.providers, role: "planner", proof }),
-      });
+      const plannerRoute = routePlanner();
       const plannerModel = modelRef(plannerRoute);
-      roles.push(Object.freeze({
-        role: "planner",
-        model: plannerModel,
-        route: plannerRoute,
-        invocation: previewShadowInvocation(planShadowInvocation({
-          snapshot: snapshotFor(input.providers, plannerModel.providerId),
-          model: plannerModel,
-          cwd,
-          payload: payload("planner", input.task, input.context),
-          fanOut: input.budget.maxConcurrentAgents > 1,
-          ...attestationFor(attestations, plannerModel.providerId),
-          ...proofFor(proof, plannerModel.providerId),
-        })),
-      }));
+      roles.push(previewPlanner(plannerRoute, plannerModel));
+
+      // The second approach, from a provider that shares no pool with the first. Previewed here
+      // rather than discovered at run time, because a plan that showed one planner and then
+      // spent two would be describing a task the operator did not approve.
+      if (input.budget.maxPlanners > 1) {
+        try {
+          const secondRoute = routePlanner({ mode: "required", level: "cross-provider", models: [plannerModel] });
+          roles.push(previewPlanner(secondRoute, modelRef(secondRoute)));
+        } catch (error) {
+          if (!(error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL")) throw error;
+        }
+      }
     } catch (error) {
       // No model declares a planner capability; the task plans and executes in one pass.
       if (!(error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL")) throw error;

@@ -372,6 +372,25 @@ function classificationView(predicted: TaskClassification, effective: TaskClassi
   return Object.freeze({ predicted: { complexity: predicted.complexity, risk: predicted.risk, confidence: predicted.confidence, ruleVersion: predicted.ruleVersion }, effective: { complexity: effective.complexity, risk: effective.risk, confidence: effective.confidence, ruleVersion: effective.ruleVersion }, prior, applied });
 }
 
+/**
+ * The routed roles, as one line.
+ *
+ * A role that appears twice is numbered rather than printed twice under the same name: a task
+ * can now spend two subscriptions on the approach, and "planner=x · planner=y" reads like a
+ * rendering bug rather than the point.
+ */
+export function roleLine(roles: readonly { readonly role: string; readonly model: { readonly providerId: string; readonly modelId: string } }[]): string {
+  const counts = new Map<string, number>();
+  for (const role of roles) counts.set(role.role, (counts.get(role.role) ?? 0) + 1);
+  const seen = new Map<string, number>();
+  return roles.map((role) => {
+    const index = (seen.get(role.role) ?? 0) + 1;
+    seen.set(role.role, index);
+    const name = (counts.get(role.role) ?? 0) > 1 ? `${role.role}-${String(index)}` : role.role;
+    return `${name}=${role.model.providerId}/${role.model.modelId}`;
+  }).join(" · ");
+}
+
 async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: string, env: NodeJS.ProcessEnv, json: boolean, stdout: (text: string) => void): Promise<DogfoodCliResult> {
   const state = resolveOperatorState(env);
   const manifest = manifestOption(args);
@@ -488,13 +507,14 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason } };
       emit(json, data, [
-        `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}`,
+        `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
         // What each role may do, and what it asked for and did not get. Read before the run,
         // where "the planner wanted the network and nobody accepted it" is still actionable.
-        ...plan.roles.map((role) => {
+        ...plan.roles.map((role, index) => {
           const grant = role.invocation.grant;
           const refused = grant.refused.map((item) => item.capability).join(", ");
-          return `  ${role.role}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`;
+          const name = roleLine(plan.roles).split(" · ")[index]?.split("=")[0] ?? role.role;
+          return `  ${name}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`;
         }),
         "Zero provider model calls executed.",
       ].join("\n"), stdout);
@@ -557,7 +577,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason }, approvalRequired: true };
-      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
+      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 

@@ -209,3 +209,78 @@ test("a task with no planning pass records no planner rather than a wrong one", 
   });
   assert.equal(receipt.planner, null);
 });
+
+/** Two planner-capable providers that do not share a pool, so a second approach is reachable. */
+function plannerRegistry(): ModelRegistry {
+  const result = new ModelRegistry();
+  result.register(def("anthropic", "opus", { capabilities: { planner: 96, coder: 92, reviewer: 90, judge: 90 } }), runtime());
+  result.register(def("xai", "grok", { capabilities: { planner: 90, reviewer: 88, judge: 86 }, writeCapable: false }), runtime());
+  result.register(def("openai", "codex", { capabilities: { planner: 88, reviewer: 94, judge: 92 }, writeCapable: false }), runtime());
+  return result;
+}
+
+function critical(text: string) {
+  const classification = classifyTask({ text, mode: "write" });
+  const budget = budgetFor(classification, { writeRequested: true });
+  return { task: text, classification, budget, requiredContextTokens: 10_000, writeRequired: true, optionalReview: false };
+}
+
+test("a budget that allows two planners spends two subscriptions on the approach, at once", async () => {
+  const invoker = new ScriptedInvoker([
+    { kind: "work", output: "approach from the first" },
+    { kind: "work", output: "approach from the second" },
+    { kind: "work", output: "patch" },
+    { kind: "review", verdict: "approve", findings: [] },
+  ]);
+  const engine = new WorkflowEngine(new CapabilityRouter(plannerRegistry()), invoker);
+  const task = critical("Redesign the authentication and payment migration for the production database");
+  assert.ok(task.budget.maxPlanners > 1, "this tier must actually permit a second approach");
+
+  const receipt = await engine.run(task);
+
+  const planners = invoker.calls.filter((call) => call.role === "planner");
+  assert.equal(planners.length, 2);
+  assert.notEqual(planners[0]!.model.providerId, planners[1]!.model.providerId, "a second opinion from the same pool is not a second opinion");
+  assert.ok(receipt.planner !== null && receipt.secondPlanner !== null, "the receipt must name both");
+
+  // The executor is handed both, labelled, with reconciling them stated as part of the work.
+  const executor = invoker.calls.find((call) => call.role === "primary");
+  assert.match(executor!.candidateOutput!, /approach from the first/);
+  assert.match(executor!.candidateOutput!, /approach from the second/);
+  assert.match(executor!.candidateOutput!, /Where they differ/);
+  assert.ok(receipt.events.some((event) => event.kind === "planner.parallel"));
+  // Two agents at once is the whole point; one after the other would just cost twice.
+  assert.equal(receipt.budget.peakConcurrentAgents, 2);
+});
+
+test("one planner-capable provider means one approach, not the same one twice", async () => {
+  const registry = new ModelRegistry();
+  registry.register(def("anthropic", "opus", { capabilities: { planner: 96, coder: 92, reviewer: 90, judge: 90 } }), runtime());
+  registry.register(def("anthropic", "sonnet", { capabilities: { planner: 88, coder: 90, reviewer: 88, judge: 84 } }), runtime());
+  // Reviews but does not plan, so critical work still gets its independent reviewer while the
+  // approach has only one provider that could have decided it.
+  registry.register(def("openai", "codex", { capabilities: { reviewer: 94, judge: 92 }, writeCapable: false }), runtime());
+  const invoker = new ScriptedInvoker([
+    { kind: "work", output: "the only approach" },
+    { kind: "work", output: "patch" },
+    { kind: "review", verdict: "approve", findings: [] },
+  ]);
+  const engine = new WorkflowEngine(new CapabilityRouter(registry), invoker);
+  const receipt = await engine.run(critical("Redesign the authentication and payment migration for the production database"));
+
+  assert.equal(invoker.calls.filter((call) => call.role === "planner").length, 1);
+  assert.equal(receipt.secondPlanner, null);
+  assert.ok(receipt.events.some((event) => event.kind === "planner.single"));
+  assert.equal(invoker.calls.find((call) => call.role === "primary")!.candidateOutput, "the only approach", "a single approach is passed through whole, not wrapped in a reconciliation brief");
+});
+
+test("a tier that did not ask for a second opinion never acquires one", async () => {
+  const invoker = new ScriptedInvoker([{ kind: "work", output: "answer" }]);
+  const engine = new WorkflowEngine(new CapabilityRouter(plannerRegistry()), invoker);
+  const task = input("where is the logo?", "ask");
+  assert.equal(task.budget.maxPlanners, 0);
+  const receipt = await engine.run(task);
+  assert.equal(invoker.calls.filter((call) => call.role === "planner").length, 0);
+  assert.equal(receipt.planner, null);
+  assert.equal(receipt.secondPlanner, null);
+});

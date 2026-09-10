@@ -93,8 +93,25 @@ function useRealCatalog(home: string): void {
   copyFileSync(source, join(globalDir, "models.json"));
 }
 
+/**
+ * Copies the operator's recorded provider acceptances into the isolated home.
+ *
+ * A provider BrainGate cannot scope per invocation runs only on the operator's own recorded
+ * decision (ADR 0008). An isolated home starts with none, so a test that did not carry them
+ * across would prove that provider unreachable rather than that it works. Copied, never
+ * written: this reads their decision, it does not make one.
+ */
+function useRealAcceptances(home: string): void {
+  const source = join(homedir(), ".braingate", "global", "provider-acceptance.json");
+  if (!existsSync(source)) return;
+  const globalDir = join(home, "global");
+  mkdirSync(globalDir, { recursive: true, mode: 0o700 });
+  copyFileSync(source, join(globalDir, "provider-acceptance.json"));
+}
+
 function register(cli: Cli): void {
   useRealCatalog(cli.home);
+  useRealAcceptances(cli.home);
   const init = cli.run(["init", "--project-id", "integration-sample", "--name", "Integration Sample"], 60_000);
   assert.equal(init.status, 0, `init failed: ${init.stdout}${init.stderr}`);
 }
@@ -233,6 +250,58 @@ test("each staged provider satisfies the role contract from its own CLI", { skip
     }
 
     assert.ok(answered.length > 0, "no staged provider was installed and authenticated, so nothing was proven");
+  } finally {
+    cli.cleanup();
+  }
+});
+
+/**
+ * One task, three subscriptions, and a receipt that says so.
+ *
+ * The unit tests prove the engine asks for two approaches when the budget allows two. Only this
+ * proves two real providers produce them, in parallel, and that an executor on a third can act
+ * on both — which is the whole argument for owning several subscriptions rather than the best
+ * one.
+ */
+test("a task the budget allows two approaches for spends two independent subscriptions on them", { skip: SKIP }, async () => {
+  const cli = makeCli();
+  try {
+    register(cli);
+
+    const task = "Redesign how this service reports authentication failures so a caller can tell a expired credential from a revoked one, covering rollback and the security review of each change.";
+    const plan = cli.run(["dogfood", "ask", "plan", "--task", task], 180_000);
+    assert.equal(plan.status, 0, `plan failed: ${plan.stdout}${plan.stderr}`);
+    // T4 is where the budget grants a second approach. If classification lands lower, the rest
+    // of this test would silently prove nothing.
+    assert.match(plan.stdout, /^T4\//m, `expected a T4 classification, got: ${plan.stdout}`);
+    // Grok is legitimately out of reach here: this repository lives in the temp directory, which
+    // every Grok sandbox profile grants, so its checkout-reachability self-test refuses. The
+    // second approach therefore comes from whichever other independent provider is available.
+    assert.match(plan.stdout, /planner-1=/, `the plan must name both planners before the run, not after: ${plan.stdout}`);
+    const planners = [...plan.stdout.matchAll(/planner-\d=([a-z-]+)\//g)].map((match) => match[1]);
+    assert.equal(planners.length, 2, `expected two planners in the plan, got: ${plan.stdout}`);
+    assert.notEqual(planners[0], planners[1], "a second approach from the same provider is not a second approach");
+
+    // JSON, because the receipt is the evidence: which providers actually spent a call, taken
+    // from the run itself rather than from a second command reading a shared history.
+    const run = cli.run(["dogfood", "ask", "run", "--task", task, "--execute", "--json"]);
+    // Exit 1 is a real outcome here, not a failure: a T4 reviewer that asks for changes ends the
+    // task at "completed but needs your eyes". What must not happen is a crash or no receipt.
+    assert.ok(run.status === 0 || run.status === 1, `run failed: ${run.stdout}${run.stderr}`);
+
+    const receipt = JSON.parse(run.stdout) as {
+      readonly outcome: string | null;
+      readonly answer: string | null;
+      readonly usage: readonly { readonly provider: string; readonly model: string | null; readonly metric: string }[];
+    };
+    assert.ok(receipt.outcome !== null, `no outcome in the receipt: ${run.stdout.slice(0, 500)}`);
+    assert.ok((receipt.answer ?? "").length > 0, "the task produced no answer");
+
+    const spenders = new Set(receipt.usage.filter((row) => row.metric === "provider_call").map((row) => row.provider));
+    assert.ok(
+      spenders.size >= 2,
+      `expected more than one subscription to have spent a call, saw: ${[...spenders].join(", ") || "none"}`,
+    );
   } finally {
     cli.cleanup();
   }
