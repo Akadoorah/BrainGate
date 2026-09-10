@@ -33,7 +33,13 @@ export interface SubscriptionAttestation {
  */
 export interface OperatorProviderAcceptance {
   readonly providerId: ProviderId;
-  readonly source: "operator-accepted-unscoped-provider";
+  /**
+   * Which decision this record is.
+   *
+   * Accepting an unscoped provider says what a CLI may reach on this machine; allowing network
+   * access says what may leave it. They expire separately and neither implies the other.
+   */
+  readonly source: "operator-accepted-unscoped-provider" | "operator-accepted-network-access";
   readonly acceptedAt: string;
   readonly expiresAt?: string | null;
 }

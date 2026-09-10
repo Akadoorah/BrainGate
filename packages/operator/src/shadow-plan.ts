@@ -69,12 +69,14 @@ interface ProviderProof {
   readonly acceptances?: readonly OperatorProviderAcceptance[];
 }
 
-function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIsolation?: CodexIsolationAttestation; grokIsolation?: GrokIsolationAttestation; acceptance?: OperatorProviderAcceptance }> {
-  const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId);
+function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIsolation?: CodexIsolationAttestation; grokIsolation?: GrokIsolationAttestation; acceptance?: OperatorProviderAcceptance; networkAcceptance?: OperatorProviderAcceptance }> {
+  const acceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId && item.source === "operator-accepted-unscoped-provider");
+  const networkAcceptance = (proof.acceptances ?? []).find((item) => item.providerId === providerId && item.source === "operator-accepted-network-access");
   return Object.freeze({
     ...(providerId === "openai" && proof.codexIsolation !== undefined ? { codexIsolation: proof.codexIsolation } : {}),
     ...(providerId === "xai" && proof.grokIsolation !== undefined ? { grokIsolation: proof.grokIsolation } : {}),
     ...(acceptance === undefined ? {} : { acceptance }),
+    ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
   });
 }
 
@@ -90,7 +92,7 @@ function excludedProviders(input: {
   readonly proof: ProviderProof;
 }): readonly string[] {
   return Object.freeze(input.providers.filter((snapshot) => {
-    const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
+    const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
     if (!shadowProviderRoleStatus(snapshot.providerId, input.role, acceptance === undefined ? {} : { acceptance }).enabled) return true;
     if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
     if (snapshot.providerId === "xai" && input.proof.grokIsolation === undefined) return true;

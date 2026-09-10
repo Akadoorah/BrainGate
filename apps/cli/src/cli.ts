@@ -14,6 +14,7 @@ import { startDashboardServer } from "@braingate/dashboard";
 import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot } from "@braingate/observability";
 import {
   ModelCatalog,
+  NETWORK_ACCESS_RISK,
   ProviderAcceptanceStore,
   UNSCOPED_PROVIDER_RISK,
   buildShadowTaskPlan,
@@ -391,7 +392,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "",
           "Everything else",
           "  discover     which provider CLIs are installed and how they are authenticated",
-          "  providers    list | capabilities | accept | revoke — which roles each provider may take, and why",
+          "  providers    list | capabilities | accept | revoke | allow-web | deny-web",
           "  doctor       validate the project, models and reviewer isolation",
           "  models       list | validate | add | remove | import-discovered | profile",
           "  memory       preview | import | promote | list",
@@ -506,6 +507,36 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         return Object.freeze({ exitCode: 0, data });
       }
 
+      if (subcommand === "allow-web" || subcommand === "deny-web") {
+        const providerId = args.shift();
+        noExtraArgs(args);
+        if (providerId === undefined || !isProviderId(providerId)) {
+          throw new BrainGateInvariantError("CLI_PROVIDER_INVALID", `providers ${subcommand} needs one of: ${PROVIDER_IDS.join(", ")}.`);
+        }
+        if (subcommand === "deny-web") {
+          const removed = store.revoke(providerId, "operator-accepted-network-access");
+          data = { providerId, revoked: removed };
+          emit(json, data, removed ? `${providerId} can no longer search the web.` : `${providerId} had no web access on record.`, stdout);
+          return Object.freeze({ exitCode: 0, data });
+        }
+        const record = store.accept(providerId, { source: "operator-accepted-network-access" });
+        data = { providerId, acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, acknowledged: record.acknowledged };
+        emit(
+          json,
+          data,
+          [
+            `${providerId} may search the web until ${record.expiresAt}.`,
+            "",
+            NETWORK_ACCESS_RISK,
+            "",
+            "Only the planning role asks for it: deciding an approach is the one job where a current answer beats a confident one.",
+            `Undo at any time with \`braingate providers deny-web ${providerId}\`.`,
+          ].join("\n"),
+          stdout,
+        );
+        return Object.freeze({ exitCode: 0, data });
+      }
+
       if (subcommand === "accept" || subcommand === "revoke") {
         const providerId = args.shift();
         noExtraArgs(args);
@@ -546,7 +577,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         return Object.freeze({ exitCode: 0, data });
       }
 
-      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "providers requires list, capabilities, accept, or revoke.");
+      throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "providers requires list, capabilities, accept, revoke, allow-web, or deny-web.");
     }
 
     if (command === "doctor") {

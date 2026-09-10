@@ -351,7 +351,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #cwd: string;
   readonly #snapshots: ReadonlyMap<string, ProviderSnapshot>;
   readonly #attestations: ReadonlyMap<string, SubscriptionAttestation>;
-  readonly #acceptances: ReadonlyMap<string, OperatorProviderAcceptance>;
+  // A list rather than a map, because one provider can carry two different decisions and a map
+  // keyed by provider silently kept whichever was written last.
+  readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #context: unknown;
@@ -414,7 +416,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#cwd = input.cwd;
     this.#snapshots = new Map(input.snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
     this.#attestations = new Map((input.attestations ?? []).map((attestation) => [attestation.providerId, attestation]));
-    this.#acceptances = new Map((input.acceptances ?? []).map((acceptance) => [acceptance.providerId, acceptance]));
+    this.#acceptances = Object.freeze([...(input.acceptances ?? [])]);
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#context = input.context;
@@ -448,7 +450,8 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       responseContract: responseContract(request.role),
     });
     const attestation = this.#attestations.get(request.model.providerId);
-    const acceptance = this.#acceptances.get(request.model.providerId);
+    const acceptance = this.#acceptances.find((item) => item.providerId === request.model.providerId && item.source === "operator-accepted-unscoped-provider");
+    const networkAcceptance = this.#acceptances.find((item) => item.providerId === request.model.providerId && item.source === "operator-accepted-network-access");
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
@@ -458,6 +461,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       fanOut: this.#fanOut,
       ...(attestation === undefined ? {} : { attestation }),
       ...(acceptance === undefined ? {} : { acceptance }),
+      ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
       ...(request.model.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
     });

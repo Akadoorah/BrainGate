@@ -158,7 +158,7 @@ export function loadAcceptances(state: OperatorStatePaths): readonly OperatorPro
     if (!isProviderId(record.providerId)) continue;
     accepted.push(Object.freeze({
       providerId: record.providerId,
-      source: "operator-accepted-unscoped-provider",
+      source: record.source,
       acceptedAt: record.acceptedAt,
       expiresAt: record.expiresAt,
     }));
@@ -177,6 +177,9 @@ export function loadAcceptances(state: OperatorStatePaths): readonly OperatorPro
 export function acceptedSubscriptions(state: OperatorStatePaths): readonly SubscriptionAttestation[] {
   const claims: SubscriptionAttestation[] = [];
   for (const acceptance of loadAcceptances(state)) {
+    // Only the unscoped-provider decision carries the subscription self-attestation with it.
+    // Allowing a role to search the web says nothing about how the account is billed.
+    if (acceptance.source !== "operator-accepted-unscoped-provider") continue;
     claims.push(Object.freeze({
       providerId: acceptance.providerId,
       mode: "subscription",

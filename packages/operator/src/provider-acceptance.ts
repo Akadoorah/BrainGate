@@ -21,9 +21,26 @@ const SCHEMA_VERSION = 1;
 const DEFAULT_TTL_DAYS = 30;
 const MAX_TTL_DAYS = 30;
 
+/**
+ * The decisions an operator can record about a provider, as one list the type is derived from.
+ *
+ * Two, and deliberately not one. Accepting a provider BrainGate cannot scope is a statement
+ * about what that CLI may reach on this machine. Allowing a role to search the web is a
+ * statement about what leaves the machine, and it applies to providers that are perfectly well
+ * scoped. Folding the second into the first would grant network access to a provider the
+ * operator accepted for an entirely different reason, and would leave it permanently out of
+ * reach for one that never needed accepting.
+ */
+export const ACCEPTANCE_SOURCES = ["operator-accepted-unscoped-provider", "operator-accepted-network-access"] as const;
+export type AcceptanceSource = (typeof ACCEPTANCE_SOURCES)[number];
+
+export function isAcceptanceSource(value: string): value is AcceptanceSource {
+  return (ACCEPTANCE_SOURCES as readonly string[]).includes(value);
+}
+
 export interface ProviderAcceptanceRecord {
   readonly providerId: string;
-  readonly source: "operator-accepted-unscoped-provider";
+  readonly source: AcceptanceSource;
   readonly acceptedAt: string;
   readonly expiresAt: string;
   /** The risk the operator was shown, stored so a later reader sees what was agreed to. */
@@ -46,6 +63,9 @@ export const UNSCOPED_PROVIDER_RISK =
  * is therefore also the operator stating which it is — a claim, recorded as a claim, that goes
  * stale on the same day the acceptance does.
  */
+export const NETWORK_ACCESS_RISK =
+  "A role granted web access sends the task and the context BrainGate assembled for it to a search provider. Nothing downstream can see what left: the diff guard, the worktree and the reviewer all check what came back.";
+
 export const SUBSCRIPTION_SELF_ATTESTATION =
   "It also records that you are signed in to this provider with a subscription rather than direct API billing, because its CLI does not report which.";
 
@@ -61,7 +81,7 @@ function parseRecord(value: unknown): ProviderAcceptanceRecord {
   if (typeof row.providerId !== "string" || row.providerId.trim().length === 0) {
     throw new BrainGateInvariantError("PROVIDER_ACCEPTANCE_INVALID", "Provider acceptance record needs a provider id.");
   }
-  if (row.source !== "operator-accepted-unscoped-provider") {
+  if (typeof row.source !== "string" || !isAcceptanceSource(row.source)) {
     throw new BrainGateInvariantError("PROVIDER_ACCEPTANCE_INVALID", "Provider acceptance record has an unrecognised source.");
   }
   for (const field of ["acceptedAt", "expiresAt"] as const) {
@@ -71,7 +91,7 @@ function parseRecord(value: unknown): ProviderAcceptanceRecord {
   }
   return Object.freeze({
     providerId: row.providerId,
-    source: "operator-accepted-unscoped-provider",
+    source: row.source,
     acceptedAt: row.acceptedAt as string,
     expiresAt: row.expiresAt as string,
     acknowledged: typeof row.acknowledged === "string" ? row.acknowledged : UNSCOPED_PROVIDER_RISK,
@@ -86,11 +106,14 @@ function parseDocument(value: unknown): AcceptanceDocument {
   const seen = new Set<string>();
   const records = document.records.map((entry) => {
     const parsed = parseRecord(entry);
-    if (seen.has(parsed.providerId)) throw new BrainGateInvariantError("PROVIDER_ACCEPTANCE_DUPLICATE", `Duplicate acceptance for ${parsed.providerId}.`);
-    seen.add(parsed.providerId);
+    // One record per provider *per decision*: accepting an unscoped provider and allowing a
+    // role to search the web are different agreements with different expiry.
+    const key = `${parsed.providerId}\u0000${parsed.source}`;
+    if (seen.has(key)) throw new BrainGateInvariantError("PROVIDER_ACCEPTANCE_DUPLICATE", `Duplicate ${parsed.source} acceptance for ${parsed.providerId}.`);
+    seen.add(key);
     return parsed;
   });
-  records.sort((a, b) => a.providerId.localeCompare(b.providerId));
+  records.sort((a, b) => a.providerId.localeCompare(b.providerId) || a.source.localeCompare(b.source));
   return Object.freeze({ schemaVersion: 1, records: Object.freeze(records) });
 }
 
@@ -111,12 +134,12 @@ export class ProviderAcceptanceStore {
     return parseDocument(parsed).records;
   }
 
-  /** The record for one provider, whether or not it is still current. */
-  find(providerId: string): ProviderAcceptanceRecord | null {
-    return this.load().find((record) => record.providerId === providerId) ?? null;
+  /** The record for one provider and one decision, whether or not it is still current. */
+  find(providerId: string, source: AcceptanceSource = "operator-accepted-unscoped-provider"): ProviderAcceptanceRecord | null {
+    return this.load().find((record) => record.providerId === providerId && record.source === source) ?? null;
   }
 
-  accept(providerId: string, options: { readonly now?: Date; readonly ttlDays?: number } = {}): ProviderAcceptanceRecord {
+  accept(providerId: string, options: { readonly now?: Date; readonly ttlDays?: number; readonly source?: AcceptanceSource } = {}): ProviderAcceptanceRecord {
     const id = providerId.trim();
     if (id.length === 0) throw new BrainGateInvariantError("PROVIDER_ACCEPTANCE_INVALID", "A provider id is required.");
     const now = options.now ?? new Date();
@@ -124,20 +147,23 @@ export class ProviderAcceptanceStore {
     if (!Number.isInteger(ttlDays) || ttlDays < 1 || ttlDays > MAX_TTL_DAYS) {
       throw new BrainGateInvariantError("PROVIDER_ACCEPTANCE_INVALID", `Acceptance lasts between 1 and ${MAX_TTL_DAYS} days.`);
     }
+    const source = options.source ?? "operator-accepted-unscoped-provider";
     const record: ProviderAcceptanceRecord = Object.freeze({
       providerId: id,
-      source: "operator-accepted-unscoped-provider",
+      source,
       acceptedAt: now.toISOString(),
       expiresAt: new Date(now.getTime() + ttlDays * 24 * 60 * 60 * 1000).toISOString(),
-      acknowledged: `${UNSCOPED_PROVIDER_RISK} ${SUBSCRIPTION_SELF_ATTESTATION}`,
+      acknowledged: source === "operator-accepted-network-access"
+        ? NETWORK_ACCESS_RISK
+        : `${UNSCOPED_PROVIDER_RISK} ${SUBSCRIPTION_SELF_ATTESTATION}`,
     });
-    this.#save([...this.load().filter((entry) => entry.providerId !== id), record]);
+    this.#save([...this.load().filter((entry) => !(entry.providerId === id && entry.source === source)), record]);
     return record;
   }
 
-  revoke(providerId: string): boolean {
+  revoke(providerId: string, source: AcceptanceSource = "operator-accepted-unscoped-provider"): boolean {
     const before = this.load();
-    const after = before.filter((record) => record.providerId !== providerId);
+    const after = before.filter((record) => !(record.providerId === providerId && record.source === source));
     if (after.length === before.length) return false;
     this.#save(after);
     return true;

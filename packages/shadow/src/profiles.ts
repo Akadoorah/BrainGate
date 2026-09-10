@@ -205,6 +205,8 @@ export function planShadowInvocation(input: {
   readonly grokIsolation?: GrokIsolationAttestation;
   /** The operator's recorded decision, for a provider BrainGate cannot isolate (ADR 0008). */
   readonly acceptance?: OperatorProviderAcceptance;
+  /** The operator's separate decision to let a role on this provider reach the network. */
+  readonly networkAcceptance?: OperatorProviderAcceptance;
   readonly maxTurns?: number;
   /**
    * Whether this task's budget allows more than one agent at once.
@@ -237,6 +239,7 @@ export function planShadowInvocation(input: {
     surface: profile.surface,
     attested,
     operatorAccepted: validOperatorAcceptance(input.acceptance, input.snapshot.providerId, now),
+    networkAccepted: validOperatorAcceptance(input.networkAcceptance, input.snapshot.providerId, now, "operator-accepted-network-access"),
     fanOutAllowed: input.fanOut === true,
   });
   const subagents = grants(grant, "subagents") ? subagentsArgument(input.payload.role) : null;
@@ -539,8 +542,14 @@ export function shadowProviderStatus(providerId: ProviderId): Readonly<{ enabled
  * Stale acceptance is refused rather than honoured: a decision made months ago about a provider
  * that has since changed is not a decision about the provider in front of you.
  */
-export function validOperatorAcceptance(value: OperatorProviderAcceptance | undefined, providerId: ProviderId, now = new Date()): boolean {
-  if (value === undefined || value.providerId !== providerId || value.source !== "operator-accepted-unscoped-provider") return false;
+export function validOperatorAcceptance(
+  value: OperatorProviderAcceptance | undefined,
+  providerId: ProviderId,
+  now = new Date(),
+  // Which decision is being checked. A record of one kind never answers for the other.
+  source: OperatorProviderAcceptance["source"] = "operator-accepted-unscoped-provider",
+): boolean {
+  if (value === undefined || value.providerId !== providerId || value.source !== source) return false;
   const accepted = new Date(value.acceptedAt);
   if (Number.isNaN(accepted.getTime())) return false;
   if (accepted.getTime() > now.getTime() + 60_000) return false;

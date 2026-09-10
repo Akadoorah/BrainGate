@@ -91,8 +91,17 @@ export interface GrantRequest {
   readonly surface: ProviderGrantSurface;
   /** True when a current self-test attestation covers this provider, version, platform and policy. */
   readonly attested: boolean;
-  /** The operator's recorded acceptance for capabilities BrainGate cannot bound on its own. */
+  /** The operator's recorded acceptance of a provider BrainGate cannot scope per invocation. */
   readonly operatorAccepted: boolean;
+  /**
+   * The operator's recorded decision to let a role reach the network, which is a different
+   * decision from the one above.
+   *
+   * A provider BrainGate can scope perfectly well still sends the task off the machine when it
+   * searches; a provider it cannot scope may be accepted for reasons that have nothing to do
+   * with the network. Neither implies the other.
+   */
+  readonly networkAccepted?: boolean;
   /**
    * Whether this task's budget allows more than one agent at once
    * (`ExecutionBudget.maxConcurrentAgents > 1`). Subagents are concurrent agents, so the number
@@ -152,8 +161,8 @@ export function resolveToolGrant(request: GrantRequest): ToolGrant {
     if (capability === "web") {
       // What leaves the machine is the one thing no outcome check downstream can see, so this
       // is the operator's decision rather than an attestation's.
-      if (!request.operatorAccepted) {
-        refused.push(refusal(capability, "Network access sends project context off the machine; it needs the operator's recorded acceptance."));
+      if (request.networkAccepted !== true) {
+        refused.push(refusal(capability, "Network access sends project context off the machine; grant it with `braingate providers allow-web <provider>`."));
         continue;
       }
       if (!request.surface.toolDenial) {

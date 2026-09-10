@@ -882,7 +882,7 @@ test("a plan carries what it was refused, so the operator reads it before the ru
   const plan = planShadowInvocation({ snapshot: snapshot("anthropic"), model, cwd: repo, payload: { ...payload, role: "planner" }, now: new Date("2026-09-07T01:00:00Z") });
   const web = plan.grant.refused.find((item) => item.capability === "web");
   assert.ok(web !== undefined, "a planner asks for the network");
-  assert.match(web.reason, /recorded acceptance/);
+  assert.match(web.reason, /allow-web/);
   assert.equal(plan.guarantees.noNetworkTools, true);
 });
 
