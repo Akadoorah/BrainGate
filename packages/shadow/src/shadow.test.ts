@@ -422,7 +422,7 @@ test("node executor blocks cwd escapes, scrubs API env overrides and stages clea
     providerId: "anthropic", executable: process.execPath,
     args: ["-e", "process.stdout.write(String(process.env.OPENAI_API_KEY)+' sk-abcdefghijklmnopqrstuvwxyz012345')"],
     cwd: repo, workspaceMode: "project", modelId: "test", quotaPool: "test", inputMode: "stdin", stdin: "{}", attachmentContent: null, attachmentToken: null,
-    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("anthropic"), guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("anthropic"), streamDialect: null, guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
   };
   const executor = new NodeShadowProcessExecutor();
   const result = await executor.run({ project, plan: basePlan, env: { PATH: process.env.PATH, OPENAI_API_KEY: "should-not-pass" } });
@@ -658,7 +658,7 @@ test("a staged Grok run gets its sandbox profile and its prompt, and neither sur
     args: ["-e", "const fs=require('node:fs');process.stdout.write([process.cwd(),fs.readFileSync('.grok/sandbox.toml','utf8'),fs.readFileSync(process.argv[1],'utf8'),String(process.env.GROK_HOME),String(process.env.HOME)].join('\\u0000'))", `${STAGE_PATH_TOKEN}/braingate-request.txt`],
     cwd: repo, workspaceMode: "staged-clean", modelId: "grok-4.6", quotaPool: "grok-subscription",
     inputMode: "staged-file", stdin: null, attachmentContent: "REQUEST BODY", attachmentToken: "braingate-request.txt",
-    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"),
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"), streamDialect: null,
     guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
     minimumVersion: null,
   };
@@ -679,7 +679,7 @@ test("a staged request file cannot be aimed anywhere but the staged workspace", 
     providerId: "xai", executable: process.execPath, args: ["-e", "0"],
     cwd: repo, workspaceMode: "staged-clean", modelId: "m", quotaPool: "q",
     inputMode: "staged-file", stdin: null, attachmentContent: "body", attachmentToken: "../escaped.txt",
-    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"),
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("xai", "staged-clean"), streamDialect: null,
     guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true },
     minimumVersion: null,
   };

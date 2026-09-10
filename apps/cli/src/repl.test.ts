@@ -7,7 +7,7 @@ import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ProjectRegistry } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
-import { activityLabel, grantLines, looksLikeWriteRequest, runRepl } from "./repl.js";
+import { activityLabel, grantLines, looksLikeWriteRequest, runRepl, withoutStreamedAnswer } from "./repl.js";
 
 function git(cwd: string, args: readonly string[]): void {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -178,4 +178,11 @@ test("the indicator names the role, the model and the pool being spent", () => {
   );
   // A role with no better verb still says which model is spending the time.
   assert.match(activityLabel({ role: "primary", model: "claude-sonnet-5", quotaPool: "claude-subscription" }), /^working · claude-sonnet-5/);
+});
+
+test("an answer that was streamed live is not printed a second time", () => {
+  const finished = "The service reports failures through a shared handler.\n\nTask 8fbc9645 · observed=1 · outcome=approved";
+  assert.equal(withoutStreamedAnswer(finished), "\nTask 8fbc9645 · observed=1 · outcome=approved");
+  // Nothing recognisable to keep is better than repeating the whole answer.
+  assert.equal(withoutStreamedAnswer("just an answer with no receipt"), "");
 });

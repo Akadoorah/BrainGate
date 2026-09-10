@@ -306,3 +306,82 @@ test("a task the budget allows two approaches for spends two independent subscri
     cli.cleanup();
   }
 });
+
+/**
+ * Streaming, proven by when the text arrives rather than by what it says.
+ *
+ * A run that hands over its answer at the end and a run that writes it as it goes produce the
+ * same string. The only difference a terminal cares about is timing, so that is what this
+ * asserts: prose reached the callback while the provider was still running.
+ */
+test("a streamed provider writes its answer while it is still working", { skip: SKIP }, async () => {
+  const { ProviderDiscovery } = await import("@braingate/providers");
+  const { NodeShadowProcessExecutor, SubscriptionShadowAgentInvoker, GrokIsolationVerifier, streamDialectFor } = await import("@braingate/shadow");
+  const { ProjectRegistry } = await import("@braingate/core");
+
+  const cli = makeCli();
+  try {
+    register(cli);
+    const registry = new ProjectRegistry(cli.home);
+    const project = registry.loadFile(join(cli.repo, ".brain", "project.json"));
+    const snapshots = await new ProviderDiscovery().discoverAll();
+    const catalogue = JSON.parse(readFileSync(join(cli.home, "global", "models.json"), "utf8")) as {
+      entries: readonly { readonly definition: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly capabilities: Record<string, number> } }[];
+    };
+
+    const streamed: string[] = [];
+    let finished = false;
+    let sawTextBeforeTheEnd = false;
+    let proven = 0;
+
+    for (const providerId of ["anthropic", "xai"] as const) {
+      assert.notEqual(streamDialectFor(providerId), null, `${providerId} must have a measured stream shape`);
+      const snapshot = snapshots.find((item) => item.providerId === providerId);
+      if (snapshot?.available.value !== true || snapshot.authState.value === "unauthenticated") continue;
+      const entry = catalogue.entries
+        .map((item) => item.definition)
+        .filter((definition) => definition.providerId === providerId && typeof definition.capabilities.planner === "number")
+        .sort((a, b) => (a.capabilities.planner ?? 0) - (b.capabilities.planner ?? 0))[0];
+      if (entry === undefined) continue;
+
+      // The temp directory is granted by every Grok profile, so the checkout-reachability check
+      // is not the thing under test here.
+      const grokIsolation = providerId === "xai" ? await new GrokIsolationVerifier().verify(snapshot) : undefined;
+      finished = false;
+      const invoker: InstanceType<typeof SubscriptionShadowAgentInvoker> = new SubscriptionShadowAgentInvoker({
+        project, cwd: cli.repo, snapshots: [snapshot],
+        ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        context: { note: "The reviewed change renames a label and touches nothing else." },
+        executor: new NodeShadowProcessExecutor(),
+        maxTurns: 6,
+        onText: (text) => {
+          streamed.push(text);
+          if (!finished && text.trim().length > 0) sawTextBeforeTheEnd = true;
+        },
+      });
+
+      // A planner, because only a contract with a prose field has prose to stream: a review
+      // answers with a verdict and a list, and there is nothing there to write out live.
+      const response: Awaited<ReturnType<typeof invoker.invoke>> = await invoker.invoke({
+        role: "planner",
+        model: { providerId, modelId: entry.modelId, quotaPool: entry.quotaPool },
+        phase: "integration",
+        task: "In two or three sentences, describe how you would rename a label in a small service without breaking callers.",
+        findings: [],
+        candidateOutput: null,
+      });
+      finished = true;
+      assert.equal(response.kind, "work", `${providerId} answered as the wrong role`);
+      proven += 1;
+    }
+
+    assert.ok(proven > 0, "neither streamed provider was installed and authenticated, so nothing was proven");
+    assert.ok(sawTextBeforeTheEnd, "no prose arrived before the run ended, so nothing actually streamed");
+    // What reached the terminal is readable text, not the JSON the contract is carried in.
+    const joined = streamed.join("");
+    assert.ok(joined.trim().length > 0, "the stream produced no readable text");
+    assert.doesNotMatch(joined, /"kind"\s*:/, "the contract's JSON reached the terminal instead of the prose inside it");
+  } finally {
+    cli.cleanup();
+  }
+});

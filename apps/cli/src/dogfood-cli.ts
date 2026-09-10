@@ -59,6 +59,15 @@ export interface DogfoodCliDependencies {
    * that made it different from running one CLI by hand.
    */
   readonly onRoleActivity?: (activity: RoleActivity) => void;
+  /**
+   * Told the model's prose as it is written.
+   *
+   * Only for the providers whose stream shape has been measured, and only the readable field
+   * inside a schema-enforced answer — the fragments themselves are JSON.
+   */
+  readonly onText?: (text: string) => void;
+  /** Told once per role, when the model starts reasoning before it says anything. */
+  readonly onThinking?: () => void;
   readonly stdout?: (text: string) => void;
   readonly stderr?: (text: string) => void;
   /**
@@ -523,7 +532,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }) });
+      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }) });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });

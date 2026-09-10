@@ -117,6 +117,7 @@ export function planCodexVisualInvocation(input: {
       attested: true,
       operatorAccepted: false,
     }),
+    streamDialect: null,
     // The workspace guarantees are unchanged from the reviewer: the image is produced outside
     // it, so nothing here is relaxed to make generation possible.
     guarantees: Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }),

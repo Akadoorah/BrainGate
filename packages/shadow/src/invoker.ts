@@ -93,12 +93,47 @@ export function extractAntigravityResult(stdout: string): string | null {
   return typeof response === "string" && response.trim().length > 0 ? response : null;
 }
 
+/**
+ * The last NDJSON line that yields something, by whatever rule the caller supplies.
+ *
+ * A streamed run's envelope is its final line; scanning from the end and taking the last hit is
+ * what makes this work whether the provider emits one line or a thousand.
+ */
+/** The last NDJSON line that carries a `usage` object: the run's own accounting. */
+function lastStreamEnvelope(stdout: string): Record<string, unknown> | null {
+  let latest: Record<string, unknown> | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    if (typeof event.usage === "object" && event.usage !== null) latest = event;
+  }
+  return latest;
+}
+
+export function lastJsonLine(stdout: string, pick: (event: Record<string, unknown>) => string | null): string | null {
+  let latest: string | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    const picked = pick(event);
+    if (picked !== null) latest = picked;
+  }
+  return latest;
+}
+
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   const trimmed = stdout.trim();
   if (providerId === "openai") return extractCodexAgentMessage(trimmed);
   if (providerId === "xai") {
-    // Grok's `--output-format json` wraps the reply in an envelope carrying the text, the stop
-    // reason and native token counts. The contract JSON is the `text` field.
+    // A streamed run has no envelope: its answer is assembled from the pieces before this is
+    // reached. What is left here is an error line, or an older non-streamed envelope whose
+    // contract JSON is the `text` field.
     try {
       const outer = JSON.parse(trimmed) as Record<string, unknown>;
       if (typeof outer.text === "string") return outer.text;
@@ -106,6 +141,8 @@ function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
     } catch (error) {
       if (error instanceof BrainGateInvariantError) throw error;
     }
+    const streamed = lastJsonLine(trimmed, (event) => (typeof event.message === "string" ? event.message : null));
+    if (streamed !== null) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", `Grok reported: ${boundedText(streamed, 300)}`);
   }
   if (providerId === "google") {
     // agy answers a stream-json run with NDJSON, and a single-shot run with one envelope. Both
@@ -133,7 +170,14 @@ function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
       if (typeof outer.result === "string") return outer.result;
       const structured = outer.structured_output;
       if (structured !== undefined) return JSON.stringify(structured);
-    } catch { /* parse role JSON below */ }
+    } catch { /* a streamed run is many lines, not one object */ }
+    // The final envelope of a stream-json run, which is the last line rather than the whole
+    // output. Reached only when the assembled answer was empty.
+    const streamed = lastJsonLine(trimmed, (event) => {
+      if (typeof event.result === "string") return event.result;
+      return event.structured_output === undefined ? null : JSON.stringify(event.structured_output);
+    });
+    if (streamed !== null) return streamed;
   }
   return trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
 }
@@ -191,6 +235,10 @@ export function providerTokenUsage(providerId: string, stdout: string): { readon
   // Reading only the outer object recorded `unknown` for a provider that had told us exactly
   // what it spent.
   if (envelope === null && providerId === "google") envelope = antigravityResultRecord(stdout);
+  // A streamed run's accounting is in its last line — Claude's result envelope, Grok's `end`
+  // event. Reading only the outer object recorded `unknown` for a provider that had said
+  // exactly what it spent.
+  if (envelope === null) envelope = lastStreamEnvelope(stdout);
   if (envelope === null) return null;
   const usage = envelope.usage;
   if (typeof usage !== "object" || usage === null) return null;
@@ -256,6 +304,8 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #maxTurns: number | undefined;
   readonly #fanOut: boolean;
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
+  readonly #onText: ((text: string) => void) | undefined;
+  readonly #onThinking: (() => void) | undefined;
   readonly #timeoutMs: number | undefined;
 
   constructor(input: {
@@ -290,6 +340,10 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
      * now — and answering it is the whole difference between a spinner and a control plane.
      */
     readonly onRoleActivity?: (activity: RoleActivity) => void;
+    /** Told the model's prose as it is written, for a provider whose stream shape is known. */
+    readonly onText?: (text: string) => void;
+    /** Told once per role, when the model starts reasoning before it says anything. */
+    readonly onThinking?: () => void;
   }) {
     this.#project = input.project;
     this.#cwd = input.cwd;
@@ -305,6 +359,8 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#maxTurns = input.maxTurns;
     this.#fanOut = input.fanOut ?? false;
     this.#onRoleActivity = input.onRoleActivity;
+    this.#onText = input.onText;
+    this.#onThinking = input.onThinking;
     this.#timeoutMs = input.timeoutMs;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
@@ -343,7 +399,13 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#event("shadow.provider.started", safeMeta);
     this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
     try {
-      const result = await this.#executor.run({ project: this.#project, plan, ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }) });
+      const result = await this.#executor.run({
+        project: this.#project,
+        plan,
+        ...(this.#timeoutMs === undefined ? {} : { timeoutMs: this.#timeoutMs }),
+        ...(this.#onText === undefined ? {} : { onText: this.#onText }),
+        ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }),
+      });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         this.#event("shadow.provider.failed", { ...safeMeta, timedOut: result.timedOut, exitCode: result.exitCode, error: redactSecrets(result.stderr).slice(0, 500) });
         const reason = providerFailureReason(request.model.providerId, result.stdout, result.stderr);
@@ -360,7 +422,9 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         this.#event("shadow.provider.failed", { ...safeMeta, reason: "sandbox-not-applied" });
         throw new BrainGateInvariantError("SHADOW_GROK_SANDBOX_NOT_APPLIED", "Grok reported that the BrainGate sandbox profile was not applied, so this run was not confined. Its output is discarded.");
       }
-      const response = parseRoleResponse(request.role, snapshot.providerId, result.stdout);
+      // A streamed run's answer is what was assembled from its pieces; the retained output no
+      // longer holds it, by design.
+      const response = parseRoleResponse(request.role, snapshot.providerId, result.assembled ?? result.stdout);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
       this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
       this.#usage(request, result.durationMs, providerTokenUsage(snapshot.providerId, result.stdout));

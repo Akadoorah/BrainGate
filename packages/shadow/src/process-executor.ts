@@ -5,7 +5,18 @@ import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import { grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
+import { ContractTextStream, LineBuffer, readStreamLine } from "./streaming.js";
 import { STAGE_PATH_TOKEN, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "./types.js";
+
+/**
+ * Runs a display callback without letting it end the run.
+ *
+ * The terminal is downstream of the work. A drawing routine that throws must not discard a
+ * provider's answer.
+ */
+function safely(action: () => void): void {
+  try { action(); } catch { /* the display is not the work */ }
+}
 
 function inside(root: string, candidate: string): boolean {
   const rel = relative(root, candidate);
@@ -41,6 +52,8 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
+    readonly onText?: (text: string) => void;
+    readonly onThinking?: () => void;
   }): Promise<ShadowProcessResult> {
     const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 20 * 60_000);
@@ -155,10 +168,52 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
-          resolveResult(Object.freeze({ spawned, exitCode: overflow ? null : exitCode, stdout: redactSecrets(stdout), stderr: redactSecrets(stderr), timedOut: timedOut || overflow, durationMs: Date.now() - started, removedEnvironmentKeys: environment.removed }));
+          if (dialect !== null) {
+            const rest = lines.flush();
+            if (rest.trim().length > 0) consume(rest);
+          }
+          resolveResult(Object.freeze({
+            spawned,
+            exitCode: overflow ? null : exitCode,
+            stdout: redactSecrets(stdout),
+            stderr: redactSecrets(stderr),
+            assembled: dialect === null || assembled.length === 0 ? null : redactSecrets(assembled),
+            timedOut: timedOut || overflow,
+            durationMs: Date.now() - started,
+            removedEnvironmentKeys: environment.removed,
+          }));
         };
         const timer = setTimeout(() => { timedOut = true; child.kill("SIGKILL"); }, timeoutMs);
+        // A streamed run is read line by line: the answer is assembled from its pieces, the
+        // prose inside it is forwarded as it arrives, and only the lines the final parse
+        // actually needs are retained. Without that last part a token stream spends the whole
+        // output cap on thinking and signature deltas nobody reads.
+        const dialect = input.plan.streamDialect;
+        const lines = new LineBuffer();
+        const prose = new ContractTextStream();
+        let assembled = "";
+        let announcedThinking = false;
+
+        const consume = (line: string): void => {
+          const verdict = readStreamLine(dialect!, line);
+          if (verdict.retain) {
+            const next = `${stdout}${line}\n`;
+            if (Buffer.byteLength(next, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
+            stdout = next;
+          }
+          if (verdict.thinking && !announcedThinking) { announcedThinking = true; safely(() => input.onThinking?.()); }
+          if (verdict.answer === null) return;
+          assembled += verdict.answer;
+          if (Buffer.byteLength(assembled, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
+          const readable = prose.push(verdict.answer);
+          if (readable.length > 0) safely(() => input.onText?.(readable));
+        };
+
         const append = (target: "stdout" | "stderr", chunk: Buffer) => {
+          if (target === "stdout" && dialect !== null) {
+            for (const line of lines.take(chunk.toString("utf8"))) consume(line);
+            return;
+          }
           const current = target === "stdout" ? stdout : stderr;
           const next = current + chunk.toString("utf8");
           if (Buffer.byteLength(next, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }

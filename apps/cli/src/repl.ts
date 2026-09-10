@@ -56,6 +56,17 @@ function firstLine(text: string): string {
 }
 
 /**
+ * The tail of a finished run, once its answer has already been streamed.
+ *
+ * `dogfood ask run` prints the answer and then the receipt line. When the answer arrived live,
+ * printing that whole block again would show it twice, so only the receipt survives.
+ */
+export function withoutStreamedAnswer(text: string): string {
+  const marker = text.lastIndexOf("\nTask ");
+  return marker < 0 ? "" : text.slice(marker);
+}
+
+/**
  * How a working role reads in the indicator: what it is doing, on which model.
  *
  * The quota pool rather than the provider id, because that is the thing being spent, and two
@@ -106,16 +117,32 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   const spoken: string[] = [];
   // The indicator has to be gone before the first byte of real output, or the two share a line.
   const working = startProgress({ write: deps.stdout, label: mode === "write" ? "writing" : "working", ...progressStyle(deps) });
+  // A streamed answer is written straight to the terminal as the model produces it, and the
+  // final print would then repeat every word of it. This tracks whether that happened.
+  let streamed = false;
   const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--execute"], {
     cwd: deps.cwd,
-    stdout: (text) => { working.stop(); spoken.push(text); deps.stdout(text); },
+    stdout: (text) => {
+      working.stop();
+      spoken.push(text);
+      // The answer is already on screen; what is left to print is the receipt after it.
+      deps.stdout(streamed ? withoutStreamedAnswer(text) : text);
+    },
     stderr: (text) => { working.stop(); deps.stderr(text); },
     // Who is working, while they work. A task spends several roles across several
     // subscriptions, and the indicator is the only place that is visible as it happens.
     onRoleActivity: (activity) => { if (activity.stage === "started") working.label(activityLabel(activity)); },
+    onThinking: () => { working.label("thinking"); },
+    onText: (text) => {
+      // The first byte of an answer is the moment the wait ends. The indicator goes, and
+      // everything after this is the model writing.
+      if (!streamed) { working.stop(); streamed = true; }
+      deps.stdout(text);
+    },
     sessionTurns,
     discoverAll,
   });
+  if (streamed) deps.stdout("\n");
   working.stop();
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
   // premise of the next follow-up.

@@ -1,6 +1,7 @@
 import type { RegisteredProject } from "@braingate/core";
 import type { ProviderId } from "@braingate/providers";
 import type { WorkflowRole } from "@braingate/workflows";
+import type { StreamDialect } from "./streaming.js";
 import type { ToolGrant } from "./tool-grants.js";
 
 /**
@@ -101,6 +102,8 @@ export interface ShadowInvocationPlan {
    * nobody accepted network access" is exactly the sentence that used to be missing.
    */
   readonly grant: ToolGrant;
+  /** The stream shape this invocation produces, for the providers whose shape was measured. */
+  readonly streamDialect: StreamDialect | null;
   readonly guarantees: ShadowGuarantees;
   readonly minimumVersion: string | null;
 }
@@ -121,6 +124,13 @@ export interface ShadowInvocationPreview {
 }
 
 export interface ShadowProcessResult {
+  /**
+   * The answer assembled from a streamed run, when the plan was streamed.
+   *
+   * A token stream has no envelope to parse: the answer is the concatenation of its pieces, and
+   * the retained output deliberately no longer contains them.
+   */
+  readonly assembled?: string | null;
   readonly spawned: boolean;
   readonly exitCode: number | null;
   readonly stdout: string;
@@ -137,5 +147,14 @@ export interface ShadowProcessExecutor {
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;
     readonly maxOutputBytes?: number;
+    /**
+     * Told the model's prose as it arrives, when the provider streams and the plan asked for it.
+     *
+     * The answer under an enforced schema is JSON, so what reaches here is the readable field
+     * inside it rather than the fragments themselves.
+     */
+    readonly onText?: (text: string) => void;
+    /** Told once, when the provider starts reasoning and has not said anything yet. */
+    readonly onThinking?: () => void;
   }): Promise<ShadowProcessResult>;
 }

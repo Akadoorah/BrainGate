@@ -248,7 +248,12 @@ export function planShadowInvocation(input: {
     const args = Object.freeze([
       "--restricted",
       "-p", SCHEMA_PROMPT,
-      "--output-format", "json",
+      // A token stream, so a waiting terminal sees the answer being written rather than a
+      // spinner. `--verbose` is not optional here: this build refuses stream-json without it.
+      // The executor keeps only the lines the parse reads, so the extra events cost no cap.
+      "--output-format", "stream-json",
+      "--verbose",
+      "--include-partial-messages",
       "--no-session-persistence",
       "--no-chrome",
       "--disable-slash-commands",
@@ -279,6 +284,7 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
       grant,
+      streamDialect: "anthropic",
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
@@ -329,6 +335,7 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
       envOverrides: Object.freeze({}),
       grant,
+      streamDialect: null,
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
@@ -351,7 +358,9 @@ export function planShadowInvocation(input: {
       // A custom profile, never a built-in one: only a custom profile that fails to apply
       // aborts the run. `--sandbox strict` would warn and continue unprotected.
       "--sandbox", GROK_SANDBOX_PROFILE,
-      "--output-format", "json",
+      // Measured: with a schema in force the stream carries the contract's JSON in `text`
+      // pieces, so the answer is their concatenation and the readable part is extracted from it.
+      "--output-format", "streaming-json",
       "--model", input.model.modelId,
       "--max-turns", String(maxTurns),
       "--json-schema", schema,
@@ -397,6 +406,7 @@ export function planShadowInvocation(input: {
       // permitted". Network blocking is real on Linux and a documented no-op on macOS, so
       // noNetworkTools claims only the tools BrainGate actually disabled.
       grant,
+      streamDialect: "xai",
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
@@ -436,6 +446,9 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
       grant,
+      // agy streams too, but its partial-event shape has not been watched on this build, and a
+      // dialect is added when someone has seen it rather than because the format shares a name.
+      streamDialect: null,
       // Deliberately the weakest guarantee set BrainGate publishes. The staged workspace holds
       // nothing but the run, and headless agy auto-denies any tool it lacks permission for —
       // but its home is the operator's own, so `isolatedUserConfig` is false and this profile
@@ -485,6 +498,7 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze(["COPILOT_HOME"]),
       envOverrides: Object.freeze({}),
       grant,
+      streamDialect: null,
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
