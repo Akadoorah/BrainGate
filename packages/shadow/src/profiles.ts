@@ -262,6 +262,11 @@ export function planShadowInvocation(input: {
       "--tools", subagents === null ? "Read,Glob,Grep" : "Read,Glob,Grep,Agent",
       ...(subagents === null ? [] : ["--agents", subagents]),
       "--disallowedTools", "mcp__*",
+      // Denying the tools is not the same as not loading the servers: a run's own init event
+      // listed the operator's MCP servers as connected while every mcp__ tool was denied. The
+      // guarantee this profile publishes is `noMcp`, so the servers do not get to be there.
+      "--strict-mcp-config",
+      "--mcp-config", "{\"mcpServers\":{}}",
       "--max-turns", String(maxTurns),
       "--model", input.model.modelId,
       "--json-schema", schema,

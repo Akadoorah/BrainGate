@@ -5,6 +5,7 @@ import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workf
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
+import { quotaReadings, type QuotaReading } from "./quota-readings.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
@@ -182,17 +183,73 @@ function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   return trimmed.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "");
 }
 
+/**
+ * The last complete JSON object in a string, or null.
+ *
+ * Walks backwards from each closing brace to its match, ignoring braces inside strings and
+ * respecting escapes, and returns the first one that parses. That is the answer, because the
+ * contract object is what a role emits last.
+ */
+export function lastBalancedJsonObject(text: string): Record<string, unknown> | null {
+  for (let end = text.lastIndexOf("}"); end >= 0; end = text.lastIndexOf("}", end - 1)) {
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let start = end; start >= 0; start -= 1) {
+      const character = text[start]!;
+      if (inString) {
+        // Walking backwards, a quote ends the string only when it is not itself escaped, which
+        // is decided by how many backslashes precede it.
+        if (character === '"') {
+          let slashes = 0;
+          for (let back = start - 1; back >= 0 && text[back] === "\\"; back -= 1) slashes += 1;
+          if (slashes % 2 === 0) inString = false;
+        }
+        continue;
+      }
+      if (character === '"') { inString = true; continue; }
+      if (character === "}") depth += 1;
+      else if (character === "{") {
+        depth -= 1;
+        if (depth === 0) {
+          try { return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>; }
+          catch { break; }
+        }
+      }
+    }
+    if (escaped) break;
+  }
+  return null;
+}
+
+/**
+ * Parses the role contract from whichever of the two places this run put it.
+ *
+ * Both are tried rather than chosen by provider, because which one holds the answer is a
+ * property of the run — whether the model filled the schema through a tool or wrote it out —
+ * and not of the CLI's name.
+ */
+function parseRoleResponseWithFallback(role: AgentRequest["role"], providerId: ProviderId, stdout: string, assembled: string | null): AgentResponse {
+  try {
+    return parseRoleResponse(role, providerId, stdout);
+  } catch (error) {
+    if (assembled === null || assembled.trim().length === 0) throw error;
+    return parseRoleResponse(role, providerId, assembled);
+  }
+}
+
 function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, stdout: string): AgentResponse {
   const candidate = unwrapProviderOutput(providerId, stdout);
   let parsed: Record<string, unknown>;
   try {
     parsed = JSON.parse(candidate) as Record<string, unknown>;
   } catch {
-    const start = candidate.indexOf("{");
-    const end = candidate.lastIndexOf("}");
-    if (start < 0 || end <= start) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider did not return parseable JSON for the role contract.");
-    try { parsed = JSON.parse(candidate.slice(start, end + 1)) as Record<string, unknown>; }
-    catch { throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider returned malformed JSON for the role contract."); }
+    // The last complete object in the text, not everything between the first brace and the last.
+    // A model that narrates before it answers puts braces in its prose — a code snippet, a JSON
+    // example — and taking the outermost span then fails on a run that actually succeeded.
+    const object = lastBalancedJsonObject(candidate);
+    if (object === null) throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Provider did not return parseable JSON for the role contract.");
+    parsed = object;
   }
 
   // `kind` only restates the role BrainGate already routed, so a provider that omits it has not
@@ -306,6 +363,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
   readonly #onText: ((text: string) => void) | undefined;
   readonly #onThinking: (() => void) | undefined;
+  readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
   readonly #timeoutMs: number | undefined;
 
   constructor(input: {
@@ -344,6 +402,13 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly onText?: (text: string) => void;
     /** Told once per role, when the model starts reasoning before it says anything. */
     readonly onThinking?: () => void;
+    /**
+     * Told what the provider said about its own remaining window, when it says anything.
+     *
+     * Free: the reading arrives on its own alongside the answer. Routing has been comparing
+     * pools against each other for want of exactly this.
+     */
+    readonly onQuotaReading?: (reading: QuotaReading & { readonly quotaPool: string }) => void;
   }) {
     this.#project = input.project;
     this.#cwd = input.cwd;
@@ -361,6 +426,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#onRoleActivity = input.onRoleActivity;
     this.#onText = input.onText;
     this.#onThinking = input.onThinking;
+    this.#onQuotaReading = input.onQuotaReading;
     this.#timeoutMs = input.timeoutMs;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
@@ -424,7 +490,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       }
       // A streamed run's answer is what was assembled from its pieces; the retained output no
       // longer holds it, by design.
-      const response = parseRoleResponse(request.role, snapshot.providerId, result.assembled ?? result.stdout);
+      for (const reading of quotaReadings(snapshot.providerId, result.stdout)) {
+        try { this.#onQuotaReading?.({ ...reading, quotaPool: request.model.quotaPool }); }
+        catch { /* a reading nobody could record is not a reason to lose the answer */ }
+      }
+      // The retained output first, because a provider that fills the schema through a tool puts
+      // the contract in its final envelope and streams only prose. When there is no envelope —
+      // a stream whose answer exists solely in its pieces — the assembled text is the answer.
+      const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null);
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
       this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
       this.#usage(request, result.durationMs, providerTokenUsage(snapshot.providerId, result.stdout));

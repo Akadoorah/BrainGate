@@ -13,6 +13,7 @@ import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole } from "@braing
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import type { GrokIsolationAttestation } from "./grok-isolation.js";
 import { SubscriptionShadowAgentInvoker, type RoleActivity } from "./invoker.js";
+import type { QuotaReading } from "./quota-readings.js";
 import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import { assertSourceCheckoutUnchanged, sourceCheckoutFingerprint } from "./source-guard.js";
@@ -80,6 +81,7 @@ export class ShadowDogfoodRunner {
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
   readonly #onText: ((text: string) => void) | undefined;
   readonly #onThinking: (() => void) | undefined;
+  readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
 
   constructor(input: {
     readonly project: RegisteredProject;
@@ -97,6 +99,8 @@ export class ShadowDogfoodRunner {
     readonly onText?: (text: string) => void;
     /** Told once per role, when the model starts reasoning before it says anything. */
     readonly onThinking?: () => void;
+    /** Told what a provider said about its own remaining window, when it says anything. */
+    readonly onQuotaReading?: (reading: QuotaReading & { readonly quotaPool: string }) => void;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
@@ -110,6 +114,7 @@ export class ShadowDogfoodRunner {
     this.#onRoleActivity = input.onRoleActivity;
     this.#onText = input.onText;
     this.#onThinking = input.onThinking;
+    this.#onQuotaReading = input.onQuotaReading;
   }
 
   async run(input: {
@@ -184,7 +189,7 @@ export class ShadowDogfoodRunner {
 
     this.#ledger.transition(task.taskId, "running", { shadow: true });
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }) });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }) });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       assertSourceCheckoutUnchanged(cwd, sourceBefore);

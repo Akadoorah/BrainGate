@@ -190,12 +190,28 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         // output cap on thinking and signature deltas nobody reads.
         const dialect = input.plan.streamDialect;
         const lines = new LineBuffer();
-        const prose = new ContractTextStream();
+        let prose = new ContractTextStream();
         let assembled = "";
         let announcedThinking = false;
+        /**
+         * Whether this provider is streaming the contract's JSON or the prose itself.
+         *
+         * Measured: given a schema, Claude fills it through a `StructuredOutput` tool and streams
+         * the human answer as text, while Grok streams the schema-constrained JSON directly. So
+         * the first character of the answer decides which one this is, and guessing wrong either
+         * shows JSON to a person or shows them nothing at all.
+         */
+        let shape: "unknown" | "contract-json" | "prose" = "unknown";
 
         const consume = (line: string): void => {
           const verdict = readStreamLine(dialect!, line);
+          if (verdict.restart === true && assembled.length > 0) {
+            // A fresh block is a fresh answer. The prose reader starts again with it, so a
+            // narrated run does not stream the same field twice.
+            assembled = "";
+            prose = new ContractTextStream();
+            shape = "unknown";
+          }
           if (verdict.retain) {
             const next = `${stdout}${line}\n`;
             if (Buffer.byteLength(next, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
@@ -205,8 +221,15 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           if (verdict.answer === null) return;
           assembled += verdict.answer;
           if (Buffer.byteLength(assembled, "utf8") > maxOutput) { overflow = true; child.kill("SIGKILL"); return; }
-          const readable = prose.push(verdict.answer);
-          if (readable.length > 0) safely(() => input.onText?.(readable));
+          if (shape === "unknown") {
+            const leading = assembled.trimStart();
+            if (leading.length > 0) shape = leading.startsWith("{") ? "contract-json" : "prose";
+          }
+          if (shape === "prose") { safely(() => input.onText?.(verdict.answer!)); return; }
+          if (shape === "contract-json") {
+            const readable = prose.push(verdict.answer);
+            if (readable.length > 0) safely(() => input.onText?.(readable));
+          }
         };
 
         const append = (target: "stdout" | "stderr", chunk: Buffer) => {

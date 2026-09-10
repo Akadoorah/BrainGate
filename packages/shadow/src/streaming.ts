@@ -16,6 +16,16 @@ export function streamDialectFor(providerId: ProviderId): StreamDialect | null {
 
 export interface StreamLineVerdict {
   /**
+   * Whether the answer assembled so far should be dropped and started again.
+   *
+   * A provider with tools narrates between them — "let me look at the router package" — and that
+   * narration streams as text exactly like the answer does. Concatenating all of it produces a
+   * string whose first brace belongs to a code snippet in the prose rather than to the contract,
+   * and the parse then fails on a run that actually succeeded. A new text block starts a new
+   * answer; the last one is the one that answers.
+   */
+  readonly restart?: boolean;
+  /**
    * Whether the line belongs in the retained output.
    *
    * A token-level stream is mostly noise that the final parse never reads — Claude's thinking
@@ -62,6 +72,11 @@ export function readStreamLine(dialect: StreamDialect, line: string): StreamLine
       const inner = event.event;
       if (typeof inner !== "object" || inner === null) return NOTHING;
       const record = inner as Record<string, unknown>;
+      if (record.type === "content_block_start") {
+        const block = record.content_block;
+        const isText = typeof block === "object" && block !== null && (block as Record<string, unknown>).type === "text";
+        return isText ? Object.freeze({ retain: false, answer: null, thinking: false, restart: true }) : NOTHING;
+      }
       if (record.type !== "content_block_delta") return NOTHING;
       const delta = record.delta;
       if (typeof delta !== "object" || delta === null) return NOTHING;

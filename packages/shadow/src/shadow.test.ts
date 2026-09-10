@@ -42,6 +42,8 @@ import {
   grokSandboxProfileToml,
   extractAntigravityResult,
   jsonSchemaFor,
+  lastBalancedJsonObject,
+  readStreamLine,
   resolveToolGrant,
   type ToolGrant,
   STAGED_SCHEMA_FILE,
@@ -919,4 +921,32 @@ test("an Antigravity stream is read from its final result, preferring the object
   assert.equal(extractAntigravityResult(withoutSchema), "plain answer");
   assert.equal(extractAntigravityResult('{"event":"init"}'), null, "a stream with no result is not an answer");
   assert.equal(extractAntigravityResult("not json at all"), null);
+});
+
+test("a narrated answer is parsed from its own object, not from the braces in the prose", () => {
+  // What a tool-using provider actually streams: an explanation with code in it, then the answer.
+  const narrated = 'Let me look. The handler is `if (x) { return {ok: false}; }` in router.ts.\n{"kind":"work","output":"the router decides which model fills a role"}';
+  assert.deepEqual(
+    lastBalancedJsonObject(narrated),
+    { kind: "work", output: "the router decides which model fills a role" },
+  );
+  // The outermost span would have started at the snippet's brace and parsed as nothing.
+  assert.throws(() => JSON.parse(narrated.slice(narrated.indexOf("{"), narrated.lastIndexOf("}") + 1)));
+});
+
+test("a brace inside a string is not a brace", () => {
+  assert.deepEqual(lastBalancedJsonObject('{"kind":"work","output":"use {} for an empty set"}'), { kind: "work", output: "use {} for an empty set" });
+  assert.deepEqual(lastBalancedJsonObject('{"kind":"work","output":"a quote \\" and a brace }"}'), { kind: "work", output: 'a quote " and a brace }' });
+});
+
+test("text with no complete object yields nothing rather than a guess", () => {
+  assert.equal(lastBalancedJsonObject("no object here"), null);
+  assert.equal(lastBalancedJsonObject('{"kind":"work"'), null);
+});
+
+test("a new text block starts the answer again, so narration is not part of it", () => {
+  const start = '{"type":"stream_event","event":{"type":"content_block_start","index":1,"content_block":{"type":"text","text":""}}}';
+  assert.equal(readStreamLine("anthropic", start).restart, true);
+  const thinkingBlock = '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}}';
+  assert.notEqual(readStreamLine("anthropic", thinkingBlock).restart, true);
 });

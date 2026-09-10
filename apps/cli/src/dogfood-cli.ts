@@ -34,6 +34,8 @@ import {
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type GrokSandboxPolicy,
+  bindingQuotaReading,
+  type QuotaReading,
   type RoleActivity,
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
@@ -400,6 +402,41 @@ export function roleLine(roles: readonly { readonly role: string; readonly model
   }).join(" · ");
 }
 
+/**
+ * Records what a provider said about its own remaining window.
+ *
+ * Written as a `pressure` ratio with `native` evidence, which is the shape routing already
+ * prefers over BrainGate's account of its own traffic — the rule was written down for the day a
+ * provider started reporting one, and Claude does.
+ */
+function recordQuotaReading(state: OperatorStatePaths, readings: readonly (QuotaReading & { readonly quotaPool: string })[]): void {
+  if (readings.length === 0) return;
+  // Every window is kept, because a receipt should be able to say what the provider reported.
+  // Only one of them decides routing: the fullest, because that is the window that will refuse
+  // first. A five-hour window at 0.9 is a pool to route away from now, whatever the weekly
+  // figure says — and `pressure` is the metric routing reads.
+  const binding = bindingQuotaReading(readings);
+  const store = new GlobalQuotaStore(state.globalDir);
+  try {
+    for (const reading of readings) {
+      store.record({
+        provider: reading.providerId,
+        quotaPool: reading.quotaPool,
+        metric: reading === binding ? "pressure" : "window_utilization",
+        window: reading.window,
+        value: reading.utilization,
+        unit: "ratio",
+        resetAt: reading.resetAt,
+        // A window the provider refused is exhausted; one it served is usable however full it
+        // is. Utilization decides where work goes, never whether the pool is up.
+        status: reading.blocked ? "exhausted" : "healthy",
+        evidence: "native",
+        source: "provider-rate-limit-event",
+      });
+    }
+  } finally { store.close(); }
+}
+
 async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: string, env: NodeJS.ProcessEnv, json: boolean, stdout: (text: string) => void): Promise<DogfoodCliResult> {
   const state = resolveOperatorState(env);
   const manifest = manifestOption(args);
@@ -531,13 +568,17 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       return Object.freeze({ exitCode: 0, data });
     }
 
+    // Collected during the run and written once it ends: a provider reports every window on
+    // every call, and only the fullest of them should decide where the next task goes.
+    const pendingQuotaReadings: (QuotaReading & { readonly quotaPool: string })[] = [];
     const ledger = new TaskLedger(project);
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }) });
+      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       const mapped = shadowOutcome(result.workflow?.outcome ?? null);
       const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
+      recordQuotaReading(state, pendingQuotaReadings);
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, outcome: result.workflow?.outcome ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });
       emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · observed=${observation.sequence} · outcome=${result.workflow?.outcome ?? "unknown"}`, stdout);
       return Object.freeze({ exitCode: mapped.success ? 0 : 1, data });
