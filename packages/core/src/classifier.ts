@@ -1,4 +1,4 @@
-import type { TaskComplexity, TaskRisk } from "./task-ledger.js";
+import type { TaskComplexity, TaskRisk } from "./task-outcome.js";
 
 // Bumped because the rules changed, not the code: a receipt written under the old version
 // classified a read-only question about a sensitive area three tiers higher than this one does.

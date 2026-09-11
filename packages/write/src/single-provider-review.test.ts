@@ -26,7 +26,7 @@ function anthropicSnapshot(): ProviderSnapshot {
 
 function router(): CapabilityRouter {
   const registry = new ModelRegistry();
-  const runtime = { available: true, quotaState: "healthy" as const, quotaPressure: 0.1, observedAt: "2026-09-07T00:00:00.000Z" };
+  const runtime = { available: true, quotaState: "healthy" as const, quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00.000Z" };
   registry.register({
     providerId: "anthropic", modelId: "strong", quotaPool: "anthropic-subscription",
     capabilities: { coder: 96, reviewer: 96, judge: 94 }, speed: "deep", contextCapacity: 200_000,
@@ -68,7 +68,7 @@ test("real write plan can fall back to the same model in a fresh invocation when
     providerId: "anthropic", modelId: "only", quotaPool: "anthropic-subscription",
     capabilities: { coder: 96, reviewer: 96, judge: 90 }, speed: "deep", contextCapacity: 200_000,
     writeCapable: true, reasoning: 96, underlyingFamily: null,
-  }, { available: true, quotaState: "healthy", quotaPressure: 0.1, observedAt: "2026-09-07T00:00:00.000Z" });
+  }, { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00.000Z" });
   const classification = classifyTask({ text: "change the button label", mode: "write" });
   const plan = buildWriteTaskPlan({
     router: new CapabilityRouter(registry), providers: [anthropicSnapshot()], classification,

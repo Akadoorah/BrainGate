@@ -24,8 +24,11 @@ function validateDefinition(input: ModelDefinition): ModelDefinition {
 }
 
 function validateRuntime(input: ModelRuntime): ModelRuntime {
-  if (input.quotaPressure !== null && (!Number.isFinite(input.quotaPressure) || input.quotaPressure < 0 || input.quotaPressure > 1)) {
-    throw new BrainGateInvariantError("MODEL_QUOTA_PRESSURE_INVALID", "quotaPressure must be null or between 0 and 1.");
+  if (input.quotaHint !== null && (!Number.isFinite(input.quotaHint) || input.quotaHint < 0 || input.quotaHint > 1)) {
+    throw new BrainGateInvariantError("MODEL_QUOTA_HINT_INVALID", "quotaHint must be null or between 0 and 1.");
+  }
+  if (input.quotaObservedAt !== null && !Number.isFinite(Date.parse(input.quotaObservedAt))) {
+    throw new BrainGateInvariantError("MODEL_RUNTIME_TIME_INVALID", "quotaObservedAt must be null or an ISO-compatible timestamp.");
   }
   if (!Number.isFinite(Date.parse(input.observedAt))) throw new BrainGateInvariantError("MODEL_RUNTIME_TIME_INVALID", "observedAt must be an ISO-compatible timestamp.");
   return Object.freeze({ ...input });

@@ -54,6 +54,18 @@ const VALID_STATUS = new Set<QuotaStatus>(["healthy", "limited", "exhausted", "u
 
 /** Metrics that describe how much of a pool is left, and so depend on its status being known. */
 const LEVEL_METRICS = new Set(["remaining", "limit", "used", "used_ratio", "pressure"]);
+
+/**
+ * How full a provider's window looked when it last said so, as a ratio.
+ *
+ * Named apart from `pressure` deliberately. `pressure` claims to be a current level of the pool
+ * and is refused alongside an unknown status; this metric is an observation of a *window*, anchored
+ * to the moment it was taken and to the reset it belongs to, and it is read back as a hint rather
+ * than as a statement about availability.
+ */
+export const WINDOW_UTILIZATION_METRIC = "window_utilization";
+/** The metric a locally derived load share is stored under. */
+export const POOL_PRESSURE_METRIC = "pressure";
 const VALID_EVIDENCE = new Set<UsageEvidence>(["native", "measured", "estimated", "unknown"]);
 
 function clean(value: string, label: string, maxLength = 240): string {

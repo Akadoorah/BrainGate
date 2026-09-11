@@ -46,14 +46,10 @@ export interface WorkflowEvent {
   readonly detail: string;
 }
 
-export type WorkflowOutcome =
-  | "completed_without_review"
-  | "approved"
-  | "approved_after_repair"
-  | "approved_by_judge"
-  | "repaired_needs_review"
-  | "blocked_disagreement"
-  | "blocked_changes_required";
+// The outcome vocabulary lives in core, next to the operator-facing outcome it maps into, so the
+// two cannot drift apart. Re-exported here because this is where the engine reads it.
+import type { WorkflowOutcome } from "@braingate/core";
+export type { WorkflowOutcome };
 
 export interface WorkflowReceipt {
   readonly outcome: WorkflowOutcome;

@@ -39,7 +39,7 @@ function route(providerId: string, modelId: string, quotaPool: string): RouteRes
       capabilities: { coder: 90 }, speed: "balanced" as const,
       contextCapacity: 100_000, writeCapable: true, reasoning: 90, underlyingFamily: null,
     },
-    runtime: { available: true, quotaState: "healthy" as const, quotaPressure: 0.2, observedAt: "2026-09-07T00:00:00.000Z" },
+    runtime: { available: true, quotaState: "healthy" as const, quotaHint: 0.2, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00.000Z" },
   };
   return {
     role: "coder",
@@ -171,4 +171,45 @@ test("an unknown pool status still refuses a level, and still accepts a measurem
       /Unknown quota evidence cannot carry/,
     );
   } finally { store.close(); }
+});
+
+// The brief is the only record of what BrainGate believed when it chose a model. Without it, a
+// refusal cannot be explained afterwards: "it dispatched to a pool we thought was fine" and "it
+// dispatched to a pool we knew was exhausted" are different incidents, and the ledger could not
+// tell them apart. The reasons a candidate lost were computed and dropped before this.
+test("the brief records the quota belief behind a choice, and who else could have taken the role", () => {
+  const { project, ledger } = setupProject();
+  try {
+    const classification = classifyTask({ text: "Where is the theme config?", mode: "ask" });
+    const task = ledger.createTask({ title: "Inspect theme", complexity: classification.complexity, risk: classification.risk });
+    const budget = budgetFor(classification, { writeRequested: false });
+    const selected = route("anthropic", "model-x", "claude-subscription");
+    const brief = buildTaskBrief({
+      project,
+      task,
+      classification,
+      budget,
+      routes: [{
+        ...selected,
+        rejected: [
+          { model: { providerId: "openai", modelId: "codex", quotaPool: "chatgpt-subscription" }, reasons: ["quota-exhausted"] },
+          { model: { providerId: "xai", modelId: "grok", quotaPool: "grok-free" }, reasons: ["capability-below-floor:60<72"] },
+        ],
+      }],
+      context: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 200, truncatedItems: 0 },
+      permissions: { executionProfile: "shadow-read-only", networkAllowed: false },
+    });
+
+    const chosen = brief.route[0]!;
+    assert.equal(chosen.quotaState, "healthy");
+    assert.equal(chosen.quotaHint, 0.2);
+    assert.deepEqual(chosen.rejected.map((entry) => entry.providerId), ["openai", "xai"]);
+    assert.deepEqual(chosen.rejected[0]!.reasons, ["quota-exhausted"]);
+    assert.deepEqual(chosen.rejected[1]!.reasons, ["capability-below-floor:60<72"]);
+
+    // And it survives the round trip through the ledger, which is where the operator reads it.
+    recordTaskBrief(ledger, brief);
+    const stored = normalizeTaskReceipt(ledger.receipt(task.taskId)).brief;
+    assert.deepEqual(stored?.route[0]?.rejected, brief.route[0]?.rejected);
+  } finally { ledger.close(); }
 });

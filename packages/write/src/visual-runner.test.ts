@@ -4,7 +4,8 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject, InMemoryObservationWriter, ResultStore, createFinalizer, type TaskClassification, type TaskFinalizer } from "@braingate/core";
+import { redactSecrets } from "@braingate/security";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
 import { codexIsolationProfileHash, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
@@ -12,6 +13,23 @@ import { WriteDogfoodRunner, buildWriteTaskPlan } from "./write-runner.js";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "./types.js";
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(300_000, 7)]);
+
+/**
+ * The finalization seam the runner requires: a ledger, a result directory, and an observation
+ * writer. A runner cannot be constructed without one, which is the point — an execution package
+ * that could skip its record is how a task ends up with nothing said about it.
+ */
+function finalizerFor(project: RegisteredProject, ledger: TaskLedger): TaskFinalizer {
+  return createFinalizer({
+    ledger,
+    results: new ResultStore(project.storageDir, { redact: redactSecrets }),
+    observations: new InMemoryObservationWriter(),
+  });
+}
+
+function observationFor(classification: TaskClassification): { predicted: TaskClassification; effective: TaskClassification; prior: null } {
+  return { predicted: classification, effective: classification, prior: null };
+}
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -60,7 +78,7 @@ function registry(): ModelRegistry {
   const models = new ModelRegistry();
   models.register(
     { providerId: "anthropic", modelId: "claude-write", quotaPool: "claude-subscription", capabilities: { coder: 92 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null },
-    { available: true, quotaState: "healthy", quotaPressure: 0.1, observedAt: "2026-09-07T00:00:00Z" },
+    { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
   );
   return models;
 }
@@ -104,10 +122,11 @@ async function runVisual(reply?: (source: string) => string, options: { readonly
     project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
     providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
     writer: new TextWriter(), visualExecutor: visual,
+    finalizer: finalizerFor(f.project, new TaskLedger(f.project)),
   });
   const result = await runner.run({
     task: "add a hero image to the landing page", repositoryPath: f.repo, classification, budget,
-    requiredContextTokens: 500, context: {}, review: false,
+    requiredContextTokens: 500, observation: observationFor(classification), context: {}, review: false,
     ...(options.codexHome === undefined ? {} : { env: { PATH: process.env.PATH, CODEX_HOME: options.codexHome } }),
     visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image", destination: "assets/hero.png" },
   });
@@ -169,8 +188,9 @@ test("a write task without a visual request is unchanged", async () => {
   const runner = new WriteDogfoodRunner({
     project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
     providers: [snapshot("anthropic")], writer: new TextWriter(),
+    finalizer: finalizerFor(f.project, new TaskLedger(f.project)),
   });
-  const result = await runner.run({ task: "update the readme line", repositoryPath: f.repo, classification, budget, requiredContextTokens: 500, context: {}, review: false });
+  const result = await runner.run({ task: "update the readme line", repositoryPath: f.repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {}, review: false });
   assert.deepEqual(result.changedFiles, ["notes.md"]);
   assert.doesNotMatch(result.diff, /new artifact/);
 });
@@ -220,11 +240,12 @@ test("an image is collected from where the provider actually wrote it, not from 
     project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
     providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
     writer: new TextWriter(), visualExecutor: new SilentVisualProvider(codexHome),
+    finalizer: finalizerFor(f.project, new TaskLedger(f.project)),
   });
   const result = await runner.run({
     task: "add a hero image to the landing page", repositoryPath: f.repo, classification,
     budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500,
-    context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
+    observation: observationFor(classification), context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
     visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image", destination: "assets/hero.png" },
   });
 
@@ -246,11 +267,12 @@ test("only what this run produced is collected, never an image from an earlier o
     project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
     providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
     writer: new TextWriter(), visualExecutor: new SilentVisualProvider(codexHome),
+    finalizer: finalizerFor(f.project, new TaskLedger(f.project)),
   });
   const result = await runner.run({
     task: "add a hero image to the landing page", repositoryPath: f.repo, classification,
     budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500,
-    context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
+    observation: observationFor(classification), context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
     visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "a hero image", destination: "assets/hero.png" },
   });
 
@@ -266,11 +288,12 @@ test("several images from one request are kept apart rather than overwriting eac
     project: f.project, ledger: new TaskLedger(f.project), router: new CapabilityRouter(registry()),
     providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: isolation(),
     writer: new TextWriter(), visualExecutor: new SilentVisualProvider(codexHome, 2),
+    finalizer: finalizerFor(f.project, new TaskLedger(f.project)),
   });
   const result = await runner.run({
     task: "add hero images", repositoryPath: f.repo, classification,
     budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500,
-    context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
+    observation: observationFor(classification), context: {}, review: false, env: { PATH: process.env.PATH, CODEX_HOME: codexHome },
     visual: { model: { providerId: "openai", modelId: "gpt-visual", quotaPool: "chatgpt-subscription" }, task: "two hero images", destination: "assets/hero.png" },
   });
   assert.ok(result.changedFiles.includes("assets/hero.png"));

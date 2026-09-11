@@ -170,7 +170,10 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
   // premise of the next follow-up.
   if (result.exitCode === 0) session.record(input, spoken.join("").replace(/\n*Task [0-9a-f-]{36}.*$/s, "").trim());
-  deps.stdout(result.exitCode === 0 ? "\n" : "\n  Exit 1: completed but needs your review.\n\n");
+  // The exit code is reported, not interpreted. Inventing "completed but needs your review" here
+  // was a guess about a task this layer never looked at: a non-zero exit can mean a blocked review,
+  // a provider refusal, or a run that recorded nothing at all, and those need different responses.
+  if (result.exitCode !== 0) deps.stdout("\n  Exit 1: this task did not finish successfully. Run `tasks list` to see what was recorded.\n\n");
 }
 
 async function runSlash(line: string, deps: ReplDeps, session: SessionContext): Promise<"continue" | "exit"> {

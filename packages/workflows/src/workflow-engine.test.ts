@@ -4,7 +4,7 @@ import { BrainGateInvariantError, budgetFor, classifyTask } from "@braingate/cor
 import { CapabilityRouter, ModelRegistry, type ModelDefinition, type ModelRuntime } from "@braingate/router";
 import { WorkflowEngine, type AgentInvoker, type AgentRequest, type AgentResponse } from "./index.js";
 
-const runtime = (): ModelRuntime => ({ available: true, quotaState: "healthy", quotaPressure: 0.1, observedAt: "2026-09-07T00:00:00Z" });
+const runtime = (): ModelRuntime => ({ available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" });
 const def = (providerId: string, modelId: string, values: Partial<ModelDefinition> = {}): ModelDefinition => ({ providerId, modelId, quotaPool: `${providerId}:pool`, capabilities: { coder: 95, reviewer: 95, judge: 95 }, speed: "deep", contextCapacity: 200_000, writeCapable: true, reasoning: 95, underlyingFamily: null, ...values });
 
 class ScriptedInvoker implements AgentInvoker {
