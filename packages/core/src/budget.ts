@@ -1,6 +1,6 @@
 import { BrainGateInvariantError } from "./errors.js";
 import type { TaskClassification } from "./classifier.js";
-import type { TaskComplexity } from "./task-ledger.js";
+import type { TaskComplexity } from "./task-outcome.js";
 
 export type ReviewerPolicy = "none" | "optional" | "required";
 export type CouncilPolicy = "disabled" | "disagreement-only";

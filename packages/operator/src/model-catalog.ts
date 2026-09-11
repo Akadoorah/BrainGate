@@ -43,7 +43,7 @@ function validateOpaqueIdentity(providerId: string, modelId: string): void {
       reasoning: 0,
       underlyingFamily: null,
     },
-    { available: false, quotaState: "unknown", quotaPressure: null, observedAt: new Date(0).toISOString() },
+    { available: false, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, observedAt: new Date(0).toISOString() },
   );
 }
 
@@ -51,7 +51,7 @@ function validateDefinition(definition: ModelDefinition): ModelDefinition {
   const registry = new ModelRegistry();
   const registered = registry.register(
     definition,
-    { available: false, quotaState: "unknown", quotaPressure: null, observedAt: new Date(0).toISOString() },
+    { available: false, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, observedAt: new Date(0).toISOString() },
   );
   return registered.definition;
 }

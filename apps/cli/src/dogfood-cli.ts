@@ -18,11 +18,8 @@ import {
   initializeDogfoodProject,
   inspectGitRepository,
   repositoryReadiness,
-  type DogfoodOutcome,
-  type DogfoodReviewerVerdict,
-  type DogfoodRole,
 } from "@braingate/dogfood";
-import { GlobalQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
+import { GlobalQuotaStore, WINDOW_UTILIZATION_METRIC, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
 import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
@@ -35,7 +32,6 @@ import {
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type GrokSandboxPolicy,
-  bindingQuotaReading,
   type MeasuredCapabilities,
   type QuotaReading,
   type RoleActivity,
@@ -46,6 +42,7 @@ import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, gro
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
 import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
 export interface DogfoodCliDependencies {
   readonly cwd?: string;
@@ -132,6 +129,26 @@ function safeError(error: unknown): { readonly code: string; readonly message: s
   if (error instanceof BrainGateInvariantError) return Object.freeze({ code: error.code, message: error.message });
   if (error instanceof RangeError) return Object.freeze({ code: "CLI_RANGE_ERROR", message: error.message });
   return Object.freeze({ code: "CLI_UNEXPECTED", message: "Unexpected BrainGate dogfood failure. Raw error details were suppressed." });
+}
+
+/**
+ * Marks an error as one that happened after a task already existed.
+ *
+ * The question the operator needs answered is not which error this was but whether anything was
+ * recorded for the attempt, and only the run path can know that. Tagged onto the error rather than
+ * threaded through six signatures, and non-enumerable so it can never reach a serialized surface.
+ */
+const RECORDED_TASK = Symbol("braingate.recordedTask");
+
+function markTaskRecorded(error: unknown): never {
+  if (typeof error === "object" && error !== null) {
+    Object.defineProperty(error, RECORDED_TASK, { value: true, enumerable: false, configurable: true });
+  }
+  throw error;
+}
+
+function taskWasRecorded(error: unknown): boolean {
+  return typeof error === "object" && error !== null && (error as Record<symbol, unknown>)[RECORDED_TASK] === true;
 }
 
 function emit(json: boolean, data: unknown, human: string, stdout: (text: string) => void): void {
@@ -359,32 +376,21 @@ function resolveWriteRepository(project: RegisteredProject, cwd: string, request
   return candidate;
 }
 
-function rolesFromPlan(roles: readonly { readonly role: string; readonly model: { readonly providerId: string; readonly modelId: string } }[]): readonly DogfoodRole[] {
-  return Object.freeze(roles.map((role) => Object.freeze({ role: role.role as DogfoodRole["role"], providerId: role.model.providerId, modelId: role.model.modelId })));
-}
-
-function shadowOutcome(value: string | null): { readonly outcome: DogfoodOutcome; readonly verdict: DogfoodReviewerVerdict; readonly success: boolean } {
-  switch (value) {
-    case "completed_without_review": return { outcome: "success", verdict: null, success: true };
-    case "approved":
-    case "approved_after_repair":
-    case "approved_by_judge": return { outcome: "success", verdict: "approve", success: true };
-    case "repaired_needs_review": return { outcome: "partial", verdict: "request_changes", success: false };
-    case "blocked_disagreement": return { outcome: "blocked", verdict: "disagree", success: false };
-    case "blocked_changes_required": return { outcome: "blocked", verdict: "request_changes", success: false };
-    default: return { outcome: "failed", verdict: null, success: false };
-  }
-}
-
-function writeOutcome(input: { readonly readyForApproval: boolean; readonly review: { readonly verdict: string } | null; readonly verification: readonly { readonly passed: boolean }[] }): { readonly outcome: DogfoodOutcome; readonly verdict: DogfoodReviewerVerdict } {
-  const verdict = input.review === null ? null : (input.review.verdict as Exclude<DogfoodReviewerVerdict, null>);
-  if (input.readyForApproval) return { outcome: "success", verdict };
-  if (input.verification.some((item) => !item.passed)) return { outcome: "failed", verdict };
-  return { outcome: "blocked", verdict };
-}
-
 function classificationView(predicted: TaskClassification, effective: TaskClassification, prior: ReturnType<DogfoodStore["derivePrior"]>, applied: boolean) {
   return Object.freeze({ predicted: { complexity: predicted.complexity, risk: predicted.risk, confidence: predicted.confidence, ruleVersion: predicted.ruleVersion }, effective: { complexity: effective.complexity, risk: effective.risk, confidence: effective.confidence, ruleVersion: effective.ruleVersion }, prior, applied });
+}
+
+/**
+ * How a recorded outcome reads on one line.
+ *
+ * `null` means the task has no readable finalization record — still running, or stopped between
+ * finishing and writing the record. That is a different fact from an outcome of UNKNOWN, which is
+ * BrainGate having recorded that it could not tell what happened; the first has a next step and the
+ * second does not.
+ */
+function describeOutcome(recorded: RecordedOutcome | null): string {
+  if (recorded === null) return "not recorded · run `braingate tasks reconcile`";
+  return recorded.failureKind === null ? recorded.outcome : `${recorded.outcome} (${recorded.failureKind})`;
 }
 
 /**
@@ -409,31 +415,37 @@ export function roleLine(roles: readonly { readonly role: string; readonly model
 /**
  * Records what a provider said about its own remaining window.
  *
- * Written as a `pressure` ratio with `native` evidence, which is the shape routing already
- * prefers over BrainGate's account of its own traffic — the rule was written down for the day a
- * provider started reporting one, and Claude does.
+ * Written as `window_utilization` with `unknown` status, and that pairing is the whole point. The
+ * number is real — the provider reported it — but *what it means for the pool right now* is not
+ * something BrainGate knows: the window it describes may already have reset, and whether the
+ * provider would serve the next call is a question only the provider can answer.
+ *
+ * This used to be written as `pressure` with a status of `healthy` or `exhausted` derived from
+ * whether the call it rode along with was served. That turned a utilisation reading into a health
+ * claim, and routing acted on it: a pool at 47% could be skipped as though it had refused.
  */
 function recordQuotaReading(state: OperatorStatePaths, readings: readonly (QuotaReading & { readonly quotaPool: string })[]): void {
   if (readings.length === 0) return;
   // Every window is kept, because a receipt should be able to say what the provider reported.
-  // Only one of them decides routing: the fullest, because that is the window that will refuse
-  // first. A five-hour window at 0.9 is a pool to route away from now, whatever the weekly
-  // figure says — and `pressure` is the metric routing reads.
-  const binding = bindingQuotaReading(readings);
+  // Which of them decides a routing hint is the reader's question, and the reader takes the fullest:
+  // a five-hour window at 0.9 matters whatever the weekly figure says.
   const store = new GlobalQuotaStore(state.globalDir);
   try {
     for (const reading of readings) {
       store.record({
         provider: reading.providerId,
         quotaPool: reading.quotaPool,
-        metric: reading === binding ? "pressure" : "window_utilization",
+        metric: WINDOW_UTILIZATION_METRIC,
         window: reading.window,
         value: reading.utilization,
         unit: "ratio",
         resetAt: reading.resetAt,
-        // A window the provider refused is exhausted; one it served is usable however full it
-        // is. Utilization decides where work goes, never whether the pool is up.
-        status: reading.blocked ? "exhausted" : "healthy",
+        // The one status worth persisting is a window the provider itself reported as refused: it
+        // is the provider's own words, it names the window, and it expires with that window's
+        // reset. Everything else is a level rather than a verdict — whether a pool will serve the
+        // *next* call is not something a utilisation number can answer, and "it served this one"
+        // is not evidence about the next.
+        status: reading.blocked ? "exhausted" : "unknown",
         evidence: "native",
         source: "provider-rate-limit-event",
       });
@@ -601,15 +613,24 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const pendingQuotaReadings: (QuotaReading & { readonly quotaPool: string })[] = [];
     const ledger = new TaskLedger(project);
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
-      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
-      const mapped = shadowOutcome(result.workflow?.outcome ?? null);
-      const observation = store.recordRun({ receipt: result.taskReceipt, mode: "ask", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
+      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
+      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
+      if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_RECEIPT_MISSING", "Executed dogfood ask did not produce a task receipt.");
+      // The runner recorded the outcome, the result and the observation; this reads them back
+      // rather than deciding again. A second derivation here is how the screen and the ledger end
+      // up disagreeing about the same task.
+      const recorded = recordedOutcomeOf(result.taskReceipt);
+      const observationSequence = store.find(result.taskId)?.sequence ?? null;
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
       recordQuotaReading(state, pendingQuotaReadings);
-      const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, outcome: result.workflow?.outcome ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });
-      emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · observed=${observation.sequence} · outcome=${result.workflow?.outcome ?? "unknown"}`, stdout);
-      return Object.freeze({ exitCode: mapped.success ? 0 : 1, data });
+      const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence, outcome: recorded?.outcome ?? null, reviewStatus: recorded?.reviewStatus ?? null, failureKind: recorded?.failureKind ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });
+      emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)}`, stdout);
+      return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
+    } catch (error) {
+      // The task exists and the runner has already recorded what became of it, so this is an
+      // execution failure rather than a preflight one. Marked so the operator is never told that
+      // nothing was recorded when the record exists.
+      markTaskRecorded(error);
     } finally { ledger.close(); }
   } finally { store.close(); }
 }
@@ -662,15 +683,21 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
 
     const ledger = new TaskLedger(project);
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
-      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
+      const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
-      const mapped = writeOutcome(result);
-      const observation = store.recordRun({ receipt: result.taskReceipt, mode: "write", predicted, effective, roles: rolesFromPlan(plan.roles), outcome: mapped.outcome, reviewerVerdict: mapped.verdict, prior });
+      // Read back what the runner recorded, so the screen and the ledger cannot disagree.
+      const recorded = recordedOutcomeOf(result.taskReceipt);
+      const observationSequence = store.find(result.taskId)?.sequence ?? null;
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
-      const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence: observation.sequence, worktree: result.worktree, changedFiles: result.changedFiles, diff: result.diff, verification: result.verification, review: result.review, readyForApproval: result.readyForApproval, approvalRequired: true, mergePerformed: false, usage: result.taskReceipt.usage });
-      emit(json, data, `Task ${result.taskId} · observed=${observation.sequence} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
-      return Object.freeze({ exitCode: result.readyForApproval ? 0 : 1, data });
+      const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence, outcome: recorded?.outcome ?? null, reviewStatus: recorded?.reviewStatus ?? null, failureKind: recorded?.failureKind ?? null, worktree: result.worktree, changedFiles: result.changedFiles, diff: result.diff, verification: result.verification, review: result.review, readyForApproval: result.readyForApproval, approvalRequired: true, mergePerformed: false, usage: result.taskReceipt.usage });
+      emit(json, data, `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
+      return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
+    } catch (error) {
+      // The task exists and the runner has already recorded what became of it, so this is an
+      // execution failure rather than a preflight one. Marked so the operator is never told that
+      // nothing was recorded when the record exists.
+      markTaskRecorded(error);
     } finally { ledger.close(); }
   } finally { store.close(); }
 }
@@ -783,8 +810,13 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
     } finally { store.close(); }
   } catch (error) {
     const safe = safeError(error);
-    data = { error: safe };
-    stderr(json ? `${JSON.stringify(data, null, 2)}\n` : `BrainGate ${safe.code}: ${safe.message}\n`);
+    // Whether anything was recorded for this attempt is the one thing the operator cannot infer
+    // from the error itself, and it decides what they do next: fix a flag, or read a task.
+    const recorded = taskWasRecorded(error);
+    data = { error: safe, recorded };
+    if (json) stderr(`${JSON.stringify(data, null, 2)}\n`);
+    else if (recorded) stderr(`BrainGate ${safe.code}: ${safe.message}\n`);
+    else stderr(`BrainGate ${safe.code}: ${safe.message}\n\nNo task was created. Nothing was recorded for this attempt.\n`);
     return Object.freeze({ exitCode: 1, data });
   }
 }

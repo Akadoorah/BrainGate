@@ -3,13 +3,21 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import {
   BrainGateInvariantError,
+  OBSERVATION_OUTCOMES,
   assertRegisteredProject,
+  isFailureKind,
+  isObservationOutcome,
+  type FailureKind,
+  type ObservationInput,
+  type ObservationRecord,
   type RegisteredProject,
-  type TaskClassification,
+  type TaskComplexity,
   type TaskReceipt,
+  type TaskRisk,
 } from "@braingate/core";
 import { deriveDogfoodPrior, emptyDogfoodPrior, parseTaskComplexity, parseTaskRisk, type PriorSample } from "./prior.js";
 import type {
+  DogfoodFeedbackOutcome,
   DogfoodFeedbackRecord,
   DogfoodMode,
   DogfoodOutcome,
@@ -22,11 +30,95 @@ import type {
   DogfoodUsage,
 } from "./types.js";
 
-const OUTCOMES = new Set<DogfoodOutcome>(["success", "partial", "blocked", "failed"]);
-const REVIEW_VERDICTS = new Set<Exclude<DogfoodReviewerVerdict, null>>(["approve", "request_changes", "disagree"]);
-const MODES = new Set<DogfoodMode>(["ask", "write"]);
+/**
+ * What a human may assert later about a run's real outcome.
+ *
+ * Deliberately narrower than the run vocabulary; see `DogfoodFeedbackOutcome`.
+ */
+const FEEDBACK_OUTCOME_LIST: readonly DogfoodFeedbackOutcome[] = ["success", "partial", "blocked", "failed"];
+const FEEDBACK_OUTCOMES = new Set<DogfoodFeedbackOutcome>(FEEDBACK_OUTCOME_LIST);
+const REVIEW_VERDICT_LIST: readonly Exclude<DogfoodReviewerVerdict, null>[] = ["approve", "request_changes", "disagree"];
+const REVIEW_VERDICTS = new Set<Exclude<DogfoodReviewerVerdict, null>>(REVIEW_VERDICT_LIST);
+const MODE_LIST: readonly DogfoodMode[] = ["ask", "write"];
+const MODES = new Set<DogfoodMode>(MODE_LIST);
 const COMPLEXITY_ORDER = ["T0", "T1", "T2", "T3", "T4"] as const;
 const RISK_ORDER = ["low", "medium", "high", "critical"] as const;
+/** Bumped when a column or constraint changes; the migration keys off it. */
+const SCHEMA_VERSION = 2;
+
+/**
+ * A SQL `IN` list from the same runtime list the TypeScript guard reads.
+ *
+ * The CHECK constraint and the parser are two enforcements of one vocabulary; writing the SQL by
+ * hand would let a sixth outcome be accepted by the code and rejected by the database, or worse,
+ * accepted by the database and never counted.
+ */
+function sqlIn(values: readonly string[]): string {
+  return values.map((value) => `'${value}'`).join(", ");
+}
+
+/**
+ * The run table, defined once.
+ *
+ * A migration that rebuilds this table must produce exactly the columns and constraints a fresh
+ * database gets, and the only way to be sure of that is for both to read the same definition.
+ */
+function runsTableSql(table: string): string {
+  return `
+    CREATE TABLE ${table} (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL UNIQUE,
+      mode TEXT NOT NULL CHECK (mode IN (${sqlIn(MODE_LIST)})),
+      predicted_complexity TEXT NOT NULL CHECK (predicted_complexity IN (${sqlIn(COMPLEXITY_ORDER)})),
+      predicted_risk TEXT NOT NULL CHECK (predicted_risk IN (${sqlIn(RISK_ORDER)})),
+      effective_complexity TEXT NOT NULL CHECK (effective_complexity IN (${sqlIn(COMPLEXITY_ORDER)})),
+      effective_risk TEXT NOT NULL CHECK (effective_risk IN (${sqlIn(RISK_ORDER)})),
+      rule_version TEXT NOT NULL,
+      roles_json TEXT NOT NULL,
+      outcome TEXT NOT NULL CHECK (outcome IN (${sqlIn(OBSERVATION_OUTCOMES)})),
+      failure_kind TEXT NULL,
+      reconciled INTEGER NOT NULL DEFAULT 0 CHECK (reconciled IN (0,1)),
+      reviewer_verdict TEXT NULL CHECK (reviewer_verdict IS NULL OR reviewer_verdict IN (${sqlIn(REVIEW_VERDICT_LIST)})),
+      usage_json TEXT NOT NULL,
+      prior_json TEXT NOT NULL,
+      observed_at TEXT NOT NULL
+    );`;
+}
+
+function runsTriggersSql(table: string): string {
+  return `
+    CREATE TRIGGER IF NOT EXISTS ${table}_no_update BEFORE UPDATE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} are append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS ${table}_no_delete BEFORE DELETE ON ${table} BEGIN SELECT RAISE(ABORT, '${table} are append-only'); END;
+  `;
+}
+
+function schemaSql(): string {
+  return `
+    CREATE TABLE IF NOT EXISTS dogfood_meta (
+      project_id TEXT PRIMARY KEY,
+      schema_version INTEGER NOT NULL,
+      created_at TEXT NOT NULL
+    );
+    ${runsTableSql("IF NOT EXISTS dogfood_runs")}
+    CREATE TABLE IF NOT EXISTS dogfood_feedback (
+      sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+      project_id TEXT NOT NULL,
+      task_id TEXT NOT NULL,
+      actual_complexity TEXT NOT NULL CHECK (actual_complexity IN (${sqlIn(COMPLEXITY_ORDER)})),
+      actual_risk TEXT NULL CHECK (actual_risk IS NULL OR actual_risk IN (${sqlIn(RISK_ORDER)})),
+      outcome TEXT NOT NULL CHECK (outcome IN (${sqlIn(FEEDBACK_OUTCOME_LIST)})),
+      regression INTEGER NOT NULL CHECK (regression IN (0,1)),
+      recorded_at TEXT NOT NULL,
+      FOREIGN KEY (task_id) REFERENCES dogfood_runs(task_id)
+    );
+    ${runsTriggersSql("dogfood_runs")}
+    CREATE TRIGGER IF NOT EXISTS dogfood_feedback_no_update BEFORE UPDATE ON dogfood_feedback BEGIN SELECT RAISE(ABORT, 'dogfood_feedback is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS dogfood_feedback_no_delete BEFORE DELETE ON dogfood_feedback BEGIN SELECT RAISE(ABORT, 'dogfood_feedback is append-only'); END;
+    CREATE TRIGGER IF NOT EXISTS dogfood_meta_no_update BEFORE UPDATE ON dogfood_meta BEGIN SELECT RAISE(ABORT, 'dogfood_meta is immutable'); END;
+    CREATE TRIGGER IF NOT EXISTS dogfood_meta_no_delete BEFORE DELETE ON dogfood_meta BEGIN SELECT RAISE(ABORT, 'dogfood_meta is immutable'); END;
+  `;
+}
 
 interface RunRow {
   sequence: number;
@@ -40,6 +132,8 @@ interface RunRow {
   rule_version: string;
   roles_json: string;
   outcome: DogfoodOutcome;
+  failure_kind: string | null;
+  reconciled: number;
   reviewer_verdict: Exclude<DogfoodReviewerVerdict, null> | null;
   usage_json: string;
   prior_json: string;
@@ -52,7 +146,7 @@ interface FeedbackRow {
   task_id: string;
   actual_complexity: string;
   actual_risk: string | null;
-  outcome: DogfoodOutcome;
+  outcome: DogfoodFeedbackOutcome;
   regression: number;
   recorded_at: string;
 }
@@ -64,9 +158,22 @@ function parseMode(value: unknown): DogfoodMode {
   return value as DogfoodMode;
 }
 
+/** A run's outcome, validated against core's list so the corpus speaks the ledger's vocabulary. */
 function parseOutcome(value: unknown): DogfoodOutcome {
-  if (typeof value !== "string" || !OUTCOMES.has(value as DogfoodOutcome)) throw new BrainGateInvariantError("DOGFOOD_OUTCOME_INVALID", "Dogfood outcome must be success, partial, blocked, or failed.");
-  return value as DogfoodOutcome;
+  if (typeof value !== "string" || !isObservationOutcome(value)) throw new BrainGateInvariantError("DOGFOOD_OUTCOME_INVALID", "Dogfood run outcome must be success, partial, blocked, failed, interrupted, or unknown.");
+  return value;
+}
+
+/** What a human asserts about a run afterwards, which cannot be "interrupted" or "unknown". */
+function parseFeedbackOutcome(value: unknown): DogfoodFeedbackOutcome {
+  if (typeof value !== "string" || !FEEDBACK_OUTCOMES.has(value as DogfoodFeedbackOutcome)) throw new BrainGateInvariantError("DOGFOOD_FEEDBACK_OUTCOME_INVALID", "Feedback outcome must be success, partial, blocked, or failed.");
+  return value as DogfoodFeedbackOutcome;
+}
+
+function parseFailureKind(value: unknown): FailureKind | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value !== "string" || !isFailureKind(value)) throw new BrainGateInvariantError("DOGFOOD_FAILURE_KIND_INVALID", "Dogfood failure kind is not a known failure kind.");
+  return value;
 }
 
 function parseReviewerVerdict(value: unknown): DogfoodReviewerVerdict {
@@ -75,7 +182,31 @@ function parseReviewerVerdict(value: unknown): DogfoodReviewerVerdict {
   return value as Exclude<DogfoodReviewerVerdict, null>;
 }
 
-function assertNoDeescalation(predicted: TaskClassification, effective: TaskClassification): void {
+function parsePrior(value: unknown, mode: DogfoodMode): DogfoodPrior {
+  if (value === null || value === undefined) return emptyDogfoodPrior(mode);
+  if (typeof value !== "object") throw new BrainGateInvariantError("DOGFOOD_PRIOR_INVALID", "Dogfood prior must be an object or null.");
+  const prior = value as DogfoodPrior;
+  if (prior.mode !== mode) throw new BrainGateInvariantError("DOGFOOD_PRIOR_MODE_MISMATCH", "Dogfood prior mode must match the recorded run mode.");
+  return prior;
+}
+
+/**
+ * What the store needs in order to write one observation.
+ *
+ * Core's `ObservationInput` plus the two things only the caller's own storage can supply: the
+ * task's receipt, which carries the measured usage, and the reviewer's verdict, which is read from
+ * the ledger's events rather than kept as a second copy of the decision.
+ */
+export interface DogfoodObservationInput extends ObservationInput {
+  readonly receipt: TaskReceipt | null;
+  readonly reviewerVerdict: DogfoodReviewerVerdict;
+}
+
+/** Shared with `recordFeedback`'s callers via core's `ObservationInput`, so it takes the subset it needs. */
+function assertNoDeescalation(
+  predicted: Readonly<{ complexity: TaskComplexity; risk: TaskRisk }>,
+  effective: Readonly<{ complexity: TaskComplexity; risk: TaskRisk }>,
+): void {
   if (COMPLEXITY_ORDER.indexOf(effective.complexity) < COMPLEXITY_ORDER.indexOf(predicted.complexity)) {
     throw new BrainGateInvariantError("DOGFOOD_DEESCALATION_FORBIDDEN", "Dogfood effective complexity cannot be lower than the classifier prediction.");
   }
@@ -119,6 +250,8 @@ function mapRun(row: RunRow): DogfoodRunRecord {
     ruleVersion: row.rule_version,
     roles: Object.freeze(JSON.parse(row.roles_json) as DogfoodRole[]),
     outcome: parseOutcome(row.outcome),
+    failureKind: parseFailureKind(row.failure_kind),
+    reconciled: row.reconciled === 1,
     reviewerVerdict: parseReviewerVerdict(row.reviewer_verdict),
     usage: Object.freeze(JSON.parse(row.usage_json) as DogfoodUsage[]),
     prior: Object.freeze(JSON.parse(row.prior_json) as DogfoodPrior),
@@ -133,7 +266,7 @@ function mapFeedback(row: FeedbackRow): DogfoodFeedbackRecord {
     taskId: row.task_id,
     actualComplexity: parseTaskComplexity(row.actual_complexity),
     actualRisk: row.actual_risk === null ? null : parseTaskRisk(row.actual_risk),
-    outcome: parseOutcome(row.outcome),
+    outcome: parseFeedbackOutcome(row.outcome),
     regression: row.regression === 1,
     recordedAt: row.recorded_at,
   });
@@ -160,34 +293,45 @@ export class DogfoodStore {
 
   close(): void { this.#db.close(); }
 
-  recordRun(input: {
-    readonly receipt: TaskReceipt;
-    readonly mode: DogfoodMode;
-    readonly predicted: TaskClassification;
-    readonly effective: TaskClassification;
-    readonly roles: readonly DogfoodRole[];
-    readonly outcome: DogfoodOutcome;
-    readonly reviewerVerdict?: DogfoodReviewerVerdict;
-    readonly prior?: DogfoodPrior;
-  }): DogfoodRunRecord {
-    if (input.receipt.task.projectId !== this.#project.projectId) throw new BrainGateInvariantError("DOGFOOD_PROJECT_MISMATCH", "Task receipt belongs to another project.");
+  /**
+   * The single write path into the corpus.
+   *
+   * Called by the finalizer for every task, including the ones being repaired, which is what makes
+   * the corpus complete rather than a record of the runs that happened to finish. Idempotent: the
+   * same observation twice is the same observation, and a *different* observation for a task that
+   * already has one is a conflict rather than an overwrite — this store cannot update, so the only
+   * honest options are "already recorded" and "refuse".
+   */
+  recordObservation(input: DogfoodObservationInput): DogfoodRunRecord {
     const mode = parseMode(input.mode);
+    const outcome = parseOutcome(input.outcome);
+    const failureKind = parseFailureKind(input.failureKind);
+    const reconciled = input.reconciled === true;
+    const verdict = parseReviewerVerdict(input.reviewerVerdict);
+    // The task a run belongs to is named by the receipt, when the caller has one. Without it the
+    // store can still write, because the task id is the caller's to name and the store is already
+    // scoped to one project.
+    if (input.receipt !== null && input.receipt.task.projectId !== this.#project.projectId) throw new BrainGateInvariantError("DOGFOOD_PROJECT_MISMATCH", "Task receipt belongs to another project.");
+
+    const existing = this.getRun(input.taskId);
+    if (existing !== undefined) {
+      if (existing.outcome === outcome && existing.failureKind === failureKind && existing.reconciled === reconciled) return existing;
+      throw new BrainGateInvariantError("DOGFOOD_OBSERVATION_CONFLICT", `Task ${input.taskId} already has a different observation (${existing.outcome}${existing.failureKind === null ? "" : `/${existing.failureKind}`}); the corpus is append-only and will not be rewritten.`);
+    }
+
     assertNoDeescalation(input.predicted, input.effective);
     const roles = validateRoles(input.roles);
-    const outcome = parseOutcome(input.outcome);
-    const verdict = parseReviewerVerdict(input.reviewerVerdict ?? null);
-    const prior = input.prior ?? emptyDogfoodPrior(mode);
-    if (prior.mode !== mode) throw new BrainGateInvariantError("DOGFOOD_PRIOR_MODE_MISMATCH", "Dogfood prior mode must match the recorded run mode.");
-    const usage = mapUsage(input.receipt);
+    const prior = parsePrior(input.prior, mode);
+    const usage = input.receipt === null ? Object.freeze([]) : mapUsage(input.receipt);
     this.#db.prepare(`
       INSERT INTO dogfood_runs (
         project_id, task_id, mode, predicted_complexity, predicted_risk,
         effective_complexity, effective_risk, rule_version, roles_json,
-        outcome, reviewer_verdict, usage_json, prior_json, observed_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        outcome, failure_kind, reconciled, reviewer_verdict, usage_json, prior_json, observed_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `).run(
       this.#project.projectId,
-      input.receipt.task.taskId,
+      input.taskId,
       mode,
       input.predicted.complexity,
       input.predicted.risk,
@@ -196,12 +340,19 @@ export class DogfoodStore {
       input.predicted.ruleVersion,
       JSON.stringify(roles),
       outcome,
+      failureKind,
+      reconciled ? 1 : 0,
       verdict,
       JSON.stringify(usage),
       JSON.stringify(prior),
       now(),
     );
-    return this.requireRun(input.receipt.task.taskId);
+    return this.requireRun(input.taskId);
+  }
+
+  find(taskId: string): ObservationRecord | null {
+    const run = this.getRun(taskId);
+    return run === undefined ? null : Object.freeze({ sequence: run.sequence, outcome: run.outcome, failureKind: run.failureKind, reconciled: run.reconciled });
   }
 
   getRun(taskId: string): DogfoodRunRecord | undefined {
@@ -251,7 +402,10 @@ export class DogfoodStore {
   }
 
   derivePrior(mode: DogfoodMode, minimumSamples = 3): DogfoodPrior {
-    const runs = new Map(this.listRuns().filter((run) => run.mode === mode).map((run) => [run.taskId, run]));
+    // Reconciled runs are excluded: a prior is a claim about what the classifier did during a live
+    // run, and a reconstructed record's roles and prior are inferences, not observations. Counting
+    // them would let a repaired task change what the next task is routed as.
+    const runs = new Map(this.listRuns().filter((run) => run.mode === mode && !run.reconciled).map((run) => [run.taskId, run]));
     const samples: PriorSample[] = [];
     for (const feedback of this.latestFeedback()) {
       const run = runs.get(feedback.taskId);
@@ -263,8 +417,10 @@ export class DogfoodStore {
 
   report(): DogfoodReport {
     const runs = this.listRuns();
+    const live = runs.filter((run) => !run.reconciled);
+    const reconciled = runs.filter((run) => run.reconciled);
     const feedback = this.latestFeedback();
-    const runByTask = new Map(runs.map((run) => [run.taskId, run]));
+    const runByTask = new Map(live.map((run) => [run.taskId, run]));
     let exact = 0; let under = 0; let over = 0; let regressions = 0;
     const complexityOrder = ["T0", "T1", "T2", "T3", "T4"] as const;
     for (const item of feedback) {
@@ -275,10 +431,18 @@ export class DogfoodStore {
       if (predicted === actual) exact += 1; else if (predicted < actual) under += 1; else over += 1;
       if (item.regression) regressions += 1;
     }
-    const outcomes: Record<DogfoodOutcome, number> = { success: 0, partial: 0, blocked: 0, failed: 0 };
+    // Built from core's own list, so adding a sixth outcome to the vocabulary cannot silently leave
+    // a bucket missing here and a counter that adds to nothing.
+    const emptyOutcomes = (): Record<DogfoodOutcome, number> => Object.fromEntries(OBSERVATION_OUTCOMES.map((outcome) => [outcome, 0])) as Record<DogfoodOutcome, number>;
+    const outcomes = emptyOutcomes();
+    const reconciledOutcomes = emptyOutcomes();
     const reviewerVerdicts: Record<"approve" | "request_changes" | "disagree" | "none", number> = { approve: 0, request_changes: 0, disagree: 0, none: 0 };
     const providers = new Map<string, { role: DogfoodRole["role"]; providerId: string; modelId: string; runs: number }>();
     for (const run of runs) {
+      if (run.reconciled) {
+        reconciledOutcomes[run.outcome] += 1;
+        continue;
+      }
       outcomes[run.outcome] += 1;
       reviewerVerdicts[run.reviewerVerdict ?? "none"] += 1;
       for (const role of run.roles) {
@@ -291,13 +455,19 @@ export class DogfoodStore {
     return Object.freeze({
       projectId: this.#project.projectId,
       runs: runs.length,
+      observedRuns: live.length,
+      reconciledRuns: reconciled.length,
       feedback: feedback.length,
-      feedbackCoverage: runs.length === 0 ? 0 : Math.round((feedback.length / runs.length) * 1000) / 1000,
+      // Coverage is asked of the runs a human could actually have judged: a reconciled record is
+      // not waiting for feedback, and counting it as missing would understate how much of the live
+      // corpus has been reviewed.
+      feedbackCoverage: live.length === 0 ? 0 : Math.round((feedback.length / live.length) * 1000) / 1000,
       exactComplexityMatches: exact,
       complexityUnderpredictions: under,
       complexityOverpredictions: over,
       regressions,
       outcomes: Object.freeze(outcomes),
+      reconciledOutcomes: Object.freeze(reconciledOutcomes),
       reviewerVerdicts: Object.freeze(reviewerVerdicts),
       providers: Object.freeze(providerRows.map((row) => Object.freeze(row))),
       priors: Object.freeze({ ask: this.derivePrior("ask"), write: this.derivePrior("write") }),
@@ -332,46 +502,58 @@ export class DogfoodStore {
   }
 
   #migrate(): void {
-    this.#db.exec(`
-      CREATE TABLE IF NOT EXISTS dogfood_meta (
-        project_id TEXT PRIMARY KEY,
-        schema_version INTEGER NOT NULL,
-        created_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS dogfood_runs (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id TEXT NOT NULL,
-        task_id TEXT NOT NULL UNIQUE,
-        mode TEXT NOT NULL CHECK (mode IN ('ask','write')),
-        predicted_complexity TEXT NOT NULL CHECK (predicted_complexity IN ('T0','T1','T2','T3','T4')),
-        predicted_risk TEXT NOT NULL CHECK (predicted_risk IN ('low','medium','high','critical')),
-        effective_complexity TEXT NOT NULL CHECK (effective_complexity IN ('T0','T1','T2','T3','T4')),
-        effective_risk TEXT NOT NULL CHECK (effective_risk IN ('low','medium','high','critical')),
-        rule_version TEXT NOT NULL,
-        roles_json TEXT NOT NULL,
-        outcome TEXT NOT NULL CHECK (outcome IN ('success','partial','blocked','failed')),
-        reviewer_verdict TEXT NULL CHECK (reviewer_verdict IS NULL OR reviewer_verdict IN ('approve','request_changes','disagree')),
-        usage_json TEXT NOT NULL,
-        prior_json TEXT NOT NULL,
-        observed_at TEXT NOT NULL
-      );
-      CREATE TABLE IF NOT EXISTS dogfood_feedback (
-        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
-        project_id TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        actual_complexity TEXT NOT NULL CHECK (actual_complexity IN ('T0','T1','T2','T3','T4')),
-        actual_risk TEXT NULL CHECK (actual_risk IS NULL OR actual_risk IN ('low','medium','high','critical')),
-        outcome TEXT NOT NULL CHECK (outcome IN ('success','partial','blocked','failed')),
-        regression INTEGER NOT NULL CHECK (regression IN (0,1)),
-        recorded_at TEXT NOT NULL,
-        FOREIGN KEY (task_id) REFERENCES dogfood_runs(task_id)
-      );
-      CREATE TRIGGER IF NOT EXISTS dogfood_runs_no_update BEFORE UPDATE ON dogfood_runs BEGIN SELECT RAISE(ABORT, 'dogfood_runs are append-only'); END;
-      CREATE TRIGGER IF NOT EXISTS dogfood_runs_no_delete BEFORE DELETE ON dogfood_runs BEGIN SELECT RAISE(ABORT, 'dogfood_runs are append-only'); END;
-      CREATE TRIGGER IF NOT EXISTS dogfood_feedback_no_update BEFORE UPDATE ON dogfood_feedback BEGIN SELECT RAISE(ABORT, 'dogfood_feedback is append-only'); END;
-      CREATE TRIGGER IF NOT EXISTS dogfood_feedback_no_delete BEFORE DELETE ON dogfood_feedback BEGIN SELECT RAISE(ABORT, 'dogfood_feedback is append-only'); END;
-      CREATE TRIGGER IF NOT EXISTS dogfood_meta_no_update BEFORE UPDATE ON dogfood_meta BEGIN SELECT RAISE(ABORT, 'dogfood_meta is immutable'); END;
-      CREATE TRIGGER IF NOT EXISTS dogfood_meta_no_delete BEFORE DELETE ON dogfood_meta BEGIN SELECT RAISE(ABORT, 'dogfood_meta is immutable'); END;
-    `);
+    const existing = this.#db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'dogfood_runs'").get() as { name: string } | undefined;
+    if (existing === undefined) {
+      this.#db.exec(schemaSql());
+      this.#db.pragma(`user_version = ${SCHEMA_VERSION}`);
+      return;
+    }
+    const version = this.#db.pragma("user_version", { simple: true }) as number;
+    if (version >= SCHEMA_VERSION) return;
+    this.#migrateToV2();
+  }
+
+  /**
+   * Widens the run outcome vocabulary and adds the failure kind and the reconciled flag.
+   *
+   * SQLite cannot alter a CHECK constraint, so the table is rebuilt around its own name and its
+   * rows are carried across with their `sequence` values intact — the sequence is what a reader
+   * uses to order the corpus, and renumbering it would rewrite history. `dogfood_feedback.task_id`
+   * references this table and `PRAGMA foreign_keys` is a no-op inside a transaction, so
+   * enforcement is suspended before the transaction opens and integrity is verified after it
+   * commits: a migration that quietly left dangling references would be worse than one that stops.
+   */
+  #migrateToV2(): void {
+    this.#db.pragma("foreign_keys = OFF");
+    try {
+      this.#db.exec("BEGIN");
+      try {
+        this.#db.exec(runsTableSql("dogfood_runs_v2"));
+        this.#db.exec(`
+          INSERT INTO dogfood_runs_v2 (
+            sequence, project_id, task_id, mode, predicted_complexity, predicted_risk,
+            effective_complexity, effective_risk, rule_version, roles_json,
+            outcome, failure_kind, reconciled, reviewer_verdict, usage_json, prior_json, observed_at
+          )
+          SELECT
+            sequence, project_id, task_id, mode, predicted_complexity, predicted_risk,
+            effective_complexity, effective_risk, rule_version, roles_json,
+            outcome, NULL, 0, reviewer_verdict, usage_json, prior_json, observed_at
+          FROM dogfood_runs;
+          DROP TABLE dogfood_runs;
+          ALTER TABLE dogfood_runs_v2 RENAME TO dogfood_runs;
+        `);
+        this.#db.exec(runsTriggersSql("dogfood_runs"));
+        this.#db.pragma(`user_version = ${SCHEMA_VERSION}`);
+        this.#db.exec("COMMIT");
+      } catch (error) {
+        this.#db.exec("ROLLBACK");
+        throw error;
+      }
+    } finally {
+      this.#db.pragma("foreign_keys = ON");
+    }
+    const violations = this.#db.pragma("foreign_key_check") as unknown[];
+    if (violations.length > 0) throw new BrainGateInvariantError("DOGFOOD_MIGRATION_FAILED", `Dogfood migration left ${violations.length} foreign key violation(s); the corpus must be inspected before BrainGate writes to it again.`);
   }
 }

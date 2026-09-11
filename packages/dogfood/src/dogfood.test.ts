@@ -50,13 +50,18 @@ function receipt(project: RegisteredProject, complexity: TaskComplexity, risk: T
 
 function record(store: DogfoodStore, project: RegisteredProject, complexity: TaskComplexity = "T1", risk: TaskRisk = "low") {
   const predicted = classification(complexity, risk);
-  return store.recordRun({
-    receipt: receipt(project, complexity, risk),
+  const taskReceipt = receipt(project, complexity, risk);
+  return store.recordObservation({
+    taskId: taskReceipt.task.taskId,
+    receipt: taskReceipt,
     mode: "ask",
     predicted,
     effective: predicted,
     roles: [{ role: "primary", providerId: "anthropic", modelId: "test-model" }],
     outcome: "success",
+    failureKind: null,
+    prior: null,
+    reconciled: false,
     reviewerVerdict: null,
   });
 }
@@ -132,15 +137,20 @@ test("persistence rejects de-escalated effective classifications and mismatched 
     const predicted = classification("T2", "medium");
     const taskReceipt = receipt(f.project, "T2", "medium");
     const base = {
+      taskId: taskReceipt.task.taskId,
       receipt: taskReceipt,
       mode: "ask" as const,
       predicted,
       roles: [{ role: "primary" as const, providerId: "anthropic", modelId: "test-model" }],
       outcome: "success" as const,
+      failureKind: null,
+      prior: null,
+      reconciled: false,
+      reviewerVerdict: null,
     };
-    assert.throws(() => store.recordRun({ ...base, effective: classification("T1", "medium") }), /effective complexity cannot be lower/);
-    assert.throws(() => store.recordRun({ ...base, effective: classification("T2", "low") }), /effective risk cannot be lower/);
-    assert.throws(() => store.recordRun({ ...base, effective: predicted, prior: emptyDogfoodPrior("write") }), /prior mode must match/);
+    assert.throws(() => store.recordObservation({ ...base, effective: classification("T1", "medium") }), /effective complexity cannot be lower/);
+    assert.throws(() => store.recordObservation({ ...base, effective: classification("T2", "low") }), /effective risk cannot be lower/);
+    assert.throws(() => store.recordObservation({ ...base, effective: predicted, prior: emptyDogfoodPrior("write") }), /prior mode must match/);
     assert.equal(store.report().runs, 0);
   } finally { store.close(); }
 });
@@ -203,13 +213,19 @@ test("every workflow role can be recorded, so none fails a task after it succeed
   const store = new DogfoodStore(f.project);
   try {
     const roles = (["planner", "primary", "reviewer", "judge"] as const).map((role) => ({ role, providerId: "anthropic", modelId: `${role}-model` }));
-    store.recordRun({
-      receipt: receipt(f.project, "T3", "low"),
+    const taskReceipt = receipt(f.project, "T3", "low");
+    store.recordObservation({
+      taskId: taskReceipt.task.taskId,
+      receipt: taskReceipt,
       mode: "ask",
       predicted: classification("T3", "low"),
       effective: classification("T3", "low"),
       roles,
       outcome: "success",
+      failureKind: null,
+      prior: null,
+      reconciled: false,
+      reviewerVerdict: null,
     });
     const stored = store.listRuns().at(-1)!;
     assert.deepEqual(stored.roles.map((entry) => entry.role), ["planner", "primary", "reviewer", "judge"]);

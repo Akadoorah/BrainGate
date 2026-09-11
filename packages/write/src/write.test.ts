@@ -4,11 +4,29 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject, InMemoryObservationWriter, ResultStore, createFinalizer, type TaskClassification, type TaskFinalizer } from "@braingate/core";
+import { redactSecrets } from "@braingate/security";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
 import { assertSourceCheckoutUnchanged, codexIsolationProfileHash, sourceCheckoutFingerprint, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
 import { WriteDogfoodRunner, assertSourceCheckoutClean, buildWriteTaskPlan, planClaudeWriteInvocation, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
+
+/**
+ * The finalization seam the runner requires: a ledger, a result directory, and an observation
+ * writer. A runner cannot be constructed without one, which is the point — an execution package
+ * that could skip its record is how a task ends up with nothing said about it.
+ */
+function finalizerFor(project: RegisteredProject, ledger: TaskLedger): TaskFinalizer {
+  return createFinalizer({
+    ledger,
+    results: new ResultStore(project.storageDir, { redact: redactSecrets }),
+    observations: new InMemoryObservationWriter(),
+  });
+}
+
+function observationFor(classification: TaskClassification): { predicted: TaskClassification; effective: TaskClassification; prior: null } {
+  return { predicted: classification, effective: classification, prior: null };
+}
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -50,8 +68,8 @@ function snapshot(providerId: "anthropic" | "openai"): ProviderSnapshot {
 
 function router(withCodex = false): CapabilityRouter {
   const registry = new ModelRegistry();
-  registry.register({ providerId: "anthropic", modelId: "claude-write", quotaPool: "claude-subscription", capabilities: { coder: 95, reviewer: 80, judge: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaPressure: 0.1, observedAt: new Date().toISOString() });
-  if (withCodex) registry.register({ providerId: "openai", modelId: "codex-review", quotaPool: "chatgpt-subscription", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaPressure: 0.1, observedAt: new Date().toISOString() });
+  registry.register({ providerId: "anthropic", modelId: "claude-write", quotaPool: "claude-subscription", capabilities: { coder: 95, reviewer: 80, judge: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: new Date().toISOString() });
+  if (withCodex) registry.register({ providerId: "openai", modelId: "codex-review", quotaPool: "chatgpt-subscription", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: new Date().toISOString() });
   return new CapabilityRouter(registry);
 }
 
@@ -93,7 +111,7 @@ test("write dry-run makes zero provider calls and creates no worktree", async ()
   const { project, repo } = fixture(); const ledger = new TaskLedger(project); const writer = new FakeWriter(() => { throw new Error("must not run"); });
   const classification = classifyTask({ text: "change the button label", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   try {
-    const result = await new WriteDogfoodRunner({ project, ledger, router: router(), providers: [snapshot("anthropic")], writer }).run({ task: "change the button label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, context: {}, review: false, dryRun: true });
+    const result = await new WriteDogfoodRunner({ project, ledger, router: router(), providers: [snapshot("anthropic")], writer , finalizer: finalizerFor(project, ledger)}).run({ task: "change the button label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {}, review: false, dryRun: true });
     assert.equal(result.dryRun, true); assert.equal(writer.calls.length, 0); assert.equal(ledger.listTasks().length, 0); assert.equal(existsSync(join(project.storageDir, "worktrees")), false);
   } finally { ledger.close(); }
 });
@@ -102,7 +120,7 @@ test("execute changes only the task worktree and never the source checkout", asy
   const { project, repo } = fixture(); const ledger = new TaskLedger(project); const writer = new FakeWriter((cwd) => writeFileSync(join(cwd, "app.txt"), "after\n"));
   const classification = classifyTask({ text: "change the button label", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   try {
-    const result = await new WriteDogfoodRunner({ project, ledger, router: router(), providers: [snapshot("anthropic")], writer }).run({ task: "change the button label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, context: {}, review: false });
+    const result = await new WriteDogfoodRunner({ project, ledger, router: router(), providers: [snapshot("anthropic")], writer , finalizer: finalizerFor(project, ledger)}).run({ task: "change the button label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {}, review: false });
     assert.equal(readFileSync(join(repo, "app.txt"), "utf8"), "before\n"); assert.equal(git(repo, ["status", "--porcelain"]), "");
     assert.equal(readFileSync(join(result.worktree!.path, "app.txt"), "utf8"), "after\n"); assert.deepEqual(result.changedFiles, ["app.txt"]); assert.match(result.diff, /\+after/);
     assert.equal(result.verification[0]?.passed, true); assert.equal(result.approvalRequired, true); assert.equal(result.mergePerformed, false); assert.equal(result.taskReceipt?.task.state, "completed");
@@ -113,7 +131,7 @@ test("sensitive writes fail closed while preserving a clean source checkout", as
   const { project, repo } = fixture(); const ledger = new TaskLedger(project); const writer = new FakeWriter((cwd) => writeFileSync(join(cwd, ".env"), "SECRET=blocked\n"));
   const classification = classifyTask({ text: "update a small config label", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   try {
-    await assert.rejects(() => new WriteDogfoodRunner({ project, ledger, router: router(), providers: [snapshot("anthropic")], writer }).run({ task: "update a small config label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, context: {}, review: false }), /sensitive path/i);
+    await assert.rejects(() => new WriteDogfoodRunner({ project, ledger, router: router(), providers: [snapshot("anthropic")], writer , finalizer: finalizerFor(project, ledger)}).run({ task: "update a small config label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {}, review: false }), /sensitive path/i);
     assert.equal(git(repo, ["status", "--porcelain"]), ""); assert.equal(writer.calls.length, 1); assert.equal(ledger.listTasks()[0]?.state, "failed");
   } finally { ledger.close(); }
 });
@@ -122,7 +140,7 @@ test("high-risk writes fail before task/worktree/provider creation", async () =>
   const { project, repo } = fixture(); const ledger = new TaskLedger(project); const writer = new FakeWriter(() => { throw new Error("must not run"); });
   const classification = classifyTask({ text: "fix auth login and session security", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   try {
-    await assert.rejects(() => new WriteDogfoodRunner({ project, ledger, router: router(true), providers: [snapshot("anthropic"), snapshot("openai")], writer }).run({ task: "fix auth login and session security", repositoryPath: repo, classification, budget, requiredContextTokens: 500, context: {} }), /M11 permits only T0-T2/);
+    await assert.rejects(() => new WriteDogfoodRunner({ project, ledger, router: router(true), providers: [snapshot("anthropic"), snapshot("openai")], writer , finalizer: finalizerFor(project, ledger)}).run({ task: "fix auth login and session security", repositoryPath: repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {} }), /M11 permits only T0-T2/);
     assert.equal(writer.calls.length, 0); assert.equal(ledger.listTasks().length, 0); assert.equal(existsSync(join(project.storageDir, "worktrees")), false);
   } finally { ledger.close(); }
 });
@@ -131,7 +149,7 @@ test("independent Codex reviewer receives the ephemeral worktree diff", { skip: 
   const { project, repo } = fixture(); const ledger = new TaskLedger(project); const writer = new FakeWriter((cwd) => writeFileSync(join(cwd, "app.txt"), "review-me\n")); const reviewer = new FakeReviewExecutor();
   const classification = classifyTask({ text: "change the button label", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   try {
-    const result = await new WriteDogfoodRunner({ project, ledger, router: router(true), providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), writer, reviewExecutor: reviewer }).run({ task: "change the button label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, context: {}, review: true });
+    const result = await new WriteDogfoodRunner({ project, ledger, router: router(true), providers: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), writer, reviewExecutor: reviewer , finalizer: finalizerFor(project, ledger)}).run({ task: "change the button label", repositoryPath: repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {}, review: true });
     assert.equal(result.review?.providerId, "openai"); assert.equal(result.review?.verdict, "approve"); assert.equal(reviewer.calls.length, 1); assert.match(reviewer.calls[0]?.stdin ?? "", /review-me/); assert.equal(reviewer.calls[0]?.workspaceMode, "staged-clean");
     const receipt = JSON.stringify(result.taskReceipt); assert.doesNotMatch(receipt, /review-me/); assert.equal(readFileSync(join(repo, "app.txt"), "utf8"), "before\n");
   } finally { ledger.close(); }

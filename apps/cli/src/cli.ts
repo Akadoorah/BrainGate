@@ -36,7 +36,10 @@ import {
 } from "@braingate/shadow";
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
+import { reconciliationNotice } from "./tasks-cli.js";
 import { WriteDogfoodRunner, buildWriteTaskPlan, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
+import { DogfoodStore } from "@braingate/dogfood";
+import { isUsableOutcome, projectFinalizer, recordedOutcomeOf } from "./finalization.js";
 
 export interface CliDependencies {
   readonly cwd?: string;
@@ -662,8 +665,20 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         // list of tiers and model names with no way to tell one task from another.
         lines.push(`  ${entry.title}`);
         lines.push(`    ${entry.complexity}/${entry.risk} · ${attribution.length === 0 ? "no route recorded" : attribution}`);
-        lines.push(`    ${entry.outcome ?? "unknown"}${calls == null ? "" : ` · ${String(calls)} provider call${calls === 1 ? "" : "s"}`}${spend.length === 0 ? "" : ` · ${spend}`} · ${entry.taskId.slice(0, 8)}`);
+        // The recorded outcome, not the workflow phrase and not "unknown" for a task whose
+        // record is simply missing: those are three different facts and only one of them has a
+        // next step.
+        const decided = entry.strictOutcome === null ? "not recorded" : `${entry.strictOutcome}${entry.failureKind === null ? "" : ` (${entry.failureKind})`}${entry.reconciled ? " · reconciled" : ""}`;
+        lines.push(`    ${decided}${calls == null ? "" : ` · ${String(calls)} provider call${calls === 1 ? "" : "s"}`}${spend.length === 0 ? "" : ` · ${spend}`} · ${entry.taskId.slice(0, 8)}`);
       }
+      // A read that finds something unfinished says so, and stops there: repairing is a separate,
+      // explicit command. Saying nothing would leave the operator reading a summary of tasks that
+      // are not finished being written.
+      const ledger = new TaskLedger(project);
+      try {
+        const notice = reconciliationNotice(project, ledger);
+        if (notice !== null) lines.push("", notice);
+      } finally { ledger.close(); }
       emit(json, data, lines.join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
     }
@@ -768,10 +783,12 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
 
       if (!json) stdout(`${classification.complexity}/${classification.risk} · creating isolated worktree · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
       const ledger = new TaskLedger(project);
+      const store = new DogfoodStore(project);
       try {
         const runner = new WriteDogfoodRunner({
           project,
           ledger,
+          finalizer: projectFinalizer({ project, ledger, store }),
           router: hydrated.router,
           providers: snapshots,
           attestations,
@@ -789,14 +806,21 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           budget,
           requiredContextTokens,
           context: writeTaskContext(project),
+          observation: { predicted: classification, effective: classification, prior: null },
           review,
           dryRun: false,
           env,
           ...(visual === undefined ? {} : { visual }),
         });
+        // Read back what the runner recorded rather than deciding again: one derivation, one
+        // answer, and the exit code cannot disagree with the ledger.
+        const recorded = result.taskReceipt === null ? null : recordedOutcomeOf(result.taskReceipt);
         data = {
           plan: planData,
           taskId: result.taskId,
+          outcome: recorded?.outcome ?? null,
+          reviewStatus: recorded?.reviewStatus ?? null,
+          failureKind: recorded?.failureKind ?? null,
           worktree: result.worktree,
           changedFiles: result.changedFiles,
           diff: result.diff,
@@ -809,9 +833,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         };
         recordSpendFromReceipt(state, result.taskReceipt?.usage ?? [], new ModelCatalog(state.modelCatalogPath).configured());
         const reviewText = result.review === null ? "review=disabled" : `review=${result.review.providerId}/${result.review.modelId}:${result.review.verdict}`;
-        emit(json, data, `Task ${result.taskId} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\n${reviewText}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
-        return Object.freeze({ exitCode: result.readyForApproval ? 0 : 1, data });
-      } finally { ledger.close(); }
+        emit(json, data, `Task ${result.taskId} · outcome=${recorded?.outcome ?? "not recorded"}\nBranch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\n${reviewText}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
+        return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
+      } finally { ledger.close(); store.close(); }
     }
 
     if (command === "shadow") {
@@ -853,10 +877,12 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
 
       if (!json) stdout(`${classification.complexity}/${classification.risk} · executing ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
       const ledger = new TaskLedger(project);
+      const store = new DogfoodStore(project);
       try {
         const runner = new ShadowDogfoodRunner({
           project,
           ledger,
+          finalizer: projectFinalizer({ project, ledger, store }),
           router: hydrated.router,
           snapshots,
           attestations,
@@ -873,21 +899,28 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           budget,
           requiredContextTokens,
           context,
+          observation: { predicted: classification, effective: classification, prior: null },
           contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: requiredContextTokens, truncatedItems: 0, sourceLabels: ["operator-minimal-context"] },
           optionalReview,
           dryRun: false,
         });
+        if (result.taskReceipt === null) throw new BrainGateInvariantError("CLI_RECEIPT_MISSING", "Executed shadow run did not produce a task receipt.");
+        // The recorded outcome decides the exit code. This used to return 0 unconditionally, so a
+        // task that failed at the provider looked exactly like one that answered.
+        const recorded = recordedOutcomeOf(result.taskReceipt);
         data = {
           plan: planData,
           taskId: result.taskId,
-          outcome: result.workflow?.outcome ?? null,
+          outcome: recorded?.outcome ?? null,
+          reviewStatus: recorded?.reviewStatus ?? null,
+          failureKind: recorded?.failureKind ?? null,
           answer: result.workflow?.finalOutput ?? null,
           usage: result.taskReceipt.usage,
         };
         recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
-        emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · outcome=${result.workflow?.outcome ?? "unknown"}`, stdout);
-        return Object.freeze({ exitCode: 0, data });
-      } finally { ledger.close(); }
+        emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · outcome=${recorded?.outcome ?? "not recorded"}${recorded?.failureKind === null || recorded?.failureKind === undefined ? "" : ` (${recorded.failureKind})`}`, stdout);
+        return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
+      } finally { ledger.close(); store.close(); }
     }
 
     throw new BrainGateInvariantError("CLI_COMMAND_INVALID", `Unknown BrainGate command: ${command}.`);

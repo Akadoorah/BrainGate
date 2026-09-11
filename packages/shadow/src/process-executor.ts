@@ -5,8 +5,14 @@ import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import { grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
+import { trackChild } from "./child-registry.js";
+import { DEFAULT_PROVIDER_CALL_MS, MAX_PROVIDER_CALL_MS } from "./limits.js";
 import { ContractTextStream, LineBuffer, ProviderStreamReader } from "./streaming.js";
 import { STAGE_PATH_TOKEN, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "./types.js";
+
+/** How much of a failed run's own words are kept for diagnosis, on top of the retained lines. */
+const FAILURE_TAIL_CHARS = 4_000;
+const FAILURE_TAIL_LINES = 50;
 
 /**
  * Runs a display callback without letting it end the run.
@@ -56,7 +62,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly onThinking?: () => void;
   }): Promise<ShadowProcessResult> {
     const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
-    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? 180_000, 1_000), 20 * 60_000);
+    const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_PROVIDER_CALL_MS, 1_000), MAX_PROVIDER_CALL_MS);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
     const baseEnv = input.env ?? process.env;
     let tempRoot: string | null = null;
@@ -163,20 +169,41 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         let overflow = false;
         let spawned = false;
         let settled = false;
+        // What the run said last, kept only for a failed run's diagnosis.
+        //
+        // A streamed provider's output is deliberately thinned on the way in — the deltas carry
+        // the answer and are dropped — so a failure would otherwise leave nothing of the CLI's own
+        // words to read. This bounded ring is the exception: raw lines, last fifty or four
+        // kilobytes, used only when something goes wrong.
+        const tail: string[] = [];
+        let tailChars = 0;
+        const remember = (line: string): void => {
+          tail.push(line);
+          tailChars += line.length;
+          while (tail.length > FAILURE_TAIL_LINES || (tailChars > FAILURE_TAIL_CHARS && tail.length > 1)) {
+            tailChars -= tail.shift()!.length;
+          }
+        };
         const child = spawn(input.plan.executable, args, { cwd: spawnCwd, env: environment.env, shell: false, stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+        // Registered so a termination signal reaches a provider that a terminal Ctrl-C would not:
+        // a signal sent to BrainGate alone leaves the child spending a subscription unrecorded.
+        const untrack = trackChild(child);
         const finish = (exitCode: number | null) => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          untrack();
           if (dialect !== null) {
             const rest = lines.flush();
             if (rest.trim().length > 0) consume(rest);
           }
+          const stdoutTail = dialect === null ? stdout.slice(-FAILURE_TAIL_CHARS) : tail.join("\n");
           resolveResult(Object.freeze({
             spawned,
             exitCode: overflow ? null : exitCode,
             stdout: redactSecrets(stdout),
             stderr: redactSecrets(stderr),
+            stdoutTail: redactSecrets(stdoutTail),
             assembled: dialect === null || assembled.length === 0 ? null : redactSecrets(assembled),
             timedOut: timedOut || overflow,
             durationMs: Date.now() - started,
@@ -205,6 +232,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         let shape: "unknown" | "contract-json" | "prose" = "unknown";
 
         const consume = (line: string): void => {
+          remember(line);
           const verdict = reader!.read(line);
           if (verdict.restart === true && assembled.length > 0) {
             // A fresh block is a fresh answer. The prose reader starts again with it, so a

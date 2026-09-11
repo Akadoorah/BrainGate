@@ -11,7 +11,7 @@ function snapshot(): DashboardSnapshot {
       observedAt: "2026-09-07T01:00:00.000Z", resetAt: null, provenances: ["unknown"],
       metrics: [{ sequence: 1, provider: "xai<script>alert(1)</script>", quotaPool: "grok-free", metric: "remaining", window: null, value: null, unit: "%", resetAt: null, status: "unknown", evidence: "unknown", source: null, observedAt: "2026-09-07T01:00:00.000Z" }],
     }],
-    activeTasks: [{ taskId: "task-1", projectId: "waslo", projectName: "Waslo", title: "<img src=x onerror=alert(1)>", state: "running", complexity: "T2", risk: "medium", updatedAt: "2026-09-07T01:00:00.000Z", route: [], budget: null, approvalStatus: "pending", outcome: null, usageProvenance: [], tokensByModel: [] }],
+    activeTasks: [{ taskId: "task-1", projectId: "waslo", projectName: "Waslo", title: "<img src=x onerror=alert(1)>", state: "running", complexity: "T2", risk: "medium", updatedAt: "2026-09-07T01:00:00.000Z", route: [], budget: null, approvalStatus: "pending", outcome: null, strictOutcome: null, reviewStatus: null, failureKind: null, reconciled: false, usageProvenance: [], tokensByModel: [] }],
     recentTasks: [],
     provenanceLegend: ["native", "measured", "estimated", "unknown"],
   };

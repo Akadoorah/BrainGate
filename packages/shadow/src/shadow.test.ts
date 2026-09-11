@@ -6,13 +6,19 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
   BrainGateInvariantError,
+  InMemoryObservationWriter,
   ProjectRegistry,
+  ResultStore,
   TaskLedger,
   budgetFor,
   classifyTask,
+  createFinalizer,
   parseProjectConfig,
   type RegisteredProject,
+  type TaskClassification,
+  type TaskFinalizer,
 } from "@braingate/core";
+import { redactSecrets } from "@braingate/security";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry, type ModelRef } from "@braingate/router";
 import type { AgentRequest } from "@braingate/workflows";
@@ -61,6 +67,24 @@ import {
   type SubscriptionAttestation,
 } from "./index.js";
 
+/**
+ * The finalization seam the runner requires.
+ *
+ * A runner cannot be constructed without one, which is the point: an execution package that could
+ * silently skip its record is how a task ends up in the ledger with nothing said about it.
+ */
+function finalizerFor(project: RegisteredProject, ledger: TaskLedger): TaskFinalizer {
+  return createFinalizer({
+    ledger,
+    results: new ResultStore(project.storageDir, { redact: redactSecrets }),
+    observations: new InMemoryObservationWriter(),
+  });
+}
+
+function observationFor(classification: TaskClassification): { predicted: TaskClassification; effective: TaskClassification; prior: null } {
+  return { predicted: classification, effective: classification, prior: null };
+}
+
 function git(cwd: string, args: readonly string[]): void {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
   if (result.status !== 0) throw new Error(String(result.stderr));
@@ -104,7 +128,7 @@ function registryWithClaude(): ModelRegistry {
   const registry = new ModelRegistry();
   registry.register(
     { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null },
-    { available: true, quotaState: "healthy", quotaPressure: 0.2, observedAt: "2026-09-07T00:00:00Z" },
+    { available: true, quotaState: "healthy", quotaHint: 0.2, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
   );
   return registry;
 }
@@ -113,7 +137,7 @@ function registryWithClaudeAndCodex(): ModelRegistry {
   const registry = registryWithClaude();
   registry.register(
     { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null },
-    { available: true, quotaState: "healthy", quotaPressure: 0.1, observedAt: "2026-09-07T00:00:00Z" },
+    { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
   );
   return registry;
 }
@@ -397,9 +421,10 @@ test("the runner spends the budget's turns rather than a fixed ceiling", async (
   const taskText = "What does the README file say?";
   const classification = classifyTask({ text: taskText, mode: "ask" });
   const budget = budgetFor(classification, { writeRequested: false });
-  await new ShadowDogfoodRunner({ project, ledger: new TaskLedger(project), router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], executor: fake }).run({
+  const ledger = new TaskLedger(project);
+  await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], executor: fake, finalizer: finalizerFor(project, ledger) }).run({
     title: "Inspect readme", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
-    context: {}, contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
   });
   const turns = fake.calls[0]!.args[fake.calls[0]!.args.indexOf("--max-turns") + 1];
   assert.equal(turns, String(budget.maxInspectionTurns));
@@ -446,7 +471,7 @@ test("node executor blocks cwd escapes, scrubs API env overrides and stages clea
   assert.equal(existsSync(spawnCwd!), false);
 });
 
-test("dogfood dry-run performs full T0 preflight with zero executor calls and zero usage", async () => {
+test("dogfood dry-run performs full T0 preflight with zero executor calls and records no task", async () => {
   const { repo, project } = setupProject();
   const ledger = new TaskLedger(project);
   const router = new CapabilityRouter(registryWithClaude());
@@ -455,14 +480,18 @@ test("dogfood dry-run performs full T0 preflight with zero executor calls and ze
   const classification = classifyTask({ text: taskText, mode: "ask" });
   const budget = budgetFor(classification, { writeRequested: false });
   try {
-    const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic")], executor: fake }).run({
+    const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic")], executor: fake, finalizer: finalizerFor(project, ledger) }).run({
       title: "Inspect theme config", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
-      context: { files: ["src/theme.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
+      context: { files: ["src/theme.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
     });
     assert.equal(result.dryRun, true);
     assert.equal(fake.calls.length, 0);
-    assert.equal(result.taskReceipt.usage.length, 0);
-    assert.equal(result.taskReceipt.task.state, "completed");
+    // A dry run reaches no provider, so it creates no task: a task row is a claim that work was
+    // attempted, and the record would otherwise carry a success for work never done. The write
+    // path already returns before creating one, and this aligns the read path with it.
+    assert.equal(result.taskId, null);
+    assert.equal(result.taskReceipt, null);
+    assert.equal(ledger.listTasks().length, 0);
   } finally { ledger.close(); }
 });
 
@@ -480,12 +509,12 @@ test("a read-only run that mutates the source checkout fails closed and the task
   // before ever reaching the guard under test.
   const taskText = "What does the README file say?";
   const classification = classifyTask({ text: taskText, mode: "ask" });
-  const runner = new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], executor: misbehaving });
+  const runner = new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], executor: misbehaving, finalizer: finalizerFor(project, ledger) });
 
   await assert.rejects(
     () => runner.run({
       title: "Inspect readme", task: taskText, cwd: repo, classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 500,
-      context: {}, contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
     }),
     /SHADOW_SOURCE_MUTATED|checkout changed while a read-only task was running/,
   );
@@ -551,9 +580,9 @@ test("high-risk workflow routes Claude primary plus Codex independent reviewer w
   assert.equal(classification.risk, "high", "the fixture must actually be a task that requires review");
   const budget = budgetFor(classification, { writeRequested: false });
   try {
-    const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake }).run({
+    const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake, finalizer: finalizerFor(project, ledger) }).run({
       title: "Inspect auth session", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
-      context: { files: ["src/auth.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+      context: { files: ["src/auth.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
     });
     assert.equal(result.workflow?.primary.model.definition.providerId, "anthropic");
     assert.equal(result.workflow?.reviewer?.model.definition.providerId, "openai");
@@ -572,9 +601,9 @@ test("high-risk auth shadow preflight without Codex isolation spends zero provid
   const classification = classifyTask({ text: taskText, mode: "review" });
   const budget = budgetFor(classification, { writeRequested: false });
   try {
-    await assert.rejects(() => new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], executor: fake }).run({
+    await assert.rejects(() => new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], executor: fake, finalizer: finalizerFor(project, ledger) }).run({
       title: "Inspect auth session", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
-      context: { files: ["src/auth.ts"] }, contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
+      context: { files: ["src/auth.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: true,
     }), /No eligible model for role reviewer/);
     assert.equal(fake.calls.length, 0);
     assert.equal(ledger.listTasks().length, 0);
@@ -973,4 +1002,65 @@ test("search reaches a provider only where the operator granted the network", ()
   // The other decision is not this decision.
   const unscopedOnly = planShadowInvocation({ ...base, acceptance: acceptance("anthropic", { acceptedAt: new Date("2026-09-07T00:00:00Z").toISOString() }) });
   assert.equal(unscopedOnly.args[unscopedOnly.args.indexOf("--tools") + 1], "Read,Glob,Grep");
+});
+
+// A provider CLI is a child process. A terminal Ctrl-C reaches the whole foreground process group,
+// so the provider gets it too; a signal sent to BrainGate alone does not, and the run would die with
+// the task unfinished and a subscription still being spent. This is the only part of that path a
+// test can drive: a real child, and a real kill.
+test("a signal sent to BrainGate alone still reaches the provider it spawned", async () => {
+  const { trackChild, trackedChildCount, abortTrackedChildren } = await import("./child-registry.js");
+  const { spawn } = await import("node:child_process");
+  const child = spawn(process.execPath, ["-e", "setTimeout(() => {}, 60_000)"], { stdio: "ignore" });
+  const exited = new Promise<void>((resolveExit) => { child.on("exit", () => { resolveExit(); }); });
+  trackChild(child);
+  assert.equal(trackedChildCount(), 1);
+
+  const killed = abortTrackedChildren();
+  assert.equal(killed, 1);
+  assert.equal(trackedChildCount(), 0);
+  await exited;
+  assert.notEqual(child.exitCode, 0, "the child must have been killed, not left running");
+  assert.equal(child.signalCode, "SIGKILL");
+  // Aborting again is not an error: a second signal on the way out must not throw.
+  assert.equal(abortTrackedChildren(), 0);
+});
+
+// The failure this closes, in the operator's own words: an exhausted Anthropic pool was dispatched
+// to, refused in a few seconds, and nothing was recorded — no refusal, no quota reading, no reason.
+// The readings were collected after the exit-code check that throws on a refusal, so the one call
+// where the provider states its own limit was the one call that recorded nothing.
+test("a refused call records what the provider said about its own limit", async () => {
+  const { repo, project } = setupProject();
+  const refusal = JSON.stringify({
+    type: "rate_limit_event",
+    rate_limit_info: {
+      status: "rejected",
+      resetsAt: 1789015200,
+      rateLimitType: "five_hour",
+      unifiedWindows: { five_hour: { utilization: 1, resetsAt: 1789015200 }, seven_day: { utilization: 0.93, resetsAt: 1789200000 } },
+    },
+  });
+  const fake = new FakeExecutor(() => `${refusal}\n{"type":"result","subtype":"error_during_execution"}`);
+  fake.exitCode = 1;
+  const readings: { window: string | null; utilization: number | null; blocked: boolean; quotaPool: string }[] = [];
+  const invoker = new SubscriptionShadowAgentInvoker({
+    project, cwd: repo, snapshots: [snapshot("anthropic")], context: {},
+    executor: fake, onQuotaReading: (reading) => { readings.push({ window: reading.window, utilization: reading.utilization, blocked: reading.blocked, quotaPool: reading.quotaPool }); },
+  });
+  const request: AgentRequest = { role: "primary", model, phase: "initial", task: "summarise the readme", findings: [] };
+  await assert.rejects(() => invoker.invoke(request), /failed with exit 1/);
+  // Both windows, with the provider's own numbers, attributed to the pool that was spent.
+  assert.deepEqual(readings.map((reading) => reading.window).sort(), ["five_hour", "seven_day"]);
+  assert.equal(readings.every((reading) => reading.blocked), true);
+  assert.equal(readings.every((reading) => reading.quotaPool === "claude-subscription"), true);
+  assert.equal(readings.find((reading) => reading.window === "seven_day")?.utilization, 0.93);
+});
+
+test("an empty answer is refused rather than recorded as work that produced nothing", async () => {
+  const { repo, project } = setupProject();
+  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "   " }) }));
+  const invoker = new SubscriptionShadowAgentInvoker({ project, cwd: repo, snapshots: [snapshot("anthropic")], context: {}, executor: fake });
+  const request: AgentRequest = { role: "primary", model, phase: "initial", task: "summarise the readme", findings: [] };
+  await assert.rejects(() => invoker.invoke(request), /empty result/);
 });

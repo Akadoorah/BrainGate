@@ -1,4 +1,6 @@
 export * from "./types.js";
+export * from "./limits.js";
+export * from "./child-registry.js";
 export * from "./codex-isolation.js";
 export * from "./grok-isolation.js";
 export * from "./isolation-cache.js";

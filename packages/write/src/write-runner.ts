@@ -1,4 +1,21 @@
-import { BrainGateInvariantError, type ExecutionBudget, type RegisteredProject, type TaskClassification, type TaskLedger } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  deriveOutcome,
+  failureKindFromCode,
+  isWriteVerdict,
+  ledgerStateFor,
+  registerActiveRun,
+  type ExecutionBudget,
+  type FailureKind,
+  type FinalizationPlan,
+  type ObservationRole,
+  type RegisteredProject,
+  type TaskClassification,
+  type TaskFinalizer,
+  type TaskLedger,
+  type TaskReceipt,
+  type WriteVerdict,
+} from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
@@ -15,6 +32,16 @@ import type { PlannedWriteRole, VisualRequest, WriteProviderExecutor, WriteRunRe
 function modelRef(route: RouteResult): ModelRef {
   const definition = route.selected.model.definition;
   return Object.freeze({ providerId: definition.providerId, modelId: definition.modelId, quotaPool: definition.quotaPool });
+}
+
+/** Who this plan says will work, recorded with the run so the record names its own models. */
+function observationRolesFor(roles: readonly PlannedWriteRole[]): readonly ObservationRole[] {
+  const seen: ObservationRole[] = [];
+  for (const role of roles) {
+    if (seen.some((entry) => entry.role === role.role && entry.providerId === role.model.providerId && entry.modelId === role.model.modelId)) continue;
+    seen.push(Object.freeze({ role: role.role, providerId: role.model.providerId, modelId: role.model.modelId }));
+  }
+  return Object.freeze(seen);
 }
 
 function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
@@ -199,6 +226,7 @@ export class WriteDogfoodRunner {
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #grokWriteIsolation: GrokIsolationAttestation | undefined;
   readonly #acceptances: readonly OperatorProviderAcceptance[];
+  readonly #finalizer: TaskFinalizer;
   readonly #writer: WriteProviderExecutor;
   readonly #reviewExecutor: ShadowProcessExecutor | undefined;
   readonly #visualExecutor: ShadowProcessExecutor | undefined;
@@ -218,6 +246,8 @@ export class WriteDogfoodRunner {
     readonly reviewExecutor?: ShadowProcessExecutor;
     /** Executor for the artifact-producing pass; defaults to the real one. */
     readonly visualExecutor?: ShadowProcessExecutor;
+    /** Where this run's permanent record is written. Required; see `ShadowDogfoodRunner`. */
+    readonly finalizer: TaskFinalizer;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
@@ -231,6 +261,7 @@ export class WriteDogfoodRunner {
     this.#writer = input.writer ?? new NodeClaudeWriteExecutor();
     this.#reviewExecutor = input.reviewExecutor;
     this.#visualExecutor = input.visualExecutor;
+    this.#finalizer = input.finalizer;
   }
 
   async run(input: {
@@ -243,6 +274,15 @@ export class WriteDogfoodRunner {
     /** When present, an artifact-producing pass runs in the same worktree (ADR 0007). */
     readonly visual?: VisualRequest;
     readonly context: unknown;
+    /**
+     * Classification and prior for the record. Required: an optional context is how a task ends up
+     * in the ledger with nothing said about it, which is the defect this milestone removes.
+     */
+    readonly observation: {
+      readonly predicted: TaskClassification;
+      readonly effective: TaskClassification;
+      readonly prior: unknown;
+    };
     readonly review?: boolean;
     readonly dryRun?: boolean;
     readonly env?: NodeJS.ProcessEnv;
@@ -267,6 +307,75 @@ export class WriteDogfoodRunner {
 
     const task = this.#ledger.createTask({ title: taskTitleFor(input.task), complexity: input.classification.complexity, risk: input.classification.risk });
     this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: true, mergeAvailable: false });
+
+    /**
+     * The one place this run's outcome is composed.
+     *
+     * It goes through the same core derivation a reconciler uses, so a run that dies between the
+     * work and the record still produces the record it would have produced itself.
+     */
+    const planFor = (evidence: {
+      readonly writeCompleted: boolean;
+      readonly writeReviewRan: boolean;
+      readonly writeVerdict: WriteVerdict | null;
+      readonly failureKind: FailureKind | null;
+      readonly result: FinalizationPlan["result"];
+    }): FinalizationPlan => {
+      const derived = deriveOutcome({
+        mode: "write",
+        workflow: null,
+        writeCompleted: evidence.writeCompleted,
+        writeReviewRan: evidence.writeReviewRan,
+        writeVerdict: evidence.writeVerdict,
+        failureKind: evidence.failureKind,
+        reconciled: false,
+      });
+      return Object.freeze({
+        taskId: task.taskId,
+        projectId: this.#project.projectId,
+        mode: "write" as const,
+        outcome: derived.outcome,
+        reviewStatus: derived.reviewStatus,
+        failureKind: evidence.failureKind,
+        basis: derived.basis,
+        result: evidence.result,
+        observation: Object.freeze({
+          predicted: input.observation.predicted,
+          effective: input.observation.effective,
+          roles: observationRolesFor(plan.roles),
+          prior: input.observation.prior,
+        }),
+        reconciled: false,
+        ledgerState: ledgerStateFor(derived.outcome, "write"),
+      });
+    };
+    let finalization: FinalizationPlan | null = null;
+    let finalized = false;
+    const complete = (): void => {
+      if (finalized || finalization === null) return;
+      finalized = true;
+      this.#finalizer.finalize(finalization);
+    };
+    // The receipt is read after finalization, not while building the return value: a return
+    // expression is evaluated before the surrounding `finally` runs, so reading it there would
+    // report the state from before the outcome was recorded.
+    const finish = (): TaskReceipt => {
+      complete();
+      return this.#ledger.receipt(task.taskId);
+    };
+    // A termination signal is the only warning this process gets before it stops writing. Without
+    // this the task would stay `running` and its worktree would be left to a later reconciler.
+    const unregister = registerActiveRun(() => {
+      finalization ??= planFor({
+        writeCompleted: false,
+        writeReviewRan: false,
+        writeVerdict: null,
+        failureKind: "interrupted",
+        result: Object.freeze({ kind: "none" as const, text: null, evidence: "lost-to-crash" as const }),
+      });
+      complete();
+    });
+
     const worktrees = new WorktreeGuard(this.#project);
     let handle;
     try {
@@ -293,8 +402,30 @@ export class WriteDogfoodRunner {
         // The write profile's proof, not the reviewer's: they are different policies.
         ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
       });
+      // The write path recorded no provider events at all: a task that spent a subscription and
+      // came back empty left nothing saying a call had happened. These are the same event kinds
+      // the read path emits, so one reader understands both.
+      this.#ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool });
       const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
-      if (!result.spawned || result.timedOut || result.exitCode !== 0) throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `${primary.model.providerId} write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
+      if (!result.spawned || result.timedOut || result.exitCode !== 0) {
+        this.#ledger.appendEvent(task.taskId, "shadow.provider.failed", {
+          role: "primary",
+          phase: "write",
+          provider: primary.model.providerId,
+          model: primary.model.modelId,
+          quotaPool: primary.model.quotaPool,
+          failureKind: result.timedOut ? "timeout" : "provider-failed",
+          timedOut: result.timedOut,
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          error: result.stderr.slice(0, 500),
+          // Bounded evidence of what the CLI said. The write executor already redacts.
+          stderrTail: result.stderr.slice(-2_000),
+          stdoutTail: result.stdout.slice(-2_000),
+        });
+        throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `${primary.model.providerId} write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
+      }
+      this.#ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool, durationMs: result.durationMs });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });
@@ -320,8 +451,8 @@ export class WriteDogfoodRunner {
       const verification: WriteVerificationResult[] = [Object.freeze({ command: "git diff --check", passed: !verifyResult.timedOut && verifyResult.exitCode === 0, exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut })];
       if (!verification[0]!.passed) {
         this.#ledger.appendEvent(task.taskId, "write.verification_failed", { command: "git diff --check", exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut });
-        this.#ledger.transition(task.taskId, "failed", { write: true, reason: "verification", readyForApproval: false });
-        return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: this.#ledger.receipt(task.taskId) });
+        finalization = planFor({ writeCompleted: false, writeReviewRan: false, writeVerdict: null, failureKind: "verification-failed", result: Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }) });
+        return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: finish() });
       }
 
       this.#ledger.transition(task.taskId, "verifying", { write: true, changedFileCount: guarded.changedFiles.length });
@@ -349,15 +480,36 @@ export class WriteDogfoodRunner {
 
       assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
       const readyForApproval = review === null || review.verdict === "approve";
-      if (readyForApproval) this.#ledger.transition(task.taskId, "completed", { write: true, readyForApproval: true, approvalRequired: true, mergePerformed: false, branch: handle.branch });
-      else this.#ledger.transition(task.taskId, "failed", { write: true, reason: "review", reviewVerdict: review?.verdict ?? "unknown", readyForApproval: false, approvalRequired: true, mergePerformed: false, branch: handle.branch });
-      return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review, readyForApproval, approvalRequired: true, mergePerformed: false, taskReceipt: this.#ledger.receipt(task.taskId) });
+      finalization = planFor({
+        writeCompleted: true,
+        writeReviewRan: review !== null,
+        writeVerdict: review !== null && isWriteVerdict(review.verdict) ? review.verdict : null,
+        failureKind: null,
+        // The guarded diff is the result: it is what the operator approves and what a later reader
+        // needs in order to judge the change without re-running a provider to see it again.
+        result: guarded.changedFiles.length > 0
+          ? Object.freeze({ kind: "diff" as const, text: guarded.diff, evidence: "redacted" as const })
+          : Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }),
+      });
+      return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review, readyForApproval, approvalRequired: true, mergePerformed: false, taskReceipt: finish() });
     } catch (error) {
-      const current = this.#ledger.requireTask(task.taskId);
-      if (current.state === "planned" || current.state === "running" || current.state === "verifying") this.#ledger.transition(task.taskId, "failed", { write: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
+      // No transition here: the finalizer owns the terminal state, and it derives it from the same
+      // evidence a reconciler would find — so a run that dies right now is repaired to the state
+      // this code would have written, rather than to a different one.
+      finalization = planFor({
+        writeCompleted: false,
+        writeReviewRan: false,
+        writeVerdict: null,
+        failureKind: error instanceof BrainGateInvariantError ? failureKindFromCode(error.code) : "unknown",
+        result: Object.freeze({ kind: "none" as const, text: null, evidence: "lost-to-crash" as const }),
+      });
       throw error;
     } finally {
-      worktrees.close();
+      unregister();
+      // The worktree is released before the record is attempted, and the record is attempted even
+      // if the release throws: an unremovable worktree must not also lose the task's outcome.
+      try { worktrees.close(); }
+      finally { try { complete(); } catch { /* an incomplete record is reconciled later, not hidden */ } }
     }
   }
 

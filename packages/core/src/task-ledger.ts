@@ -4,10 +4,11 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 import { BrainGateInvariantError } from "./errors.js";
 import { assertRegisteredProject, type RegisteredProject } from "./project-registry.js";
+import type { TaskComplexity, TaskRisk, TaskState } from "./task-outcome.js";
 
-export type TaskState = "created" | "planned" | "running" | "verifying" | "completed" | "failed" | "cancelled";
-export type TaskComplexity = "T0" | "T1" | "T2" | "T3" | "T4";
-export type TaskRisk = "low" | "medium" | "high" | "critical";
+// The vocabularies live in `task-outcome.ts` as runtime lists, so a validator and the type it
+// checks cannot drift apart. They are exported from the package index, not from here, so the
+// barrel has exactly one source for each name.
 export type UsageEvidence = "native" | "measured" | "estimated" | "unknown";
 
 export interface CreateTaskInput {

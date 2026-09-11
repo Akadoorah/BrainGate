@@ -1,15 +1,23 @@
 import {
   BrainGateInvariantError,
+  deriveOutcome,
+  failureKindFromCode,
+  ledgerStateFor,
+  registerActiveRun,
   type ExecutionBudget,
+  type FailureKind,
+  type FinalizationPlan,
+  type ObservationRole,
   type RegisteredProject,
   type TaskClassification,
+  type TaskFinalizer,
   type TaskLedger,
   type TaskReceipt,
 } from "@braingate/core";
 import { buildTaskBrief, recordTaskBrief, recordWorkflowReceipt } from "@braingate/observability";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
-import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole } from "@braingate/workflows";
+import { CapabilityRouter, type ModelRef, type RouteCandidate, type RouteResult } from "@braingate/router";
+import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole, type WorkflowOutcome } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import type { GrokIsolationAttestation } from "./grok-isolation.js";
 import { SubscriptionShadowAgentInvoker, type RoleActivity } from "./invoker.js";
@@ -61,10 +69,65 @@ function exclusionsFor(
   }).map((snapshot) => snapshot.providerId));
 }
 
+const ROUTE_ROLE: Readonly<Record<string, ObservationRole["role"]>> = Object.freeze({
+  coder: "primary",
+  primary: "primary",
+  planner: "planner",
+  reviewer: "reviewer",
+  judge: "judge",
+});
+
+function observationRole(role: string, definition: { readonly providerId: string; readonly modelId: string }): ObservationRole | null {
+  const mapped = ROUTE_ROLE[role];
+  if (mapped === undefined) return null;
+  return Object.freeze({ role: mapped, providerId: definition.providerId, modelId: definition.modelId });
+}
+
+function addRole(into: ObservationRole[], entry: ObservationRole | null): void {
+  if (entry === null) return;
+  if (into.some((existing) => existing.role === entry.role && existing.providerId === entry.providerId && existing.modelId === entry.modelId)) return;
+  into.push(entry);
+}
+
+/** What actually ran, taken from the workflow's own record rather than from what was planned. */
+function rolesFromWorkflow(workflow: WorkflowReceipt): readonly ObservationRole[] {
+  const roles: ObservationRole[] = [];
+  const add = (candidate: RouteCandidate | null, role: string): void => {
+    if (candidate === null) return;
+    addRole(roles, observationRole(role, candidate.model.definition));
+  };
+  add(workflow.planner, "planner");
+  add(workflow.secondPlanner, "planner");
+  add(workflow.primary, "primary");
+  add(workflow.reviewer, "reviewer");
+  add(workflow.judge, "judge");
+  return Object.freeze(roles);
+}
+
+/** What was planned, for a run that failed before the workflow recorded anything. */
+function rolesFromRoutes(routes: readonly RouteResult[]): readonly ObservationRole[] {
+  const roles: ObservationRole[] = [];
+  for (const route of routes) addRole(roles, observationRole(route.role, route.selected.model.definition));
+  return Object.freeze(roles);
+}
+
+/**
+ * What the measurement layer needs about this run, supplied by the caller that classified it.
+ *
+ * Required rather than optional: an optional context is exactly how a task ends up in the ledger
+ * with no observation, which is the defect M19 exists to remove. Making it required turns an
+ * omission into a compile error at every construction site.
+ */
+export interface ShadowObservationContext {
+  readonly predicted: TaskClassification;
+  readonly effective: TaskClassification;
+  readonly prior: unknown;
+}
+
 export interface ShadowDogfoodResult {
   readonly dryRun: boolean;
-  readonly taskId: string;
-  readonly taskReceipt: TaskReceipt;
+  readonly taskId: string | null;
+  readonly taskReceipt: TaskReceipt | null;
   readonly workflow: WorkflowReceipt | null;
 }
 
@@ -78,6 +141,7 @@ export class ShadowDogfoodRunner {
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
+  readonly #finalizer: TaskFinalizer;
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
   readonly #onText: ((text: string) => void) | undefined;
   readonly #onThinking: (() => void) | undefined;
@@ -93,6 +157,14 @@ export class ShadowDogfoodRunner {
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly grokIsolation?: GrokIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
+    /**
+     * Where the run's permanent record is written.
+     *
+     * Required, and called exactly once per run on every exit path. The runner does not know what
+     * is behind it: the CLI composes a ledger, a project-local measurement store and the result
+     * directory, and an execution package that imported any of those would be the wrong shape.
+     */
+    readonly finalizer: TaskFinalizer;
     /** Told which provider and model is working, as each role starts and finishes. */
     readonly onRoleActivity?: (activity: RoleActivity) => void;
     /** Told the model's prose as it is written, for a provider whose stream shape is known. */
@@ -111,6 +183,7 @@ export class ShadowDogfoodRunner {
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#executor = input.executor;
+    this.#finalizer = input.finalizer;
     this.#onRoleActivity = input.onRoleActivity;
     this.#onText = input.onText;
     this.#onThinking = input.onThinking;
@@ -133,11 +206,15 @@ export class ShadowDogfoodRunner {
       readonly truncatedItems: number;
       readonly sourceLabels?: readonly string[];
     };
+    /** Classification and prior for the record. Required; see `ShadowObservationContext`. */
+    readonly observation: ShadowObservationContext;
     readonly optionalReview?: boolean;
     readonly dryRun?: boolean;
   }): Promise<ShadowDogfoodResult> {
     if (input.task.trim().length === 0) throw new BrainGateInvariantError("SHADOW_TASK_INVALID", "Shadow task must be non-empty.");
     if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("SHADOW_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
+    const dryRun = input.dryRun ?? false;
+
     const cwd = assertShadowProjectCwd(this.#project, input.cwd);
     const isolation = Object.freeze({
       ...(this.#codexIsolation === undefined ? {} : { codex: this.#codexIsolation }),
@@ -175,32 +252,123 @@ export class ShadowDogfoodRunner {
       });
     }
 
+    // A dry run performs no provider call, so it creates no task: a task row is a claim that work
+    // was attempted, and the record would otherwise carry an outcome for work never done. The
+    // write path already returns before creating one, and this keeps the two aligned. Everything
+    // above still runs, so a dry run remains a real preflight — routing and eligibility are
+    // checked, which is what the caller is asking for.
+    if (dryRun) {
+      return Object.freeze({ dryRun: true, taskId: null, taskReceipt: null, workflow: null });
+    }
+
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
-    this.#ledger.transition(task.taskId, "planned", { shadow: true, dryRun: input.dryRun ?? false });
+    this.#ledger.transition(task.taskId, "planned", { shadow: true, dryRun: false });
     const brief = buildTaskBrief({ project: this.#project, task: this.#ledger.requireTask(task.taskId), classification: input.classification, budget: input.budget, routes, context: input.contextSummary, permissions: { executionProfile: "shadow-read-only", networkAllowed: false }, worktree: { enabled: false, taskWorktreeLabel: null } });
     recordTaskBrief(this.#ledger, brief);
 
-    if (input.dryRun ?? false) {
-      this.#ledger.appendEvent(task.taskId, "shadow.dry_run", { providers: routes.map((route) => route.selected.model.definition.providerId), roles: routes.map((route) => route.role), providerCalls: 0 });
-      this.#ledger.transition(task.taskId, "running", { dryRun: true, providerCalls: 0 });
-      this.#ledger.transition(task.taskId, "completed", { dryRun: true, providerCalls: 0 });
-      return Object.freeze({ dryRun: true, taskId: task.taskId, taskReceipt: this.#ledger.receipt(task.taskId), workflow: null });
-    }
-
     this.#ledger.transition(task.taskId, "running", { shadow: true });
+
+    /**
+     * Everything the finalization needs, composed in one place.
+     *
+     * The outcome is derived from the evidence this run recorded, through the same core function a
+     * reconciler uses — so a run that dies mid-finalization and is completed later produces the
+     * same record it would have produced itself.
+     */
+    const planFor = (options: {
+      readonly workflow: WorkflowOutcome | null;
+      readonly failureKind: FailureKind | null;
+      readonly result: FinalizationPlan["result"];
+      readonly roles: readonly ObservationRole[];
+    }): FinalizationPlan => {
+      const derived = deriveOutcome({
+        mode: "ask",
+        workflow: options.workflow,
+        writeCompleted: false,
+        writeReviewRan: false,
+        writeVerdict: null,
+        failureKind: options.failureKind,
+        reconciled: false,
+      });
+      return Object.freeze({
+        taskId: task.taskId,
+        projectId: this.#project.projectId,
+        mode: "ask" as const,
+        outcome: derived.outcome,
+        reviewStatus: derived.reviewStatus,
+        failureKind: options.failureKind,
+        basis: derived.basis,
+        result: options.result,
+        observation: Object.freeze({
+          predicted: input.observation.predicted,
+          effective: input.observation.effective,
+          roles: options.roles,
+          prior: input.observation.prior,
+        }),
+        reconciled: false,
+        ledgerState: ledgerStateFor(derived.outcome, "ask"),
+      });
+    };
+
+    let finalization: FinalizationPlan | null = null;
+    let workflowReceipt: WorkflowReceipt | null = null;
+    let finalized = false;
+    const complete = (): void => {
+      if (finalized || finalization === null) return;
+      finalized = true;
+      this.#finalizer.finalize(finalization);
+    };
+    // The receipt is read *after* finalization, not as part of building the return value: a return
+    // expression is evaluated before the surrounding `finally` runs, so reading it there would
+    // report the state from before the outcome was recorded.
+    const finish = (): TaskReceipt => {
+      complete();
+      return this.#ledger.receipt(task.taskId);
+    };
+    // A signal is the one moment this process knows it is about to stop writing. Without this the
+    // task would stay `running` forever, which is how one real task sat abandoned for 33 hours.
+    const unregister = registerActiveRun(() => {
+      finalization ??= planFor({
+        workflow: null,
+        failureKind: "interrupted",
+        result: Object.freeze({ kind: "none" as const, text: null, evidence: "lost-to-crash" as const }),
+        roles: rolesFromRoutes(routes),
+      });
+      complete();
+    });
+
     try {
       const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }) });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
+      workflowReceipt = workflow;
       assertSourceCheckoutUnchanged(cwd, sourceBefore);
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
+      // The receipt is the canonical source of the outcome, and it is durable before finalization
+      // begins — which is what lets a second process derive exactly the same record.
       recordWorkflowReceipt(this.#ledger, task.taskId, workflow);
-      this.#ledger.transition(task.taskId, "completed", { shadow: true, outcome: workflow.outcome });
-      return Object.freeze({ dryRun: false, taskId: task.taskId, taskReceipt: this.#ledger.receipt(task.taskId), workflow });
+      finalization = planFor({
+        workflow: workflow.outcome,
+        failureKind: null,
+        result: workflow.finalOutput.trim().length > 0
+          ? Object.freeze({ kind: "answer" as const, text: workflow.finalOutput, evidence: "redacted" as const })
+          : Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }),
+        roles: rolesFromWorkflow(workflow),
+      });
     } catch (error) {
-      const current = this.#ledger.requireTask(task.taskId);
-      if (current.state === "running" || current.state === "verifying" || current.state === "planned") this.#ledger.transition(task.taskId, "failed", { shadow: true, code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN" });
+      finalization = planFor({
+        workflow: null,
+        failureKind: error instanceof BrainGateInvariantError ? failureKindFromCode(error.code) : "unknown",
+        result: Object.freeze({ kind: "none" as const, text: null, evidence: "lost-to-crash" as const }),
+        roles: rolesFromRoutes(routes),
+      });
       throw error;
+    } finally {
+      unregister();
+      try { complete(); }
+      catch { /* the record is left incomplete on purpose: reconcilers finish it, and swallowing here would hide the run's own error */ }
     }
+
+    return Object.freeze({ dryRun: false, taskId: task.taskId, taskReceipt: finish(), workflow: workflowReceipt });
   }
 }

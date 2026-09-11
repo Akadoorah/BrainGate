@@ -1,5 +1,5 @@
 import { BrainGateInvariantError, type TaskComplexity } from "@braingate/core";
-import type { IndependenceLevel, ModelRef, RegisteredModel, RouteCandidate, RouteRejection, RouteRequest, RouteResult, SpeedClass } from "./types.js";
+import type { IndependenceLevel, ModelRef, QuotaState, RegisteredModel, RouteCandidate, RouteRejection, RouteRequest, RouteResult, SpeedClass } from "./types.js";
 import { ModelRegistry } from "./model-registry.js";
 
 const MIN_CAPABILITY: Readonly<Record<TaskComplexity, number>> = Object.freeze({ T0: 25, T1: 35, T2: 55, T3: 72, T4: 84 });
@@ -15,7 +15,17 @@ const MIN_CAPABILITY: Readonly<Record<TaskComplexity, number>> = Object.freeze({
  */
 const SPEED_BONUS_LOW: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 45, balanced: 18, deep: 0 });
 const SPEED_BONUS_HIGH: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 0, balanced: 6, deep: 12 });
-const QUOTA_PENALTY = Object.freeze({ healthy: 0, limited: 30, unknown: 14, exhausted: Number.POSITIVE_INFINITY });
+/**
+ * What a known quota state costs a candidate.
+ *
+ * `unknown` is deliberately absent. It used to carry a penalty of fourteen points, which is a
+ * routing decision made on the absence of information: a pool nobody had a reading for was
+ * quietly demoted in favour of one whose status happened to be known. Ignorance is not evidence
+ * against a pool, and the operator pays for the models either way.
+ *
+ * `exhausted` stays infinite: a provider that said it is refusing calls is not a fallback.
+ */
+const QUOTA_PENALTY: Readonly<Partial<Record<QuotaState, number>>> = Object.freeze({ healthy: 0, limited: 30, exhausted: Number.POSITIVE_INFINITY });
 
 function ref(model: RegisteredModel): ModelRef {
   return Object.freeze({ providerId: model.definition.providerId, modelId: model.definition.modelId, quotaPool: model.definition.quotaPool });
@@ -93,10 +103,10 @@ export class CapabilityRouter {
       const effectiveCapability = lowComplexity ? floor + (capability - floor) * 0.25 : capability;
       let score = effectiveCapability * 2 + definition.reasoning * (lowComplexity ? 0.30 : 0.45);
       score += lowComplexity ? SPEED_BONUS_LOW[definition.speed] : SPEED_BONUS_HIGH[definition.speed];
-      score -= QUOTA_PENALTY[runtime.quotaState];
-      if (runtime.quotaPressure !== null) {
-        score -= runtime.quotaPressure * 28;
-        scoreReasons.push(`quota-pressure:${runtime.quotaPressure.toFixed(2)}`);
+      score -= QUOTA_PENALTY[runtime.quotaState] ?? 0;
+      if (runtime.quotaHint !== null) {
+        score -= runtime.quotaHint * 28;
+        scoreReasons.push(`quota-hint:${runtime.quotaHint.toFixed(2)}`);
       }
       if (request.independence?.mode === "preferred") {
         const penalty = independencePenalty(modelRef, request.independence.models);

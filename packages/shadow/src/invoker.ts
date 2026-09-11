@@ -1,4 +1,4 @@
-import { BrainGateInvariantError, type RegisteredProject, type TaskLedger } from "@braingate/core";
+import { BrainGateInvariantError, failureKindFromCode, type RegisteredProject, type TaskLedger } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
@@ -261,7 +261,14 @@ function parseRoleResponse(role: AgentRequest["role"], providerId: ProviderId, s
 
   if (role === "planner" || role === "primary") {
     if (parsed.kind !== "work") throw new BrainGateInvariantError("SHADOW_RESPONSE_INVALID", "Primary shadow response must have kind=work.");
-    return Object.freeze({ kind: "work", output: boundedText(parsed.output) });
+    const output = boundedText(parsed.output);
+    // An empty answer satisfies the contract's shape while saying nothing. Accepting it would
+    // record a task as successful that produced no result at all — the one kind of completion the
+    // operator cannot distinguish from real work.
+    if (output.trim().length === 0) {
+      throw new BrainGateInvariantError("SHADOW_RESPONSE_EMPTY", "The provider answered with an empty result.");
+    }
+    return Object.freeze({ kind: "work", output });
   }
   if (role === "reviewer") {
     if (parsed.kind !== "review" || !["approve", "request_changes", "disagree"].includes(String(parsed.verdict))) {
@@ -492,7 +499,30 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }),
       });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
-        this.#event("shadow.provider.failed", { ...safeMeta, timedOut: result.timedOut, exitCode: result.exitCode, error: redactSecrets(result.stderr).slice(0, 500) });
+        const failureKind = result.timedOut ? "timeout" : "provider-failed";
+        this.#event("shadow.provider.failed", {
+          ...safeMeta,
+          failureKind,
+          timedOut: result.timedOut,
+          exitCode: result.exitCode,
+          durationMs: result.durationMs,
+          error: redactSecrets(result.stderr).slice(0, 500),
+          // Bounded, redacted evidence of what the CLI actually said. A refusal BrainGate does not
+          // yet understand is still diagnosable later, from the words the provider used — and none
+          // of it is interpreted here.
+          stderrTail: redactSecrets(result.stderr).slice(-2_000),
+          stdoutTail: redactSecrets(result.stdoutTail ?? result.stdout).slice(-2_000),
+          retainedChars: result.stdout.length,
+        });
+        // A refusal must be able to record itself. Readings used to be collected only after the
+        // exit-code check below had already thrown, so a call that was refused — the one case where
+        // the provider is telling us something about its own limit — recorded nothing at all, and
+        // the next task was dispatched to the same pool. The tail is included because a streamed
+        // run's retained output is thinned on the way in.
+        for (const reading of quotaReadings(snapshot.providerId, `${result.stdout}\n${result.stdoutTail ?? ""}`)) {
+          try { this.#onQuotaReading?.({ ...reading, quotaPool: request.model.quotaPool }); }
+          catch { /* a reading nobody could record is not a reason to lose the failure */ }
+        }
         const reason = providerFailureReason(request.model.providerId, result.stdout, result.stderr);
         throw new BrainGateInvariantError(
           "SHADOW_PROVIDER_FAILED",
@@ -539,7 +569,12 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       return response;
     } catch (error) {
       if (!(error instanceof BrainGateInvariantError && error.code === "SHADOW_PROVIDER_FAILED")) {
-        this.#event("shadow.provider.failed", { ...safeMeta, error: redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 500) });
+        this.#event("shadow.provider.failed", {
+          ...safeMeta,
+          failureKind: error instanceof BrainGateInvariantError ? failureKindFromCode(error.code) : "unknown",
+          code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN",
+          error: redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 500),
+        });
       }
       throw error;
     }

@@ -36,8 +36,24 @@ export interface TaskBriefRouteRole {
   readonly providerId: string;
   readonly modelId: string;
   readonly quotaPool: string;
+  /**
+   * What BrainGate believed about this pool when it chose this model.
+   *
+   * Recorded because a refusal is only explicable against it: "dispatched to a provider we thought
+   * was fine" and "dispatched to a provider we knew was exhausted" are different incidents, and
+   * without this the ledger cannot tell them apart after the fact.
+   */
+  readonly quotaState: string;
+  readonly quotaHint: number | null;
+  readonly quotaObservedAt: string | null;
   readonly rationale: readonly string[];
   readonly fallbackCount: number;
+  /** Who else could have taken this role, and what disqualified them. */
+  readonly rejected: readonly {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly reasons: readonly string[];
+  }[];
 }
 
 export interface TaskBrief {
@@ -127,13 +143,25 @@ function nonNegativeInteger(value: number, label: string): number {
 
 function routeRole(route: RouteResult): TaskBriefRouteRole {
   const selected = route.selected.model.definition;
+  const runtime = route.selected.model.runtime;
   return Object.freeze({
     role: route.role,
     providerId: sanitizeText(selected.providerId, 120),
     modelId: sanitizeText(selected.modelId, 200),
     quotaPool: sanitizeText(selected.quotaPool, 160),
+    quotaState: sanitizeText(runtime.quotaState, 40),
+    quotaHint: runtime.quotaHint === null ? null : Math.round(runtime.quotaHint * 1000) / 1000,
+    quotaObservedAt: runtime.quotaObservedAt,
     rationale: sanitizeList(route.rationale, 12),
     fallbackCount: route.fallbacks.length,
+    // The reasons a candidate lost are what turn "it chose Anthropic" into an explanation. They
+    // were computed and dropped before this, so the only person who could answer "why not Codex?"
+    // was the one who was not there to ask.
+    rejected: Object.freeze(route.rejected.slice(0, 12).map((rejection) => Object.freeze({
+      providerId: sanitizeText(rejection.model.providerId, 120),
+      modelId: sanitizeText(rejection.model.modelId, 200),
+      reasons: sanitizeList(rejection.reasons, 8),
+    }))),
   });
 }
 
@@ -269,6 +297,12 @@ export interface NormalizedTaskReceipt {
   readonly usage: readonly UsageRecord[];
   readonly brief: TaskBrief | null;
   readonly workflow: WorkflowReceiptSummary | null;
+  /**
+   * The events themselves, kept because a summary cannot answer "what did BrainGate finally decide
+   * about this task" — that lives in the finalization marker's payload, and a reader that has only
+   * the summary would have to derive a second answer.
+   */
+  readonly events: readonly TaskEvent[];
 }
 
 function looksLikeBrief(value: unknown): value is TaskBrief {
@@ -306,5 +340,6 @@ export function normalizeTaskReceipt(receipt: TaskReceipt): NormalizedTaskReceip
     usage: Object.freeze(receipt.usage.map((usage) => Object.freeze({ ...usage }))),
     brief,
     workflow,
+    events: receipt.events,
   });
 }

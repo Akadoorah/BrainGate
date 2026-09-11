@@ -141,6 +141,14 @@ export interface ShadowProcessResult {
   readonly exitCode: number | null;
   readonly stdout: string;
   readonly stderr: string;
+  /**
+   * The last of what the run wrote, kept only for diagnosing a failure.
+   *
+   * A streamed provider's stdout is thinned as it arrives, so a redacted tail of the raw lines is
+   * the only record of the CLI's own words when a call is refused. Redacted and bounded by the
+   * executor; optional so a fake executor need not invent one.
+   */
+  readonly stdoutTail?: string;
   readonly timedOut: boolean;
   readonly durationMs: number;
   readonly removedEnvironmentKeys: readonly string[];

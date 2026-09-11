@@ -12,6 +12,9 @@ const DIRECT_BILLING_ENV = new Set([
 const SAFE_ENV = new Set([
   "PATH", "PATHEXT", "SystemRoot", "SYSTEMROOT", "WINDIR", "HOME", "USERPROFILE", "USER", "LOGNAME", "TMP", "TEMP",
   "LANG", "LC_ALL", "LC_CTYPE", "CI", "NO_COLOR", "TERM",
+  // A CLI that stages its own workspace needs to be told where temporary files go; without these
+  // the child guesses, and it guesses at the operator's real cache directories.
+  "TMPDIR", "APPDATA", "LOCALAPPDATA", "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME",
 ]);
 
 const SENSITIVE_BASENAMES = new Set([
@@ -28,6 +31,15 @@ const REDACTIONS: readonly [RegExp, string][] = [
   [/\bgh[pousr]_[A-Za-z0-9]{20,}\b/g, "[REDACTED_GITHUB_TOKEN]"],
   [/\bAKIA[0-9A-Z]{16}\b/g, "[REDACTED_AWS_KEY]"],
   [/\b(?:sk|xai)-[A-Za-z0-9_-]{16,}\b/g, "[REDACTED_API_TOKEN]"],
+  // Provider and platform keys that the prefix rules above do not reach. Each one is a prefix
+  // BrainGate's own providers, and the tools they call, actually mint.
+  [/\bAIza[0-9A-Za-z_-]{35}\b/g, "[REDACTED_API_TOKEN]"],
+  [/\bxox[baprs]-[0-9A-Za-z-]{10,}\b/g, "[REDACTED_SLACK_TOKEN]"],
+  [/\bgsk_[A-Za-z0-9]{20,}\b/g, "[REDACTED_API_TOKEN]"],
+  [/\bsk-[A-Za-z0-9]{20,}\b/g, "[REDACTED_API_TOKEN]"],
+  // A bare JWT: three base64url segments, the first of which decodes to a JSON header. Bearer
+  // prefixes are already covered, but a token pasted into a config or a log line has none.
+  [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b/g, "[REDACTED_JWT]"],
   [/\bBearer\s+[A-Za-z0-9._~+\/-]{16,}=*/gi, "Bearer [REDACTED]"],
   [/\b(api[_-]?key|password|passwd|secret|access[_-]?token|refresh[_-]?token)\s*([:=])\s*([^\s'\"]{8,})/gi, "$1$2[REDACTED]"],
 ];
