@@ -72,6 +72,7 @@ export class CapabilityRouter {
     const maxFallbacks = Math.max(0, Math.min(3, Math.floor(request.maxFallbacks ?? 2)));
     const floor = capabilityFloor(request);
     const excluded = new Set(request.excludeProviders ?? []);
+    const excludedPools = new Set(request.excludeQuotaPools ?? []);
     const accepted: RouteCandidate[] = [];
     const rejected: RouteRejection[] = [];
     const independenceLevel = request.independence?.level ?? "cross-provider";
@@ -84,6 +85,12 @@ export class CapabilityRouter {
       const capability = definition.capabilities[request.role] ?? 0;
 
       if (excluded.has(definition.providerId)) reasons.push("provider-excluded");
+      if (excludedPools.has(definition.quotaPool)) reasons.push(`quota-pool-excluded:${definition.quotaPool}`);
+      // A pool BrainGate is avoiding because it refused us recently. The reason names the policy, not
+      // exhaustion: this is BrainGate's decision to wait, not the provider's statement about its quota.
+      if (runtime.refusalBackoffUntil !== null && Date.parse(runtime.refusalBackoffUntil) > Date.now()) {
+        reasons.push(`quota-pool-backoff:${definition.quotaPool}`);
+      }
       if (!runtime.available) reasons.push("runtime-unavailable");
       if (runtime.quotaState === "exhausted") reasons.push("quota-exhausted");
       if (capability < floor) reasons.push(`capability-below-floor:${capability}<${floor}`);
@@ -126,7 +133,20 @@ export class CapabilityRouter {
 
     const selected = accepted[0];
     if (selected === undefined) {
-      throw new BrainGateInvariantError("ROUTE_NO_ELIGIBLE_MODEL", `No eligible model for role ${request.role} at ${request.classification.complexity}/${request.classification.risk}.`);
+      // Why nothing was eligible, in the words the rejections used. Without this the operator sees
+      // "no eligible model" and cannot tell a policy wait from a capability floor from a provider
+      // that is simply unavailable — and the reasons are already computed a few lines above.
+      const reasons = new Map<string, number>();
+      for (const rejection of rejected) {
+        for (const reason of rejection.reasons) reasons.set(reason, (reasons.get(reason) ?? 0) + 1);
+      }
+      const summary = [...reasons.entries()]
+        .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+        .slice(0, 6)
+        .map(([reason, count]) => (count > 1 ? `${reason} (${String(count)})` : reason))
+        .join(", ");
+      const detail = summary.length === 0 ? "no model was registered for the role" : `rejected: ${summary}`;
+      throw new BrainGateInvariantError("ROUTE_NO_ELIGIBLE_MODEL", `No eligible model for role ${request.role} at ${request.classification.complexity}/${request.classification.risk}. ${detail}.`);
     }
 
     return Object.freeze({

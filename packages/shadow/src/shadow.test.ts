@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import {
   BrainGateInvariantError,
   InMemoryObservationWriter,
+  recordedExecutionAttribution,
   ProjectRegistry,
   ResultStore,
   TaskLedger,
@@ -128,7 +129,7 @@ function registryWithClaude(): ModelRegistry {
   const registry = new ModelRegistry();
   registry.register(
     { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null },
-    { available: true, quotaState: "healthy", quotaHint: 0.2, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
+    { available: true, quotaState: "healthy", quotaHint: 0.2, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
   );
   return registry;
 }
@@ -137,7 +138,7 @@ function registryWithClaudeAndCodex(): ModelRegistry {
   const registry = registryWithClaude();
   registry.register(
     { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null },
-    { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
+    { available: true, quotaState: "healthy", quotaHint: 0.1, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
   );
   return registry;
 }
@@ -1063,4 +1064,85 @@ test("an empty answer is refused rather than recorded as work that produced noth
   const invoker = new SubscriptionShadowAgentInvoker({ project, cwd: repo, snapshots: [snapshot("anthropic")], context: {}, executor: fake });
   const request: AgentRequest = { role: "primary", model, phase: "initial", task: "summarise the readme", findings: [] };
   await assert.rejects(() => invoker.invoke(request), /empty result/);
+});
+
+/**
+ * Attribution: the run records every provider that actually ran, including the planner.
+ *
+ * The measured gap this closes: a real task dispatched its planner to Google, the planner answered,
+ * its native tokens were recorded — and the task's roles named only the primary and the reviewer,
+ * because the planner is routed by the workflow engine rather than by the runner. A later reader (the
+ * corpus, a report, the dashboard) was told a two-call task had one role.
+ */
+function registryWithPlanner(): ModelRegistry {
+  const registry = new ModelRegistry();
+  const runtime = { available: true, quotaState: "unknown" as const, quotaHint: null, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-12T00:00:00Z" };
+  // Two Anthropic models so the planner and the executor are distinguishable in the record, plus a
+  // staged reviewer on another provider (the shape the real router uses).
+  registry.register({ providerId: "anthropic", modelId: "claude-planner", quotaPool: "claude-subscription", capabilities: { planner: 95, coder: 40, reviewer: 40 }, speed: "deep", contextCapacity: 200_000, writeCapable: false, reasoning: 95, underlyingFamily: null }, runtime);
+  registry.register({ providerId: "anthropic", modelId: "claude-coder", quotaPool: "claude-subscription", capabilities: { planner: 40, coder: 90, reviewer: 88 }, speed: "deep", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null }, runtime);
+  registry.register({ providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { planner: 70, coder: 40, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, runtime);
+  return registry;
+}
+
+/** Answers by the model that was asked, so the test knows which role each response belongs to. */
+function plannerFixture(): FakeExecutor {
+  return new FakeExecutor((plan) => {
+    if (plan.modelId === "claude-planner") return JSON.stringify({ result: JSON.stringify({ kind: "work", output: "the approach" }) });
+    if (plan.modelId === "claude-coder") return JSON.stringify({ result: JSON.stringify({ kind: "work", output: "the answer" }) });
+    // Codex speaks JSONL, and the invoker reads the last completed agent_message.
+    return [JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "ignored" } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ kind: "review", verdict: "approve", findings: [] }) } })].join("\n");
+  });
+}
+
+test("the executed planner appears in the task's own attribution record", async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const fake = plannerFixture();
+  const taskText = "Audit the authentication session storage across the whole application";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  assert.equal(classification.complexity, "T3", "this test is about the planning pass, so the tier must route one");
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    const result = await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithPlanner()), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Audit auth storage", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: { files: ["src/auth.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    });
+    assert.equal(result.workflow?.outcome, "approved");
+    const attribution = recordedExecutionAttribution(ledger.receipt(result.taskId!).events);
+    assert.ok(attribution, "the task records who ran");
+    const roles = (attribution ?? []).map((role) => `${role.role}:${role.providerId}/${role.modelId}:${role.status}`);
+    assert.deepEqual(roles, [
+      "planner:anthropic/claude-planner:completed",
+      "primary:anthropic/claude-coder:completed",
+      "reviewer:openai/codex-test:completed",
+    ], "the planner which actually ran is named, and only roles that ran are called completed");
+  } finally { ledger.close(); }
+});
+
+test("a reviewer that was dispatched and failed is recorded as attempted, never as completed", async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const fake = new FakeExecutor((plan) => {
+    if (plan.modelId === "claude-planner") return JSON.stringify({ result: JSON.stringify({ kind: "work", output: "the approach" }) });
+    if (plan.providerId === "openai") throw new Error("the reviewer provider exploded");
+    return JSON.stringify({ result: JSON.stringify({ kind: "work", output: "the answer" }) });
+  });
+  const taskText = "Audit the authentication session storage across the whole application";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    const error = await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithPlanner()), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Audit auth storage", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: { files: ["src/auth.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    }).then(() => null, (caught: unknown) => caught);
+    assert.ok(error instanceof Error, "the failed reviewer fails the task");
+    const taskId = ledger.listTasks()[0]!.taskId;
+    const attribution = recordedExecutionAttribution(ledger.receipt(taskId).events)!;
+    const reviewer = attribution.find((role) => role.role === "reviewer");
+    assert.equal(reviewer?.status, "attempted", "the reviewer was dispatched and did not answer");
+    assert.equal(reviewer?.providerId, "openai");
+    assert.equal(attribution.find((role) => role.role === "planner")?.status, "completed");
+    assert.equal(attribution.find((role) => role.role === "primary")?.status, "completed");
+  } finally { ledger.close(); }
 });

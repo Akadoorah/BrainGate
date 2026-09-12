@@ -36,6 +36,16 @@ export interface ModelRuntime {
   readonly quotaHint: number | null;
   /** When that hint was seen, so a reader can decide for itself whether it is still interesting. */
   readonly quotaObservedAt: string | null;
+  /**
+   * When BrainGate's own refusal backoff for this pool lapses, or null.
+   *
+   * Deliberately not part of `quotaState`: that answers what the *provider* has proven about current
+   * availability, and a refusal with no machine-readable reset proves nothing about the future. This
+   * answers a different question — should BrainGate stop asking for a few minutes — and it is a
+   * local policy with a local clock. Nothing may render it as a reset, and nothing may set
+   * `quotaState` from it.
+   */
+  readonly refusalBackoffUntil: string | null;
   readonly observedAt: string;
 }
 
@@ -65,6 +75,16 @@ export interface RouteRequest {
   readonly writeRequired: boolean;
   readonly independence?: IndependenceConstraint;
   readonly excludeProviders?: readonly string[];
+  /**
+   * Quota pools this task has already been refused by.
+   *
+   * Excluding the *pool* rather than the provider is what makes this correct across families: a
+   * provider may expose models through more than one pool, and every model that shares a refused
+   * pool is refused with it. The pool is the thing the provider refused, so the pool is the thing
+   * routing is told to avoid — a provider-level exclusion would be both too wide in one direction
+   * and too narrow in the other.
+   */
+  readonly excludeQuotaPools?: readonly string[];
   readonly maxFallbacks?: number;
 }
 

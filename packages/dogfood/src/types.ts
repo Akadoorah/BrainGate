@@ -25,6 +25,13 @@ export interface DogfoodRole {
   readonly role: "planner" | "primary" | "reviewer" | "judge";
   readonly providerId: string;
   readonly modelId: string;
+  /**
+   * How far this role got: routed, dispatched-and-not-finished, or answered.
+   *
+   * Absent on rows written before attribution was recorded, and read as "planned" there rather than
+   * as evidence that the role ran.
+   */
+  readonly status?: "planned" | "attempted" | "completed";
 }
 
 export interface DogfoodPrior {

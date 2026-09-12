@@ -70,8 +70,8 @@ test("review request_changes leaves worktree inspectable but marks task blocked"
   const registry = new ProjectRegistry(join(root, "brain"));
   const project = registry.register(parseProjectConfig({ project_id: "review-block", name: "Review Block", repositories: [repo] }));
   const models = new ModelRegistry();
-  models.register({ providerId: "anthropic", modelId: "claude", quotaPool: "claude", capabilities: { coder: 95, reviewer: 80, judge: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: new Date().toISOString() });
-  models.register({ providerId: "openai", modelId: "codex", quotaPool: "chatgpt", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: new Date().toISOString() });
+  models.register({ providerId: "anthropic", modelId: "claude", quotaPool: "claude", capabilities: { coder: 95, reviewer: 80, judge: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: new Date().toISOString() });
+  models.register({ providerId: "openai", modelId: "codex", quotaPool: "chatgpt", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: new Date().toISOString() });
   const ledger = new TaskLedger(project);
   const classification = classifyTask({ text: "change the button label", mode: "write" });
   const budget = budgetFor(classification, { writeRequested: true });

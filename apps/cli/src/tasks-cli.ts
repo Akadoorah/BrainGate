@@ -18,7 +18,8 @@ import {
 } from "@braingate/core";
 import { DogfoodStore } from "@braingate/dogfood";
 import { MAX_PROVIDER_CALL_MS } from "@braingate/shadow";
-import { STALE_CALL_MULTIPLIER } from "@braingate/core";
+import { STALE_CALL_MULTIPLIER, executionAttribution, recordedExecutionAttribution } from "@braingate/core";
+import { quotaRefusalFromEvents } from "@braingate/observability";
 import { redactSecrets } from "@braingate/security";
 import { resolveOperatorState } from "@braingate/operator";
 import { DEFAULT_MANIFEST, findManifest } from "./manifest-path.js";
@@ -288,6 +289,9 @@ async function runShow(args: string[], deps: TasksCliDependencies, cwd: string, 
   try {
     const receipt: TaskReceipt = ledger.receipt(resolveTaskId(ledger, taskId));
     const snapshot = finalizedSnapshotOf(receipt.events);
+    // Read from the run's own provider events: what was dispatched, not what was planned.
+    const execution = recordedExecutionAttribution(receipt.events) ?? executionAttribution({ events: receipt.events });
+    const refusal = quotaRefusalFromEvents(receipt.events);
     const results = new ResultStore(project.storageDir, { redact: redactSecrets });
     let resultEvent: Record<string, unknown> | null = null;
     for (let index = receipt.events.length - 1; index >= 0; index -= 1) {
@@ -314,6 +318,10 @@ async function runShow(args: string[], deps: TasksCliDependencies, cwd: string, 
       failureKind: snapshot?.failureKind ?? null,
       reconciled: snapshot?.reconciled ?? false,
       basis: snapshot?.basis ?? Object.freeze([]),
+      // Who actually ran, and how far each role got: the plan's roles are not the same fact as the
+      // executed ones, and this is the record that keeps a planner on another provider from vanishing.
+      execution,
+      quotaRefusal: refusal,
       transitions: Object.freeze(receipt.events.filter((event) => event.toState !== null).map((event) => Object.freeze({ from: event.fromState, to: event.toState, at: event.occurredAt }))),
       events: Object.freeze(receipt.events.map((event) => Object.freeze({ sequence: event.sequence, kind: event.kind, at: event.occurredAt }))),
       usage: receipt.usage,
@@ -361,6 +369,8 @@ async function runShow(args: string[], deps: TasksCliDependencies, cwd: string, 
       `  basis    ${snapshot === null || snapshot.basis.length === 0 ? "none" : snapshot.basis.join(", ")}`,
       `  tier     ${receipt.task.complexity ?? "-"}/${receipt.task.risk ?? "-"}`,
       `  updated  ${receipt.task.updatedAt}`,
+      ...(execution.length === 0 ? [] : [`  executed ${execution.map((role) => `${role.role}=${role.providerId}/${role.modelId}(${role.status ?? "planned"})`).join(" · ")}`]),
+      ...(refusal === null ? [] : [`  refusal  ${refusal.providerId}/${refusal.quotaPool} · ${refusal.reason} · ${refusal.observedAt} · ${refusal.resetAt === null ? "no machine-readable reset" : `reset ${refusal.resetAt}`}`]),
     ];
     // What was tried and what the provider said, before anything else on a failed task. The outcome
     // line names the failure kind; this is the evidence behind it, and until now it was recorded and

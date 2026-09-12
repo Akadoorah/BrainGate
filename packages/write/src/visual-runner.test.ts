@@ -78,7 +78,7 @@ function registry(): ModelRegistry {
   const models = new ModelRegistry();
   models.register(
     { providerId: "anthropic", modelId: "claude-write", quotaPool: "claude-subscription", capabilities: { coder: 92 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null },
-    { available: true, quotaState: "healthy", quotaHint: 0.1, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
+    { available: true, quotaState: "healthy", quotaHint: 0.1, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" },
   );
   return models;
 }

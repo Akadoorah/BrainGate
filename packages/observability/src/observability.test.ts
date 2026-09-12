@@ -39,7 +39,7 @@ function route(providerId: string, modelId: string, quotaPool: string): RouteRes
       capabilities: { coder: 90 }, speed: "balanced" as const,
       contextCapacity: 100_000, writeCapable: true, reasoning: 90, underlyingFamily: null,
     },
-    runtime: { available: true, quotaState: "healthy" as const, quotaHint: 0.2, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00.000Z" },
+    runtime: { available: true, quotaState: "healthy" as const, quotaHint: 0.2, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00.000Z" },
   };
   return {
     role: "coder",

@@ -11,6 +11,8 @@ export interface HydratedModelRuntime {
   /** The last full-window reading, 0–1, with the moment it was taken. A hint, not a level. */
   readonly quotaHint: number | null;
   readonly quotaObservedAt: string | null;
+  /** When BrainGate's own refusal backoff lapses. Policy, never a provider statement. */
+  readonly refusalBackoffUntil: string | null;
   readonly observedAt: string;
   readonly providerAvailableEvidence: string;
   readonly quotaEvidence: readonly string[];
@@ -66,6 +68,13 @@ export function hydrateModelRegistry(input: {
   readonly entries: readonly ModelCatalogEntry[];
   readonly providers: readonly ProviderSnapshot[];
   readonly quota: readonly QuotaSnapshot[];
+  /**
+   * Pools BrainGate is currently avoiding because a provider refused them.
+   *
+   * Passed in rather than read here: the backoff is a local policy record, and the caller that
+   * decided it is the one that owns explaining it.
+   */
+  readonly backoff?: readonly { readonly provider: string; readonly quotaPool: string; readonly policyBackoffUntil: string }[];
   readonly observedAt?: string;
   /** Injectable so a caller can ask what was true at a given moment, and so tests are not clocks. */
   readonly now?: number;
@@ -78,11 +87,14 @@ export function hydrateModelRegistry(input: {
     if (!entry.configured) continue;
     const provider = input.providers.find((candidate) => candidate.providerId === entry.providerId);
     const quota = quotaFor(entry.definition, input.quota, now);
+    const backoff = (input.backoff ?? []).find((row) => row.provider === entry.providerId && row.quotaPool === entry.definition.quotaPool);
     const runtime: ModelRuntime = {
       available: provider?.available.value === true,
       quotaState: quota.state,
       quotaHint: quota.hint,
       quotaObservedAt: quota.observedAt,
+      // A backoff never moves `quotaState`: it is BrainGate waiting, not a provider verdict.
+      refusalBackoffUntil: backoff === undefined ? null : backoff.policyBackoffUntil,
       observedAt: latestObserved(provider, quota.rows, fallback),
     };
     registry.register(entry.definition, runtime);
@@ -93,6 +105,7 @@ export function hydrateModelRegistry(input: {
       quotaState: runtime.quotaState,
       quotaHint: runtime.quotaHint,
       quotaObservedAt: runtime.quotaObservedAt,
+      refusalBackoffUntil: runtime.refusalBackoffUntil,
       observedAt: runtime.observedAt,
       providerAvailableEvidence: provider?.available.evidence ?? "unknown",
       quotaEvidence: quota.evidence,

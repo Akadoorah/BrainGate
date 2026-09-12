@@ -103,6 +103,82 @@ function mapRow(row: QuotaRow): QuotaSnapshot {
   });
 }
 
+/**
+ * How long BrainGate avoids a pool that just refused it, before letting the next task try again.
+ *
+ * This is a policy number, not a provider fact, and it is deliberately short. The one refusal
+ * BrainGate has measured (2026-09-12, Claude Code 2.1.268) stated its own reset as ~5 minutes away
+ * ("resets 4:10am (Europe/Istanbul)" for a session limit at 01:05Z); the failure mode being fixed
+ * was a burst of tasks re-probing the same exhausted subscription within seconds. Ten minutes stops
+ * that loop, and costs at most one wasted probe per pool per ten minutes if the provider comes back
+ * sooner. It is never presented as a reset time, and it never sets `quotaState`.
+ */
+export const REFUSAL_BACKOFF_MS = 10 * 60_000;
+
+/** The provenance of every backoff row: a local decision, from a provider's own refusal. */
+export const REFUSAL_BACKOFF_POLICY = "operational-backoff";
+
+export interface RefusalBackoffInput {
+  readonly provider: string;
+  readonly quotaPool: string;
+  /** Why the pool was refused, in the provider's terms (`rate_limit`). */
+  readonly reason: string;
+  /** Task whose refusal caused this, when one is known. */
+  readonly sourceTaskId?: string | null;
+  readonly detail?: string | null;
+  readonly observedAt?: string;
+  /** Overridable only so tests can place a backoff in the past; never used to lengthen one. */
+  readonly backoffMs?: number;
+}
+
+export interface RefusalBackoff {
+  readonly sequence: number;
+  readonly provider: string;
+  readonly quotaPool: string;
+  readonly reason: string;
+  readonly evidence: "native";
+  readonly policy: typeof REFUSAL_BACKOFF_POLICY;
+  /**
+   * When the *policy* stops applying — not when the provider's quota resets.
+   *
+   * Named apart from `resetAt` on purpose: nothing may read this as a provider statement, and no
+   * surface may render it as "exhausted until".
+   */
+  readonly policyBackoffUntil: string;
+  readonly sourceTaskId: string | null;
+  readonly detail: string | null;
+  readonly observedAt: string;
+}
+
+interface BackoffRow {
+  sequence: number;
+  provider: string;
+  quota_pool: string;
+  op: string;
+  reason: string;
+  evidence: string;
+  policy: string;
+  policy_backoff_until: string | null;
+  source_task_id: string | null;
+  detail: string | null;
+  observed_at: string;
+}
+
+function mapBackoff(row: BackoffRow): RefusalBackoff {
+  return Object.freeze({
+    sequence: row.sequence,
+    provider: row.provider,
+    quotaPool: row.quota_pool,
+    reason: row.reason,
+    evidence: "native" as const,
+    policy: REFUSAL_BACKOFF_POLICY,
+    policyBackoffUntil: row.policy_backoff_until ?? row.observed_at,
+    sourceTaskId: row.source_task_id,
+    detail: row.detail,
+    observedAt: row.observed_at,
+  });
+}
+
 export class GlobalQuotaStore {
   readonly databasePath: string;
   readonly #db: Database.Database;
@@ -196,6 +272,89 @@ export class GlobalQuotaStore {
     return Object.freeze(rows.map(mapRow));
   }
 
+  /**
+   * Records that a provider refused this pool, and that BrainGate will avoid it briefly.
+   *
+   * Separate from `record()` in this class and separate in storage: a refusal is evidence about a
+   * call, a snapshot is a statement about a pool, and a backoff is neither — it is a local decision
+   * about what to try next. Keeping them in one table is how a policy guess becomes a quota claim.
+   *
+   * Best-effort and idempotent: this row is written to a different database from the task ledger, and
+   * nothing here is transactional across the two. Losing a write costs one redundant provider probe
+   * later; it cannot change quota truth or what any task recorded. The state is decided by
+   * `observed_at` (with the append sequence only as a tie-break), so writing the same fact twice, or
+   * out of order, is harmless.
+   */
+  recordRefusalBackoff(input: RefusalBackoffInput): RefusalBackoff {
+    const provider = clean(input.provider, "provider", 120);
+    const quotaPool = clean(input.quotaPool, "quotaPool", 160);
+    const reason = clean(input.reason, "reason", 120);
+    const observedAt = timestamp(input.observedAt, "observedAt");
+    const backoffMs = input.backoffMs ?? REFUSAL_BACKOFF_MS;
+    if (!Number.isFinite(backoffMs) || backoffMs <= 0) throw new BrainGateInvariantError("QUOTA_BACKOFF_INVALID", "Backoff must be a positive duration.");
+    const until = new Date(Date.parse(observedAt) + backoffMs).toISOString();
+    const sourceTaskId = input.sourceTaskId === undefined || input.sourceTaskId === null ? null : clean(input.sourceTaskId, "sourceTaskId", 120);
+    const detail = input.detail === undefined || input.detail === null ? null : clean(input.detail, "detail", 500);
+    const result = this.#db.prepare(`
+      INSERT INTO refusal_backoffs (provider, quota_pool, op, reason, evidence, policy, policy_backoff_until, source_task_id, detail, observed_at)
+      VALUES (?, ?, 'refuse', ?, 'native', ?, ?, ?, ?, ?)
+    `).run(provider, quotaPool, reason, REFUSAL_BACKOFF_POLICY, until, sourceTaskId, detail, observedAt);
+    return mapBackoff(this.#db.prepare("SELECT * FROM refusal_backoffs WHERE sequence = ?").get(Number(result.lastInsertRowid)) as BackoffRow);
+  }
+
+  /**
+   * Supersedes any active backoff for a pool, because a call to it has just succeeded.
+   *
+   * Appended rather than updated, like everything else here: the record of having backed off is
+   * worth keeping, and "it worked" is exactly the evidence that should end the policy.
+   */
+  clearRefusalBackoff(input: { readonly provider: string; readonly quotaPool: string; readonly sourceTaskId?: string | null; readonly observedAt?: string }): RefusalBackoff {
+    const provider = clean(input.provider, "provider", 120);
+    const quotaPool = clean(input.quotaPool, "quotaPool", 160);
+    const observedAt = timestamp(input.observedAt, "observedAt");
+    const sourceTaskId = input.sourceTaskId === undefined || input.sourceTaskId === null ? null : clean(input.sourceTaskId, "sourceTaskId", 120);
+    const result = this.#db.prepare(`
+      INSERT INTO refusal_backoffs (provider, quota_pool, op, reason, evidence, policy, policy_backoff_until, source_task_id, detail, observed_at)
+      VALUES (?, ?, 'clear', 'served', 'native', ?, NULL, ?, NULL, ?)
+    `).run(provider, quotaPool, REFUSAL_BACKOFF_POLICY, sourceTaskId, observedAt);
+    return mapBackoff(this.#db.prepare("SELECT * FROM refusal_backoffs WHERE sequence = ?").get(Number(result.lastInsertRowid)) as BackoffRow);
+  }
+
+  /**
+   * The pools BrainGate is currently avoiding, with the time the avoidance lapses.
+   *
+   * The newest row per pool decides, and only a `refuse` row whose window has not lapsed counts.
+   * An expired backoff simply stops applying — the next task probes the pool again, which is the
+   * only way a prober can learn the provider came back.
+   */
+  activeRefusalBackoffs(now: number = Date.now()): readonly RefusalBackoff[] {
+    // Newest *observed fact* wins, not newest row: the writes are separate statements to separate
+    // stores and can land out of order — a success observed at 01:00 whose `clear` is persisted
+    // after a refusal observed at 01:00:05 must not supersede it. `observed_at` is the provider
+    // event's own time, never BrainGate's write time, and `sequence` decides only a genuine tie.
+    const rows = this.#db.prepare("SELECT * FROM refusal_backoffs ORDER BY observed_at DESC, sequence DESC").all() as BackoffRow[];
+    const seen = new Set<string>();
+    const active: RefusalBackoff[] = [];
+    for (const row of rows) {
+      const key = `${row.provider}\u0000${row.quota_pool}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (row.op !== "refuse") continue;
+      const until = row.policy_backoff_until;
+      if (until === null || Date.parse(until) <= now) continue;
+      active.push(mapBackoff(row));
+    }
+    active.sort((a, b) => a.provider.localeCompare(b.provider) || a.quotaPool.localeCompare(b.quotaPool));
+    return Object.freeze(active);
+  }
+
+  /** Every backoff decision, in the order it was observed, for the record and for the surfaces that explain one. */
+  refusalBackoffHistory(limit = 200): readonly RefusalBackoff[] {
+    const safeLimit = Math.max(1, Math.min(1000, Math.floor(limit)));
+    const rows = this.#db.prepare("SELECT * FROM refusal_backoffs ORDER BY observed_at ASC, sequence ASC LIMIT ?").all(safeLimit) as BackoffRow[];
+    return Object.freeze(rows.map(mapBackoff));
+  }
+
   #migrate(): void {
     this.#db.exec(`
       CREATE TABLE IF NOT EXISTS quota_snapshots (
@@ -222,6 +381,33 @@ export class GlobalQuotaStore {
       END;
       CREATE INDEX IF NOT EXISTS idx_quota_identity_sequence
       ON quota_snapshots(provider, quota_pool, metric, window_name, sequence DESC);
+
+      -- Operational refusal backoff: BrainGate's own short-lived decision to leave a pool alone.
+      -- It lives beside the readings and never inside them: nothing that reads provider quota truth
+      -- reads this table, and nothing here can be mistaken for a reset time.
+      CREATE TABLE IF NOT EXISTS refusal_backoffs (
+        sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+        provider TEXT NOT NULL,
+        quota_pool TEXT NOT NULL,
+        op TEXT NOT NULL CHECK (op IN ('refuse', 'clear')),
+        reason TEXT NOT NULL,
+        evidence TEXT NOT NULL CHECK (evidence = 'native'),
+        policy TEXT NOT NULL CHECK (policy = 'operational-backoff'),
+        policy_backoff_until TEXT,
+        source_task_id TEXT,
+        detail TEXT,
+        observed_at TEXT NOT NULL
+      );
+      CREATE TRIGGER IF NOT EXISTS refusal_backoffs_no_update
+      BEFORE UPDATE ON refusal_backoffs BEGIN
+        SELECT RAISE(ABORT, 'refusal backoffs are append-only');
+      END;
+      CREATE TRIGGER IF NOT EXISTS refusal_backoffs_no_delete
+      BEFORE DELETE ON refusal_backoffs BEGIN
+        SELECT RAISE(ABORT, 'refusal backoffs are append-only');
+      END;
+      CREATE INDEX IF NOT EXISTS idx_refusal_backoff_identity_sequence
+      ON refusal_backoffs(provider, quota_pool, sequence DESC);
     `);
   }
 }

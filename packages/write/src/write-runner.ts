@@ -1,5 +1,7 @@
 import {
   BrainGateInvariantError,
+  executionAttribution,
+  executionRecord,
   deriveOutcome,
   failureKindFromCode,
   isWriteVerdict,
@@ -22,7 +24,7 @@ import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type Rout
 import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
-import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
+import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
 import { assertWriteEligible, planWriteInvocation } from "./write-profiles.js";
 import { collectGuardedDiff } from "./diff-guard.js";
@@ -35,6 +37,7 @@ function modelRef(route: RouteResult): ModelRef {
 }
 
 /** Who this plan says will work, recorded with the run so the record names its own models. */
+/** The plan's roles, as the fallback attribution for a write that never dispatched one of them. */
 function observationRolesFor(roles: readonly PlannedWriteRole[]): readonly ObservationRole[] {
   const seen: ObservationRole[] = [];
   for (const role of roles) {
@@ -342,7 +345,10 @@ export class WriteDogfoodRunner {
         observation: Object.freeze({
           predicted: input.observation.predicted,
           effective: input.observation.effective,
-          roles: observationRolesFor(plan.roles),
+          // Executed attribution from this task's own provider events, with the plan supplying the
+          // roles that were routed and never dispatched. A reviewer the plan named but the run never
+          // reached is recorded as planned, not as one that ran.
+          roles: executionAttribution({ events: this.#ledger.receipt(task.taskId).events, planned: observationRolesFor(plan.roles) }),
           prior: input.observation.prior,
         }),
         reconciled: false,
@@ -408,7 +414,12 @@ export class WriteDogfoodRunner {
       this.#ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool });
       const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
+        // Recognised and recorded even though this path will not act on it: a write that was refused
+        // is a fact the operator needs, whether or not a failover is safe here (it is not — the
+        // worktree may already carry the first agent's partial work).
+        const writeRefusal = providerQuotaRefusal(primary.model.providerId, primary.model.quotaPool, `${result.stdout}\n${result.stderr}`);
         this.#ledger.appendEvent(task.taskId, "shadow.provider.failed", {
+          ...(writeRefusal === null ? {} : { quotaRefusal: writeRefusal }),
           role: "primary",
           phase: "write",
           provider: primary.model.providerId,
@@ -509,7 +520,12 @@ export class WriteDogfoodRunner {
       // The worktree is released before the record is attempted, and the record is attempted even
       // if the release throws: an unremovable worktree must not also lose the task's outcome.
       try { worktrees.close(); }
-      finally { try { complete(); } catch { /* an incomplete record is reconciled later, not hidden */ } }
+      finally {
+        // The attribution is durable before the observation that reads it.
+        try { this.#ledger.appendEvent(task.taskId, "task.execution", executionRecord(executionAttribution({ events: this.#ledger.receipt(task.taskId).events, planned: observationRolesFor(plan.roles) }))); }
+        catch { /* evidence, not the run's own error: never replace it */ }
+        try { complete(); } catch { /* an incomplete record is reconciled later, not hidden */ }
+      }
     }
   }
 

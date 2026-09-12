@@ -9,7 +9,10 @@ import {
   TaskLedger,
   budgetFor,
   classifyTask,
+  quotaRefusalOf,
+  type ProviderQuotaRefusal,
   type RegisteredProject,
+  type TaskReceipt,
   type TaskClassification,
 } from "@braingate/core";
 import {
@@ -359,7 +362,10 @@ function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnaps
   if (!entries.some((entry) => entry.configured)) throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Import/discover then add scored model definitions before dogfood execution.");
   const quota = new GlobalQuotaStore(state.globalDir);
   try {
-    const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota: quota.latest() });
+    // The refusal backoff is applied here, where a task is about to be routed: a pool a provider
+    // refused minutes ago is avoided before the call rather than after it. It does not touch
+    // availability — it is a local decision to wait, with its own expiry.
+    const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota: quota.latest(), backoff: quota.activeRefusalBackoffs() });
     return Object.freeze({ router: new CapabilityRouter(hydrated.registry), runtimes: hydrated.runtimes });
   } finally { quota.close(); }
 }
@@ -424,6 +430,79 @@ export function roleLine(roles: readonly { readonly role: string; readonly model
  * whether the call it rode along with was served. That turned a utilisation reading into a health
  * claim, and routing acted on it: a pool at 47% could be skipped as though it had refused.
  */
+/**
+ * Applies what a finished task taught about refusals, in both directions.
+ *
+ * A pool a provider refused is avoided for a short, bounded time (a local decision, never a quota
+ * claim), and a pool that just served a call has any backoff superseded — a success is the evidence
+ * that ends the policy.
+ *
+ * Both are read from the task's own events rather than from the thrown error, so the policy can only
+ * describe facts the ledger already holds. It is *not* written in the same transaction as those facts,
+ * and cannot be: the ledger and this store are separate databases in WAL mode. A hard kill between
+ * them loses the backoff — one redundant provider probe on a later task — and never touches quota
+ * truth or the task's own record. Re-recording the same refusal is idempotent, because the state is
+ * decided by observation time rather than by how many times something was written.
+ */
+function recordRefusalBackoffs(state: OperatorStatePaths, receipt: TaskReceipt, providerCalls: readonly { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly completed: boolean }[]): void {
+  const refusals = refusalsIn(receipt.events);
+  const served = providerCalls.filter((call) => call.completed);
+  if (refusals.length === 0 && served.length === 0) return;
+  const store = new GlobalQuotaStore(state.globalDir);
+  try {
+    for (const refusal of refusals) {
+      store.recordRefusalBackoff({
+        provider: refusal.providerId,
+        quotaPool: refusal.quotaPool,
+        reason: refusal.reason,
+        detail: refusal.detail,
+        sourceTaskId: receipt.task.taskId,
+      });
+    }
+    for (const call of served) {
+      store.clearRefusalBackoff({ provider: call.providerId, quotaPool: call.quotaPool, sourceTaskId: receipt.task.taskId });
+    }
+  } finally { store.close(); }
+}
+
+/** Every distinct refusal this task recorded, by pool: a task may have been refused more than once. */
+function refusalsIn(events: TaskReceipt["events"]): readonly ProviderQuotaRefusal[] {
+  const seen = new Map<string, ProviderQuotaRefusal>();
+  for (const event of events) {
+    if (event.kind !== "shadow.provider.failed" && event.kind !== "shadow.provider.quota_refused") continue;
+    const payload = typeof event.payload === "object" && event.payload !== null ? (event.payload as { readonly quotaRefusal?: unknown }) : null;
+    const refusal = quotaRefusalOf({ quotaRefusal: payload?.quotaRefusal });
+    if (refusal === null) continue;
+    seen.set(`${refusal.providerId}\u0000${refusal.quotaPool}`, refusal);
+  }
+  return Object.freeze([...seen.values()]);
+}
+
+/** Pools whose provider actually answered in this task — the evidence that ends a backoff. */
+function servedPools(events: TaskReceipt["events"]): readonly { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly completed: boolean }[] {
+  const completed = new Set<string>();
+  const started = new Map<string, { providerId: string; modelId: string; quotaPool: string }>();
+  for (const event of events) {
+    if (event.kind !== "shadow.provider.started" && event.kind !== "shadow.provider.completed") continue;
+    const payload = typeof event.payload === "object" && event.payload !== null ? (event.payload as Record<string, unknown>) : null;
+    if (payload === null) continue;
+    const providerId = typeof payload.provider === "string" ? payload.provider : null;
+    const modelId = typeof payload.model === "string" ? payload.model : null;
+    const quotaPool = typeof payload.quotaPool === "string" ? payload.quotaPool : null;
+    if (providerId === null || modelId === null || quotaPool === null) continue;
+    started.set(`${providerId}\u0000${modelId}`, { providerId, modelId, quotaPool });
+    if (event.kind === "shadow.provider.completed") completed.add(`${providerId}\u0000${modelId}`);
+  }
+  return Object.freeze([...started.entries()].map(([key, call]) => Object.freeze({ ...call, completed: completed.has(key) })));
+}
+
+/** The single task this invocation just ran, read from the ledger rather than guessed at. */
+function taskJustRun(ledger: TaskLedger, preexistingTaskId: string | null): TaskReceipt | null {
+  const newest = ledger.listTasks()[0];
+  if (newest === undefined || newest.taskId === preexistingTaskId) return null;
+  return ledger.receipt(newest.taskId);
+}
+
 function recordQuotaReading(state: OperatorStatePaths, readings: readonly (QuotaReading & { readonly quotaPool: string })[]): void {
   if (readings.length === 0) return;
   // Every window is kept, because a receipt should be able to say what the provider reported.
@@ -612,6 +691,9 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // every call, and only the fullest of them should decide where the next task goes.
     const pendingQuotaReadings: (QuotaReading & { readonly quotaPool: string })[] = [];
     const ledger = new TaskLedger(project);
+    // Whatever was newest before this invocation, so the task this run created can be identified on
+    // the failure path — a refusal ends the run, and its backoff must be applied anyway.
+    const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
       const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
@@ -623,10 +705,17 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       const observationSequence = store.find(result.taskId)?.sequence ?? null;
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
       recordQuotaReading(state, pendingQuotaReadings);
+      recordRefusalBackoffs(state, result.taskReceipt, servedPools(result.taskReceipt.events));
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence, outcome: recorded?.outcome ?? null, reviewStatus: recorded?.reviewStatus ?? null, failureKind: recorded?.failureKind ?? null, answer: result.workflow?.finalOutput ?? null, usage: result.taskReceipt.usage });
       emit(json, data, `${result.workflow?.finalOutput ?? "No answer returned."}\n\nTask ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)}`, stdout);
       return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
     } catch (error) {
+      try {
+        // Best effort by design: the ledger already holds the refusal, so a process killed before this
+        // runs costs at most one more probe by a later task. It never changes what this task recorded.
+        const receipt = taskJustRun(ledger, beforeTaskId);
+        if (receipt !== null) recordRefusalBackoffs(state, receipt, servedPools(receipt.events));
+      } catch { /* a backoff that cannot be recorded must not replace the run's own failure */ }
       // The task exists and the runner has already recorded what became of it, so this is an
       // execution failure rather than a preflight one. Marked so the operator is never told that
       // nothing was recorded when the record exists.
@@ -682,6 +771,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     }
 
     const ledger = new TaskLedger(project);
+    const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
       const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
@@ -690,6 +780,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       const recorded = recordedOutcomeOf(result.taskReceipt);
       const observationSequence = store.find(result.taskId)?.sequence ?? null;
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
+      recordRefusalBackoffs(state, result.taskReceipt, servedPools(result.taskReceipt.events));
       const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence, outcome: recorded?.outcome ?? null, reviewStatus: recorded?.reviewStatus ?? null, failureKind: recorded?.failureKind ?? null, worktree: result.worktree, changedFiles: result.changedFiles, diff: result.diff, verification: result.verification, review: result.review, readyForApproval: result.readyForApproval, approvalRequired: true, mergePerformed: false, usage: result.taskReceipt.usage });
       emit(json, data, `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
       return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });

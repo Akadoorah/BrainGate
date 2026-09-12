@@ -288,6 +288,11 @@ export function failureKindFromCode(code: string): FailureKind {
       return "provider-empty";
     case "SHADOW_TIMEOUT":
       return "timeout";
+    // A refusal the provider stated, with no eligible model left once its pool is excluded, is a
+    // routing outcome rather than a provider failure: the provider behaved correctly.
+    case "ROLE_NO_ELIGIBLE_FALLBACK":
+    case "ROLE_FAILOVER_BUDGET_EXHAUSTED":
+      return "routing-unavailable";
     case "SHADOW_AUTH_REQUIRED":
     case "SHADOW_API_AUTH_DENIED":
     case "WRITE_SUBSCRIPTION_REQUIRED":

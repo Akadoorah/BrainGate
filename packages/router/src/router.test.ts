@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { BrainGateInvariantError, budgetFor, classifyTask } from "@braingate/core";
 import { CapabilityRouter, ModelRegistry, type ModelDefinition, type ModelRuntime } from "./index.js";
 
-const runtime = (quotaState: ModelRuntime["quotaState"], quotaHint: number | null = null): ModelRuntime => ({ available: true, quotaState, quotaHint, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" });
+const runtime = (quotaState: ModelRuntime["quotaState"], quotaHint: number | null = null): ModelRuntime => ({ available: true, quotaState, quotaHint, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-07T00:00:00Z" });
 const model = (providerId: string, modelId: string, values: Partial<ModelDefinition> = {}): ModelDefinition => ({
   providerId, modelId, quotaPool: `${providerId}:subscription`,
   capabilities: { scout: 70, planner: 70, coder: 70, reviewer: 70, judge: 70 },
@@ -132,7 +132,7 @@ test("a model without a visual capability cannot take a visual task", () => {
 // twelve, so a stronger, slower model won a one-line lookup by roughly two points.
 test("a lookup goes to the fastest model that clears the floor, not the strongest", () => {
   const registry = new ModelRegistry();
-  const runtime = { available: true, quotaState: "healthy" as const, quotaHint: null, quotaObservedAt: null, observedAt: "2026-09-09T00:00:00Z" };
+  const runtime = { available: true, quotaState: "healthy" as const, quotaHint: null, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-09T00:00:00Z" };
   registry.register({ providerId: "anthropic", modelId: "fast-model", quotaPool: "pool", capabilities: { coder: 70 }, speed: "fast", contextCapacity: 200_000, writeCapable: false, reasoning: 78, underlyingFamily: null }, runtime);
   registry.register({ providerId: "anthropic", modelId: "balanced-model", quotaPool: "pool", capabilities: { coder: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 85, underlyingFamily: null }, runtime);
   registry.register({ providerId: "anthropic", modelId: "deep-model", quotaPool: "pool", capabilities: { coder: 95 }, speed: "deep", contextCapacity: 200_000, writeCapable: false, reasoning: 98, underlyingFamily: null }, runtime);
@@ -155,7 +155,7 @@ test("a lookup goes to the fastest model that clears the floor, not the stronges
 
 test("speed does not outrank a model that cannot do the job at all", () => {
   const registry = new ModelRegistry();
-  const runtime = { available: true, quotaState: "healthy" as const, quotaHint: null, quotaObservedAt: null, observedAt: "2026-09-09T00:00:00Z" };
+  const runtime = { available: true, quotaState: "healthy" as const, quotaHint: null, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: "2026-09-09T00:00:00Z" };
   // Below the floor is not a preference, it is a rejection: being quick about the wrong answer
   // is not what "cheapest worker that can do it" means.
   registry.register({ providerId: "anthropic", modelId: "too-weak", quotaPool: "pool", capabilities: { coder: 10 }, speed: "fast", contextCapacity: 200_000, writeCapable: false, reasoning: 20, underlyingFamily: null }, runtime);

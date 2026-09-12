@@ -1,11 +1,11 @@
-import { BrainGateInvariantError, failureKindFromCode, type RegisteredProject, type TaskLedger } from "@braingate/core";
+import { BrainGateInvariantError, ProviderQuotaRefusalError, failureKindFromCode, type RegisteredProject, type TaskLedger } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { planShadowInvocation } from "./profiles.js";
-import { quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
+import { providerQuotaRefusal, quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
 import { grants } from "./tool-grants.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
@@ -500,7 +500,11 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       });
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         const failureKind = result.timedOut ? "timeout" : "provider-failed";
+        // Recognised before the event is written, so the refusal is in the failure record itself and
+        // every reader — `tasks show`, the dashboard, a reconciler — sees the same fact.
+        const failureRefusal = providerQuotaRefusal(request.model.providerId, request.model.quotaPool, `${result.stdout}\n${result.stdoutTail ?? ""}`);
         this.#event("shadow.provider.failed", {
+          ...(failureRefusal === null ? {} : { quotaRefusal: failureRefusal }),
           ...safeMeta,
           failureKind,
           timedOut: result.timedOut,
@@ -524,9 +528,19 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           catch { /* a reading nobody could record is not a reason to lose the failure */ }
         }
         const reason = providerFailureReason(request.model.providerId, result.stdout, result.stderr);
-        throw new BrainGateInvariantError(
+        // A structured quota refusal is the one failure that says a *different* pool would do
+        // better, so it is recognised here — from the provider's own machine-readable statement —
+        // and carried on the error. Everything else stays an ordinary failure.
+        const refusal = failureRefusal;
+        if (refusal !== null) {
+          this.#event("shadow.provider.quota_refused", { ...safeMeta, reason: refusal.reason, resetAt: refusal.resetAt, detail: refusal.detail.slice(0, 500) });
+        }
+        const message = `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.${reason === null ? "" : ` The provider reported: ${reason}.`}${failureAdvice(reason)}`;
+        if (refusal === null) throw new BrainGateInvariantError("SHADOW_PROVIDER_FAILED", message);
+        throw new ProviderQuotaRefusalError(
           "SHADOW_PROVIDER_FAILED",
-          `Shadow provider ${request.model.providerId}/${request.model.modelId} failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.${reason === null ? "" : ` The provider reported: ${reason}.`}${failureAdvice(reason)}`,
+          `${message} The provider refused this call on quota (${refusal.reason}, pool ${refusal.quotaPool}); the pool is excluded for the rest of this task.`,
+          refusal,
         );
       }
       // A Grok build that cannot apply the profile now warns and carries on (measured against

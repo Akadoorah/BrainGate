@@ -1,6 +1,7 @@
 import { BrainGateInvariantError, BudgetTracker } from "@braingate/core";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteCandidate } from "@braingate/router";
 import type { AgentInvoker, AgentRequest, AgentResponse, ReviewIndependence, WorkflowEvent, WorkflowInput, WorkflowOutcome, WorkflowReceipt } from "./types.js";
+import { RoleFailover, type FailoverAttempt } from "./role-failover.js";
 
 const MAX_FINDINGS = 8;
 const MAX_FINDING_CHARS = 1_000;
@@ -103,16 +104,25 @@ export class WorkflowEngine {
       events.push(Object.freeze({ sequence: ++sequence, kind, role, model, detail }));
     };
 
+    // Task-local quota-refusal state. Created per run, so a pool refused here is excluded for this
+    // task and no other; the next task re-measures rather than inheriting a verdict.
+    const failover = new RoleFailover({
+      tracker,
+      budget: input.budget,
+      emit: (kind, role, model, detail) => emit(kind, role as WorkflowEvent["role"], model, detail),
+    });
+
     const primaryExcluded = input.excludeProviders?.primary;
-    const primaryRoute = this.#router.route({
+    const routePrimary = (): RouteCandidate => this.#router.route({
       role: "coder",
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: input.writeRequired,
       ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
-    });
-    const primary = primaryRoute.selected;
+      ...failover.routeOptions(),
+    }).selected;
+    let primary = routePrimary();
     let finalOutput = "";
 
     const invoke = async (
@@ -138,6 +148,20 @@ export class WorkflowEngine {
       }
     };
 
+    // The failover's view of one attempt. `invoke` stays the only path to a provider, so a failed
+    // over call is reserved, recorded and bounded exactly like a first one.
+    const attempt = (a: FailoverAttempt): Promise<AgentResponse> =>
+      invoke(a.role as AgentRequest["role"], a.candidate, a.phase, a.findings, a.candidateOutput, a.reviewerLike);
+    const dispatch = (
+      role: AgentRequest["role"],
+      candidate: RouteCandidate,
+      phase: string,
+      findings: readonly string[],
+      candidateOutput: string | null,
+      reviewerLike: boolean,
+      reroute: () => RouteCandidate,
+    ) => failover.dispatch({ role, candidate, phase, findings, candidateOutput, reviewerLike }, attempt, reroute);
+
     // A separate planning pass, on complex work only (ADR: the budget decides). The planner is
     // routed on its own capability, so the strongest model available decides the approach while
     // a cheaper one carries it out — which is the point of routing across a shared quota. Its
@@ -158,6 +182,7 @@ export class WorkflowEngine {
         writeRequired: false,
         ...(independence === undefined ? {} : { independence }),
         ...(plannerExcluded === undefined ? {} : { excludeProviders: plannerExcluded }),
+        ...failover.routeOptions(),
       }).selected;
 
       try {
@@ -182,16 +207,22 @@ export class WorkflowEngine {
       }
 
       if (plan !== null && secondPlan === null) {
-        const planned = await invoke("planner", plan, "planning", [], null, false);
+        const plannedDispatch = await dispatch("planner", plan, "planning", [], null, false, () => routePlanner());
+        plan = plannedDispatch.candidate;
+        const planned = plannedDispatch.response;
         if (planned.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Planner response was not work.");
         approach = planned.output;
       } else if (plan !== null && secondPlan !== null) {
         // Together, not in turn: the concurrency the budget already grants is what makes a
         // second subscription free in wall-clock terms rather than twice as slow.
-        const [first, second] = await Promise.all([
-          invoke("planner", plan, "planning-a", [], null, false),
-          invoke("planner", secondPlan, "planning-b", [], null, false),
+        const [firstDispatch, secondDispatch] = await Promise.all([
+          dispatch("planner", plan, "planning-a", [], null, false, () => routePlanner()),
+          dispatch("planner", secondPlan, "planning-b", [], null, false, () => routePlanner({ mode: "required", level: "cross-provider", models: [modelRef(secondPlan!)] })),
         ]);
+        plan = firstDispatch.candidate;
+        secondPlan = secondDispatch.candidate;
+        const first = firstDispatch.response;
+        const second = secondDispatch.response;
         if (first.kind !== "work" || second.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Planner response was not work.");
         approach = mergedApproaches([
           { model: modelRef(plan), output: first.output },
@@ -201,7 +232,25 @@ export class WorkflowEngine {
       }
     }
 
-    const initial = await invoke("primary", primary, "initial", [], approach, false);
+    // What the task has learned since the primary was routed. The primary's route was decided before
+    // the planning pass ran, and a planner that was refused has already proved this task may not use
+    // that pool — so the primary is routed again rather than dispatched into a refusal the task
+    // already knows about. When nothing was refused this is the same candidate, call for call.
+    const primaryForDispatch = (): RouteCandidate => {
+      if (failover.excludedQuotaPools.length === 0) return primary;
+      try {
+        return routePrimary();
+      } catch (error) {
+        if (!isNoEligibleModel(error)) throw error;
+        throw new BrainGateInvariantError(
+          "ROLE_NO_ELIGIBLE_FALLBACK",
+          `The primary role has no eligible model once the quota pools refused by this task (${failover.excludedQuotaPools.join(", ")}) are excluded. ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
+    };
+    const initialDispatch = await dispatch("primary", primaryForDispatch(), "initial", [], approach, false, () => routePrimary());
+    primary = initialDispatch.candidate;
+    const initial = initialDispatch.response;
     if (initial.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Primary response was not work.");
     finalOutput = initial.output;
 
@@ -218,6 +267,7 @@ export class WorkflowEngine {
       writeRequired: false,
       independence,
       ...(reviewerExcluded === undefined ? {} : { excludeProviders: reviewerExcluded }),
+      ...failover.routeOptions(),
     }).selected;
 
     let reviewer: RouteCandidate;
@@ -240,20 +290,24 @@ export class WorkflowEngine {
     const independence = reviewIndependence(primary, reviewer, input);
     emit("review.independence", "reviewer", modelRef(reviewer), `${independence.level};shared-quota=${independence.sharedQuotaPool};human-approval=${independence.humanApprovalRequired}`);
 
-    let reviewerResponse = await invoke("reviewer", reviewer, "review-1", [], finalOutput, true);
+    const reviewOne = await dispatch("reviewer", reviewer, "review-1", [], finalOutput, true, () => routeReviewer({ mode: "required", level: "cross-provider", models: [modelRef(primary)] }));
+    reviewer = reviewOne.candidate;
+    let reviewerResponse = reviewOne.response;
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
 
     if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
 
     if (reviewerResponse.verdict === "disagree") {
-      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke, secondPlan);
+      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, dispatch, routeReviewer, () => failover.routeOptions(), secondPlan);
     }
 
     if (input.budget.maxRepairRounds < 1) return this.#receipt(input, "blocked_changes_required", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
     tracker.recordRepairRound();
     const findings = boundFindings(reviewerResponse.findings);
-    const repair = await invoke("primary", primary, "repair-1", findings, finalOutput, false);
+    const repairDispatch = await dispatch("primary", primary, "repair-1", findings, finalOutput, false, () => routePrimary());
+    primary = repairDispatch.candidate;
+    const repair = repairDispatch.response;
     if (repair.kind !== "work") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Repair response was not work.");
     finalOutput = repair.output;
     emit("repair.completed", "primary", primaryRef, `findings:${findings.length}`);
@@ -262,12 +316,14 @@ export class WorkflowEngine {
       return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
     }
 
-    reviewerResponse = await invoke("reviewer", reviewer, "review-2", [], finalOutput, true);
+    const reviewTwo = await dispatch("reviewer", reviewer, "review-2", [], finalOutput, true, () => routeReviewer({ mode: "required", level: "cross-provider", models: [modelRef(primary)] }));
+    reviewer = reviewTwo.candidate;
+    reviewerResponse = reviewTwo.response;
     if (reviewerResponse.kind !== "review") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Reviewer response was not review.");
     emit(`review.${reviewerResponse.verdict}`, "reviewer", modelRef(reviewer), reviewerResponse.verdict);
     if (reviewerResponse.verdict === "approve") return this.#receipt(input, "approved_after_repair", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
     if (reviewerResponse.verdict === "disagree") {
-      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, invoke, secondPlan);
+      return await this.#resolveDisagreement(input, plan, primary, reviewer, reviewerResponse.findings, events, tracker, finalOutput, dispatch, routeReviewer, () => failover.routeOptions(), secondPlan);
     }
     return this.#receipt(input, "repaired_needs_review", plan, primary, reviewer, null, events, tracker, finalOutput, secondPlan);
   }
@@ -281,7 +337,17 @@ export class WorkflowEngine {
     events: WorkflowEvent[],
     tracker: BudgetTracker,
     finalOutput: string,
-    invoke: (role: AgentRequest["role"], candidate: RouteCandidate, phase: string, findings: readonly string[], candidateOutput: string | null, reviewerLike: boolean) => Promise<AgentResponse>,
+    dispatch: (
+      role: AgentRequest["role"],
+      candidate: RouteCandidate,
+      phase: string,
+      findings: readonly string[],
+      candidateOutput: string | null,
+      reviewerLike: boolean,
+      reroute: () => RouteCandidate,
+    ) => Promise<{ readonly response: AgentResponse; readonly candidate: RouteCandidate }>,
+    routeReviewer: (independence: IndependenceConstraint) => RouteCandidate,
+    quotaExclusions: () => { readonly excludeQuotaPools?: readonly string[] },
     secondPlanner: RouteCandidate | null = null,
   ): Promise<WorkflowReceipt> {
     if (input.budget.councilPolicy !== "disagreement-only" || input.budget.maxCouncilRounds < 1) {
@@ -292,7 +358,7 @@ export class WorkflowEngine {
     }
     tracker.recordCouncilRound();
     const judgeExcluded = input.excludeProviders?.judge;
-    const judge = this.#router.route({
+    const routeJudge = (): RouteCandidate => this.#router.route({
       role: "judge",
       classification: input.classification,
       budget: input.budget,
@@ -300,9 +366,11 @@ export class WorkflowEngine {
       writeRequired: false,
       independence: { mode: "preferred", level: "cross-provider", models: [modelRef(primary), modelRef(reviewer)] },
       ...(judgeExcluded === undefined ? {} : { excludeProviders: judgeExcluded }),
+      ...quotaExclusions(),
     }).selected;
-    const bounded = boundFindings(findings);
-    const response = await invoke("judge", judge, "judge-1", bounded, finalOutput, true);
+    const judgeDispatch = await dispatch("judge", routeJudge(), "judge-1", boundFindings(findings), finalOutput, true, routeJudge);
+    const judge = judgeDispatch.candidate;
+    const response = judgeDispatch.response;
     if (response.kind !== "judge") throw new BrainGateInvariantError("WORKFLOW_RESPONSE_INVALID", "Judge response was not judge.");
     events.push(Object.freeze({ sequence: events.length + 1, kind: `judge.${response.verdict}`, role: "judge", model: modelRef(judge), detail: response.rationale.slice(0, 1_000) }));
     return this.#receipt(input, response.verdict === "approve" ? "approved_by_judge" : "blocked_changes_required", plan, primary, reviewer, judge, events, tracker, finalOutput, secondPlanner);
