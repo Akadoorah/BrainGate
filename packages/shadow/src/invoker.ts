@@ -4,7 +4,8 @@ import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-isolation.js";
-import { planShadowInvocation } from "./profiles.js";
+import { planShadowInvocation, snapshotPrimaryEligibility } from "./profiles.js";
+import type { TaskSnapshotEvidence, TaskSnapshotProvider } from "./snapshot-provider.js";
 import { providerQuotaRefusal, quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
 import { grants } from "./tool-grants.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
@@ -364,6 +365,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
+  readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
   readonly #context: unknown;
   readonly #executor: ShadowProcessExecutor;
   readonly #ledger: TaskLedger | null;
@@ -377,6 +379,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #onThinking: (() => void) | undefined;
   readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
   readonly #timeoutMs: number | undefined;
+  readonly #snapshotStore: TaskSnapshotProvider | undefined;
 
   constructor(input: {
     readonly project: RegisteredProject;
@@ -386,10 +389,20 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly acceptances?: readonly OperatorProviderAcceptance[];
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly grokIsolation?: GrokIsolationAttestation;
+    /** The snapshot-read proof, which is a different posture from the staged one. */
+    readonly grokSnapshotIsolation?: GrokIsolationAttestation;
     readonly context: unknown;
     readonly executor?: ShadowProcessExecutor;
     readonly ledger?: TaskLedger;
     readonly taskId?: string;
+    /**
+     * Where a read-primary run's project copy comes from.
+     *
+     * Injected rather than imported: this package must not depend on the package that copies projects.
+     * A provider that is snapshot-capable and attestation-current but handed no provider fails closed
+     * rather than falling back to the checkout, which is the whole point of the mode.
+     */
+    readonly snapshotStore?: TaskSnapshotProvider;
     /** Tool-use turns a read-only inspection may spend; from the task's execution budget. */
     readonly maxTurns?: number;
     /** Wall-clock allowance for one invocation; from the task's execution budget. */
@@ -438,6 +451,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#acceptances = Object.freeze([...(input.acceptances ?? [])]);
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
+    this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
     this.#context = input.context;
     this.#executor = input.executor ?? new NodeShadowProcessExecutor();
     this.#ledger = input.ledger ?? null;
@@ -450,6 +464,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#onThinking = input.onThinking;
     this.#onQuotaReading = input.onQuotaReading;
     this.#timeoutMs = input.timeoutMs;
+    this.#snapshotStore = input.snapshotStore;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
 
@@ -472,10 +487,44 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     const attestation = this.#attestations.get(request.model.providerId);
     const acceptance = this.#acceptances.find((item) => item.providerId === request.model.providerId && item.source === "operator-accepted-unscoped-provider");
     const networkAcceptance = this.#acceptances.find((item) => item.providerId === request.model.providerId && item.source === "operator-accepted-network-access");
+    // Read-primary on a snapshot-capable provider reads a copy BrainGate made for this task. The
+    // decision is made here, from the provider's capability and its current sandbox attestation, and
+    // the copy is created once per task and reused by every later attempt.
+    // Read-primary only, and only for a provider whose sandbox BrainGate can currently attest. A
+    // reviewer on the same provider keeps its staged workspace: the role decides the mode, not the
+    // provider, so an attestation for one role never silently changes how another one executes.
+    const snapshotPrimary = request.role === "primary" && snapshotPrimaryEligibility({
+      providerId: snapshot.providerId,
+      snapshot,
+      ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+      ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+      ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),
+    }).eligible;
+    let snapshotEvidence: TaskSnapshotEvidence | null = null;
+    if (snapshotPrimary) {
+      if (this.#snapshotStore === undefined || this.#taskId === null) {
+        throw new BrainGateInvariantError("SHADOW_SNAPSHOT_PROVIDER_MISSING", "A snapshot-primary run needs the snapshot provider, and it was not supplied.");
+      }
+      snapshotEvidence = this.#snapshotStore.ensure({ taskId: this.#taskId, source: this.#cwd });
+      this.#event("task.snapshot", {
+        snapshotId: snapshotEvidence.snapshotId,
+        manifestHash: snapshotEvidence.manifestHash,
+        fileCount: snapshotEvidence.fileCount,
+        totalBytes: snapshotEvidence.totalBytes,
+        policyVersion: snapshotEvidence.policyVersion,
+        sourceFingerprint: snapshotEvidence.sourceFingerprint,
+        workspaceMode: "staged-read-snapshot",
+        role: request.role,
+        provider: request.model.providerId,
+        model: request.model.modelId,
+      });
+    }
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
       cwd: this.#cwd,
+      ...(snapshotEvidence === null ? {} : { snapshotPrimary: true, workspaceRoot: snapshotEvidence.root }),
+      ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),
       payload,
       ...(this.#maxTurns === undefined ? {} : { maxTurns: this.#maxTurns }),
       // Closed once the task has spent what it was granted. Enforced before the call rather
@@ -487,7 +536,16 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
       ...(request.model.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
     });
-    const safeMeta = Object.freeze({ role: request.role, phase: request.phase, provider: request.model.providerId, model: request.model.modelId, quotaPool: request.model.quotaPool });
+    const safeMeta = Object.freeze({
+      role: request.role,
+      phase: request.phase,
+      provider: request.model.providerId,
+      model: request.model.modelId,
+      quotaPool: request.model.quotaPool,
+      // The workspace this attempt actually received. Recorded on every provider event so the mode
+      // travels with the attempt instead of being inferred later from what was planned.
+      workspaceMode: plan.workspaceMode,
+    });
     this.#event("shadow.provider.started", safeMeta);
     this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
     try {
@@ -498,6 +556,16 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         ...(this.#onText === undefined ? {} : { onText: this.#onText }),
         ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }),
       });
+      // The copy the provider was given must still match its manifest, byte for byte, before anything
+      // it said is believed. A run that wrote into it is a boundary violation whether or not it also
+      // produced an answer — and an answer from a workspace that changed underneath it is not one
+      // BrainGate may present as a reading of the project.
+      if (snapshotEvidence !== null) {
+        if (this.#snapshotStore === undefined || this.#taskId === null || !this.#snapshotStore.verify(this.#taskId)) {
+          this.#event("shadow.snapshot.mutated", { ...safeMeta, snapshotId: snapshotEvidence.snapshotId, manifestHash: snapshotEvidence.manifestHash });
+          throw new BrainGateInvariantError("SHADOW_SNAPSHOT_MUTATED", "The provider's read-only project snapshot changed during the run, so its output is discarded.");
+        }
+      }
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         const failureKind = result.timedOut ? "timeout" : "provider-failed";
         // Recognised before the event is written, so the refusal is in the failure record itself and

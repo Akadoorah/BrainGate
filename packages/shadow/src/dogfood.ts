@@ -4,6 +4,7 @@ import {
   executionRecord,
   deriveOutcome,
   failureKindFromCode,
+  isTerminalTaskState,
   ledgerStateFor,
   registerActiveRun,
   type ExecutionBudget,
@@ -24,7 +25,8 @@ import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import type { GrokIsolationAttestation } from "./grok-isolation.js";
 import { SubscriptionShadowAgentInvoker, type RoleActivity } from "./invoker.js";
 import type { QuotaReading } from "./quota-readings.js";
-import { planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
+import { planShadowInvocation, shadowProviderRoleStatus, snapshotPrimaryEligibility } from "./profiles.js";
+import type { TaskSnapshotProvider } from "./snapshot-provider.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import { assertSourceCheckoutUnchanged, sourceCheckoutFingerprint } from "./source-guard.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
@@ -57,11 +59,22 @@ function acceptanceFor(acceptances: readonly OperatorProviderAcceptance[], provi
 function exclusionsFor(
   snapshots: readonly ProviderSnapshot[],
   role: WorkflowRole,
-  isolation: { readonly codex?: CodexIsolationAttestation; readonly grok?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[] } = {},
+  isolation: { readonly codex?: CodexIsolationAttestation; readonly grok?: GrokIsolationAttestation; readonly grokSnapshot?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[] } = {},
 ): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
     const acceptance = (isolation.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
-    if (!shadowProviderRoleStatus(snapshot.providerId, role, acceptance === undefined ? {} : { acceptance }).enabled) return true;
+    // Read-primary is the one role that may run on a provider whose entire reach is the workspace it
+    // was pointed at, because BrainGate now hands it a copy of the project instead of the checkout.
+    // The question is the same one the invocation asks, from the same function, so the plan cannot
+    // name a model the invocation would then refuse.
+    const snapshotEligible = role === "primary" && snapshotPrimaryEligibility({
+      providerId: snapshot.providerId,
+      snapshot,
+      ...(isolation.codex === undefined ? {} : { codexIsolation: isolation.codex }),
+      ...(isolation.grok === undefined ? {} : { grokIsolation: isolation.grok }),
+      ...(isolation.grokSnapshot === undefined ? {} : { grokSnapshotIsolation: isolation.grokSnapshot }),
+    }).eligible;
+    if (!shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible }).enabled) return true;
     // A provider whose isolation is proven per run, not per install, is not routable until this
     // run has the proof. Excluding it here means the router never selects it and the operator
     // never sees a plan naming a model the invocation would then refuse.
@@ -69,6 +82,12 @@ function exclusionsFor(
     if (snapshot.providerId === "xai" && isolation.grok === undefined) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
+}
+
+/** Whether a task has reached a terminal state, from the ledger rather than from a guess. */
+function taskIsFinished(ledger: TaskLedger, taskId: string): boolean | undefined {
+  try { return isTerminalTaskState(ledger.receipt(taskId).task.state); }
+  catch { return undefined; }
 }
 
 const ROUTE_ROLE: Readonly<Record<string, ObservationRole["role"]>> = Object.freeze({
@@ -142,7 +161,9 @@ export class ShadowDogfoodRunner {
   readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
+  readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
+  readonly #snapshotStore: TaskSnapshotProvider | undefined;
   readonly #finalizer: TaskFinalizer;
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
   readonly #onText: ((text: string) => void) | undefined;
@@ -158,7 +179,22 @@ export class ShadowDogfoodRunner {
     readonly acceptances?: readonly OperatorProviderAcceptance[];
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly grokIsolation?: GrokIsolationAttestation;
+    /**
+     * The snapshot-read proof for Grok.
+     *
+     * Separate from the staged proof because it is a separate posture: an isolated home, its own
+     * profile, and no writable root. A run that has not earned it cannot route primary to Grok.
+     */
+    readonly grokSnapshotIsolation?: GrokIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
+    /**
+     * Where a read-primary run's project copy comes from.
+     *
+     * Supplied by the caller (the CLI wires the execution-side implementation) so this package needs
+     * no dependency on the code that copies projects. Absent it, a snapshot-capable provider is left
+     * out of the primary candidate set rather than handed the checkout.
+     */
+    readonly snapshotStore?: TaskSnapshotProvider;
     /**
      * Where the run's permanent record is written.
      *
@@ -184,7 +220,9 @@ export class ShadowDogfoodRunner {
     this.#acceptances = input.acceptances ?? [];
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
+    this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
     this.#executor = input.executor;
+    this.#snapshotStore = input.snapshotStore;
     this.#finalizer = input.finalizer;
     this.#onRoleActivity = input.onRoleActivity;
     this.#onText = input.onText;
@@ -221,6 +259,7 @@ export class ShadowDogfoodRunner {
     const isolation = Object.freeze({
       ...(this.#codexIsolation === undefined ? {} : { codex: this.#codexIsolation }),
       ...(this.#grokIsolation === undefined ? {} : { grok: this.#grokIsolation }),
+      ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshot: this.#grokSnapshotIsolation }),
       acceptances: this.#acceptances,
     });
     const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation);
@@ -228,11 +267,55 @@ export class ShadowDogfoodRunner {
     const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation);
     const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation);
 
+    // The state this task started from, measured before any provider is called.
+    //
+    // A snapshot is taken later, and only if a snapshot-capable provider ends up running the primary.
+    // Recording the fingerprint now is what makes the later copy provably the same project the
+    // planner and the context were read from: without it, an edit made while the planner worked would
+    // silently be handed to the provider that answered.
+    const snapshotMayBeNeeded = this.#snapshotStore !== undefined && this.#snapshots.some((item) => snapshotPrimaryEligibility({
+      providerId: item.providerId,
+      snapshot: item,
+      ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+      ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+    }).eligible);
+    if (input.dryRun !== true && this.#snapshotStore !== undefined) {
+      // A copy of the operator's source left behind by a killed process is a privacy problem before it
+      // is a disk problem, so a run sweeps its own project's orphans before it starts. Bounded and
+      // reported; it never looks outside this project's snapshots root and never deletes a copy whose
+      // process is alive.
+      try { this.#snapshotStore.sweep({ isTaskFinished: (taskId) => taskIsFinished(this.#ledger, taskId) }); }
+      catch { /* a sweep that cannot run is not a reason to refuse the task */ }
+    }
+
     const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
-    planShadowInvocation({ snapshot: primarySnapshot, model: primaryRef, cwd, payload: preflightPayload("primary", input.task, input.context), ...attestationFor(this.#attestations, primaryRef.providerId), ...acceptanceFor(this.#acceptances, primaryRef.providerId) });
+    // Read-primary may run against a project copy, and whether it will is decided by the same
+    // function the invocation uses. The check is a preview: it proves the invocation is
+    // constructible and names the workspace mode, without creating a snapshot for a plan.
+    const primarySnapshotEligible = snapshotPrimaryEligibility({
+      providerId: primarySnapshot.providerId,
+      snapshot: primarySnapshot,
+      ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+      ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+      ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),
+    }).eligible;
+    planShadowInvocation({
+      snapshot: primarySnapshot,
+      model: primaryRef,
+      cwd,
+      payload: preflightPayload("primary", input.task, input.context),
+      ...(primarySnapshotEligible ? { snapshotPrimary: true, preview: true } : {}),
+      ...attestationFor(this.#attestations, primaryRef.providerId),
+      ...acceptanceFor(this.#acceptances, primaryRef.providerId),
+      // A provider whose isolation is proven per run is only constructible with its proof in hand,
+      // and the primary route can now be one of those providers.
+      ...(primaryRef.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
+      ...(primaryRef.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
+      ...(primaryRef.providerId === "xai" && this.#grokSnapshotIsolation !== undefined ? { grokSnapshotIsolation: this.#grokSnapshotIsolation } : {}),
+    });
 
     const needsReview = input.budget.reviewerPolicy === "required" || (input.budget.reviewerPolicy === "optional" && (input.optionalReview ?? false));
     if (needsReview) {
@@ -264,6 +347,11 @@ export class ShadowDogfoodRunner {
     }
 
     const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
+    // Recorded here — after the task exists, before the first provider call — so the copy a later
+    // failover takes is provably of the state this task started from.
+    if (snapshotMayBeNeeded && this.#snapshotStore !== undefined) {
+      this.#snapshotStore.beginTask({ taskId: task.taskId, source: cwd });
+    }
     this.#ledger.transition(task.taskId, "planned", { shadow: true, dryRun: false });
     const brief = buildTaskBrief({ project: this.#project, task: this.#ledger.requireTask(task.taskId), classification: input.classification, budget: input.budget, routes, context: input.contextSummary, permissions: { executionProfile: "shadow-read-only", networkAllowed: false }, worktree: { enabled: false, taskWorktreeLabel: null } });
     recordTaskBrief(this.#ledger, brief);
@@ -356,7 +444,7 @@ export class ShadowDogfoodRunner {
     });
 
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }) });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }) });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       workflowReceipt = workflow;
@@ -383,6 +471,11 @@ export class ShadowDogfoodRunner {
       throw error;
     } finally {
       unregister();
+      // The copy the provider read exists for this task only. Released here, which is the path every
+      // exit takes — success, provider failure, and a signal, because the interrupt handler runs this
+      // same finally.
+      try { this.#snapshotStore?.discard(task.taskId); }
+      catch { /* a snapshot that cannot be removed is a leftover, not a reason to lose the record */ }
       // Written before the observation, so the attribution the corpus stores is already durable.
       try { recordExecution(); }
       catch { /* attribution is evidence; failing to append it must not replace the run's own error */ }

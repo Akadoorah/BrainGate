@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync, existsSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import { spawn } from "node:child_process";
@@ -9,6 +9,22 @@ import { SecretGuard, redactSecrets } from "@braingate/security";
 import { STAGE_PATH_TOKEN } from "./types.js";
 
 export const CODEX_REVIEW_PROFILE = "braingate-review";
+
+/**
+ * Which self-test contract an attestation was earned under.
+ *
+ * The *profile* hash says what policy was in force. This says what the test that proved it actually
+ * did — and those are different things. When the probe was strengthened to attempt five denied writes
+ * (create, overwrite and delete inside the workspace, and create and overwrite outside it), the policy
+ * did not change at all: same profile, same CLI, same platform, same hash. An attestation earned under
+ * the weaker probe therefore *looked* identical to one earned under the stronger probe, and a cache
+ * that had been trusted before would have kept being trusted for a mode it never demonstrated.
+ *
+ * So proof identity is (profile, contract). A cached proof earns nothing until it names the contract
+ * the current probe produces, and the check for that is a value comparison rather than a convention:
+ * forgetting to delete a cache can never widen a guarantee.
+ */
+export const CODEX_PROBE_VERSION = "codex-sandbox-self-test-v2";
 
 export const CODEX_REVIEW_DISABLED_FEATURES = Object.freeze([
   // Mirrors the isolation-oriented temporary structured request surface in current Codex,
@@ -59,6 +75,14 @@ const PROFILE_POLICY = Object.freeze({
 export interface CodexIsolationAttestation {
   readonly providerId: "openai";
   readonly source: "sandbox-self-test";
+  /**
+   * The self-test contract this proof was earned under.
+   *
+   * Optional because records written before this field existed are still readable — and treated as
+   * what they are: a proof of an older, weaker contract, which satisfies nothing that requires the
+   * current one.
+   */
+  readonly probeVersion?: string;
   readonly version: string;
   readonly platform: "darwin" | "linux";
   readonly profileHash: string;
@@ -230,9 +254,22 @@ function platformGate(platform: NodeJS.Platform): "darwin" | "linux" {
 export function validCodexIsolationAttestation(
   value: CodexIsolationAttestation | undefined,
   snapshot: ProviderSnapshot,
-  options: { readonly platform?: NodeJS.Platform; readonly now?: Date } = {},
+  options: {
+    readonly platform?: NodeJS.Platform;
+    readonly now?: Date;
+    /**
+     * The self-test contract the caller needs the proof to have been earned under.
+     *
+     * Omitted means "any contract this policy accepts": the staged roles are proved by whatever the
+     * profile hash covers, and the stronger contract is a strict superset, so a v2 proof serves them
+     * too. A caller that needs the write-denial attempts asks for v2 by name, and a proof that does
+     * not name it — including one written before the field existed — does not satisfy it.
+     */
+    readonly minProbeVersion?: string;
+  } = {},
 ): boolean {
   if (value === undefined || value.providerId !== "openai" || value.source !== "sandbox-self-test") return false;
+  if (options.minProbeVersion !== undefined && value.probeVersion !== options.minProbeVersion) return false;
   const platform = platformGate(options.platform ?? process.platform);
   // The hash covers the controls actually in force, so it is recomputed from the attestation's
   // own dropped set. A dropped key that is not a declared key, or a hash that does not match
@@ -312,6 +349,13 @@ export class CodexIsolationVerifier {
     const insideFile = join(stage, "inside.txt");
     const outsideFile = join(outside, "outside.txt");
     const writeFile = join(stage, "write-denied.txt");
+    // A stand-in for the operator's checkout: outside the workspace, and holding a file whose bytes a
+    // denied overwrite must leave exactly as they were.
+    const checkout = join(root, "checkout");
+    mkdirSync(checkout, { mode: 0o700 });
+    const checkoutFile = join(checkout, "checkout-canary.txt");
+    const checkoutWrite = join(checkout, "checkout-write-denied.txt");
+    writeFileSync(checkoutFile, "BRAINGATE_CHECKOUT_CANARY", { encoding: "utf8", mode: 0o600 });
     writeFileSync(insideFile, "BRAINGATE_INSIDE_CANARY", { encoding: "utf8", mode: 0o600 });
     writeFileSync(outsideFile, "BRAINGATE_OUTSIDE_CANARY", { encoding: "utf8", mode: 0o600 });
     writeFileSync(join(codexHome, "config.toml"), profileConfig(stage), { encoding: "utf8", mode: 0o600 });
@@ -331,9 +375,22 @@ export class CodexIsolationVerifier {
         throw new BrainGateInvariantError("CODEX_ISOLATION_SELF_TEST_FAILED", "Codex sandbox allowed reading outside the staged workspace.");
       }
 
-      const deniedWrite = await this.#runner.run({ binary: snapshot.binary, args: [...base, "/bin/sh", "-c", "printf blocked > \"$1\"", "_", writeFile], cwd: stage, env: environment.env });
-      if (!deniedWrite.spawned || deniedWrite.timedOut || deniedWrite.exitCode === 0 || existsSync(writeFile)) {
-        throw new BrainGateInvariantError("CODEX_ISOLATION_SELF_TEST_FAILED", "Codex sandbox allowed writing inside the staged read-only workspace.");
+      // Every write a read-only run must not be able to make, attempted for real rather than inferred
+      // from the flags: create, overwrite and delete inside the workspace, and create and overwrite in
+      // the checkout. Denial by the execution boundary is the property BrainGate relies on; noticing a
+      // write afterwards is a second line of defence, not this one.
+      const attempts: readonly { readonly what: string; readonly args: readonly string[]; readonly touched: () => boolean }[] = [
+        { what: "create a file inside the workspace", args: ["/bin/sh", "-c", "printf blocked > \"$1\"", "_", writeFile], touched: () => existsSync(writeFile) },
+        { what: "overwrite a file inside the workspace", args: ["/bin/sh", "-c", "printf tampered >> \"$1\"", "_", insideFile], touched: () => readFileSync(insideFile, "utf8") !== "BRAINGATE_INSIDE_CANARY" },
+        { what: "delete a file inside the workspace", args: ["/bin/rm", "-f", insideFile], touched: () => !existsSync(insideFile) },
+        { what: "create a file in the source checkout", args: ["/bin/sh", "-c", "printf blocked > \"$1\"", "_", checkoutWrite], touched: () => existsSync(checkoutWrite) },
+        { what: "overwrite a file in the source checkout", args: ["/bin/sh", "-c", "printf tampered >> \"$1\"", "_", checkoutFile], touched: () => readFileSync(checkoutFile, "utf8") !== "BRAINGATE_CHECKOUT_CANARY" },
+      ];
+      for (const attempt of attempts) {
+        const outcome = await this.#runner.run({ binary: snapshot.binary, args: [...base, ...attempt.args], cwd: stage, env: environment.env });
+        if (!outcome.spawned || outcome.timedOut || outcome.exitCode === 0 || attempt.touched()) {
+          throw new BrainGateInvariantError("CODEX_ISOLATION_SELF_TEST_FAILED", `Codex sandbox allowed a write: ${attempt.what}.`);
+        }
       }
 
       // ADR 0006: the installed CLI, not a hand-edited list, decides which control keys are
@@ -349,6 +406,7 @@ export class CodexIsolationVerifier {
         source: "sandbox-self-test",
         version,
         platform,
+        probeVersion: CODEX_PROBE_VERSION,
         profileHash: codexIsolationProfileHash(keys.accepted),
         droppedFeatureKeys: keys.dropped,
         observedAt: now.toISOString(),

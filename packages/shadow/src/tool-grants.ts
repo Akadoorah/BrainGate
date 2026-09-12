@@ -9,7 +9,14 @@ import type { ShadowGuarantees } from "./types.js";
  * Wider than `ShadowWorkspaceMode` because the write path has a place the read path does not:
  * a task worktree BrainGate created, which is the only place an `edit` grant is meaningful.
  */
-export type GrantWorkspace = "project" | "staged-clean" | "task-worktree";
+/**
+ * Where a run's workspace came from, in the terms a grant reasons about.
+ *
+ * `staged-read-snapshot` is separate from `staged-clean` on purpose: they hold different things — the
+ * second holds the context a role was handed, the first holds a copy of the operator's project — and a
+ * grant that could not tell them apart could not state which one a role received.
+ */
+export type GrantWorkspace = "project" | "staged-clean" | "staged-read-snapshot" | "task-worktree";
 
 /**
  * What a run may be permitted to do, as one list the type is derived from.

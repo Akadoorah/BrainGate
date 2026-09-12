@@ -16,7 +16,7 @@
  * - `attempted` — a call started and did not complete.
  * - `completed` — the provider answered.
  */
-import { isObservationRoleName, type ObservationRole, type ObservationRoleName } from "./finalization.js";
+import { isObservationRoleName, observationWorkspaceMode, type ObservationRole, type ObservationRoleName, type ObservationWorkspaceMode } from "./finalization.js";
 import type { TaskEvent } from "./task-ledger.js";
 
 export interface RoleAttributionInput {
@@ -45,7 +45,7 @@ function payloadOf(event: TaskEvent): Record<string, unknown> | null {
  * primary ran on Anthropic".
  */
 export function executionAttribution(input: RoleAttributionInput): readonly ObservationRole[] {
-  const entries: { role: ObservationRoleName; providerId: string; modelId: string; status: "attempted" | "completed"; phases: string[]; key: string }[] = [];
+  const entries: { role: ObservationRoleName; providerId: string; modelId: string; status: "attempted" | "completed"; phases: string[]; workspaceMode: ObservationWorkspaceMode | null; key: string }[] = [];
   const byKey = new Map<string, (typeof entries)[number]>();
 
   for (const event of input.events) {
@@ -62,11 +62,15 @@ export function executionAttribution(input: RoleAttributionInput): readonly Obse
     const key = `${role}\u0000${providerId}\u0000${modelId}`;
     let entry = byKey.get(key);
     if (entry === undefined) {
-      entry = { role, providerId, modelId, status: "attempted", phases: [], key };
+      entry = { role, providerId, modelId, status: "attempted", phases: [], workspaceMode: null, key };
       byKey.set(key, entry);
       entries.push(entry);
     }
     if (phase !== null && !entry.phases.includes(phase)) entry.phases.push(phase);
+    // The mode travels on the event itself, so the record says where the provider was pointed rather
+    // than re-deriving it later from what was planned — a failover changes it mid-task.
+    const workspaceMode = observationWorkspaceMode(payload.workspaceMode);
+    if (workspaceMode !== null) entry.workspaceMode = workspaceMode;
     if (event.kind === "shadow.provider.completed") entry.status = "completed";
   }
 
@@ -75,6 +79,7 @@ export function executionAttribution(input: RoleAttributionInput): readonly Obse
     providerId: entry.providerId,
     modelId: entry.modelId,
     status: entry.status,
+    ...(entry.workspaceMode === null ? {} : { workspaceMode: entry.workspaceMode }),
   }));
   const seen = new Set(entries.map((entry) => entry.role));
   for (const planned of input.planned ?? []) {

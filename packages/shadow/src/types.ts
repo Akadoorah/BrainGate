@@ -76,7 +76,15 @@ export interface ShadowRolePayload {
  * one directory such a provider is confined to.
  */
 export type ShadowInputMode = "stdin" | "temp-attachment" | "staged-file";
-export type ShadowWorkspaceMode = "project" | "staged-clean";
+/**
+ * Where a provider's run is pointed.
+ *
+ * `project` is the operator's registered checkout. `staged-clean` is a workspace BrainGate builds for
+ * the run, holding only the context the role was given. `staged-read-snapshot` is that same idea with
+ * the project itself in it: a read-only copy of the checkout, made by BrainGate, so a provider that
+ * must not see the operator's working directory can still be asked about their project.
+ */
+export type ShadowWorkspaceMode = "project" | "staged-clean" | "staged-read-snapshot";
 
 export interface ShadowInvocationPlan {
   readonly providerId: ProviderId;
@@ -84,6 +92,20 @@ export interface ShadowInvocationPlan {
   readonly args: readonly string[];
   readonly cwd: string;
   readonly workspaceMode: ShadowWorkspaceMode;
+  /**
+   * The prepared workspace a `staged-read-snapshot` run is pointed at.
+   *
+   * Present only in that mode, and always a BrainGate-owned directory: the source checkout never
+   * appears here, which is what keeps the operational mode and the security boundary the same fact.
+   */
+  readonly workspaceRoot?: string;
+  /**
+   * Set on a plan built only to be validated — a dry run, or a route check before execution.
+   *
+   * A preview states the mode a real run would use without claiming a workspace exists, and the
+   * executor refuses to run one, so "this is what would happen" can never quietly become "this ran".
+   */
+  readonly preview?: boolean;
   readonly modelId: string;
   readonly quotaPool: string;
   readonly inputMode: ShadowInputMode;

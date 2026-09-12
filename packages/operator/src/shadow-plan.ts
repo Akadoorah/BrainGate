@@ -7,6 +7,7 @@ import {
   planShadowInvocation,
   previewShadowInvocation,
   shadowProviderRoleStatus,
+  snapshotPrimaryEligibility,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type MeasuredCapabilities,
@@ -67,6 +68,8 @@ function attestationFor(attestations: readonly SubscriptionAttestation[], provid
 interface ProviderProof {
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
+  /** The snapshot posture's own proof: a different home and a different contract from the staged one. */
+  readonly grokSnapshotIsolation?: GrokIsolationAttestation;
   readonly acceptances?: readonly OperatorProviderAcceptance[];
 }
 
@@ -81,6 +84,7 @@ function proofFor(proof: ProviderProof, providerId: string): Readonly<{ codexIso
   return Object.freeze({
     ...(providerId === "openai" && proof.codexIsolation !== undefined ? { codexIsolation: proof.codexIsolation } : {}),
     ...(providerId === "xai" && proof.grokIsolation !== undefined ? { grokIsolation: proof.grokIsolation } : {}),
+    ...(providerId === "xai" && proof.grokSnapshotIsolation !== undefined ? { grokSnapshotIsolation: proof.grokSnapshotIsolation } : {}),
     ...(acceptance === undefined ? {} : { acceptance }),
     ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
   });
@@ -99,9 +103,19 @@ function excludedProviders(input: {
 }): readonly string[] {
   return Object.freeze(input.providers.filter((snapshot) => {
     const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
-    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, acceptance === undefined ? {} : { acceptance }).enabled) return true;
+    // The same question the runner asks, from the same function: a plan that hid a provider the runner
+    // would accept is as wrong as one that named a provider the runner would refuse — and the read
+    // primary's snapshot posture is exactly the case where the two drifted apart.
+    const snapshotEligible = input.role === "primary" && snapshotPrimaryEligibility({
+      providerId: snapshot.providerId,
+      snapshot,
+      ...(input.proof.codexIsolation === undefined ? {} : { codexIsolation: input.proof.codexIsolation }),
+      ...(input.proof.grokIsolation === undefined ? {} : { grokIsolation: input.proof.grokIsolation }),
+      ...(input.proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: input.proof.grokSnapshotIsolation }),
+    }).eligible;
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible }).enabled) return true;
     if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
-    if (snapshot.providerId === "xai" && input.proof.grokIsolation === undefined) return true;
+    if (snapshot.providerId === "xai" && (input.role === "primary" ? input.proof.grokSnapshotIsolation === undefined : input.proof.grokIsolation === undefined)) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
 }
@@ -145,10 +159,19 @@ export function buildShadowTaskPlan(input: {
     excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof }),
   });
   const primaryModel = modelRef(primaryRoute);
+  const primarySnapshot = snapshotFor(input.providers, primaryModel.providerId);
+  const primarySnapshotEligible = snapshotPrimaryEligibility({
+    providerId: primarySnapshot.providerId,
+    snapshot: primarySnapshot,
+    ...(proof.codexIsolation === undefined ? {} : { codexIsolation: proof.codexIsolation }),
+    ...(proof.grokIsolation === undefined ? {} : { grokIsolation: proof.grokIsolation }),
+    ...(proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: proof.grokSnapshotIsolation }),
+  }).eligible;
   const primaryInvocation = planShadowInvocation({
-    snapshot: snapshotFor(input.providers, primaryModel.providerId),
+    snapshot: primarySnapshot,
     model: primaryModel,
     cwd,
+    ...(primarySnapshotEligible ? { snapshotPrimary: true, preview: true } : {}),
     payload: payload("primary", input.task, input.context),
     fanOut: input.budget.maxConcurrentAgents > 1,
     ...measuredFor(input, primaryModel.providerId),

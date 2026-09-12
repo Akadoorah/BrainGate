@@ -24,10 +24,12 @@ import {
 } from "@braingate/operator";
 import { CLI_FEATURES, ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, isProviderId, probeCliCapabilities, type CliCapabilityReport, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition, type ModelRef } from "@braingate/router";
+import { CODEX_PROBE_VERSION } from "@braingate/shadow";
 import {
   CodexIsolationVerifier,
   ShadowDogfoodRunner,
   shadowProviderRoleStatus,
+  snapshotPrimaryCapable,
   shadowProviderStatus,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
@@ -38,6 +40,7 @@ import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, gro
 import { taskTitleFor } from "@braingate/security";
 import { reconciliationNotice } from "./tasks-cli.js";
 import { WriteDogfoodRunner, buildWriteTaskPlan, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
+import { ProjectSnapshotProvider } from "@braingate/execution";
 import { DogfoodStore } from "@braingate/dogfood";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf } from "./finalization.js";
 
@@ -140,12 +143,27 @@ function roleReport(
   acceptances: readonly { readonly providerId: string }[],
   codex: CodexIsolationStatus,
   grok: { readonly eligible: boolean; readonly reason: string | null },
+  /**
+   * The snapshot-read posture's own proof.
+   *
+   * Read-primary spends a copy of the project rather than the checkout, so for Grok it is gated on a
+   * different proof from the staged roles: an isolated home and a read-only workspace. The staged
+   * proof being current says nothing about this one.
+   */
+  grokSnapshot: { readonly eligible: boolean; readonly reason: string | null } = { eligible: false, reason: null },
 ): Readonly<Record<string, unknown>> {
   const acceptance = acceptances.find((item) => item.providerId === providerId) as never;
+  // A provider that can be confined to a BrainGate-made project copy is eligible for the read-primary
+  // role, and the same probe that gates its staged roles gates that one: the sandbox proof is what
+  // makes either safe, so doctor reports the role from the proof rather than from the policy alone.
+  const snapshotPrimary = snapshotPrimaryCapable(providerId) && (providerId === "openai" ? codex.eligible : providerId === "xai" ? grokSnapshot.eligible : false);
+  const snapshotPrimaryReason = providerId === "xai" ? grokSnapshot.reason : null;
   const entries = (["planner", "primary", "reviewer", "judge"] as const).map((role) => {
-    const status = shadowProviderRoleStatus(providerId, role, acceptance === undefined ? {} : { acceptance });
+    const status = shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary });
     if (providerId === "openai" && role === "reviewer") return [role, { enabled: codex.eligible, reason: codex.reason, acceptedByOperator: false }] as const;
     if (providerId === "xai" && status.enabled && !grok.eligible) return [role, { enabled: false, reason: grok.reason, acceptedByOperator: false }] as const;
+    if (role === "primary" && snapshotPrimary) return [role, { enabled: true, reason: "Read-only project snapshot; requires the provider's current sandbox self-test attestation.", acceptedByOperator: false }] as const;
+    if (role === "primary" && snapshotPrimaryCapable(providerId) && !snapshotPrimary) return [role, { enabled: false, reason: snapshotPrimaryReason ?? "Read-only project snapshot needs the provider's current self-test attestation for that posture.", acceptedByOperator: false }] as const;
     return [role, status] as const;
   });
   return Object.freeze(Object.fromEntries(entries));
@@ -266,12 +284,15 @@ async function codexIsolationStatus(
   env: NodeJS.ProcessEnv,
   shouldAttempt: boolean,
   state: OperatorStatePaths,
+  /** Read-primary needs the contract that proves the denied writes; the staged roles need the profile. */
+  minProbeVersion?: string,
 ): Promise<IsolationStatus<CodexIsolationAttestation>> {
   return await codexIsolationStatusFor({
     snapshots,
     env,
     shouldAttempt,
     cache: isolationCacheFor(state),
+    ...(minProbeVersion === undefined ? {} : { minProbeVersion }),
     ...(deps.verifyCodexIsolation === undefined ? {} : { verify: deps.verifyCodexIsolation }),
   });
 }
@@ -293,6 +314,8 @@ async function grokProof(
   deps: CliDependencies,
   env: NodeJS.ProcessEnv,
   project?: RegisteredProject,
+  /** `snapshot-read` earns the proof for a read-primary run on a project copy. */
+  mode?: "staged" | "snapshot-read",
 ): Promise<Awaited<ReturnType<typeof grokIsolationStatus>>> {
   return await grokIsolationStatus({
     snapshots,
@@ -300,6 +323,7 @@ async function grokProof(
     shouldAttempt: configuredProvider(new ModelCatalog(state.modelCatalogPath).load(), "xai"),
     cache: isolationCacheFor(state),
     ...(project === undefined ? {} : { project }),
+    ...(mode === undefined ? {} : { mode }),
     ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
   });
 }
@@ -589,8 +613,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const project = projectFromManifest(state, manifest, cwd);
       const snapshots = await discovery(deps, state);
       const entries = new ModelCatalog(state.modelCatalogPath).load();
-      const isolation = await codexIsolationStatus(snapshots, deps, env, true, state);
+      const isolation = await codexIsolationStatus(snapshots, deps, env, true, state, CODEX_PROBE_VERSION);
       const grok = await grokProof(state, snapshots, deps, env, project);
+      const grokSnapshot = await grokProof(state, snapshots, deps, env, project, "snapshot-read");
       const acceptances = loadAcceptances(state);
       const store = new GlobalQuotaStore(state.globalDir);
       let runtimes: readonly unknown[] = [];
@@ -614,9 +639,14 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           authState: snapshot.authState.value,
           authMode: snapshot.authMode.value,
           shadow: shadowProviderStatus(snapshot.providerId),
-          roles: roleReport(snapshot.providerId, acceptances, isolation, grok),
+          roles: roleReport(snapshot.providerId, acceptances, isolation, grok, grokSnapshot),
           ...(snapshot.providerId === "openai" ? { isolation: { attempted: isolation.attempted, eligible: isolation.eligible, source: isolation.attestation?.source ?? null, profileHash: isolation.attestation?.profileHash ?? null, reason: isolation.reason } } : {}),
-          ...(snapshot.providerId === "xai" ? { isolation: { attempted: grok.attempted, eligible: grok.eligible, source: grok.attestation?.source ?? null, profileHash: grok.attestation?.profileHash ?? null, networkRestricted: grok.attestation?.networkRestricted ?? null, configSurfaces: grok.attestation?.configSurfaces ?? [], reason: grok.reason } } : {}),
+          ...(snapshot.providerId === "xai" ? {
+            isolation: { attempted: grok.attempted, eligible: grok.eligible, source: grok.attestation?.source ?? null, profileHash: grok.attestation?.profileHash ?? null, networkRestricted: grok.attestation?.networkRestricted ?? null, configSurfaces: grok.attestation?.configSurfaces ?? [], reason: grok.reason },
+            // The posture a read-primary run executes under: its own profile, its own home, and the
+            // writable roots the kernel actually granted.
+            snapshotIsolation: { attempted: grokSnapshot.attempted, eligible: grokSnapshot.eligible, profileHash: grokSnapshot.attestation?.profileHash ?? null, isolatedHome: grokSnapshot.attestation?.isolatedHome ?? null, writableRoots: grokSnapshot.attestation?.writableRoots ?? [], configSurfaces: grokSnapshot.attestation?.configSurfaces ?? [], observedAt: grokSnapshot.attestation?.observedAt ?? null, expiresAt: grokSnapshot.attestation?.expiresAt ?? null, reason: grokSnapshot.reason },
+          } : {}),
           ...(acceptances.some((item) => item.providerId === snapshot.providerId) ? { acceptance: acceptances.find((item) => item.providerId === snapshot.providerId) } : {}),
         })),
       };
@@ -730,16 +760,23 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       // The artifact pass runs under the same Codex sandbox profile as the reviewer, so it needs
       // the same self-test — including when review is switched off, which is exactly the case
       // that failed: `--visual --no-review` asked for an isolated run and skipped proving it.
-      const isolation = await codexIsolationStatus(snapshots, deps, env, (review || visualTask !== undefined) && configuredOpenAi(state), state);
+      const isolation = await codexIsolationStatus(snapshots, deps, env, // A review needs Codex's proof, and so does a read primary on a project copy: the same
+            // self-test answers both, so the probe runs whenever Codex is configured at all.
+            configuredOpenAi(state), state, CODEX_PROBE_VERSION);
       const codexIsolation = isolation.attestation ?? undefined;
       const grok = await grokProof(state, snapshots, deps, env, project);
       const grokIsolation = grok.attestation ?? undefined;
+    // A read-primary run on a project copy executes from a BrainGate-owned Grok home with no operator
+    // plugins, which is a different proof from the staged one. Earned here, on the same terms.
+    const grokSnapshot = await grokProof(state, snapshots, deps, env, project, "snapshot-read");
+    const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
       const acceptances = loadAcceptances(state);
       const plan = buildWriteTaskPlan({
         router: hydrated.router,
         providers: snapshots,
         ...(codexIsolation === undefined ? {} : { codexIsolation }),
         ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }),
         acceptances,
         classification,
         budget,
@@ -803,6 +840,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           acceptances,
           ...(codexIsolation === undefined ? {} : { codexIsolation }),
           ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }),
+          ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }),
           ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }),
           ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }),
         });
@@ -864,16 +903,21 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const requiredContextTokens = contextTokens(task);
       const context = taskContext(project);
       const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
-      const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state), state);
+      const isolation = await codexIsolationStatus(snapshots, deps, env, configuredOpenAi(state), state, CODEX_PROBE_VERSION);
       const codexIsolation = isolation.attestation ?? undefined;
       const grok = await grokProof(state, snapshots, deps, env, project);
       const grokIsolation = grok.attestation ?? undefined;
+    // A read-primary run on a project copy executes from a BrainGate-owned Grok home with no operator
+    // plugins, which is a different proof from the staged one. Earned here, on the same terms.
+    const grokSnapshot = await grokProof(state, snapshots, deps, env, project, "snapshot-read");
+    const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
       const acceptances = loadAcceptances(state);
       const plan = buildShadowTaskPlan({
         project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
         classification, budget, requiredContextTokens, optionalReview, acceptances,
         ...(codexIsolation === undefined ? {} : { codexIsolation }),
         ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }),
       });
       const planData = serializedPlan(plan);
 
@@ -893,10 +937,13 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           finalizer: projectFinalizer({ project, ledger, store }),
           router: hydrated.router,
           snapshots,
+          snapshotStore: new ProjectSnapshotProvider(project),
           attestations,
           acceptances,
           ...(codexIsolation === undefined ? {} : { codexIsolation }),
           ...(grokIsolation === undefined ? {} : { grokIsolation }),
+        ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }),
+          ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }),
           ...(deps.executor === undefined ? {} : { executor: deps.executor }),
         });
         const result = await runner.run({

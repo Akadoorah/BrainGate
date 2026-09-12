@@ -1,10 +1,10 @@
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
-import { grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
+import { GROK_SNAPSHOT_READ_SANDBOX, createIsolatedGrokHome, grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
 import { trackChild } from "./child-registry.js";
 import { DEFAULT_PROVIDER_CALL_MS, MAX_PROVIDER_CALL_MS } from "./limits.js";
 import { ContractTextStream, LineBuffer, ProviderStreamReader } from "./streaming.js";
@@ -40,7 +40,10 @@ export function assertShadowProjectCwd(project: RegisteredProject, cwdInput: str
   // "outside the project" when it was the one place it was supposed to be. Worktrees live under
   // the project's own private storage directory, so this widens the boundary to a directory
   // BrainGate created, not to the filesystem.
-  const roots = [...project.repositories, join(project.storageDir, "worktrees")];
+  // Two directories BrainGate created for its own runs are approved as working directories: task
+  // worktrees, and the project snapshots a read-primary run is pointed at. Neither is the operator's
+  // checkout, and both are deleted when the task reaches a terminal path.
+  const roots = [...project.repositories, join(project.storageDir, "worktrees"), join(project.storageDir, "snapshots")];
   const approved = roots.some((root) => {
     try { return inside(realpathSync.native(root), cwd); }
     catch { return false; }
@@ -61,6 +64,9 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     readonly onText?: (text: string) => void;
     readonly onThinking?: () => void;
   }): Promise<ShadowProcessResult> {
+    if (input.plan.preview === true) {
+      throw new BrainGateInvariantError("SHADOW_PREVIEW_NOT_EXECUTABLE", "A preview invocation states what a run would do; it is not a run.");
+    }
     const sourceCwd = assertShadowProjectCwd(input.project, input.plan.cwd);
     const timeoutMs = Math.min(Math.max(input.timeoutMs ?? DEFAULT_PROVIDER_CALL_MS, 1_000), MAX_PROVIDER_CALL_MS);
     const maxOutput = Math.min(Math.max(input.maxOutputBytes ?? 1024 * 1024, 8 * 1024), 8 * 1024 * 1024);
@@ -72,11 +78,23 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     const internalAllowedEnv = new Set(input.plan.allowedEnvKeys);
 
     try {
-      if (input.plan.workspaceMode === "staged-clean") {
+      if (input.plan.workspaceMode === "staged-clean" || input.plan.workspaceMode === "staged-read-snapshot") {
+        // Both modes need an isolated home; only the staged one needs a workspace built here. The
+        // snapshot is prepared before the call and handed in, so it is verified (and reused across a
+        // failover's attempts) rather than quietly rebuilt per attempt.
         tempRoot = realpathSync.native(mkdtempSync(join(tmpdir(), "braingate-shadow-stage-")));
-        spawnCwd = join(tempRoot, "workspace");
         const isolatedHome = join(tempRoot, "home");
-        mkdirSync(spawnCwd, { mode: 0o700 });
+        if (input.plan.workspaceMode === "staged-read-snapshot") {
+          if (input.plan.workspaceRoot === undefined) {
+            throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROOT_REQUIRED", "A snapshot-primary run requires the prepared workspace it must read.");
+          }
+          spawnCwd = realpathSync.native(input.plan.workspaceRoot);
+          assertShadowProjectCwd(input.project, spawnCwd);
+          if (!statSync(spawnCwd).isDirectory()) throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROOT_REQUIRED", "The snapshot workspace is not a directory.");
+        } else {
+          spawnCwd = join(tempRoot, "workspace");
+          mkdirSync(spawnCwd, { mode: 0o700 });
+        }
         mkdirSync(isolatedHome, { mode: 0o700 });
 
         if (input.plan.providerId === "openai") {
@@ -101,12 +119,32 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
           // workspace it is being pointed at. Writing it here rather than into the operator's
           // own sandbox.toml means BrainGate never edits their Grok configuration, and the
           // profile disappears with the stage.
+          //
+          // A read-primary run on a project copy uses the snapshot-read profile and executes from a
+          // BrainGate-created home: the operator's Grok home carries their installed plugins and hook
+          // configuration, and a plugin is an arbitrary process that would otherwise be inside the
+          // sandbox with a copy of the project's source. A staged role keeps the operator's home,
+          // because that is the posture its own attestation was earned under.
+          const snapshotRead = input.plan.workspaceMode === "staged-read-snapshot";
           mkdirSync(join(spawnCwd, ".grok"), { mode: 0o700 });
-          writeFileSync(join(spawnCwd, ".grok", "sandbox.toml"), grokSandboxProfileToml(), { encoding: "utf8", mode: 0o600, flag: "wx" });
+          writeFileSync(
+            join(spawnCwd, ".grok", "sandbox.toml"),
+            snapshotRead ? GROK_SNAPSHOT_READ_SANDBOX.toml : grokSandboxProfileToml(),
+            { encoding: "utf8", mode: 0o600, flag: "wx" },
+          );
           // Same shape as Codex: an isolated HOME so the run cannot see another tool's
           // settings file, and the provider's own home variable so authentication survives.
           internalAllowedEnv.add("GROK_HOME");
-          overrides.GROK_HOME = resolveGrokHome(baseEnv.GROK_HOME === undefined && baseEnv.HOME === undefined ? process.env : baseEnv);
+          const operatorGrokHome = resolveGrokHome(baseEnv.GROK_HOME === undefined && baseEnv.HOME === undefined ? process.env : baseEnv);
+          if (snapshotRead) {
+            const isolatedGrokHome = createIsolatedGrokHome({ root: tempRoot, realHome: operatorGrokHome });
+            if (!isolatedGrokHome.credentialReferenced) {
+              throw new BrainGateInvariantError("SHADOW_GROK_CREDENTIAL_MISSING", `Grok's credential was not found where the isolated home could reference it (${join(operatorGrokHome, "auth.json")}).`);
+            }
+            overrides.GROK_HOME = isolatedGrokHome.home;
+          } else {
+            overrides.GROK_HOME = operatorGrokHome;
+          }
           overrides.HOME = isolatedHome;
         }
 
@@ -135,11 +173,11 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         throw new BrainGateInvariantError("SHADOW_STAGE_TOKEN_INVALID", "Project-mode shadow invocation cannot contain a staged workspace token.");
       }
 
-      if (Object.keys(input.plan.stagedFiles ?? {}).length > 0 && input.plan.workspaceMode !== "staged-clean") {
+      if (Object.keys(input.plan.stagedFiles ?? {}).length > 0 && input.plan.workspaceMode === "project") {
         throw new BrainGateInvariantError("SHADOW_STAGED_FILE_INVALID", "Staged files have nowhere to go outside a staged workspace.");
       }
 
-      if (input.plan.inputMode === "staged-file" && input.plan.workspaceMode !== "staged-clean") {
+      if (input.plan.inputMode === "staged-file" && input.plan.workspaceMode === "project") {
         throw new BrainGateInvariantError("SHADOW_ATTACHMENT_INVALID", "A staged request file has nowhere to go outside a staged workspace.");
       }
 

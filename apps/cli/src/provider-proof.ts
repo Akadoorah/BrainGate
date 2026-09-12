@@ -8,8 +8,10 @@ import {
   codexIsolationFingerprint,
   grokIsolationFingerprint,
   GROK_STAGED_SANDBOX,
+  GROK_SNAPSHOT_READ_SANDBOX,
   validCodexIsolationAttestation,
   validGrokIsolationAttestation,
+  validGrokSnapshotReadAttestation,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type GrokSandboxPolicy,
@@ -73,6 +75,14 @@ export async function grokIsolationStatus(input: {
    * the policy, so one earned here is not accepted there.
    */
   readonly policy?: GrokSandboxPolicy;
+  /**
+   * Which posture the proof is for.
+   *
+   * `snapshot-read` is a different Grok home as well as a different profile: a read-primary run on a
+   * project copy executes from a BrainGate-created home with no operator plugins, so it needs the
+   * proof earned under that posture and is validated by the stricter check.
+   */
+  readonly mode?: "staged" | "snapshot-read";
 }): Promise<IsolationStatus<GrokIsolationAttestation>> {
   const snapshot = input.snapshots.find((item) => item.providerId === "xai");
   if (snapshot === undefined || snapshot.available.value !== true) return failed("Grok CLI is unavailable.");
@@ -83,20 +93,25 @@ export async function grokIsolationStatus(input: {
   // accepted it when it was earned, against the snapshot taken moments ago. A CLI that has been
   // updated, a policy whose hash has moved, or an entry past its own expiry falls through to a
   // fresh self-test rather than being believed.
-  const policy = input.policy ?? GROK_STAGED_SANDBOX;
-  // The policy is part of the key: two profiles earn two proofs, and a cache that conflated them
-  // would hand a write the answer a read-only run had earned.
+  const snapshotRead = input.mode === "snapshot-read";
+  const policy = input.policy ?? (snapshotRead ? GROK_SNAPSHOT_READ_SANDBOX : GROK_STAGED_SANDBOX);
+  const accepts = (candidate: GrokIsolationAttestation): boolean =>
+    snapshotRead
+      ? validGrokSnapshotReadAttestation(candidate, snapshot, { projectPaths: input.project?.repositories ?? [] })
+      : validGrokIsolationAttestation(candidate, snapshot, { policy });
+  // The policy and the posture are part of the key: two profiles earn two proofs, and a cache that
+  // conflated them would hand a write the answer a read-only run had earned.
   const fingerprint = input.cache === undefined ? null : safely(() => `${grokIsolationFingerprint(input.env, snapshot.binary)}:${policy.hash}`);
   if (input.cache !== undefined && fingerprint !== null) {
     const remembered = input.cache.read<GrokIsolationAttestation>("xai", fingerprint);
-    if (remembered !== null && validGrokIsolationAttestation(remembered, snapshot, { policy })) {
+    if (remembered !== null && accepts(remembered)) {
       return Object.freeze({ attempted: false, eligible: true, attestation: remembered, reason: null });
     }
   }
 
   try {
     const attestation = input.verify === undefined
-      ? await new GrokIsolationVerifier({ env: input.env }).verify(snapshot, { projectPaths: input.project?.repositories ?? [], policy })
+      ? await new GrokIsolationVerifier({ env: input.env }).verify(snapshot, { projectPaths: input.project?.repositories ?? [], policy, ...(snapshotRead ? { mode: "snapshot-read" as const } : {}) })
       : await input.verify(snapshot);
     if (input.cache !== undefined && fingerprint !== null) input.cache.write("xai", fingerprint, attestation);
     return Object.freeze({ attempted: true, eligible: true, attestation, reason: null });
@@ -116,6 +131,14 @@ export async function codexIsolationStatusFor(input: {
   readonly shouldAttempt: boolean;
   readonly cache?: IsolationAttestationCache;
   readonly verify?: (snapshot: ProviderSnapshot) => Promise<CodexIsolationAttestation>;
+  /**
+   * The self-test contract this proof must have been earned under.
+   *
+   * A caller that may route read-primary asks for the contract that proves the denied writes. A
+   * remembered proof from an older contract is then not accepted — it is replaced by a fresh one, so
+   * the operator gets the stronger proof instead of an error, and never a weaker guarantee.
+   */
+  readonly minProbeVersion?: string;
 }): Promise<IsolationStatus<CodexIsolationAttestation>> {
   const snapshot = input.snapshots.find((item) => item.providerId === "openai");
   if (snapshot === undefined || snapshot.available.value !== true) return failed("Codex CLI is unavailable.");
@@ -127,7 +150,8 @@ export async function codexIsolationStatusFor(input: {
   const fingerprint = input.cache === undefined ? null : safely(() => codexIsolationFingerprint(input.env, snapshot.binary));
   if (input.cache !== undefined && fingerprint !== null) {
     const remembered = input.cache.read<CodexIsolationAttestation>("openai", fingerprint);
-    if (remembered !== null && validCodexIsolationAttestation(remembered, snapshot)) {
+    const contract = input.minProbeVersion === undefined ? {} : { minProbeVersion: input.minProbeVersion };
+    if (remembered !== null && validCodexIsolationAttestation(remembered, snapshot, contract)) {
       return Object.freeze({ attempted: false, eligible: true, attestation: remembered, reason: null });
     }
   }

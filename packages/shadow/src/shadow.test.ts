@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -20,6 +20,8 @@ import {
   type TaskFinalizer,
 } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
+import { executionAttribution, finalizedSnapshotOf } from "@braingate/core";
+import type { TaskSnapshotProvider } from "./snapshot-provider.js";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry, type ModelRef } from "@braingate/router";
 import type { AgentRequest } from "@braingate/workflows";
@@ -31,6 +33,10 @@ import {
   ShadowDogfoodRunner,
   SubscriptionShadowAgentInvoker,
   acceptedFeatureKeys,
+  CODEX_PROBE_VERSION,
+  snapshotPrimaryEligibility,
+  GROK_SNAPSHOT_PROBE_VERSION,
+  GROK_STAGED_PROBE_VERSION,
   codexIsolationProfileHash,
   codexReviewerConfigArgs,
   extractCodexAgentMessage,
@@ -46,6 +52,11 @@ import {
   validCodexIsolationAttestation,
   validGrokIsolationAttestation,
   grokIsolationProfileHash,
+  grokSnapshotReadProfileHash,
+  GROK_SNAPSHOT_READ_SANDBOX,
+  createIsolatedGrokHome,
+  validGrokSnapshotReadAttestation,
+  grokConfigSurfaces,
   grokSandboxProfileToml,
   extractAntigravityResult,
   jsonSchemaFor,
@@ -156,6 +167,7 @@ function codexIsolation(values: Partial<CodexIsolationAttestation> = {}, referen
     source: "sandbox-self-test",
     version: "1.0.0",
     platform: process.platform === "darwin" ? "darwin" : "linux",
+    probeVersion: CODEX_PROBE_VERSION,
     profileHash: codexIsolationProfileHash(),
     droppedFeatureKeys: [],
     observedAt: new Date(reference - 60 * 60 * 1000).toISOString(),
@@ -164,7 +176,7 @@ function codexIsolation(values: Partial<CodexIsolationAttestation> = {}, referen
   };
 }
 
-function readOnlyGrant(providerId: ProviderId, workspaceMode: "project" | "staged-clean" = "project"): ToolGrant {
+function readOnlyGrant(providerId: ProviderId, workspaceMode: "project" | "staged-clean" | "staged-read-snapshot" = "project"): ToolGrant {
   return resolveToolGrant({
     role: "primary", providerId, workspaceMode, writeMode: false,
     surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false },
@@ -295,20 +307,34 @@ test("an unaccepted provider names the command that would open it", () => {
 
 
 test("Codex sandbox self-test proves allow-inside deny-outside deny-write without model calls", async () => {
+  // One allowed read, then denials for everything the sandbox must refuse: the outside read, and the
+  // five write attempts (create/overwrite/delete inside the workspace, create/overwrite outside it).
   const runner = new FakeSandboxRunner([
     { exitCode: 0, stdout: "BRAINGATE_INSIDE_CANARY" },
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "denied" },
     { exitCode: 1, stderr: "denied" },
     { exitCode: 1, stderr: "denied" },
     // The ADR 0006 control-key probe: no unknown field reported, so every declared key stands.
     { exitCode: 1, stderr: "stream error: unauthorized" },
   ]);
   const attestation = await new CodexIsolationVerifier({ runner, platform: "linux", env: { PATH: process.env.PATH } }).verify(snapshot("openai"), new Date("2026-09-07T01:00:00Z"));
-  assert.equal(runner.calls.length, 4);
+  assert.equal(runner.calls.length, 8, "one read, one denied read, five denied writes, one key probe");
   assert.deepEqual(attestation.droppedFeatureKeys, []);
   assert.equal(attestation.profileHash, codexIsolationProfileHash());
   assert.equal(attestation.platform, "linux");
-  const sandboxCalls = runner.calls.slice(0, 3);
+  const sandboxCalls = runner.calls.slice(0, 7);
   assert.ok(sandboxCalls.every((args) => args[0] === "sandbox" && args.includes("--permission-profile")));
+  // The five writes are attempted, not assumed: create, overwrite and delete inside the workspace,
+  // and create and overwrite outside it.
+  const writes = sandboxCalls.slice(2).map((args) => args.join(" "));
+  assert.ok(writes.some((call) => call.includes("printf blocked >") && call.includes("write-denied.txt")), "create inside the workspace");
+  assert.ok(writes.some((call) => call.includes("printf tampered >>") && call.includes("inside.txt")), "overwrite inside the workspace");
+  assert.ok(writes.some((call) => call.includes("rm -f")), "delete inside the workspace");
+  assert.ok(writes.some((call) => call.includes("checkout-write-denied.txt")), "create in the checkout");
+  assert.ok(writes.some((call) => call.includes("checkout-canary.txt")), "overwrite in the checkout");
   assert.ok(runner.calls.every((args) => !args.includes("--model")), "the probe must never pin a model");
 });
 
@@ -317,6 +343,11 @@ test("the control-key probe drops only keys this Codex build rejects, and rebind
   // so the probe drops it and retries.
   const runner = new FakeSandboxRunner([
     { exitCode: 0, stdout: "BRAINGATE_INSIDE_CANARY" },
+    { exitCode: 1, stderr: "denied" },
+    // create / overwrite / delete inside the workspace, then create / overwrite outside it.
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "denied" },
+    { exitCode: 1, stderr: "denied" },
     { exitCode: 1, stderr: "denied" },
     { exitCode: 1, stderr: "denied" },
     { exitCode: 1, stderr: "Error loading config.toml: unknown configuration field `features.hooks` in -c/--config override" },
@@ -365,11 +396,14 @@ test("Codex JSONL parser extracts only completed agent_message and ignores reaso
 class FakeExecutor implements ShadowProcessExecutor {
   exitCode = 0;
   calls: ShadowInvocationPlan[] = [];
-  readonly response: (plan: ShadowInvocationPlan) => string;
-  constructor(response: (plan: ShadowInvocationPlan) => string) { this.response = response; }
+  readonly response: (plan: ShadowInvocationPlan) => string | { readonly stdout: string; readonly exitCode: number };
+  constructor(response: (plan: ShadowInvocationPlan) => string | { readonly stdout: string; readonly exitCode: number }) { this.response = response; }
   async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
     this.calls.push(input.plan);
-    return { spawned: true, exitCode: this.exitCode, stdout: this.response(input.plan), stderr: "", timedOut: false, durationMs: 12, removedEnvironmentKeys: ["OPENAI_API_KEY"] };
+    const answer = this.response(input.plan);
+    const stdout = typeof answer === "string" ? answer : answer.stdout;
+    const exitCode = typeof answer === "string" ? this.exitCode : answer.exitCode;
+    return { spawned: true, exitCode, stdout, stderr: "", timedOut: false, durationMs: 12, removedEnvironmentKeys: ["OPENAI_API_KEY"] };
   }
 }
 
@@ -565,31 +599,119 @@ test("a read-only run is still allowed against an already-dirty checkout it does
   assert.throws(() => assertSourceCheckoutUnchanged(repo, before), /checkout changed while a read-only task was running/);
 });
 
-test("high-risk workflow routes Claude primary plus Codex independent reviewer when isolation is proven", { skip: process.platform === "win32" }, async () => {
+
+// Superseded by the two tests below: "Claude primary plus Codex reviewer" was the arrangement while
+// Codex was staged-only. A proven Codex now takes the primary and reads a snapshot, and the
+// cross-provider reviewer it forces is the assertion worth keeping. The old expectation is not
+// preserved as a test because it is no longer a behaviour BrainGate should have.
+
+/**
+ * A snapshot store for the tests: it hands out a real directory with real content, so the assertion
+ * that matters — what the provider's working directory was — is checked against the filesystem rather
+ * than against a string the caller passed in.
+ */
+function fakeSnapshotStore(): TaskSnapshotProvider & { readonly roots: readonly string[]; readonly started: string[] } {
+  const roots: string[] = [];
+  const started: string[] = [];
+  const byTask = new Map<string, string>();
+  return {
+    roots,
+    started,
+    beginTask({ taskId }: { readonly taskId: string }) { started.push(taskId); return "task-start-fingerprint"; },
+    sweep() { return { removed: 0, kept: 0, unrecognised: 0 }; },
+    ensure({ taskId }: { readonly taskId: string }) {
+      let root = byTask.get(taskId);
+      if (root === undefined) {
+        root = realpathSync.native(mkdtempSync(join(tmpdir(), "braingate-test-snapshot-")));
+        writeFileSync(join(root, "app.txt"), "snapshot content\n");
+        byTask.set(taskId, root);
+        roots.push(root);
+      }
+      return { snapshotId: `snapshot-${String(roots.length)}`, root, manifestHash: "a".repeat(64), fileCount: 1, totalBytes: 17, policyVersion: "test", sourceFingerprint: "b".repeat(64) };
+    },
+    verify() { return true; },
+    discard(taskId: string) {
+      const root = byTask.get(taskId);
+      if (root !== undefined) rmSync(root, { recursive: true, force: true });
+      byTask.delete(taskId);
+    },
+  };
+}
+
+test("a proven Codex primary reads the snapshot, never the checkout, and keeps the reviewer independent", { skip: process.platform === "win32" }, async () => {
+  // Before this milestone Codex could only be a staged reviewer: the primary role was closed to it
+  // because it would have needed the operator's checkout. It is now eligible *and* safe, because the
+  // workspace it is given is a copy — and this test is about those two facts at once.
   const { repo, project } = setupProject();
   const ledger = new TaskLedger(project);
-  const router = new CapabilityRouter(registryWithClaudeAndCodex());
+  const snapshotsUnderTest = fakeSnapshotStore();
+  const registry = new ModelRegistry();
+  registry.register({ providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90, reviewer: 90, judge: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" });
+  registry.register({ providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" });
   const fake = new FakeExecutor((plan) => {
-    if (plan.providerId === "anthropic") return JSON.stringify({ result: JSON.stringify({ kind: "work", output: "auth session summary" }) });
+    // Codex answers in its JSONL envelope; the reviewer here is Claude, whose answer is a single
+    // result object. Each provider's own shape, so the fake is testing the path rather than itself.
+    if (plan.providerId === "openai") {
+      // Checked while the call is in flight: the snapshot is released when the task ends, so this is
+      // the only moment the copy exists to be inspected.
+      assert.ok(plan.workspaceRoot !== undefined && existsSync(join(plan.workspaceRoot, "app.txt")), "the snapshot holds the project content while the provider reads it");
+      const work = JSON.stringify({ kind: "work", output: "the answer, read from the snapshot" });
+      return [JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "ignored" } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: work } })].join("\n");
+    }
     const review = JSON.stringify({ kind: "review", verdict: "approve", findings: [] });
-    return [JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "ignored" } }), JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: review } })].join("\n");
+    return JSON.stringify({ result: review });
   });
-  // A review of a change, not a question about one: reading about authentication is not risky,
-  // and this test is about who reviews a risky task rather than about what makes one risky.
+  // Reviewing a change is risky, so a cross-provider reviewer is required — which is what makes the
+  // independence half of this test meaningful.
   const taskText = "Review the auth session handling change";
   const classification = classifyTask({ text: taskText, mode: "review" });
-  assert.equal(classification.risk, "high", "the fixture must actually be a task that requires review");
   const budget = budgetFor(classification, { writeRequested: false });
   try {
-    const result = await new ShadowDogfoodRunner({ project, ledger, router, snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake, finalizer: finalizerFor(project, ledger) }).run({
-      title: "Inspect auth session", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
-      context: { files: ["src/auth.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 1, explicitCandidates: 1, includedItems: 2, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    const result = await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registry), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), snapshotStore: snapshotsUnderTest, executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Read the project", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: { files: ["src/auth.ts"] }, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
     });
-    assert.equal(result.workflow?.primary.model.definition.providerId, "anthropic");
-    assert.equal(result.workflow?.reviewer?.model.definition.providerId, "openai");
-    assert.equal(result.workflow?.outcome, "approved");
-    assert.deepEqual(fake.calls.map((plan) => plan.providerId), ["anthropic", "openai"]);
-    assert.equal(fake.calls[1]?.workspaceMode, "staged-clean");
+    // The stronger model is now eligible and wins the primary, which is the whole point.
+    assert.equal(result.workflow?.primary.model.definition.providerId, "openai");
+    const primaryCall = fake.calls[0]!;
+    assert.equal(primaryCall.workspaceMode, "staged-read-snapshot");
+    // The plan names the snapshot as the workspace, and nothing the provider receives names the
+    // checkout: not the workspace, not one argument of it.
+    assert.equal(primaryCall.workspaceRoot, snapshotsUnderTest.roots[0], "the provider's workspace is the snapshot");
+    assert.equal(primaryCall.workspaceRoot?.includes(repo) ?? true, false, "the snapshot is not inside the checkout");
+    assert.ok(primaryCall.args.every((argument) => !argument.includes(repo)), "no argument carries the checkout path");
+    assert.equal(existsSync(snapshotsUnderTest.roots[0]!), false, "the snapshot is released when the task ends");
+    // Independence is recomputed from the effective primary: Codex ran, so the cross-provider reviewer
+    // cannot be Codex.
+    assert.equal(result.workflow?.reviewer?.model.definition.providerId, "anthropic");
+    // Claude is the one provider BrainGate points at the checkout, for every role it runs — that is
+    // unchanged, and it is why the reviewer's mode is `project` rather than a stage. The new fact is
+    // that the *snapshot-capable* provider never appears with that mode.
+    assert.equal(fake.calls[1]?.workspaceMode, "project");
+    assert.equal(fake.calls.some((plan) => plan.providerId === "openai" && plan.workspaceMode === "project"), false);
+    assert.deepEqual(fake.calls.at(-1)!.cwd, fake.calls[1]!.cwd);
+    assert.equal(snapshotsUnderTest.roots.length, 1, "one task, one snapshot, however many attempts");
+  } finally { ledger.close(); }
+});
+
+test("an unavailable snapshot is not a licence to read the checkout", { skip: process.platform === "win32" }, async () => {
+  // Codex is snapshot-capable and attested, but no snapshot provider was supplied. The run must fail
+  // rather than silently hand Codex the operator's working directory.
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const registry = new ModelRegistry();
+  registry.register({ providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" });
+  registry.register({ providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" });
+  const fake = new FakeExecutor(() => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "answer" }) }));
+  const taskText = "Where is the auth session stored, and what reads it?";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    await assert.rejects(() => new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registry), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Read the project", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    }), /snapshot provider/);
+    assert.ok(fake.calls.every((plan) => plan.cwd !== repo || plan.workspaceMode === "project"), "the checkout is never used as a Codex workspace");
   } finally { ledger.close(); }
 });
 
@@ -655,12 +777,33 @@ test("a provider failure reaches the operator with the reason attached", async (
 
 const grokModel: ModelRef = { providerId: "xai", modelId: "grok-4.6", quotaPool: "grok-subscription" };
 
+/** A snapshot-read proof: the snapshot policy, an isolated home and no writable root. */
+function grokSnapshotProof(values: Partial<GrokIsolationAttestation> = {}, reference = Date.now()): GrokIsolationAttestation {
+  return {
+    providerId: "xai",
+    source: "sandbox-event-self-test",
+    version: "1.0.13",
+    platform: process.platform === "darwin" ? "darwin" : "linux",
+    probeVersion: GROK_SNAPSHOT_PROBE_VERSION,
+    profileHash: grokSnapshotReadProfileHash(),
+    readableRoots: ["/usr"],
+    writableRoots: [],
+    isolatedHome: true,
+    networkRestricted: process.platform === "linux",
+    configSurfaces: [],
+    observedAt: new Date(reference - 60 * 60 * 1000).toISOString(),
+    expiresAt: new Date(reference + 60 * 60 * 1000).toISOString(),
+    ...values,
+  };
+}
+
 function grokIsolation(values: Partial<GrokIsolationAttestation> = {}, reference = Date.now()): GrokIsolationAttestation {
   return {
     providerId: "xai",
     source: "sandbox-event-self-test",
     version: "1.0.13",
     platform: process.platform === "darwin" ? "darwin" : "linux",
+    probeVersion: GROK_STAGED_PROBE_VERSION,
     profileHash: grokIsolationProfileHash(),
     readableRoots: ["/usr"],
     networkRestricted: process.platform === "linux",
@@ -1145,4 +1288,370 @@ test("a reviewer that was dispatched and failed is recorded as attempted, never 
     assert.equal(attribution.find((role) => role.role === "planner")?.status, "completed");
     assert.equal(attribution.find((role) => role.role === "primary")?.status, "completed");
   } finally { ledger.close(); }
+});
+
+test("a snapshot primary's process runs in the snapshot, with the checkout not even as its working directory", async () => {
+  const { repo, project } = setupProject();
+  // The snapshot lives where snapshots live — inside the project's own storage, which is the one
+  // place outside the checkout the executor will accept as a workspace.
+  const snapshotRoot = join(project.storageDir, "snapshots", "test-snapshot", "workspace");
+  mkdirSync(snapshotRoot, { recursive: true, mode: 0o700 });
+  writeFileSync(join(snapshotRoot, "app.txt"), "snapshot content\n");
+  const executor = new NodeShadowProcessExecutor();
+  const plan: ShadowInvocationPlan = {
+    providerId: "openai", executable: process.execPath,
+    // The process reports its own working directory, so the assertion is about where the provider
+    // actually ran rather than about an argument BrainGate meant to pass.
+    args: ["-e", "process.stdout.write(process.cwd())"],
+    cwd: repo, workspaceMode: "staged-read-snapshot", workspaceRoot: snapshotRoot,
+    modelId: "codex-test", quotaPool: "chatgpt-subscription", inputMode: "stdin", stdin: "{}", attachmentContent: null, attachmentToken: null,
+    allowedEnvKeys: [], envOverrides: {}, grant: readOnlyGrant("openai", "staged-read-snapshot"), streamDialect: null,
+    guarantees: { projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true }, minimumVersion: null,
+  };
+  const result = await executor.run({ project, plan, env: { PATH: process.env.PATH, HOME: process.env.HOME } });
+  assert.equal(result.exitCode, 0);
+  assert.equal(realpathSync.native(result.stdout.trim()), realpathSync.native(snapshotRoot));
+  assert.notEqual(realpathSync.native(result.stdout.trim()), realpathSync.native(repo));
+  // And the workspace really was the copy: the checkout is not reachable as a relative path from it.
+  assert.equal(existsSync(join(result.stdout.trim(), "..", "..", "repo")), false);
+});
+
+test("an active backoff on the Claude pool gives a proven Codex the primary without probing Claude", async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const snapshotsUnderTest = fakeSnapshotStore();
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null },
+    // BrainGate's own policy wait, not a provider statement: the pool is avoided for a while after a
+    // refusal, so the next task may route elsewhere without spending a call to find out.
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: new Date(Date.now() + 5 * 60_000).toISOString(), observedAt: "2026-09-12T00:00:00Z" },
+  );
+  registry.register(
+    { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" },
+  );
+  const fake = new FakeExecutor((plan) => {
+    const work = JSON.stringify({ kind: "work", output: "answered from the snapshot" });
+    if (plan.providerId === "openai") return JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: work } });
+    return JSON.stringify({ result: work });
+  });
+  const taskText = "Fix the off-by-one in the retry counter and keep the existing tests passing";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    const result = await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registry), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), snapshotStore: snapshotsUnderTest, executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Retry counter", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    });
+    assert.equal(result.workflow?.primary.model.definition.providerId, "openai", "the pool under backoff is not asked again");
+    assert.deepEqual(fake.calls.map((plan) => plan.providerId), ["openai"], "zero calls to the backed-off pool");
+    assert.equal(fake.calls[0]?.workspaceMode, "staged-read-snapshot");
+  } finally { ledger.close(); }
+});
+
+test("a refused Claude primary fails over to Codex, which reads the snapshot", { skip: process.platform === "win32" }, async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const snapshotsUnderTest = fakeSnapshotStore();
+  const registry = new ModelRegistry();
+  // Claude is the stronger model, so it is routed first and it is the one that refuses.
+  registry.register(
+    { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 95 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 95, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" },
+  );
+  registry.register(
+    { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 80, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" },
+  );
+  const refusal = JSON.stringify({ type: "assistant", is_api_error_message: true, error: "rate_limit", api_error_status: 429, terminal_reason: "api_error", content: [{ type: "text", text: "You've hit your session limit · resets 4:10am" }] });
+  const fake = new FakeExecutor((plan) => {
+    const work = JSON.stringify({ kind: "work", output: "the second provider answered" });
+    // The real CLI exits non-zero when its API call was refused; the refusal is read from what it
+    // wrote, which is why the exit code and the words have to agree for the failover to trigger.
+    if (plan.providerId === "anthropic") return { stdout: refusal, exitCode: 1 };
+    return JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: work } });
+  });
+  const taskText = "Fix the off-by-one in the retry counter and keep the existing tests passing";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    const result = await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registry), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), snapshotStore: snapshotsUnderTest, executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Retry counter", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    });
+    // Both attempts are in the record, in order, and the second one read a snapshot.
+    assert.deepEqual(fake.calls.map((plan) => plan.providerId), ["anthropic", "openai"]);
+    assert.equal(fake.calls[0]?.workspaceMode, "project", "the refused attempt had the checkout, as Claude always does");
+    assert.equal(fake.calls[1]?.workspaceMode, "staged-read-snapshot", "the failover's provider reads a copy, not the checkout");
+    assert.equal(result.workflow?.outcome, "completed_without_review");
+    const roles = executionAttribution({ events: ledger.receipt(result.taskId!).events });
+    const primary = roles.filter((role) => role.role === "primary");
+    assert.equal(primary.length, 2, "both attempts are attributed, not only the one that answered");
+    assert.deepEqual(primary.map((role) => role.providerId), ["anthropic", "openai"]);
+    assert.deepEqual(primary.map((role) => role.status), ["attempted", "completed"]);
+    assert.equal(primary[1]?.workspaceMode, "staged-read-snapshot");
+    assert.equal(primary[0]?.workspaceMode, "project-checkout");
+  } finally { ledger.close(); }
+});
+
+test("a T4 task with no eligible model fails closed rather than downgrading to a weaker provider", async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 90 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 90, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: new Date(Date.now() + 5 * 60_000).toISOString(), observedAt: "2026-09-12T00:00:00Z" },
+  );
+  registry.register(
+    // Below the T4 floor, so it may not take the role however available it is.
+    { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 70 }, speed: "balanced", contextCapacity: 1_000_000, writeCapable: false, reasoning: 70, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" },
+  );
+  const fake = new FakeExecutor(() => JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ kind: "work", output: "should never run" }) } }));
+  const taskText = "Design the migration of the whole authentication subsystem to a new identity provider, across every service, with a staged rollout and rollback plan";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    await assert.rejects(() => new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registry), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), snapshotStore: fakeSnapshotStore(), executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Identity migration", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    }), /no eligible|cannot be routed|ROUTE_NO_ELIGIBLE/i);
+    assert.deepEqual(fake.calls, [], "a floor that cannot be met is not a reason to spend a call");
+  } finally { ledger.close(); }
+});
+
+test("a project that moved between the planner and the failover fails closed instead of mixing two states", { skip: process.platform === "win32" }, async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const registry = new ModelRegistry();
+  registry.register(
+    { providerId: "anthropic", modelId: "claude-test", quotaPool: "claude-subscription", capabilities: { coder: 95 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 95, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" },
+  );
+  registry.register(
+    { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription", capabilities: { coder: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 80, underlyingFamily: null },
+    { available: true, quotaState: "unknown", quotaHint: null, quotaObservedAt: null, refusalBackoffUntil: null, observedAt: "2026-09-12T00:00:00Z" },
+  );
+  // A store that stands in for "the project moved since this task started": the real fingerprint
+  // arithmetic is proven in the execution package; this proves the *runner* refuses rather than
+  // handing the failover a project the refused attempt never saw.
+  const roots: string[] = [];
+  let snapshotsTaken = 0;
+  const store: TaskSnapshotProvider = {
+    beginTask: () => "fingerprint-at-task-start",
+    ensure: () => { snapshotsTaken += 1; throw new BrainGateInvariantError("SNAPSHOT_SOURCE_CHANGED_SINCE_TASK_START", "The project changed after this task started."); },
+    verify: () => true,
+    discard: () => { /* nothing was created */ },
+    sweep: () => ({ removed: 0, kept: 0, unrecognised: 0 }),
+  };
+  void roots;
+  const refusal = JSON.stringify({ type: "assistant", is_api_error_message: true, error: "rate_limit", content: [{ type: "text", text: "You've hit your session limit" }] });
+  const fake = new FakeExecutor((plan) => (plan.providerId === "anthropic" ? { stdout: refusal, exitCode: 1 } : JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: JSON.stringify({ kind: "work", output: "should never run" }) } })));
+  const taskText = "Fix the off-by-one in the retry counter and keep the existing tests passing";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    await assert.rejects(() => new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registry), snapshots: [snapshot("anthropic"), snapshot("openai")], codexIsolation: codexIsolation(), snapshotStore: store, executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Retry counter", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    }));
+    // Exactly one provider call: the one that was refused. No provider was asked to read a project
+    // state that the earlier attempt did not read.
+    assert.equal(snapshotsTaken, 1, "the snapshot was attempted once, and refused");
+    assert.deepEqual(fake.calls.map((plan) => plan.providerId), ["anthropic"], "the failover never reached a provider");
+    const receipt = ledger.listTasks()[0]!;
+    const events = ledger.receipt(receipt.taskId).events;
+    assert.equal(events.some((event) => event.kind === "shadow.provider.failed" && (event.payload as { readonly provider?: string }).provider === "openai"), false);
+    const snapshotRecord = finalizedSnapshotOf(events);
+    assert.equal(snapshotRecord?.failureKind, "source-fingerprint-changed", `the record names the reason: ${JSON.stringify(snapshotRecord)}`);
+  } finally { ledger.close(); }
+});
+
+test("an Anthropic-only task creates no snapshot data at all", { skip: process.platform === "win32" }, async () => {
+  const { repo, project } = setupProject();
+  const ledger = new TaskLedger(project);
+  const store = fakeSnapshotStore();
+  const fake = new FakeExecutor((plan) => JSON.stringify({ result: JSON.stringify({ kind: "work", output: "answered" }) }));
+  const taskText = "Fix the off-by-one in the retry counter and keep the existing tests passing";
+  const classification = classifyTask({ text: taskText, mode: "ask" });
+  const budget = budgetFor(classification, { writeRequested: false });
+  try {
+    // No Codex or Grok attestation, so no copy can ever be needed and the run does no snapshot work:
+    // no fingerprint pass over the project, no directory, nothing to clean up.
+    const result = await new ShadowDogfoodRunner({ project, ledger, router: new CapabilityRouter(registryWithClaude()), snapshots: [snapshot("anthropic")], snapshotStore: store, executor: fake, finalizer: finalizerFor(project, ledger) }).run({
+      title: "Retry counter", task: taskText, cwd: repo, classification, budget, requiredContextTokens: 500,
+      context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
+    });
+    assert.equal(result.workflow?.primary.model.definition.providerId, "anthropic");
+    assert.deepEqual(store.started, [], "no task-start fingerprint was taken for a task that cannot need one");
+    assert.deepEqual(store.roots, [], "and no snapshot exists");
+  } finally { ledger.close(); }
+});
+
+/**
+ * The equivalence proof behind reusing one attestation for two roles.
+ *
+ * `snapshotPrimaryEligibility` accepts the sandbox self-test the staged roles earned, which is only
+ * legitimate if the *policy* a read-primary run executes under is the same policy. Role names are not
+ * policy; the workspace's content is not policy. Everything that decides what the provider can reach,
+ * write, spawn or talk to *is*, and this compares all of it between a staged Grok role and a Grok
+ * read-primary — so if any of it ever diverges, this fails before the reuse can silently broaden.
+ */
+function schemaValue(args: readonly string[]): string | null {
+  const index = args.indexOf("--json-schema");
+  return index === -1 ? null : args[index + 1] ?? null;
+}
+
+test("a Grok read-primary runs under its own profile from an isolated home, and a staged proof does not open it", () => {
+  const { repo, project } = setupProject();
+  const workspaceRoot = join(project.storageDir, "snapshots", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "workspace");
+  const stagedPlan = planShadowInvocation({ snapshot: snapshot("xai", { version: "1.0.13" }), model: grokModel, cwd: repo, payload: { ...payload, role: "planner" }, grokIsolation: grokIsolation() });
+
+  // A staged attestation is not a snapshot-primary attestation: the home and the policy differ, and
+  // the difference is exactly what a plugin's reach would depend on.
+  assert.throws(
+    () => planShadowInvocation({ snapshot: snapshot("xai", { version: "1.0.13" }), model: grokModel, cwd: repo, payload: { ...payload, role: "primary" }, grokIsolation: grokIsolation(), snapshotPrimary: true, workspaceRoot }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_GROK_SNAPSHOT_ISOLATION_REQUIRED",
+    "the staged proof does not cover the snapshot posture",
+  );
+
+  const primary = planShadowInvocation({
+    snapshot: snapshot("xai", { version: "1.0.13" }), model: grokModel, cwd: repo, payload: { ...payload, role: "primary" },
+    grokSnapshotIsolation: grokSnapshotProof(), snapshotPrimary: true, workspaceRoot,
+  });
+  // The profile is a different one, and its hash is what the snapshot attestation is bound to.
+  assert.equal(primary.args[primary.args.indexOf("--sandbox") + 1], "braingate-snapshot-read");
+  assert.equal(stagedPlan.args[stagedPlan.args.indexOf("--sandbox") + 1], GROK_SANDBOX_PROFILE);
+  assert.notEqual(grokSnapshotReadProfileHash(), grokIsolationProfileHash());
+  assert.equal(grokSnapshotReadProfileHash(), GROK_SNAPSHOT_READ_SANDBOX.hash);
+  // What stays the same is everything that bounds the run: the read-only tool grant, the isolated
+  // HOME, the network switch and the refusal of unsafe approval flags.
+  assert.deepEqual([...primary.grant.granted].sort(), [...stagedPlan.grant.granted].sort());
+  assert.equal(primary.grant.granted.includes("edit"), false);
+  assert.equal(primary.grant.granted.includes("shell"), false);
+  // The isolated HOME and the Grok home are applied by the executor at run time, not stated in the
+  // plan; what the plan carries is the same MCP switches either way.
+  assert.deepEqual(primary.envOverrides, stagedPlan.envOverrides);
+  assert.equal(primary.args.includes("--disable-web-search"), stagedPlan.args.includes("--disable-web-search"));
+  assert.doesNotMatch(primary.args.join(" "), /always-approve|dangerously/);
+  assert.match(GROK_SNAPSHOT_READ_SANDBOX.toml, /extends = "strict"/);
+  assert.match(GROK_SNAPSHOT_READ_SANDBOX.toml, /restrict_network = true/);
+  assert.match(GROK_SNAPSHOT_READ_SANDBOX.toml, /\*\*\/\.env/, "a credential is unreadable rather than merely off-limits");
+  assert.equal(primary.workspaceMode, "staged-read-snapshot");
+  assert.equal(stagedPlan.workspaceMode, "staged-clean");
+});
+
+test("the isolated Grok home carries the credential by reference and nothing else", () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-grok-home-test-"));
+  const realHome = join(root, "operator-grok");
+  mkdirSync(realHome, { recursive: true, mode: 0o700 });
+  writeFileSync(join(realHome, "auth.json"), "{\"token\": \"referenced-not-copied\"}\n");
+  // Everything the operator's home would otherwise contribute to a run.
+  writeFileSync(join(realHome, "config.toml"), "[plugins]\nenabled = true\n");
+  writeFileSync(join(realHome, "hooks-paths"), "/some/hook.json\n");
+  mkdirSync(join(realHome, "installed-plugins"), { recursive: true });
+  writeFileSync(join(realHome, "installed-plugins", "something.json"), "{}\n");
+  try {
+    assert.deepEqual(grokConfigSurfaces(realHome), ["plugins", "hooks"], "the operator's home is what the staged posture loads");
+    const isolated = createIsolatedGrokHome({ root, realHome });
+    assert.equal(isolated.credentialReferenced, true);
+    assert.deepEqual(readdirSync(isolated.home).sort(), ["auth.json", "config.toml"], "only the reference and BrainGate's own configuration");
+    assert.deepEqual(grokConfigSurfaces(isolated.home), [], "no plugins, no hooks, no MCP configuration");
+    assert.equal(readFileSync(join(isolated.home, "config.toml"), "utf8").includes("plugins"), false);
+    // Referenced, not copied: the entry is a link to the operator's own credential.
+    assert.equal(lstatSync(join(isolated.home, "auth.json")).isSymbolicLink(), true);
+    assert.equal(realpathSync(join(isolated.home, "auth.json")), realpathSync(join(realHome, "auth.json")));
+    rmSync(join(isolated.home, "auth.json"));
+    assert.equal(existsSync(join(realHome, "auth.json")), true, "and deleting the reference never touches the credential itself");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a Codex read-primary executes the identical argv, under the attested read-only profile", () => {
+  const { repo, project } = setupProject();
+  const workspaceRoot = join(project.storageDir, "snapshots", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "workspace");
+  const codexModel: ModelRef = { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription" };
+  const staged = planShadowInvocation({ snapshot: snapshot("openai"), model: codexModel, cwd: repo, payload: { ...payload, role: "reviewer" }, codexIsolation: codexIsolation() });
+  const primary = planShadowInvocation({ snapshot: snapshot("openai"), model: codexModel, cwd: repo, payload: { ...payload, role: "primary" }, codexIsolation: codexIsolation(), snapshotPrimary: true, workspaceRoot });
+  assert.deepEqual(primary.args, staged.args, "one argv, so one profile the attestation covers");
+  assert.equal(primary.args.includes("--dangerously-bypass-approvals-and-sandbox"), false);
+  assert.equal(primary.args.includes("--sandbox"), false, "the sandbox comes from the accepted config keys, as before");
+  assert.deepEqual(primary.allowedEnvKeys, staged.allowedEnvKeys);
+  assert.deepEqual([...primary.grant.granted].sort(), [...staged.grant.granted].sort());
+  assert.equal(primary.grant.granted.includes("edit"), false);
+  assert.equal(staged.workspaceMode, "staged-clean");
+  assert.equal(primary.workspaceMode, "staged-read-snapshot");
+});
+
+test("a Grok proof of a writable workspace is not a snapshot-primary proof", () => {
+  // The shape the current CLI actually produces: the workspace is named read-only and read-write at
+  // once, so the write grant is the one in force. This is the measurement that keeps xAI read-primary
+  // closed, expressed as a property rather than a comment.
+  const writable = grokSnapshotProof({ writableRoots: ["/private/tmp/workspace", "/tmp/workspace"] });
+  assert.equal(validGrokSnapshotReadAttestation(writable, snapshot("xai", { version: "1.0.13" })), false, "a writable workspace is not read-only");
+  const { isolatedHome: _omitted, ...withoutIsolation } = grokSnapshotProof();
+  const notIsolated = withoutIsolation as GrokIsolationAttestation;
+  assert.equal(validGrokSnapshotReadAttestation(notIsolated, snapshot("xai", { version: "1.0.13" })), false, "the posture includes where the run executed from");
+  const stagedPolicy = grokSnapshotProof({ profileHash: grokIsolationProfileHash() });
+  assert.equal(validGrokSnapshotReadAttestation(stagedPolicy, snapshot("xai", { version: "1.0.13" })), false, "and which profile it ran under");
+  assert.equal(validGrokSnapshotReadAttestation(grokSnapshotProof(), snapshot("xai", { version: "1.0.13" })), true, "the proven posture passes");
+});
+
+/**
+ * Proof identity is (profile, contract), and these are the cases where the two disagree.
+ *
+ * The stronger probe — five attempted writes instead of one — changed nothing about the *profile*: same
+ * name, same CLI, same platform, same hash. An operator whose cache holds a proof earned under the
+ * older contract therefore has an attestation that looks identical to a current one. These tests are
+ * the difference, expressed as behaviour rather than as a note about deleting a cache.
+ */
+test("a Codex proof from an older self-test contract does not authorize a snapshot, whatever else matches", () => {
+  const { repo, project } = setupProject();
+  const workspaceRoot = join(project.storageDir, "snapshots", "cccccccccccccccccccccccccccccccc", "workspace");
+  const codexModel: ModelRef = { providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription" };
+  const plan = (attestation: CodexIsolationAttestation) => planShadowInvocation({ snapshot: snapshot("openai"), model: codexModel, cwd: repo, payload: { ...payload, role: "primary" }, codexIsolation: attestation, snapshotPrimary: true, workspaceRoot });
+
+  // A: a record written before the field existed.
+  const { probeVersion: _absent, ...legacy } = codexIsolation();
+  const legacyAttestation = legacy as CodexIsolationAttestation;
+  assert.equal(validCodexIsolationAttestation(legacyAttestation, snapshot("openai"), { minProbeVersion: CODEX_PROBE_VERSION }), false);
+  assert.equal(snapshotPrimaryEligibility({ providerId: "openai", snapshot: snapshot("openai"), codexIsolation: legacyAttestation }).eligible, false, "no contract named means the snapshot mode cannot rely on it");
+  assert.throws(() => plan(legacyAttestation), (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_CODEX_ISOLATION_REQUIRED");
+
+  // B: v1 by name — same profile hash, same version, same platform, unexpired.
+  const v1 = codexIsolation({ probeVersion: "codex-sandbox-self-test-v1" });
+  assert.equal(v1.profileHash, codexIsolation().profileHash, "the profile hash really is identical, which is the whole problem");
+  assert.equal(validCodexIsolationAttestation(v1, snapshot("openai")), true, "the staged roles' check accepts it: their contract is the profile");
+  assert.equal(snapshotPrimaryEligibility({ providerId: "openai", snapshot: snapshot("openai"), codexIsolation: v1 }).eligible, false, "and the snapshot mode does not");
+  assert.throws(() => plan(v1), (error: unknown) => error instanceof BrainGateInvariantError && error.code === "SHADOW_CODEX_ISOLATION_REQUIRED");
+
+  // C: the current contract, and the mode opens.
+  const current = codexIsolation();
+  assert.equal(current.probeVersion, CODEX_PROBE_VERSION);
+  assert.equal(validCodexIsolationAttestation(current, snapshot("openai"), { minProbeVersion: CODEX_PROBE_VERSION }), true);
+  assert.equal(snapshotPrimaryEligibility({ providerId: "openai", snapshot: snapshot("openai"), codexIsolation: current }).eligible, true);
+  assert.equal(plan(current).workspaceMode, "staged-read-snapshot");
+
+  // D: expired, current contract.
+  const expired = codexIsolation({ observedAt: new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString(), expiresAt: new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString() });
+  assert.equal(snapshotPrimaryEligibility({ providerId: "openai", snapshot: snapshot("openai"), codexIsolation: expired }).eligible, false);
+
+  // E: right contract, wrong machine.
+  assert.equal(validCodexIsolationAttestation(codexIsolation({ version: "0.1.0" }), snapshot("openai"), { minProbeVersion: CODEX_PROBE_VERSION }), false);
+  assert.equal(validCodexIsolationAttestation(codexIsolation({ platform: "linux" }), snapshot("openai"), { minProbeVersion: CODEX_PROBE_VERSION, platform: "darwin" }), false);
+  assert.equal(validCodexIsolationAttestation(codexIsolation({ profileHash: "0".repeat(64) }), snapshot("openai"), { minProbeVersion: CODEX_PROBE_VERSION }), false);
+});
+
+test("a Grok proof has to name the posture and the contract that proved it", () => {
+  const xai = snapshot("xai", { version: "1.0.13" });
+  // F: a staged proof, whatever its contract.
+  assert.equal(validGrokSnapshotReadAttestation(grokIsolation(), xai), false, "the staged posture is not the snapshot posture");
+  assert.equal(validGrokSnapshotReadAttestation(grokSnapshotProof({ profileHash: grokIsolationProfileHash() }), xai), false);
+  // G: a snapshot proof from an older contract, and the shape a failed probe leaves behind.
+  assert.equal(validGrokSnapshotReadAttestation(grokSnapshotProof({ probeVersion: "grok-snapshot-read-self-test-v1" }), xai), false, "an older contract cannot become sufficient because the strings match");
+  const { probeVersion: _omitted, ...withoutContract } = grokSnapshotProof();
+  assert.equal(validGrokSnapshotReadAttestation(withoutContract as GrokIsolationAttestation, xai), false, "and a record with no contract named does not either");
+  assert.equal(validGrokSnapshotReadAttestation(undefined, xai), false, "a probe that never produced an attestation proves nothing");
+  assert.equal(snapshotPrimaryEligibility({ providerId: "xai", snapshot: xai, grokSnapshotIsolation: grokSnapshotProof({ probeVersion: "grok-snapshot-read-self-test-v1" }) }).eligible, false);
+  assert.equal(snapshotPrimaryEligibility({ providerId: "xai", snapshot: xai, grokSnapshotIsolation: grokSnapshotProof() }).eligible, true, "the current snapshot-read contract opens it, if one is ever earnable");
 });

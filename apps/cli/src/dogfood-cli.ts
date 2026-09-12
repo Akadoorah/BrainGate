@@ -3,6 +3,9 @@ import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
+import { CODEX_PROBE_VERSION } from "@braingate/shadow";
+import { ProjectSnapshotProvider } from "@braingate/execution";
+import type { TaskSnapshotProvider } from "@braingate/shadow";
 import {
   BrainGateInvariantError,
   ProjectRegistry,
@@ -55,6 +58,11 @@ export interface DogfoodCliDependencies {
   readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly executor?: ShadowProcessExecutor;
   readonly writeExecutor?: WriteProviderExecutor;
+  /**
+   * Where a read-primary run's project copy comes from; a test supplies a fake so it can assert what
+   * the provider was pointed at without copying a real project.
+   */
+  readonly snapshotStore?: TaskSnapshotProvider;
   /**
    * Told which provider and model is working, as each role starts and finishes.
    *
@@ -292,12 +300,15 @@ async function codexIsolationStatus(
   env: NodeJS.ProcessEnv,
   shouldAttempt: boolean,
   state: OperatorStatePaths,
+  /** Read-primary needs the contract that proves the denied writes; the staged roles need the profile. */
+  minProbeVersion?: string,
 ): Promise<IsolationStatus<CodexIsolationAttestation>> {
   return await codexIsolationStatusFor({
     snapshots,
     env,
     shouldAttempt,
     cache: isolationCacheFor(state),
+    ...(minProbeVersion === undefined ? {} : { minProbeVersion }),
     ...(deps.verifyCodexIsolation === undefined ? {} : { verify: deps.verifyCodexIsolation }),
   });
 }
@@ -311,6 +322,8 @@ async function grokProof(
   project?: RegisteredProject,
   /** The write profile earns its own proof; the read-only staged profile is the default. */
   policy?: GrokSandboxPolicy,
+  /** `snapshot-read` earns the proof for a read-primary run on a project copy. */
+  mode?: "staged" | "snapshot-read",
 ): Promise<Awaited<ReturnType<typeof grokIsolationStatus>>> {
   return await grokIsolationStatus({
     snapshots,
@@ -319,6 +332,7 @@ async function grokProof(
     cache: isolationCacheFor(state),
     ...(project === undefined ? {} : { project }),
     ...(policy === undefined ? {} : { policy }),
+    ...(mode === undefined ? {} : { mode }),
     ...(deps.verifyGrokIsolation === undefined ? {} : { verify: deps.verifyGrokIsolation }),
   });
 }
@@ -564,7 +578,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const snapshots = await discovery(deps, state);
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
   const configured = catalog.filter((entry) => entry.configured);
-  const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"), state);
+  const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"), state, CODEX_PROBE_VERSION);
   const grok = await grokProof(state, snapshots, deps, env, project);
   const acceptances = loadAcceptances(state);
   const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer") => {
@@ -660,13 +674,19 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
-    const isolation = await codexIsolationStatus(snapshots, deps, env, needsReview && configuredOpenAi(state), state);
+    // A review needs Codex's proof, and so does a read primary on a project copy: one self-test
+    // answers both, so the probe runs whenever Codex is configured rather than only before a review.
+    const isolation = await codexIsolationStatus(snapshots, deps, env, configuredOpenAi(state), state, CODEX_PROBE_VERSION);
     const codexIsolation = isolation.attestation ?? undefined;
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;
+    // A read-primary run on a project copy executes from a BrainGate-owned Grok home with no operator
+    // plugins, which is a different proof from the staged one. Earned here, on the same terms.
+    const grokSnapshot = await grokProof(state, snapshots, deps, env, project, undefined, "snapshot-read");
+    const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
-    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }) });
+    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     const planData = Object.freeze({ classification: view, budget, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })), providerCallsOnPlan: 0 });
 
@@ -695,7 +715,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // the failure path — a refusal ends the run, and its backoff must be applied anyway.
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
+      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_RECEIPT_MISSING", "Executed dogfood ask did not produce a task receipt.");
       // The runner recorded the outcome, the result and the observation; this reads them back
@@ -751,7 +771,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const effective = adaptive.effective;
     const budget = budgetFor(effective, { writeRequested: true });
     const requiredContextTokens = contextTokens(task);
-    const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state);
+    const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state, CODEX_PROBE_VERSION);
     const codexIsolation = isolation.attestation ?? undefined;
     const grok = await grokProof(state, snapshots, deps, env, project);
     const grokIsolation = grok.attestation ?? undefined;

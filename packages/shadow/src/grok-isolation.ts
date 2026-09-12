@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { BrainGateInvariantError } from "@braingate/core";
@@ -37,6 +37,17 @@ import { NodeCodexSandboxRunner, type CodexSandboxResult, type CodexSandboxRunne
 export const GROK_SANDBOX_PROFILE = "braingate-staged";
 
 /**
+ * Which self-test contract a Grok attestation was earned under, per posture.
+ *
+ * The staged contract reads the applied policy back. The snapshot-read contract does that *and* proves
+ * the posture a project copy needs: a BrainGate-isolated home with no operator plugins, and no writable
+ * root at all. A future Grok release whose grants change must earn the current contract; an older proof
+ * cannot become sufficient merely because the profile strings happen to match.
+ */
+export const GROK_STAGED_PROBE_VERSION = "grok-sandbox-event-self-test-v2";
+export const GROK_SNAPSHOT_PROBE_VERSION = "grok-snapshot-read-self-test-v2";
+
+/**
  * A sandbox profile BrainGate defines, with the hash an attestation is bound to.
  *
  * There is more than one because a read and a write want different things from the kernel, and
@@ -49,8 +60,18 @@ export interface GrokSandboxPolicy {
   readonly hash: string;
 }
 
-function sandboxPolicy(input: { readonly name: string; readonly extends: string; readonly restrictNetwork: boolean; readonly deny?: readonly string[] }): GrokSandboxPolicy {
-  const definition = Object.freeze({ schemaVersion: 1, profile: input.name, extends: input.extends, restrictNetwork: input.restrictNetwork, ...(input.deny === undefined ? {} : { deny: input.deny }) });
+function sandboxPolicy(input: { readonly name: string; readonly extends: string; readonly restrictNetwork: boolean; readonly deny?: readonly string[]; readonly home?: "operator" | "isolated" }): GrokSandboxPolicy {
+  const definition = Object.freeze({
+    schemaVersion: 1,
+    profile: input.name,
+    extends: input.extends,
+    restrictNetwork: input.restrictNetwork,
+    // Which Grok home the run executes from is part of the policy, not an implementation detail: a
+    // home that carries the operator's plugins and hooks grants a plugin far more reach than the same
+    // profile does from an empty one. The hash says which posture the attestation was earned under.
+    home: input.home ?? "operator",
+    ...(input.deny === undefined ? {} : { deny: input.deny }),
+  });
   const lines = [
     `[profiles.${input.name}]`,
     `extends = "${input.extends}"`,
@@ -100,6 +121,61 @@ export function grokIsolationProfileHash(): string {
 }
 
 /**
+ * The profile a **read-primary snapshot** run uses.
+ *
+ * It is a separate policy rather than a reuse of `braingate-staged` for one reason that is not a role
+ * name: the home is different. A staged role runs from the operator's Grok home, which on this machine
+ * carries installed plugins and Claude-Code hook configuration; the snapshot-primary posture runs from
+ * a BrainGate-created home that holds a minimal configuration and a *reference* to the credential, and
+ * nothing else. That changes what a plugin could reach — from a copy of the project's source tree —
+ * so it is a different policy with a different hash, earned by its own self-test.
+ *
+ * The sandbox posture itself is the same `strict` base with network restricted, and the deny list is
+ * the same idea as the write profile's: a credential is unreadable rather than merely off-limits.
+ */
+/*
+ * MEASURED 2026-09-12, grok 1.0.24, darwin, and it is why xAI read-primary is not eligible:
+ *
+ * the applied `strict` profile lists the workspace under `read_only_paths` *and* under
+ * `read_write_paths` (the same directory through macOS's `/private` alias), so Grok grants write
+ * access to its own working directory. A project copy a provider can rewrite is not a read-only
+ * workspace, whatever the flags say, so the snapshot-primary self-test below refuses this posture
+ * and `braingate doctor` reports the grants it saw. The profile is kept because it is the posture a
+ * future build would have to earn: the moment a Grok release can deny writes inside its workspace,
+ * this proof becomes earnable and nothing else has to change.
+ */
+export const GROK_SNAPSHOT_READ_SANDBOX: GrokSandboxPolicy = sandboxPolicy({
+  name: "braingate-snapshot-read",
+  extends: "strict",
+  restrictNetwork: true,
+  home: "isolated",
+  deny: Object.freeze(["**/.env", "**/.env.*", "**/*.pem", "**/*.key", "**/credentials*", "**/.git/config"]),
+});
+
+export function grokSnapshotReadProfileHash(): string {
+  return GROK_SNAPSHOT_READ_SANDBOX.hash;
+}
+
+/**
+ * The Grok home a snapshot-primary run executes from.
+ *
+ * BrainGate creates it: one file of its own configuration, and the operator's `auth.json` **referenced
+ * by symlink** rather than copied — so no credential is duplicated anywhere and the operator's own
+ * `grok` sessions keep working unchanged. What is deliberately absent is everything else the operator's
+ * home carries: installed plugins, hook configuration, MCP servers, marketplace state, memory.
+ */
+export function createIsolatedGrokHome(input: { readonly root: string; readonly realHome: string }): { readonly home: string; readonly credentialReferenced: boolean } {
+  const home = join(input.root, "grok-home");
+  rmSync(home, { recursive: true, force: true });
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const credential = join(input.realHome, "auth.json");
+  const referenced = existsSync(credential);
+  if (referenced) symlinkSync(credential, join(home, "auth.json"));
+  writeFileSync(join(home, "config.toml"), "# BrainGate-owned Grok home for a read-only snapshot run.\n", { encoding: "utf8", mode: 0o600 });
+  return Object.freeze({ home, credentialReferenced: referenced });
+}
+
+/**
  * User-level Grok surfaces that will still load in a staged run, because they live in
  * `GROK_HOME` alongside the credentials the run needs.
  *
@@ -126,11 +202,22 @@ export function grokConfigSurfaces(grokHome: string): readonly string[] {
 export interface GrokIsolationAttestation {
   readonly providerId: "xai";
   readonly source: "sandbox-event-self-test";
+  /** The self-test contract this proof was earned under; absent on records written before it existed. */
+  readonly probeVersion?: string;
   readonly version: string;
   readonly platform: "darwin" | "linux";
   readonly profileHash: string;
   /** Path roots Grok reported it would allow reads from, as recorded by its own event log. */
   readonly readableRoots: readonly string[];
+  /**
+   * Roots the applied profile granted *write* access to.
+   *
+   * Recorded so a read-only claim is a fact about the kernel rather than a hope: the snapshot-primary
+   * attestation is valid only when the workspace is absent from this list.
+   */
+  readonly writableRoots?: readonly string[];
+  /** Whether the proof was earned from a BrainGate-created home rather than the operator's. */
+  readonly isolatedHome?: boolean;
   /** False on macOS, where child-process network blocking is a documented no-op. */
   readonly networkRestricted: boolean;
   /** User-level Grok surfaces loaded inside the sandbox; see grokConfigSurfaces. */
@@ -173,9 +260,20 @@ function normalizedVersion(snapshot: ProviderSnapshot): string {
 export function validGrokIsolationAttestation(
   value: GrokIsolationAttestation | undefined,
   snapshot: ProviderSnapshot,
-  options: { readonly platform?: NodeJS.Platform; readonly now?: Date; readonly policy?: GrokSandboxPolicy } = {},
+  options: {
+    readonly platform?: NodeJS.Platform;
+    readonly now?: Date;
+    readonly policy?: GrokSandboxPolicy;
+    /**
+     * The self-test contract the caller needs. Omitted means any contract this policy accepts; a
+     * caller that needs the snapshot posture asks for it by name, and a proof from an older contract
+     * does not satisfy the request.
+     */
+    readonly minProbeVersion?: string;
+  } = {},
 ): boolean {
   if (value === undefined || value.providerId !== "xai" || value.source !== "sandbox-event-self-test") return false;
+  if (options.minProbeVersion !== undefined && value.probeVersion !== options.minProbeVersion) return false;
   const platform = platformGate(options.platform ?? process.platform);
   // An attestation earned under the read profile does not cover a write: the hash is over the
   // policy, so asking for the wrong one has no proof rather than the nearest available one.
@@ -200,6 +298,23 @@ interface ProfileAppliedEvent {
 }
 
 /** The last `ProfileApplied` event Grok recorded for this workspace, or null. */
+/**
+ * Whether an attestation proves the snapshot-primary posture: the snapshot policy, an isolated home,
+ * and a workspace the kernel will not let the provider write to.
+ */
+export function validGrokSnapshotReadAttestation(
+  value: GrokIsolationAttestation | undefined,
+  snapshot: ProviderSnapshot,
+  options: { readonly now?: Date; readonly projectPaths?: readonly string[] } = {},
+): boolean {
+  if (value === undefined) return false;
+  // Both halves of the identity: the snapshot policy *and* the snapshot-read contract.
+  if (!validGrokIsolationAttestation(value, snapshot, { ...options, policy: GROK_SNAPSHOT_READ_SANDBOX, minProbeVersion: GROK_SNAPSHOT_PROBE_VERSION })) return false;
+  if (value.isolatedHome !== true) return false;
+  if (!Array.isArray(value.writableRoots) || value.writableRoots.length > 0) return false;
+  return true;
+}
+
 export function latestProfileApplied(log: string, workspace: string): ProfileAppliedEvent | null {
   let found: ProfileAppliedEvent | null = null;
   for (const rawLine of log.split(/\r?\n/)) {
@@ -258,7 +373,7 @@ export class GrokIsolationVerifier {
    */
   async verify(
     snapshot: ProviderSnapshot,
-    options: { readonly projectPaths?: readonly string[]; readonly now?: Date; readonly policy?: GrokSandboxPolicy } = {},
+    options: { readonly projectPaths?: readonly string[]; readonly now?: Date; readonly policy?: GrokSandboxPolicy; readonly mode?: "staged" | "snapshot-read" } = {},
   ): Promise<GrokIsolationAttestation> {
     if (snapshot.providerId !== "xai") throw new BrainGateInvariantError("GROK_ISOLATION_PROVIDER_INVALID", "The Grok isolation verifier accepts only the xAI provider.");
     if (snapshot.available.value !== true) throw new BrainGateInvariantError("GROK_ISOLATION_UNAVAILABLE", "Grok CLI is unavailable.");
@@ -266,13 +381,26 @@ export class GrokIsolationVerifier {
     const version = normalizedVersion(snapshot);
     const now = options.now ?? new Date();
     const policy = options.policy ?? GROK_STAGED_SANDBOX;
-    const grokHome = resolveGrokHome(this.#baseEnv);
+    const operatorHome = resolveGrokHome(this.#baseEnv);
+    const snapshotRead = options.mode === "snapshot-read";
     const root = mkdtempSync(join(tmpdir(), "braingate-grok-verify-"));
     const workspace = join(root, "workspace");
     const isolatedHome = join(root, "home");
     mkdirSync(join(workspace, ".grok"), { recursive: true, mode: 0o700 });
     mkdirSync(isolatedHome, { mode: 0o700 });
     writeFileSync(join(workspace, ".grok", "sandbox.toml"), policy.toml, { encoding: "utf8", mode: 0o600 });
+    // The posture the attestation will speak for: a snapshot-primary run executes from BrainGate's own
+    // Grok home, so that is what this self-test measures. A staged run keeps the operator's home,
+    // because that is what a staged run actually uses.
+    const isolated = snapshotRead ? createIsolatedGrokHome({ root, realHome: operatorHome }) : null;
+    if (isolated !== null && !isolated.credentialReferenced) {
+      throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", `No Grok credential was found to reference from the isolated home (${join(operatorHome, "auth.json")}).`);
+    }
+    const grokHome = isolated === null ? operatorHome : isolated.home;
+    if (isolated !== null) {
+      const surfaces = grokConfigSurfaces(isolated.home);
+      if (surfaces.length > 0) throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", `The isolated Grok home still loads operator configuration: ${surfaces.join(", ")}.`);
+    }
 
     // Per file, because either one may be the one this build writes and a mark taken across
     // both would shift the moment the other grows.
@@ -327,6 +455,31 @@ export class GrokIsolationVerifier {
       if (reachable.length > 0) {
         throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "The applied Grok sandbox would still reach the registered project checkout.");
       }
+      // A copy of the project is worth no more than the checkout if the provider can rewrite it, so a
+      // snapshot-primary proof must show the workspace read-only and nothing writable at all.
+      if (snapshotRead) {
+        const readWrite = [...(event.read_write_paths ?? [])];
+        const workspaceReadOnly = (event.read_only_paths ?? []).some((path) => within(path, workspace) && within(workspace, path));
+        if (!workspaceReadOnly) {
+          // The grants are named in the failure, because "not read-only" has two very different causes:
+          // a sandbox that does not enforce it, and a path reported under another name (macOS resolves
+          // a workspace opened through a symlinked temp root). The first must stop the mode; the second
+          // is an identity question the caller can answer.
+          throw new BrainGateInvariantError(
+            "GROK_ISOLATION_SELF_TEST_FAILED",
+            `The applied Grok sandbox does not report the workspace as read-only, so writes into a snapshot could not be denied (workspace ${workspace}; read-only ${JSON.stringify(event.read_only_paths ?? [])}; read-write ${JSON.stringify(event.read_write_paths ?? [])}).`,
+          );
+        }
+        if (readWrite.some((path) => within(path, workspace))) {
+          throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "The applied Grok sandbox grants write access inside the workspace, so a snapshot would be mutable by the provider.");
+        }
+        if (readWrite.length > 0) {
+          throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", `The applied Grok sandbox grants write access to ${readWrite.join(", ")}, which a read-only run has no reason to need.`);
+        }
+        if (readable.some((path) => within(path, operatorHome))) {
+          throw new BrainGateInvariantError("GROK_ISOLATION_SELF_TEST_FAILED", "The applied Grok sandbox can read the operator's Grok home, which carries their plugins and hooks.");
+        }
+      }
 
       return Object.freeze({
         providerId: "xai",
@@ -334,7 +487,10 @@ export class GrokIsolationVerifier {
         version,
         platform,
         profileHash: policy.hash,
+        probeVersion: snapshotRead ? GROK_SNAPSHOT_PROBE_VERSION : GROK_STAGED_PROBE_VERSION,
         readableRoots: Object.freeze([...(event.read_only_paths ?? [])]),
+        writableRoots: Object.freeze([...(event.read_write_paths ?? [])]),
+        ...(snapshotRead ? { isolatedHome: true } : {}),
         // Recorded rather than claimed: on macOS Grok reports the request but the kernel does
         // not block child-process network, and an attestation that said otherwise would be a
         // guarantee BrainGate cannot keep.

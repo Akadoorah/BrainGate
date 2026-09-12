@@ -44,6 +44,26 @@ import type { TaskEvent, TaskLedger } from "./task-ledger.js";
  * a role the engine can route but this list omits would silently vanish from the record, which is
  * exactly the bug this vocabulary is used to fix.
  */
+/**
+ * The workspace modes a task's own record can name, as a runtime list so the type cannot drift from
+ * what the writers actually record.
+ */
+export const OBSERVATION_WORKSPACE_MODES = Object.freeze(["project-checkout", "staged-read-snapshot", "staged-context", "task-worktree"] as const);
+export type ObservationWorkspaceMode = (typeof OBSERVATION_WORKSPACE_MODES)[number];
+
+export function isObservationWorkspaceMode(value: unknown): value is ObservationWorkspaceMode {
+  return typeof value === "string" && (OBSERVATION_WORKSPACE_MODES as readonly string[]).includes(value);
+}
+
+/** The invariant `workspaceMode` an invocation is recorded with, mapped from the plan's vocabulary. */
+export function observationWorkspaceMode(workspaceMode: unknown): ObservationWorkspaceMode | null {
+  if (workspaceMode === "project") return "project-checkout";
+  if (workspaceMode === "staged-read-snapshot") return "staged-read-snapshot";
+  if (workspaceMode === "staged-clean") return "staged-context";
+  if (workspaceMode === "task-worktree") return "task-worktree";
+  return null;
+}
+
 export const OBSERVATION_ROLE_NAMES = Object.freeze(["planner", "primary", "reviewer", "judge"] as const);
 export type ObservationRoleName = (typeof OBSERVATION_ROLE_NAMES)[number];
 
@@ -63,6 +83,14 @@ export interface ObservationRole {
    * that was only routed must not read as one that ran.
    */
   readonly status?: "planned" | "attempted" | "completed";
+  /**
+   * Where this role's provider was pointed, when the record says.
+   *
+   * `project-checkout` is the operator's working directory; `staged-read-snapshot` is a copy BrainGate
+   * made. They are different security facts about the same task, so a record that omits this reads as
+   * though every role saw the same thing.
+   */
+  readonly workspaceMode?: ObservationWorkspaceMode;
 }
 
 export interface ObservationContext {

@@ -18,7 +18,9 @@ import {
 } from "@braingate/core";
 import { DogfoodStore } from "@braingate/dogfood";
 import { MAX_PROVIDER_CALL_MS } from "@braingate/shadow";
-import { STALE_CALL_MULTIPLIER, executionAttribution, recordedExecutionAttribution } from "@braingate/core";
+import { STALE_CALL_MULTIPLIER, executionAttribution, isTerminalTaskState, recordedExecutionAttribution } from "@braingate/core";
+import { ProjectSnapshotProvider } from "@braingate/execution";
+import type { TaskSnapshotProvider } from "@braingate/shadow";
 import { quotaRefusalFromEvents } from "@braingate/observability";
 import { redactSecrets } from "@braingate/security";
 import { resolveOperatorState } from "@braingate/operator";
@@ -41,6 +43,13 @@ export interface TasksCliDependencies {
   readonly stderr?: (text: string) => void;
   /** Injectable for tests; the real one reads the per-command ledger. */
   readonly now?: () => Date;
+  /**
+   * Where a project copy would come from, and what reconciles a leftover one.
+   *
+   * A test supplies a fake, so it can prove reconciliation tidies what a killed process left without
+   * copying a real project to do it.
+   */
+  readonly snapshotStore?: TaskSnapshotProvider;
 }
 
 export interface TasksCliResult {
@@ -176,6 +185,54 @@ function numberOf(payload: Record<string, unknown>, key: string): number | null 
  * written; they are redacted again here, because this is the path that puts them on a screen and
  * somewhere a person will copy them from.
  */
+/**
+ * What the provider was given, when it was given a project copy.
+ *
+ * The manifest identity, the counts, the policy version and the source fingerprint are read back from
+ * the task's own events, so the answer survives the snapshot being deleted — which it always is.
+ */
+export interface SnapshotView {
+  readonly snapshotId: string;
+  readonly manifestHash: string;
+  readonly fileCount: number;
+  readonly totalBytes: number;
+  readonly policyVersion: string;
+  readonly sourceFingerprint: string;
+  readonly role: string | null;
+  readonly provider: string | null;
+  readonly model: string | null;
+}
+
+export function snapshotViews(events: readonly { readonly kind: string; readonly payload: unknown }[]): readonly SnapshotView[] {
+  const views: SnapshotView[] = [];
+  for (const event of events) {
+    if (event.kind !== "task.snapshot") continue;
+    const payload = event.payload;
+    if (payload === null || typeof payload !== "object") continue;
+    const record = payload as Record<string, unknown>;
+    const text = (value: unknown): string | null => (typeof value === "string" && value.length > 0 ? value : null);
+    const count = (value: unknown): number | null => (typeof value === "number" && Number.isFinite(value) ? value : null);
+    views.push(Object.freeze({
+      snapshotId: text(record.snapshotId) ?? "unknown",
+      manifestHash: text(record.manifestHash) ?? "unknown",
+      fileCount: count(record.fileCount) ?? 0,
+      totalBytes: count(record.totalBytes) ?? 0,
+      policyVersion: text(record.policyVersion) ?? "unknown",
+      sourceFingerprint: text(record.sourceFingerprint) ?? "unknown",
+      role: text(record.role),
+      provider: text(record.provider),
+      model: text(record.model),
+    }));
+  }
+  return Object.freeze(views);
+}
+
+function snapshotLines(events: readonly { readonly kind: string; readonly payload: unknown }[]): readonly string[] {
+  return snapshotViews(events).map((view) =>
+    `  snapshot ${view.manifestHash.slice(0, 16)} · ${String(view.fileCount)} files · ${String(view.totalBytes)} bytes · policy ${view.policyVersion}${view.provider === null ? "" : ` · read by ${view.provider}/${view.model ?? "unknown"} as ${view.role ?? "unknown"}`}`,
+  );
+}
+
 export function failureViews(events: readonly { readonly kind: string; readonly payload: unknown }[]): readonly FailureView[] {
   const views: FailureView[] = [];
   for (const event of events) {
@@ -321,6 +378,7 @@ async function runShow(args: string[], deps: TasksCliDependencies, cwd: string, 
       // Who actually ran, and how far each role got: the plan's roles are not the same fact as the
       // executed ones, and this is the record that keeps a planner on another provider from vanishing.
       execution,
+      snapshots: snapshotViews(receipt.events),
       quotaRefusal: refusal,
       transitions: Object.freeze(receipt.events.filter((event) => event.toState !== null).map((event) => Object.freeze({ from: event.fromState, to: event.toState, at: event.occurredAt }))),
       events: Object.freeze(receipt.events.map((event) => Object.freeze({ sequence: event.sequence, kind: event.kind, at: event.occurredAt }))),
@@ -369,7 +427,10 @@ async function runShow(args: string[], deps: TasksCliDependencies, cwd: string, 
       `  basis    ${snapshot === null || snapshot.basis.length === 0 ? "none" : snapshot.basis.join(", ")}`,
       `  tier     ${receipt.task.complexity ?? "-"}/${receipt.task.risk ?? "-"}`,
       `  updated  ${receipt.task.updatedAt}`,
-      ...(execution.length === 0 ? [] : [`  executed ${execution.map((role) => `${role.role}=${role.providerId}/${role.modelId}(${role.status ?? "planned"})`).join(" · ")}`]),
+      // The workspace a role read is part of what the role did, so it is rendered beside the model
+      // rather than left to the reader to infer from the provider's name.
+      ...(execution.length === 0 ? [] : [`  executed ${execution.map((role) => `${role.role}=${role.providerId}/${role.modelId}(${role.status ?? "planned"}${role.workspaceMode === undefined ? "" : `, ${role.workspaceMode}`})`).join(" · ")}`]),
+      ...snapshotLines(receipt.events),
       ...(refusal === null ? [] : [`  refusal  ${refusal.providerId}/${refusal.quotaPool} · ${refusal.reason} · ${refusal.observedAt} · ${refusal.resetAt === null ? "no machine-readable reset" : `reset ${refusal.resetAt}`}`]),
     ];
     // What was tried and what the provider said, before anything else on a failed task. The outcome
@@ -438,6 +499,16 @@ async function runReconcile(args: string[], deps: TasksCliDependencies, cwd: str
   try {
     const now = deps.now ?? (() => new Date());
     const report = reconcile(project, depsFor(project, ledger, store, now), now());
+    // Reconciliation is where a task's remains are already being tidied, so it is where a project copy
+    // left by a killed process is tidied too. A separate concern from the record: the sweep removes
+    // only BrainGate-owned snapshot directories whose owning process is gone, and reports what it
+    // will not touch rather than guessing at it.
+    const sweep = (deps.snapshotStore ?? new ProjectSnapshotProvider(project)).sweep({
+      isTaskFinished: (taskId) => {
+        try { return isTerminalTaskState(ledger.receipt(taskId).task.state); }
+        catch { return undefined; }
+      },
+    });
     const data = Object.freeze({
       projectId: project.projectId,
       required: report.required,
@@ -446,6 +517,9 @@ async function runReconcile(args: string[], deps: TasksCliDependencies, cwd: str
       conflicts: report.conflicts,
       partialFinalizations: report.partialFinalizations,
       staleNonTerminal: report.staleNonTerminal,
+      snapshotsRemoved: sweep.removed,
+      snapshotsKept: sweep.kept,
+      snapshotsUnrecognised: sweep.unrecognised,
     });
     const lines = report.required === 0
       ? ["Nothing to reconcile: every task has a complete record."]
@@ -454,6 +528,8 @@ async function runReconcile(args: string[], deps: TasksCliDependencies, cwd: str
         ...report.reconciled.map((taskId) => `  ${taskId}`),
       ];
     if (report.conflicts.length > 0) lines.push(...["Conflicts (the store refused to overwrite):", ...report.conflicts.map((entry) => `  ${entry}`)]);
+    if (sweep.removed > 0) lines.push(`Removed ${String(sweep.removed)} project snapshot(s) left by a process that is gone.`);
+    if (sweep.unrecognised > 0) lines.push(`Left ${String(sweep.unrecognised)} unrecognised entr(ies) in the snapshots directory alone.`);
     emit(json, data, lines.join("\n"), stdout);
     return Object.freeze({ exitCode: 0, data });
   } finally {
