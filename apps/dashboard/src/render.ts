@@ -48,7 +48,9 @@ function routeLine(task: DashboardTaskCard): string {
  */
 function executionLine(task: DashboardTaskCard): string {
   if (task.execution.length === 0) return "";
-  const entries = task.execution.map((role) => `${escapeHtml(role.role)}: <strong>${escapeHtml(role.providerId)}</strong> / ${escapeHtml(role.modelId)} <span class="status ${role.status === "completed" ? "native" : role.status === "attempted" ? "limited" : "unknown"}">${escapeHtml(role.status ?? "planned")}</span>`).join(" · ");
+  // The workspace is shown beside the model because it is part of what the role did: a provider that
+  // read a copy of the project and one that read the checkout are different facts about a task.
+  const entries = task.execution.map((role) => `${escapeHtml(role.role)}: <strong>${escapeHtml(role.providerId)}</strong> / ${escapeHtml(role.modelId)} <span class="status ${role.status === "completed" ? "native" : role.status === "attempted" ? "limited" : "unknown"}">${escapeHtml(role.status ?? "planned")}</span>${role.workspaceMode === undefined ? "" : ` <span class="muted">${escapeHtml(role.workspaceMode)}</span>`}`).join(" · ");
   return `<p class="muted">Executed: ${entries}</p>`;
 }
 

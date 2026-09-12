@@ -22,6 +22,9 @@ importers:
       '@braingate/dogfood':
         specifier: workspace:*
         version: link:../../packages/dogfood
+      '@braingate/execution':
+        specifier: workspace:*
+        version: link:../../packages/execution
       '@braingate/memory':
         specifier: workspace:*
         version: link:../../packages/memory

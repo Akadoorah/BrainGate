@@ -3,15 +3,17 @@ import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import type { ModelRef } from "@braingate/router";
 import type { WorkflowRole } from "@braingate/workflows";
 import {
+  CODEX_PROBE_VERSION,
   acceptedFeatureKeys,
   codexReviewerConfigArgs,
   validCodexIsolationAttestation,
   type CodexIsolationAttestation,
 } from "./codex-isolation.js";
-import { GROK_SANDBOX_PROFILE, validGrokIsolationAttestation, type GrokIsolationAttestation } from "./grok-isolation.js";
+import { GROK_SANDBOX_PROFILE, GROK_SNAPSHOT_READ_SANDBOX, validGrokIsolationAttestation, validGrokSnapshotReadAttestation, type GrokIsolationAttestation } from "./grok-isolation.js";
 import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
 import { subagentsArgument } from "./subagents.js";
 import { grants, guaranteesFor, measuredSurface, resolveToolGrant, type MeasuredCapabilities, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
+import type { SnapshotPrimaryIneligibleReason } from "./snapshot-provider.js";
 import { STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -67,6 +69,14 @@ interface ProfileDefinition {
    * strongest model in an otherwise unusable subscription reachable at all.
    */
   readonly stagedRoles?: readonly WorkflowRole[];
+  /**
+   * Whether this provider may run the read-primary role against a BrainGate-made project snapshot.
+   *
+   * The flag is a statement about the *provider's* surface (it can be confined to a workspace it was
+   * pointed at), not about its scores. It is not enough on its own: eligibility also requires the
+   * provider's current sandbox attestation and the snapshot contract below.
+   */
+  readonly snapshotPrimary?: boolean;
   /** True when project access is reachable only through an operator acceptance. */
   readonly needsOperatorAcceptance?: boolean;
   /**
@@ -100,14 +110,14 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // restriction outlived its reason: a planner and a judge run in the same staged workspace,
   // under the same attestation, reading nothing the reviewer does not read. What stays closed is
   // `primary`, which would need the real checkout.
-  openai: { providerId: "openai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: null, blockedReason: "Staged roles only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
+  openai: { providerId: "openai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], snapshotPrimary: true, minimumVersion: null, blockedReason: "Staged roles only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
   // Grok was blocked for two reasons, and grok 1.0.13 ended both (ADR 0009). `GROK_HOME` now
   // carries configuration and credentials together, so an isolated HOME removes the other
   // tool's settings file — `grok inspect` reports `Permissions: (none)` — while authentication
   // survives; and a custom sandbox profile that cannot be applied now aborts the run instead of
   // warning. What remains is proven per invocation by a self-test rather than assumed, so Grok
   // is enabled for staged roles and still closed for anything that reads the real checkout.
-  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true } },
+  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], snapshotPrimary: true, minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true } },
   // Headless `agy` is fail-closed about tools — one needing permission is auto-denied, because
   // there is nobody to prompt, and the denial is reported in `denied_actions`. What is still
   // missing is any way to scope it per invocation: permissions and credentials share HOME, and
@@ -117,6 +127,44 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // is the residual only the operator can accept (ADR 0008).
   google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
 });
+
+/**
+ * The attestation contract for read-primary on a project snapshot.
+ *
+ * A snapshot-primary run executes under the *same* sandbox policy the staged roles already use: for
+ * Codex, the read-only sandbox with the same accepted control keys; for Grok, the same kernel profile
+ * (`strict`, network restricted) with the same isolated home. The role differs and the workspace's
+ * *content* differs — a snapshot rather than a handful of context files — and neither of those is part
+ * of the policy the attestation is a hash over.
+ *
+ * That makes reusing the existing attestation legitimate, but only because it is checked rather than
+ * assumed. This table is the explicit contract, and `snapshotProfileArguments` below is what a test
+ * asserts equality of: if the snapshot-mode arguments ever stop matching the profile the attestation
+ * was earned under, the attestation no longer covers this mode and the test fails before the code can
+ * quietly keep trusting it.
+ */
+/** The profile name a snapshot-primary Grok run asks for. */
+export const GROK_SNAPSHOT_READ_PROFILE = GROK_SNAPSHOT_READ_SANDBOX.name;
+
+export const SNAPSHOT_PRIMARY_CONTRACT = Object.freeze({
+  openai: Object.freeze({ attestationSource: "sandbox-self-test" as const, policy: "read-only sandbox, reviewer control keys", roles: Object.freeze(["primary"] as const) }),
+  xai: Object.freeze({ attestationSource: "sandbox-event-self-test" as const, policy: `${GROK_SNAPSHOT_READ_PROFILE} (strict, network restricted, BrainGate-isolated home)`, roles: Object.freeze(["primary"] as const) }),
+});
+
+/** The workspace a run is pointed at, from the two facts that decide it. */
+export function workspaceModeFor(providerId: ProviderId, role: WorkflowRole, snapshotPrimary: boolean): "project" | "staged-clean" | "staged-read-snapshot" {
+  if (role !== "primary") return "staged-clean";
+  if (!snapshotPrimary) return "project";
+  if (!snapshotPrimaryCapable(providerId)) {
+    throw new BrainGateInvariantError("SHADOW_SNAPSHOT_PROVIDER_UNSUPPORTED", `${providerId} cannot run read-primary against a project snapshot.`);
+  }
+  return "staged-read-snapshot";
+}
+
+/** Whether this build can run the given provider as read-primary against a snapshot at all. */
+export function snapshotPrimaryCapable(providerId: ProviderId): boolean {
+  return PROFILES[providerId].snapshotPrimary === true;
+}
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
   if (value === null) return null;
@@ -168,11 +216,12 @@ function assertProfile(
   acceptance: OperatorProviderAcceptance | undefined,
   role: WorkflowRole,
   now: Date,
+  eligibility: { readonly snapshotPrimary?: boolean } = {},
 ): ProfileDefinition {
   if (snapshot.providerId !== model.providerId) throw new BrainGateInvariantError("SHADOW_PROVIDER_MISMATCH", "Provider snapshot and routed model do not match.");
   const profile = PROFILES[snapshot.providerId];
   if (!profile.enabled) {
-    const status = shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now });
+    const status = shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now, snapshotPrimary: eligibility.snapshotPrimary === true });
     if (!status.enabled) throw new BrainGateInvariantError("SHADOW_PROVIDER_BLOCKED", status.reason ?? profile.blockedReason ?? "Provider shadow profile is blocked.");
   }
   if (snapshot.available.value !== true) throw new BrainGateInvariantError("SHADOW_PROVIDER_UNAVAILABLE", `${snapshot.displayName} CLI is unavailable.`);
@@ -209,6 +258,20 @@ export function planShadowInvocation(input: {
   readonly networkAcceptance?: OperatorProviderAcceptance;
   readonly maxTurns?: number;
   /**
+   * Set by the caller when this role runs read-primary against a BrainGate-made project snapshot,
+   * with `workspaceRoot` pointing at the copy.
+   *
+   * Named for the *fact* rather than the provider: the caller establishes that the snapshot contract
+   * holds (the explicit contract plus the provider's current sandbox attestation), and the profile
+   * decides how that is executed.
+   */
+  readonly snapshotPrimary?: boolean;
+  readonly workspaceRoot?: string;
+  /** The snapshot-read attestation a Grok read-primary run is gated on. */
+  readonly grokSnapshotIsolation?: GrokIsolationAttestation;
+  /** This plan is being validated rather than executed, so no workspace has to exist yet. */
+  readonly preview?: boolean;
+  /**
    * Whether this task's budget allows more than one agent at once.
    *
    * Taken from `ExecutionBudget.maxConcurrentAgents` rather than invented here: subagents are
@@ -228,7 +291,14 @@ export function planShadowInvocation(input: {
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
-  const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now);
+  const snapshotPrimary = input.snapshotPrimary === true;
+  if (snapshotPrimary && input.payload.role !== "primary") {
+    throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROLE_INVALID", "A project snapshot is offered to the read-primary role only.");
+  }
+  if (snapshotPrimary && input.preview !== true && (input.workspaceRoot === undefined || input.workspaceRoot.length === 0)) {
+    throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROOT_REQUIRED", "A snapshot-primary run requires the prepared workspace it must read.");
+  }
+  const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now, { snapshotPrimary });
   const body = serializedPayload(input.payload);
   // The shape the provider must answer in, as a constraint it applies rather than a paragraph
   // it may ignore. Every CLI here except Copilot accepts one; Copilot keeps the long prompt.
@@ -243,7 +313,8 @@ export function planShadowInvocation(input: {
     providerId: input.snapshot.providerId,
     // Every shadow role reads; nothing here edits, which is what keeps `edit` and `shell` out of
     // reach on this path however generous a provider's surface is.
-    workspaceMode: input.snapshot.providerId === "anthropic" || input.snapshot.providerId === "github-copilot" ? "project" : "staged-clean",
+    // The mode belongs to *this invocation*: decided by role and provider, never by a global setting.
+    workspaceMode: workspaceModeFor(input.snapshot.providerId, input.payload.role, snapshotPrimary),
     writeMode: false,
     surface: measuredSurface(profile.surface, input.measured ?? null),
     attested,
@@ -315,11 +386,16 @@ export function planShadowInvocation(input: {
 
   if (input.snapshot.providerId === "openai") {
     const codexStaged = PROFILES.openai.stagedRoles ?? [];
-    if (!codexStaged.includes(input.payload.role)) {
+    if (!codexStaged.includes(input.payload.role) && !snapshotPrimary) {
       throw new BrainGateInvariantError("SHADOW_CODEX_ROLE_DENIED", `Codex runs staged roles only (${codexStaged.join(", ")}); ${input.payload.role} would need the real checkout, which the staged workspace does not contain.`);
     }
-    if (!validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now })) {
-      throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", "Codex reviewer isolation requires a current sandbox self-test attestation for this version/platform/profile.");
+    const attested = snapshotPrimary
+      ? validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now, minProbeVersion: CODEX_PROBE_VERSION })
+      : validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now });
+    if (!attested) {
+      throw new BrainGateInvariantError("SHADOW_CODEX_ISOLATION_REQUIRED", snapshotPrimary
+        ? "Codex read-primary requires a current sandbox self-test attestation earned under the current self-test contract, which attempts the writes a snapshot must refuse."
+        : "Codex read-only workspace isolation requires a current sandbox self-test attestation for this version/platform/profile.");
     }
     const args = Object.freeze([
       "exec",
@@ -347,7 +423,9 @@ export function planShadowInvocation(input: {
       executable: input.snapshot.binary,
       args,
       cwd: input.cwd,
-      workspaceMode: "staged-clean",
+      workspaceMode: workspaceModeFor("openai", input.payload.role, snapshotPrimary),
+      ...(snapshotPrimary && input.workspaceRoot !== undefined ? { workspaceRoot: input.workspaceRoot } : {}),
+      ...(input.preview === true ? { preview: true } : {}),
       modelId: input.model.modelId,
       quotaPool: input.model.quotaPool,
       inputMode: "stdin",
@@ -366,10 +444,16 @@ export function planShadowInvocation(input: {
 
   if (input.snapshot.providerId === "xai") {
     const staged = PROFILES.xai.stagedRoles ?? [];
-    if (!staged.includes(input.payload.role)) {
+    if (!staged.includes(input.payload.role) && !snapshotPrimary) {
       throw new BrainGateInvariantError("SHADOW_GROK_ROLE_DENIED", `Grok runs staged roles only (${staged.join(", ")}); ${input.payload.role} would need the real checkout, which the sandbox does not grant.`);
     }
-    if (!validGrokIsolationAttestation(input.grokIsolation, input.snapshot, { now })) {
+    // A read-primary run on a project copy executes from a BrainGate-owned home with no operator
+    // plugins, so it needs the proof earned under *that* posture rather than the staged one.
+    if (snapshotPrimary) {
+      if (!validGrokSnapshotReadAttestation(input.grokSnapshotIsolation, input.snapshot, { now })) {
+        throw new BrainGateInvariantError("SHADOW_GROK_SNAPSHOT_ISOLATION_REQUIRED", "Grok read-primary requires a current snapshot-read self-test attestation: the snapshot profile, an isolated home and no writable root.");
+      }
+    } else if (!validGrokIsolationAttestation(input.grokIsolation, input.snapshot, { now })) {
       throw new BrainGateInvariantError("SHADOW_GROK_ISOLATION_REQUIRED", "Grok requires a current sandbox self-test attestation for this version/platform/profile.");
     }
     const args = Object.freeze([
@@ -380,7 +464,9 @@ export function planShadowInvocation(input: {
       "--cwd", STAGE_PATH_TOKEN,
       // A custom profile, never a built-in one: only a custom profile that fails to apply
       // aborts the run. `--sandbox strict` would warn and continue unprotected.
-      "--sandbox", GROK_SANDBOX_PROFILE,
+      // The policy is chosen by the mode, and its hash is what an attestation is bound to: a
+      // snapshot-primary run names the snapshot-read profile, whose proof it was gated on above.
+      "--sandbox", snapshotPrimary ? GROK_SNAPSHOT_READ_PROFILE : GROK_SANDBOX_PROFILE,
       // Measured: with a schema in force the stream carries the contract's JSON in `text`
       // pieces, so the answer is their concatenation and the readable part is extracted from it.
       "--output-format", "streaming-json",
@@ -404,7 +490,9 @@ export function planShadowInvocation(input: {
       executable: input.snapshot.binary,
       args,
       cwd: input.cwd,
-      workspaceMode: "staged-clean",
+      workspaceMode: workspaceModeFor("xai", input.payload.role, snapshotPrimary),
+      ...(snapshotPrimary && input.workspaceRoot !== undefined ? { workspaceRoot: input.workspaceRoot } : {}),
+      ...(input.preview === true ? { preview: true } : {}),
       modelId: input.model.modelId,
       quotaPool: input.model.quotaPool,
       inputMode: "staged-file",
@@ -579,7 +667,7 @@ export function validOperatorAcceptance(
 export function shadowProviderRoleStatus(
   providerId: ProviderId,
   role: WorkflowRole,
-  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date } = {},
+  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date; readonly snapshotPrimary?: boolean } = {},
 ): Readonly<{ enabled: boolean; reason: string | null; acceptedByOperator: boolean }> {
   const profile = PROFILES[providerId];
 
@@ -625,9 +713,73 @@ export function shadowProviderRoleStatus(
   // roles safe and, by the same fact, makes a role that must read the checkout impossible.
   const staged = profile.stagedRoles;
   if (staged !== undefined && !staged.includes(role)) {
+    // The read-primary role was closed for the same reason the staged roles are open: it would need
+    // the checkout. A snapshot removes that reason without granting the checkout — the provider reads
+    // a copy BrainGate made — so it is the one widening this milestone makes, and only when the caller
+    // has established the snapshot contract and the provider's sandbox attestation.
+    if (role === "primary" && profile.snapshotPrimary === true && options.snapshotPrimary === true) {
+      return Object.freeze({ enabled: true, reason: "Read-only project snapshot; requires the provider's current sandbox self-test attestation.", acceptedByOperator: false });
+    }
     return Object.freeze({ enabled: false, reason: `Runs staged roles only (${staged.join(", ")}); ${role} would need the real checkout.`, acceptedByOperator: false });
   }
   if (providerId === "openai") return Object.freeze({ enabled: true, reason: "Requires current sandbox self-test attestation.", acceptedByOperator: false });
   if (staged !== undefined) return Object.freeze({ enabled: true, reason: "Runs in a kernel-sandboxed staged workspace; requires a current self-test attestation.", acceptedByOperator: false });
   return Object.freeze({ enabled: true, reason: null, acceptedByOperator: false });
+}
+
+/**
+ * Whether a provider may take the read-primary path on a project snapshot, and why not when it may not.
+ *
+ * One function, used by the router's exclusion list, the invocation planner and the doctor, so the
+ * question "may this provider read a snapshot?" has one answer rather than three that can drift. It is
+ * deliberately *not* a capability score: it is a security question, and a model's scores never change
+ * the answer.
+ */
+export function snapshotPrimaryEligibility(input: {
+  readonly providerId: ProviderId;
+  readonly snapshot: ProviderSnapshot;
+  readonly codexIsolation?: CodexIsolationAttestation;
+  readonly grokIsolation?: GrokIsolationAttestation;
+  /** The snapshot-read proof, which is a different posture from the staged one. */
+  readonly grokSnapshotIsolation?: GrokIsolationAttestation;
+  readonly now?: Date;
+}): Readonly<{ eligible: boolean; reason: SnapshotPrimaryIneligibleReason | null; detail: string | null }> {
+  const now = input.now ?? new Date();
+  if (PROFILES[input.providerId].snapshotPrimary !== true) {
+    return Object.freeze({
+      eligible: false,
+      reason: "provider-not-snapshot-capable",
+      detail: input.providerId === "google"
+        ? "Antigravity has no per-invocation permission scope, so it cannot be confined to a snapshot."
+        : `${input.providerId} has no read-primary snapshot profile.`,
+    });
+  }
+  if (input.snapshot.available.value !== true) {
+    return Object.freeze({ eligible: false, reason: "provider-unavailable", detail: `${input.snapshot.displayName} CLI is unavailable.` });
+  }
+  if (input.providerId === "openai") {
+    // The snapshot mode needs the *stronger* proof: the contract that demonstrated the denied writes,
+    // not merely the profile hash every Codex proof shares.
+    if (!validCodexIsolationAttestation(input.codexIsolation, input.snapshot, { now, minProbeVersion: CODEX_PROBE_VERSION })) {
+      return Object.freeze({
+        eligible: false,
+        reason: "sandbox-attestation-missing-or-expired",
+        detail: "Codex read-primary requires a current sandbox self-test attestation for this version, platform, profile and self-test contract (the one that proves the denied writes).",
+      });
+    }
+    return Object.freeze({ eligible: true, reason: null, detail: null });
+  }
+  if (input.providerId === "xai") {
+    // The staged proof is not the snapshot proof: the home, the profile and the write posture differ,
+    // so a run on a project copy needs the attestation earned under that posture.
+    if (!validGrokSnapshotReadAttestation(input.grokSnapshotIsolation, input.snapshot, { now })) {
+      return Object.freeze({
+        eligible: false,
+        reason: "sandbox-attestation-missing-or-expired",
+        detail: "Grok read-primary requires a current snapshot-read self-test attestation: the snapshot profile, an isolated home and no writable root.",
+      });
+    }
+    return Object.freeze({ eligible: true, reason: null, detail: null });
+  }
+  return Object.freeze({ eligible: false, reason: "provider-not-snapshot-capable", detail: `${input.providerId} has no read-primary snapshot profile.` });
 }

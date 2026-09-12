@@ -15,3 +15,4 @@ export * from "./tool-grants.js";
 export * from "./subagents.js";
 export * from "./streaming.js";
 export * from "./quota-readings.js";
+export * from "./snapshot-provider.js";

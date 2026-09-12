@@ -1,11 +1,12 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
+import { CODEX_PROBE_VERSION } from "@braingate/shadow";
 import {
   codexIsolationProfileHash,
   type CodexIsolationAttestation,
@@ -54,6 +55,7 @@ function isolation(): CodexIsolationAttestation {
     droppedFeatureKeys: [],
     version: "codex-cli 0.152.0",
     platform: process.platform === "darwin" ? "darwin" : "linux",
+    probeVersion: CODEX_PROBE_VERSION,
     profileHash: codexIsolationProfileHash(),
     observedAt: new Date().toISOString(),
     expiresAt: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
@@ -62,24 +64,39 @@ function isolation(): CodexIsolationAttestation {
 
 class FakeExecutor implements ShadowProcessExecutor {
   readonly calls: ShadowInvocationPlan[] = [];
+  /** Read while the call is in flight: a snapshot is released when the task ends. */
+  snapshotHadContent = false;
   async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
     this.calls.push(input.plan);
-    if (input.plan.providerId === "openai") {
-      const review = JSON.stringify({ kind: "review", verdict: "approve", findings: [] });
-      return {
-        spawned: true,
-        exitCode: 0,
-        stdout: [
-          JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "PRIVATE_REASONING_MUST_NOT_PERSIST" } }),
-          JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: review } }),
-        ].join("\n"),
-        stderr: "",
-        timedOut: false,
-        durationMs: 7,
-        removedEnvironmentKeys: [],
-      };
+    // The role is in the payload the caller sent, which is how a fake knows whether it is answering as
+    // the primary or reviewing — the same distinction the real CLIs are given.
+    const role = input.plan.stdin === null ? null : (JSON.parse(input.plan.stdin) as { readonly role?: string }).role ?? null;
+    if (input.plan.workspaceMode === "staged-read-snapshot" && input.plan.workspaceRoot !== undefined) {
+      this.snapshotHadContent = existsSync(input.plan.workspaceRoot) && readdirSync(input.plan.workspaceRoot).length > 0;
     }
-    return { spawned: true, exitCode: 0, stdout: JSON.stringify({ result: JSON.stringify({ kind: "work", output: "safe ephemeral answer" }) }), stderr: "", timedOut: false, durationMs: 5, removedEnvironmentKeys: [] };
+    if (role === "primary") {
+      const work = JSON.stringify({ kind: "work", output: "safe ephemeral answer" });
+      if (input.plan.providerId === "openai") {
+        return {
+          spawned: true,
+          exitCode: 0,
+          stdout: [
+            JSON.stringify({ type: "item.completed", item: { type: "reasoning", text: "PRIVATE_REASONING_MUST_NOT_PERSIST" } }),
+            JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: work } }),
+          ].join("\n"),
+          stderr: "",
+          timedOut: false,
+          durationMs: 7,
+          removedEnvironmentKeys: [],
+        };
+      }
+      return { spawned: true, exitCode: 0, stdout: JSON.stringify({ result: work }), stderr: "", timedOut: false, durationMs: 5, removedEnvironmentKeys: [] };
+    }
+    const review = JSON.stringify({ kind: "review", verdict: "approve", findings: [] });
+    if (input.plan.providerId === "openai") {
+      return { spawned: true, exitCode: 0, stdout: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: review } }), stderr: "", timedOut: false, durationMs: 7, removedEnvironmentKeys: [] };
+    }
+    return { spawned: true, exitCode: 0, stdout: JSON.stringify({ result: review }), stderr: "", timedOut: false, durationMs: 5, removedEnvironmentKeys: [] };
   }
 }
 
@@ -244,9 +261,13 @@ test("high-risk execute routes Claude primary then self-tested Codex reviewer an
   });
   assert.equal(executed.exitCode, 0);
   assert.equal(isolationChecks, 1);
-  assert.deepEqual(fake.calls.map((call) => call.providerId), ["anthropic", "openai"]);
-  assert.equal(fake.calls[0]?.workspaceMode, "project");
-  assert.equal(fake.calls[1]?.workspaceMode, "staged-clean");
+  // A self-tested Codex is now eligible for the read-primary role, and the stronger model wins it —
+  // reading a snapshot rather than the checkout. The reviewer it leaves has to be another provider.
+  assert.deepEqual(fake.calls.map((call) => call.providerId), ["openai", "anthropic"]);
+  assert.equal(fake.calls[0]?.workspaceMode, "staged-read-snapshot");
+  assert.equal(fake.calls[0]?.workspaceRoot?.includes(f.repo) ?? true, false, "the snapshot is not the checkout");
+  assert.equal(fake.snapshotHadContent, true, "the provider read a snapshot with the project's content in it");
+  assert.equal(fake.calls[1]?.workspaceMode, "project");
   assert.match(output.out(), /safe ephemeral answer/);
   assert.doesNotMatch(output.out(), /PRIVATE_REASONING_MUST_NOT_PERSIST/);
 

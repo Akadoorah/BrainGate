@@ -216,3 +216,19 @@ test("a Grok write's shell is granted by the attestation it actually holds", () 
     (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_GROK_ISOLATION_REQUIRED",
   );
 });
+
+test("a read snapshot never becomes a write workspace, however current the Codex attestation is", () => {
+  // The write primary runs in the task worktree through the write executor; the shadow invoker is
+  // built for the reviewer only. This asserts the separation rather than trusting it: the same
+  // provider and the same attestation that make Codex eligible to *read* a project snapshot must
+  // leave every write path exactly where it was.
+  const cwd = worktree();
+  const plan = planWriteInvocation({
+    snapshot: snapshot("openai", "0.153.4"), model: model("openai", "gpt-5.1-codex"), cwd,
+    task: "rename a local variable", context: { files: [] }, codexIsolation: codexProof(), schemaPath: join(worktree(), "schema.json"), now: NOW,
+  });
+  // The write plan has no workspace-mode field at all: it is a worktree plan by construction, and the
+  // snapshot vocabulary lives on the shadow read path.
+  assert.equal(plan.cwd, cwd, "a write is still confined to its own worktree");
+  assert.equal(plan.grant.granted.includes("edit"), true, "and it is still a write, not a read");
+});

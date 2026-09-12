@@ -100,8 +100,12 @@ export class IsolationAttestationCache {
     let document: CacheDocument;
     try { document = this.#parse(readFileSync(this.path, "utf8")); }
     catch { return null; }
-    const entry = document.entries.find((candidate) => candidate.providerId === providerId);
-    if (entry === undefined || entry.fingerprint !== fingerprint) return null;
+    // Selected by provider *and* fingerprint, because one provider can now hold more than one proof:
+    // a staged role and a snapshot-primary run execute different policies from different homes, and
+    // the fingerprint is what distinguishes them. Matching on the provider alone would hand back
+    // whichever posture happened to be written last.
+    const entry = document.entries.find((candidate) => candidate.providerId === providerId && candidate.fingerprint === fingerprint);
+    if (entry === undefined) return null;
     const storedAt = new Date(entry.storedAt).getTime();
     if (Number.isNaN(storedAt)) return null;
     // A clock that moved backwards, or an entry stamped ahead of now, is not reusable.
@@ -115,7 +119,8 @@ export class IsolationAttestationCache {
       let existing: readonly CachedAttestation<unknown>[] = [];
       try { existing = this.#parse(readFileSync(this.path, "utf8")).entries; } catch { /* start fresh */ }
       const entries = [
-        ...existing.filter((entry) => entry.providerId !== providerId),
+        // Replaced by (provider, fingerprint): a new proof for one posture leaves the other intact.
+        ...existing.filter((entry) => !(entry.providerId === providerId && entry.fingerprint === fingerprint)),
         { providerId, fingerprint, storedAt: new Date(this.#now()).toISOString(), attestation },
       ];
       mkdirSync(dirname(this.path), { recursive: true, mode: 0o700 });

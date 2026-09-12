@@ -299,6 +299,7 @@ export function failureKindFromCode(code: string): FailureKind {
       return "auth-unavailable";
     case "SHADOW_CODEX_ISOLATION_REQUIRED":
     case "SHADOW_GROK_ISOLATION_REQUIRED":
+    case "SHADOW_SNAPSHOT_MUTATED":
     case "SHADOW_GROK_SANDBOX_NOT_APPLIED":
     case "SHADOW_PROFILE_UNSAFE":
     case "WRITE_PROFILE_UNSAFE":
@@ -329,6 +330,9 @@ export function failureKindFromCode(code: string): FailureKind {
       return "verification-failed";
     case "SHADOW_SOURCE_MUTATED":
     case "WRITE_SOURCE_MUTATED":
+    // The task's project moved between the state it started from and the copy a failover would need:
+    // the same fact as a guarded source changing under a run, and named the same way.
+    case "SNAPSHOT_SOURCE_CHANGED_SINCE_TASK_START":
       return "source-fingerprint-changed";
     default:
       return "unknown";
