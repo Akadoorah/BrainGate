@@ -233,7 +233,15 @@ function validateRoles(roles: readonly DogfoodRole[]): readonly DogfoodRole[] {
     if (!["planner", "primary", "reviewer", "judge"].includes(role.role) || role.providerId.trim().length === 0 || role.modelId.trim().length === 0) {
       throw new BrainGateInvariantError("DOGFOOD_ROLE_INVALID", "Dogfood roles require a valid role, providerId and modelId.");
     }
-    return Object.freeze({ role: role.role, providerId: role.providerId.trim(), modelId: role.modelId.trim() });
+    // `status` is carried through rather than dropped: the corpus has to be able to say whether a
+    // role was routed, attempted or completed, and a stored row that lost that distinction is how a
+    // planner that ran on another provider went missing.
+    return Object.freeze({
+      role: role.role,
+      providerId: role.providerId.trim(),
+      modelId: role.modelId.trim(),
+      ...(role.status === undefined ? {} : { status: role.status }),
+    });
   }));
 }
 

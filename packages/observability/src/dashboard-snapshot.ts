@@ -1,13 +1,19 @@
 import {
   BrainGateInvariantError,
+  executionAttribution,
   finalizedSnapshotOf,
+  quotaRefusalOf,
+  recordedExecutionAttribution,
   type RegisteredProject,
   type TaskLedger,
+  type ObservationRole,
+  type ProviderQuotaRefusal,
+  type TaskEvent,
   type TaskOutcome,
   type TaskState,
   type UsageEvidence,
 } from "@braingate/core";
-import { GlobalQuotaStore, type QuotaSnapshot, type QuotaStatus } from "./quota-store.js";
+import { GlobalQuotaStore, type QuotaSnapshot, type QuotaStatus, type RefusalBackoff } from "./quota-store.js";
 import { normalizeTaskReceipt, type NormalizedTaskReceipt } from "./task-brief.js";
 
 const ACTIVE_STATES = new Set<TaskState>(["created", "planned", "running", "verifying"]);
@@ -19,6 +25,16 @@ export interface ProviderQuotaCard {
   readonly resetAt: string | null;
   readonly provenances: readonly UsageEvidence[];
   readonly metrics: readonly QuotaSnapshot[];
+  /**
+   * When BrainGate's own refusal backoff for this pool lapses, or null.
+   *
+   * Never folded into `status`: the status answers what the provider proved, and this answers what
+   * BrainGate decided to do about a refusal. A card may show both, and must never render this as
+   * "exhausted" or as a reset time.
+   */
+  readonly refusalBackoffUntil: string | null;
+  /** Why the backoff was taken, in the provider's terms. */
+  readonly refusalBackoffReason: string | null;
 }
 
 export interface DashboardTaskCard {
@@ -57,6 +73,14 @@ export interface DashboardTaskCard {
   readonly failureKind: string | null;
   readonly reconciled: boolean;
   readonly usageProvenance: readonly UsageEvidence[];
+  /**
+   * Who actually ran, with how far each role got. Read from the run's own provider events (or the
+   * recorded `task.execution`), never inferred from the plan: a role that was routed but never
+   * dispatched is `planned`, and a provider that answered is `completed`.
+   */
+  readonly execution: readonly ObservationRole[];
+  /** The provider's own quota refusal, when this task's failure was one. */
+  readonly quotaRefusal: ProviderQuotaRefusal | null;
   /**
    * What each model in the route actually cost, when the provider counted it itself.
    *
@@ -103,6 +127,24 @@ function tokensByModel(receipt: NormalizedTaskReceipt): DashboardTaskCard["token
   return Object.freeze([...totals.values()].map((entry) => Object.freeze(entry)));
 }
 
+/**
+ * The provider's structured quota refusal, if this task's failures include one.
+ *
+ * Read from the failure payload the invoker wrote, so the dashboard and `tasks show` cannot disagree
+ * about what the provider said, and a refusal that carried no reset is shown as exactly that.
+ */
+export function quotaRefusalFromEvents(events: readonly TaskEvent[]): ProviderQuotaRefusal | null {
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const event = events[index]!;
+    if (event.kind !== "shadow.provider.failed" && event.kind !== "shadow.provider.quota_refused") continue;
+    if (typeof event.payload !== "object" || event.payload === null) continue;
+    const candidate = (event.payload as { readonly quotaRefusal?: unknown }).quotaRefusal;
+    const refusal = quotaRefusalOf({ quotaRefusal: candidate });
+    if (refusal !== null) return refusal;
+  }
+  return null;
+}
+
 export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTaskReceipt): DashboardTaskCard {
   if (receipt.task.projectId !== project.projectId) {
     throw new BrainGateInvariantError("DASHBOARD_PROJECT_MISMATCH", "Task card cannot mix project identities.");
@@ -140,11 +182,13 @@ export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTas
     failureKind: finalized?.failureKind ?? null,
     reconciled: finalized?.reconciled ?? false,
     usageProvenance: uniqueSorted(receipt.usage.map((usage) => usage.evidence)),
+    execution: recordedExecutionAttribution(receipt.events) ?? executionAttribution({ events: receipt.events }),
+    quotaRefusal: quotaRefusalFromEvents(receipt.events),
     tokensByModel: tokensByModel(receipt),
   });
 }
 
-function providerCards(snapshots: readonly QuotaSnapshot[], now: number): readonly ProviderQuotaCard[] {
+function providerCards(snapshots: readonly QuotaSnapshot[], now: number, backoffs: readonly RefusalBackoff[]): readonly ProviderQuotaCard[] {
   const groups = new Map<string, QuotaSnapshot[]>();
   for (const snapshot of snapshots) {
     const key = `${snapshot.provider}\u0000${snapshot.quotaPool}`;
@@ -170,9 +214,12 @@ function providerCards(snapshots: readonly QuotaSnapshot[], now: number): readon
     // that are still current: a date that has already passed is not a fact about now, and pairing one
     // with a status would describe a window nobody is in.
     const resetAt = current.map((item) => item.resetAt).filter((value): value is string => value !== null).sort()[0] ?? null;
+    const backoff = backoffs.find((row) => row.provider === first.provider && row.quotaPool === first.quotaPool);
     cards.push(Object.freeze({
       provider: first.provider,
       quotaPool: first.quotaPool,
+      refusalBackoffUntil: backoff?.policyBackoffUntil ?? null,
+      refusalBackoffReason: backoff?.reason ?? null,
       status,
       observedAt,
       resetAt,
@@ -213,7 +260,7 @@ export function buildDashboardSnapshot(input: {
   const generatedAt = input.generatedAt ?? new Date().toISOString();
   return Object.freeze({
     generatedAt,
-    providers: providerCards(input.quotaStore.latest(), Date.parse(generatedAt)),
+    providers: providerCards(input.quotaStore.latest(), Date.parse(generatedAt), input.quotaStore.activeRefusalBackoffs(Date.parse(generatedAt))),
     activeTasks: Object.freeze(active),
     recentTasks: Object.freeze(cards.slice(0, recentLimit)),
     provenanceLegend: Object.freeze(["native", "measured", "estimated", "unknown"] as const),

@@ -6,6 +6,8 @@ import { join } from "node:path";
 import * as activeRuns from "./active-run.js";
 import {
   InMemoryObservationWriter,
+  executionAttribution,
+  executionRecord,
   ProjectRegistry,
   ResultStore,
   STALE_CALL_MULTIPLIER,
@@ -325,5 +327,112 @@ test("a termination signal reaches the run that is still working, and the task e
     assert.equal(f.ledger.requireTask(taskId).state, "failed");
     unregister();
     assert.equal(activeRunCount(), 0);
+  } finally { f.close(); }
+});
+
+/**
+ * A crash after the execution attribution exists but before anything is recorded.
+ *
+ * The attribution is written before the observation so the observation can read it, which means the
+ * window between them is a real place for a process to die. What the reconciler does there decides
+ * whether a two-provider task is remembered as a two-provider task.
+ */
+const PLANNER_REFUSED = Object.freeze({
+  providerId: "anthropic", quotaPool: "claude-subscription", reason: "rate_limit" as const,
+  observedAt: "2026-09-12T01:05:10.123Z", evidence: "native" as const, resetAt: null,
+  detail: "You've hit your session limit · resets 4:10am (Europe/Istanbul)",
+});
+
+function seedProviderEvents(f: ReturnType<typeof fixture>, taskId: string, options: { readonly failover: boolean }): void {
+  f.ledger.appendEvent(taskId, "shadow.provider.started", { role: "planner", phase: "planning", provider: "anthropic", model: "claude-fable-5-1", quotaPool: "claude-subscription" });
+  f.ledger.appendEvent(taskId, "shadow.provider.failed", { role: "planner", phase: "planning", provider: "anthropic", model: "claude-fable-5-1", quotaPool: "claude-subscription", failureKind: "provider-failed", exitCode: 1, quotaRefusal: PLANNER_REFUSED });
+  if (!options.failover) {
+    f.ledger.appendEvent(taskId, "shadow.provider.quota_refused", { role: "planner", phase: "planning", provider: "anthropic", model: "claude-fable-5-1", reason: "rate_limit" });
+    return;
+  }
+  // The failover: a second, successful attempt on another provider's pool.
+  f.ledger.appendEvent(taskId, "shadow.provider.started", { role: "planner", phase: "planning", provider: "google", model: "gemini-3.1-pro-high", quotaPool: "antigravity-subscription" });
+  f.ledger.appendEvent(taskId, "shadow.provider.completed", { role: "planner", phase: "planning", provider: "google", model: "gemini-3.1-pro-high", quotaPool: "antigravity-subscription", durationMs: 12_119 });
+}
+
+test("a crash after the attribution leaves the reconciler an attribution to recover, not a blank", () => {
+  for (const failover of [false, true]) {
+    const f = fixture(`execution-prefix-${failover ? "failover" : "plain"}`);
+    try {
+      const taskId = runningTask(f);
+      seedProviderEvents(f, taskId, { failover });
+      const attribution = executionAttribution({ events: f.ledger.receipt(taskId).events });
+      // What the run wrote before the crash.
+      f.ledger.appendEvent(taskId, "task.execution", executionRecord(attribution));
+      const before = f.ledger.receipt(taskId);
+
+      const report = reconcile(f.project, depsFor(f, () => new Date()), new Date());
+      assert.equal(report.required, 1, "a recorded attribution is enough to know the run is over, without waiting out the stale bound");
+      assert.equal(report.changed, true);
+
+      const receipt = f.ledger.receipt(taskId);
+      const kinds = receipt.events.map((event) => event.kind);
+      assert.equal(kinds.filter((kind) => kind === "task.execution").length, 1, "the reconciler does not write a second attribution");
+      assert.equal(kinds.filter((kind) => kind === "task.finalized").length, 1);
+      const observation = f.observations.recordedInput(taskId)!;
+      assert.deepEqual(observation.roles, attribution, "the recovered observation carries the attribution the run recorded");
+      if (failover) {
+        assert.deepEqual(observation.roles.map((role) => `${role.role}:${role.providerId}:${role.status}`), [
+          "planner:anthropic:attempted",
+          "planner:google:completed",
+        ], "both attempts survive, with the one that answered marked completed");
+      } else {
+        assert.deepEqual(observation.roles.map((role) => `${role.role}:${role.providerId}:${role.status}`), ["planner:anthropic:attempted"]);
+      }
+      // No provider call is invented: the reconciler made none, so the record's calls are the ones
+      // the run actually made.
+      assert.deepEqual(receipt.usage, before.usage, "reconciliation spends nothing");
+      assert.equal(receipt.events.filter((event) => event.kind === "shadow.provider.started").length, failover ? 2 : 1);
+
+      // A second reconcile is a complete no-op.
+      const markerBefore = receipt.events.find((event) => event.kind === "task.finalized");
+      const again = reconcile(f.project, depsFor(f, () => new Date()), new Date());
+      assert.equal(again.required, 0);
+      assert.equal(again.changed, false);
+      const after = f.ledger.receipt(taskId);
+      assert.equal(after.events.length, receipt.events.length, "no event is appended twice");
+      assert.deepEqual(after.events.find((event) => event.kind === "task.finalized"), markerBefore);
+      assert.equal(f.observations.list().length, 1, "exactly one observation");
+      assert.equal(after.task.state, f.ledger.requireTask(taskId).state);
+    } finally { f.close(); }
+  }
+});
+
+test("a crash between the failed attempt and its replacement keeps both, and the outcome is truthful", () => {
+  const f = fixture("execution-prefix-mid-failover");
+  try {
+    const taskId = runningTask(f);
+    // The prefix in the order the engine writes it: the refusal, then the failover's start, and
+    // nothing after — the process died before the fallback's completion.
+    f.ledger.appendEvent(taskId, "shadow.provider.started", { role: "planner", phase: "planning", provider: "anthropic", model: "claude-fable-5-1", quotaPool: "claude-subscription" });
+    f.ledger.appendEvent(taskId, "shadow.provider.failed", { role: "planner", phase: "planning", provider: "anthropic", model: "claude-fable-5-1", quotaPool: "claude-subscription", failureKind: "provider-failed", quotaRefusal: PLANNER_REFUSED });
+    f.ledger.appendEvent(taskId, "shadow.provider.started", { role: "planner", phase: "planning", provider: "google", model: "gemini-3.1-pro-high", quotaPool: "antigravity-subscription" });
+
+    // Nothing durable was written after the failover's start, so this is the crash the stale bound
+    // exists for: a process that died mid-run and a run still in flight look identical from here.
+    const later = () => new Date(Date.now() + STALE_CALL_MULTIPLIER * 20 * 60_000 + 60_000);
+    const report = reconcile(f.project, depsFor(f, later), later());
+    assert.equal(report.required, 1);
+    assert.equal(report.changed, true);
+
+    const receipt = f.ledger.receipt(taskId);
+    const observation = f.observations.recordedInput(taskId)!;
+    assert.deepEqual(observation.roles.map((role) => `${role.role}:${role.providerId}:${role.status}`), [
+      "planner:anthropic:attempted",
+      "planner:google:attempted",
+    ], "the attempt that never answered is not reported as completed");
+    // The run did not finish, so the task is interrupted rather than dressed up as a success.
+    assert.equal(f.ledger.requireTask(taskId).state, "failed");
+    assert.equal(receipt.events.filter((event) => event.kind === "task.finalized").length, 1);
+    assert.equal(receipt.events.filter((event) => event.kind === "shadow.provider.started").length, 2, "no third provider call is invented");
+    assert.equal(f.observations.list().length, 1);
+    const again = reconcile(f.project, depsFor(f, later), later());
+    assert.equal(again.required, 0);
+    assert.equal(again.changed, false);
   } finally { f.close(); }
 });

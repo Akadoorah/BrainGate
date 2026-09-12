@@ -234,3 +234,45 @@ test("a provider card reports a refusal only while its window is current", () =>
   const onlyExpired = snapshot([{ status: "exhausted", resetAt: "2026-09-11T10:00:00.000Z" }]);
   assert.equal(onlyExpired.providers[0]!.resetAt, null, "no current window, no current reset");
 });
+
+/**
+ * The refusal backoff reaches routing without becoming a quota claim.
+ *
+ * Hydration is where a task's routing inputs are assembled, so it is where "BrainGate is avoiding
+ * this pool for a few minutes" must arrive — as its own field, with `quotaState` untouched.
+ */
+test("hydration carries the refusal backoff and leaves quota state unknown", () => {
+  const directory = mkdtempSync(join(tmpdir(), "braingate-backoff-hydrate-"));
+  const catalog = new ModelCatalog(join(directory, "models.json"));
+  const definition = (providerId: string, modelId: string, quotaPool: string, coder: number) => ({
+    providerId, modelId, quotaPool, capabilities: { coder }, speed: "deep" as const, contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null,
+  });
+  catalog.upsert(definition("anthropic", "claude-sonnet", "claude-subscription", 90));
+  catalog.upsert(definition("openai", "astra", "chatgpt-subscription", 80));
+  const now = Date.parse("2026-09-12T01:05:00.000Z");
+  const providers = ["anthropic", "openai"].map((providerId) => ({
+    providerId, displayName: providerId, binary: providerId === "anthropic" ? "claude" : "codex",
+    available: { value: true, evidence: "native" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    version: { value: "1.0.0", evidence: "native" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    authState: { value: "authenticated" as const, evidence: "native" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    authMode: { value: "subscription" as const, evidence: "native" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    models: { value: null, evidence: "unknown" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    capabilities: { value: null, evidence: "unknown" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    usage: { value: null, evidence: "unknown" as const, sourceCommand: null, observedAt: "2026-09-12T00:00:00Z" },
+    removedBillingOverrides: [], warnings: [],
+  }));
+  const { runtimes } = hydrateModelRegistry({
+    entries: catalog.load(),
+    providers: providers as never,
+    quota: [],
+    backoff: [{ provider: "anthropic", quotaPool: "claude-subscription", policyBackoffUntil: "2026-09-12T01:15:00.000Z" }],
+    now,
+  });
+  const anthropic = runtimes.find((entry) => entry.modelId === "claude-sonnet")!;
+  const openai = runtimes.find((entry) => entry.modelId === "astra")!;
+  assert.equal(anthropic.refusalBackoffUntil, "2026-09-12T01:15:00.000Z");
+  assert.equal(anthropic.quotaState, "unknown", "a policy wait is not a quota verdict");
+  assert.equal(anthropic.quotaHint, null);
+  assert.equal(openai.refusalBackoffUntil, null);
+  assert.equal(openai.quotaState, "unknown");
+});

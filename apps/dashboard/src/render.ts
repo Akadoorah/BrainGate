@@ -30,6 +30,7 @@ function providerCard(card: ProviderQuotaCard): string {
     <div class="card-head"><div><h3>${escapeHtml(card.provider)}</h3><p>${escapeHtml(card.quotaPool)}</p></div><span class="status ${escapeHtml(card.status)}">${escapeHtml(card.status)}</span></div>
     <div class="metrics">${metrics}</div>
     <div class="meta">Observed ${escapeHtml(card.observedAt)}${card.resetAt === null ? "" : ` · Reset ${escapeHtml(card.resetAt)}`}</div>
+    ${card.refusalBackoffUntil === null ? "" : `<div class="meta">Backoff until ${escapeHtml(card.refusalBackoffUntil)} — BrainGate policy after a ${escapeHtml(card.refusalBackoffReason ?? "quota")} refusal; this is not a provider reset and not an exhaustion verdict.</div>`}
   </article>`;
 }
 
@@ -38,12 +39,34 @@ function routeLine(task: DashboardTaskCard): string {
   return task.route.map((role) => `${escapeHtml(role.role)}: <strong>${escapeHtml(role.providerId)}</strong> / ${escapeHtml(role.modelId)}`).join(" · ");
 }
 
+/**
+ * Who actually ran, which is not the same as who was routed.
+ *
+ * The plan's line above says what the task intended; this says what happened, one entry per
+ * provider/model that was dispatched, with the status that tells the two apart. A planner that
+ * executed on another provider appears here even when the plan never named it.
+ */
+function executionLine(task: DashboardTaskCard): string {
+  if (task.execution.length === 0) return "";
+  const entries = task.execution.map((role) => `${escapeHtml(role.role)}: <strong>${escapeHtml(role.providerId)}</strong> / ${escapeHtml(role.modelId)} <span class="status ${role.status === "completed" ? "native" : role.status === "attempted" ? "limited" : "unknown"}">${escapeHtml(role.status ?? "planned")}</span>`).join(" · ");
+  return `<p class="muted">Executed: ${entries}</p>`;
+}
+
+function refusalLine(task: DashboardTaskCard): string {
+  const refusal = task.quotaRefusal;
+  if (refusal === null) return "";
+  const reset = refusal.resetAt === null ? "no machine-readable reset given" : `reset ${refusal.resetAt}`;
+  return `<p class="muted">Quota refusal · <strong>${escapeHtml(refusal.providerId)}</strong> / ${escapeHtml(refusal.quotaPool)} · ${escapeHtml(refusal.reason)} · ${escapeHtml(refusal.observedAt)} · ${escapeHtml(reset)} · ${escapeHtml(refusal.detail)}</p>`;
+}
+
 function taskCard(task: DashboardTaskCard): string {
   const budget = task.budget === null ? "No workflow budget receipt" : `${task.budget.providerCalls} calls · ${task.budget.contextTokens} ctx tokens · ${task.budget.repairRounds} repairs · ${task.budget.councilRounds} council`;
   return `<article class="card task-card">
     <div class="card-head"><div><h3>${escapeHtml(task.title)}</h3><p>${escapeHtml(task.projectName)} · ${escapeHtml(task.taskId)}</p></div><span class="status ${escapeHtml(task.state)}">${escapeHtml(task.state)}</span></div>
     <div class="task-grid"><span>Tier</span><strong>${escapeHtml(task.complexity ?? "Unknown")}</strong><span>Risk</span><strong>${escapeHtml(task.risk ?? "Unknown")}</strong><span>Approval</span><strong>${escapeHtml(task.approvalStatus ?? "Unknown")}</strong></div>
     <p>${routeLine(task)}</p>
+    ${executionLine(task)}
+    ${refusalLine(task)}
     <p class="muted">${escapeHtml(budget)}</p>
     <div>${evidenceBadges(task.usageProvenance)}</div>
   </article>`;

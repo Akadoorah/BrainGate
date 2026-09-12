@@ -11,7 +11,7 @@ import {
   type RegisteredProject,
 } from "@braingate/core";
 import { startDashboardServer } from "@braingate/dashboard";
-import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot } from "@braingate/observability";
+import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot, type RefusalBackoff } from "@braingate/observability";
 import {
   ModelCatalog,
   NETWORK_ACCESS_RISK,
@@ -316,7 +316,7 @@ function runtimeFor(
   const store = new GlobalQuotaStore(state.globalDir);
   try {
     const quota = store.latest();
-    const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota });
+    const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota, backoff: store.activeRefusalBackoffs() });
     return Object.freeze({ router: new CapabilityRouter(hydrated.registry), runtimes: hydrated.runtimes, quota });
   } finally { store.close(); }
 }
@@ -594,9 +594,17 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const acceptances = loadAcceptances(state);
       const store = new GlobalQuotaStore(state.globalDir);
       let runtimes: readonly unknown[] = [];
-      try { runtimes = hydrateModelRegistry({ entries, providers: snapshots, quota: store.latest() }).runtimes; }
+      let backoffs: readonly RefusalBackoff[] = [];
+      try {
+        backoffs = store.activeRefusalBackoffs();
+        runtimes = hydrateModelRegistry({ entries, providers: snapshots, quota: store.latest(), backoff: backoffs }).runtimes;
+      }
       finally { store.close(); }
       data = {
+        // Pools BrainGate is briefly avoiding after a refusal. Labelled as policy, and kept out of
+        // every availability field: a refusal with no machine-readable reset says nothing about the
+        // provider's quota, and this must never read as "exhausted".
+        quotaRefusalBackoff: { policy: "operational-backoff", pools: backoffs.map((row) => ({ provider: row.provider, quotaPool: row.quotaPool, reason: row.reason, policyBackoffUntil: row.policyBackoffUntil, sourceTaskId: row.sourceTaskId })) },
         project: { projectId: project.projectId, name: project.name, repositories: project.repositories },
         models: { entries: entries.length, configured: entries.filter((entry) => entry.configured).length, runtimes },
         providers: snapshots.map((snapshot) => ({
@@ -632,7 +640,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           }
           const accepted = acceptances.some((entry) => entry.providerId === item.providerId);
           return `${item.providerId}: ${item.available.value ? "available" : "missing"} · shadow=${shadowProviderStatus(item.providerId).enabled ? "enabled" : accepted ? "operator-accepted" : "blocked"}`;
-        }).join("\n")}`,
+        }).join("\n")}${backoffs.length === 0 ? "" : `\n${backoffs.map((row) => `${row.provider}/${row.quotaPool}: backoff until ${row.policyBackoffUntil} (local policy after a ${row.reason} refusal — not a provider reset, and not an exhaustion verdict)`).join("\n")}`}`,
         stdout,
       );
       return Object.freeze({ exitCode: 0, data });

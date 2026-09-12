@@ -1,5 +1,7 @@
 import {
   BrainGateInvariantError,
+  executionAttribution,
+  executionRecord,
   deriveOutcome,
   failureKindFromCode,
   ledgerStateFor,
@@ -275,6 +277,21 @@ export class ShadowDogfoodRunner {
      * reconciler uses — so a run that dies mid-finalization and is completed later produces the
      * same record it would have produced itself.
      */
+    /**
+     * Who actually ran, read back from this task's own provider events.
+     *
+     * Computed at finalization time on purpose: the brief is written before the run and can only
+     * carry the plan, so this is the record that a planner which executed on another provider, or a
+     * role whose call was refused, is not lost.
+     */
+    const attribution = (): readonly ObservationRole[] => executionAttribution({
+      events: this.#ledger.receipt(task.taskId).events,
+      planned: rolesFromRoutes(routes),
+    });
+    const recordExecution = (): void => {
+      this.#ledger.appendEvent(task.taskId, "task.execution", executionRecord(attribution()));
+    };
+
     const planFor = (options: {
       readonly workflow: WorkflowOutcome | null;
       readonly failureKind: FailureKind | null;
@@ -302,7 +319,8 @@ export class ShadowDogfoodRunner {
         observation: Object.freeze({
           predicted: input.observation.predicted,
           effective: input.observation.effective,
-          roles: options.roles,
+          // Executed attribution, falling back to the planned roles when nothing was dispatched.
+          roles: attribution(),
           prior: input.observation.prior,
         }),
         reconciled: false,
@@ -365,6 +383,9 @@ export class ShadowDogfoodRunner {
       throw error;
     } finally {
       unregister();
+      // Written before the observation, so the attribution the corpus stores is already durable.
+      try { recordExecution(); }
+      catch { /* attribution is evidence; failing to append it must not replace the run's own error */ }
       try { complete(); }
       catch { /* the record is left incomplete on purpose: reconcilers finish it, and swallowing here would hide the run's own error */ }
     }

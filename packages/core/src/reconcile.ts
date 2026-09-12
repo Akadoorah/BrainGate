@@ -1,4 +1,5 @@
 import type { RegisteredProject } from "./project-registry.js";
+import { executionAttribution, recordedExecutionAttribution } from "./role-attribution.js";
 import { finalizeTask, finalizedSnapshotOf, type FinalizationDeps, type FinalizationPlan, type ObservationRole, type ObservationRoleName } from "./finalization.js";
 import {
   deriveOutcome,
@@ -104,47 +105,57 @@ const ROLE_ALIASES: Readonly<Record<string, ObservationRoleName>> = Object.freez
   judge: "judge",
 });
 
-function pushRole(into: ObservationRole[], role: string, providerId: unknown, modelId: unknown): void {
+function pushRole(into: ObservationRole[], role: string, providerId: unknown, modelId: unknown, status?: ObservationRole["status"]): void {
   const mapped = ROLE_ALIASES[role];
   if (mapped === undefined) return;
   if (typeof providerId !== "string" || typeof modelId !== "string") return;
   if (into.some((entry) => entry.role === mapped && entry.providerId === providerId && entry.modelId === modelId)) return;
-  into.push(Object.freeze({ role: mapped, providerId, modelId }));
+  into.push(Object.freeze({ role: mapped, providerId, modelId, ...(status === undefined ? {} : { status }) }));
 }
 
 /**
- * Which roles ran, from the evidence a run left behind: the brief when it wrote one, then the
- * provider start events, then the review event and the usage rows a write leaves.
+ * Which roles ran, from the evidence a run left behind.
+ *
+ * The recorded attribution is preferred when the run got as far as writing one: it distinguishes a
+ * role that was planned from one that was attempted from one that answered, and a reconciler that
+ * flattened those back into a bare list would be undoing exactly what the run recorded. Only when
+ * there is no such record does this fall back to reading the brief, the provider start events, the
+ * review event and the usage rows a write leaves — a list that can say who ran, but not how far each
+ * got.
  *
  * A role list that cannot be known stays empty rather than being guessed — a reconciled
  * observation must be able to say "we do not know who ran" without pretending otherwise.
  */
 function deriveRoles(events: readonly TaskEvent[], receipt: TaskReceipt): readonly ObservationRole[] {
-  const roles: ObservationRole[] = [];
+  const recorded = recordedExecutionAttribution(events);
+  if (recorded !== null && recorded.length > 0) return recorded;
+  // What the plan and the non-provider evidence say about who took part. The statuses here are
+  // conservative: the brief is a plan, while a review event and a `provider_call` usage row are only
+  // written after the call they describe returned.
+  const planned: ObservationRole[] = [];
   const route = lastPayload(events, "task.brief")?.route;
   if (Array.isArray(route)) {
     for (const entry of route) {
       if (typeof entry !== "object" || entry === null) continue;
       const record = entry as Record<string, unknown>;
-      pushRole(roles, String(record.role), record.providerId, record.modelId);
+      pushRole(planned, String(record.role), record.providerId, record.modelId);
     }
-  }
-  for (const payload of payloads(events, "shadow.provider.started")) {
-    pushRole(roles, String(payload.role), payload.provider, payload.model);
   }
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]!;
     if (!event.kind.startsWith("write.review.")) continue;
     const payload = payloadOf(event);
-    if (payload !== null) pushRole(roles, "reviewer", payload.provider, payload.model);
+    if (payload !== null) pushRole(planned, "reviewer", payload.provider, payload.model, "completed");
     break;
   }
   for (const usage of receipt.usage) {
     if (usage.metric !== "provider_call" || usage.model === null) continue;
-    pushRole(roles, "primary", usage.provider, usage.model);
+    pushRole(planned, "primary", usage.provider, usage.model, "completed");
     break;
   }
-  return Object.freeze(roles);
+  // The provider events decide who actually ran and how far each got; the plan above fills in the
+  // roles that were routed and never dispatched.
+  return executionAttribution({ events, planned });
 }
 
 function failureKindFor(input: {
@@ -296,13 +307,19 @@ function classify(deps: ReconciliationDeps, now: Date): readonly Candidate[] {
     // unreferenced, and inspection would report that nothing was waiting.
     const hasArtifact = !hasClaim && deps.results.locate(task.taskId).valid.length > 0;
     const hasResult = hasClaim || hasArtifact;
+    // The attribution is written in the run's own `finally`, immediately before the record is
+    // completed, so its presence says the work is over even when nothing after it was written. It is
+    // treated like the other partial evidence — repaired at once, with the same idempotent finalizer
+    // and the same lost-race tolerance — rather than waiting out the stale bound, which would leave a
+    // finished run's attribution unrecorded for the length of the bound.
+    const hasAttribution = lastPayload(receipt.events, "task.execution") !== null;
     const complete = hasClaim && hasMarker && hasObservation;
 
     if (task.state === "completed" || task.state === "failed" || task.state === "cancelled") {
       if (!complete) found.push({ task, receipt, kind: "partial" });
       continue;
     }
-    if (hasResult || hasMarker || hasObservation) {
+    if (hasResult || hasMarker || hasObservation || hasAttribution) {
       // Finalization began, so the run is over whatever the state row still says.
       found.push({ task, receipt, kind: "partial" });
       continue;

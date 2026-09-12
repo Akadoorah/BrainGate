@@ -366,3 +366,86 @@ test("a role that appears once keeps its plain name", () => {
     "primary=anthropic/haiku",
   );
 });
+
+// ── Operational refusal backoff, through the CLI ────────────────────────────────────────────────
+// The failure the backoff exists for: after a refusal, every *new* task tried the same pool once
+// more. These tests drive the real CLI so the policy is written from the task's own record and read
+// back by the next task's routing, with a fake executor counting every call.
+
+const REFUSAL_STDOUT = [
+  JSON.stringify({ type: "assistant", is_api_error_message: true, error: "rate_limit", content: [{ type: "text", text: "You've hit your session limit · resets 4:10am (Europe/Istanbul)" }] }),
+  JSON.stringify({ type: "result", subtype: "success", is_error: true, num_turns: 1, api_error_status: 429, terminal_reason: "api_error", result: "You've hit your session limit · resets 4:10am (Europe/Istanbul)" }),
+].join("\n");
+
+/** A provider that refuses on quota, like the real one did. */
+class RefusingShadowExecutor implements ShadowProcessExecutor {
+  readonly calls: ShadowInvocationPlan[] = [];
+  async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
+    this.calls.push(input.plan);
+    return { spawned: true, exitCode: 1, stdout: REFUSAL_STDOUT, stderr: "", timedOut: false, durationMs: 6, removedEnvironmentKeys: [] };
+  }
+}
+
+/** A provider that fails for a reason that says nothing about quota. */
+class GenericFailureShadowExecutor implements ShadowProcessExecutor {
+  readonly calls: ShadowInvocationPlan[] = [];
+  constructor(private readonly mode: "exit" | "timeout" | "auth" | "sandbox") {}
+  async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
+    this.calls.push(input.plan);
+    const timedOut = this.mode === "timeout";
+    const stderr = this.mode === "auth" ? "Authentication failed: please log in" : this.mode === "sandbox" ? "sandbox profile was not applied" : "connection reset by peer";
+    return { spawned: true, exitCode: 1, stdout: JSON.stringify({ type: "result", is_error: true, terminal_reason: "api_error", result: stderr }), stderr, timedOut, durationMs: 4, removedEnvironmentKeys: [] };
+  }
+}
+
+test("a real refusal leaves an operational backoff, never an exhausted verdict", async () => {
+  const f = fixture(); const refusing = new RefusingShadowExecutor(); const out = io();
+  const deps = { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], executor: refusing, stdout: out.stdout, stderr: out.stderr };
+  const refused = await runDogfoodCli(["dogfood", "ask", "run", "--task", "Where is the theme config?", "--execute", "--json"], deps);
+  assert.equal(refused.exitCode, 1);
+  assert.equal(refusing.calls.length, 1);
+
+  const { GlobalQuotaStore, REFUSAL_BACKOFF_POLICY, REFUSAL_BACKOFF_MS } = await import("@braingate/observability");
+  const store = new GlobalQuotaStore(resolveOperatorState(f.env, f.repo).globalDir);
+  try {
+    const backoffs = store.activeRefusalBackoffs();
+    assert.equal(backoffs.length, 1, "the pool the provider refused is being avoided");
+    assert.equal(backoffs[0]!.quotaPool, "claude-subscription");
+    assert.equal(backoffs[0]!.reason, "rate_limit");
+    assert.equal(backoffs[0]!.policy, REFUSAL_BACKOFF_POLICY);
+    assert.equal(backoffs[0]!.evidence, "native");
+    assert.equal(typeof backoffs[0]!.sourceTaskId, "string", "the backoff names the task it came from");
+    assert.equal(Date.parse(backoffs[0]!.policyBackoffUntil), Date.parse(backoffs[0]!.observedAt) + REFUSAL_BACKOFF_MS);
+    // The provider's quota truth is untouched: no snapshot was written, let alone an exhausted one.
+    assert.equal(store.latest().filter((row) => row.status === "exhausted").length, 0);
+    assert.equal(store.latest().length, 0);
+  } finally { store.close(); }
+});
+
+test("the next task avoids the refused pool before making any call", async () => {
+  const f = fixture(); const refusing = new RefusingShadowExecutor(); const out = io();
+  const deps = { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], executor: refusing, stdout: out.stdout, stderr: out.stderr };
+  assert.equal((await runDogfoodCli(["dogfood", "ask", "run", "--task", "Where is the theme config?", "--execute", "--json"], deps)).exitCode, 1);
+  assert.equal(refusing.calls.length, 1);
+  // A second, independent task: it must not spend another call learning the same fact.
+  const out2 = io();
+  const second = await runDogfoodCli(["dogfood", "ask", "run", "--task", "Where is the theme config now?", "--execute", "--json"], { ...deps, stdout: out2.stdout, stderr: out2.stderr });
+  assert.equal(second.exitCode, 1);
+  assert.equal(refusing.calls.length, 1, "the refused pool was avoided before any provider call");
+  assert.match(out2.err(), /quota-pool-backoff:claude-subscription/);
+});
+
+test("failures that are not quota refusals never create a backoff", async () => {
+  for (const mode of ["exit", "timeout", "auth", "sandbox"] as const) {
+    const f = fixture(`sample-${mode}`); const failing = new GenericFailureShadowExecutor(mode); const out = io();
+    const deps = { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], executor: failing, stdout: out.stdout, stderr: out.stderr };
+    const result = await runDogfoodCli(["dogfood", "ask", "run", "--task", "Where is the theme config?", "--execute", "--json"], deps);
+    assert.equal(result.exitCode, 1, `${mode} must still fail the task`);
+    const { GlobalQuotaStore } = await import("@braingate/observability");
+    const store = new GlobalQuotaStore(resolveOperatorState(f.env, f.repo).globalDir);
+    try {
+      assert.deepEqual(store.activeRefusalBackoffs(), [], `${mode} is not a quota statement and must not avoid the pool`);
+      assert.equal(store.refusalBackoffHistory().length, 0);
+    } finally { store.close(); }
+  }
+});

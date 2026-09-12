@@ -37,12 +37,32 @@ import type { TaskEvent, TaskLedger } from "./task-ledger.js";
  * with nothing recorded about what it produced.
  */
 
-export type ObservationRoleName = "planner" | "primary" | "reviewer" | "judge";
+/**
+ * The workflow roles, as a runtime list with a derived type.
+ *
+ * Attribution is read back out of ledger payloads, so the check and the type must be the same fact:
+ * a role the engine can route but this list omits would silently vanish from the record, which is
+ * exactly the bug this vocabulary is used to fix.
+ */
+export const OBSERVATION_ROLE_NAMES = Object.freeze(["planner", "primary", "reviewer", "judge"] as const);
+export type ObservationRoleName = (typeof OBSERVATION_ROLE_NAMES)[number];
+
+export function isObservationRoleName(value: unknown): value is ObservationRoleName {
+  return typeof value === "string" && (OBSERVATION_ROLE_NAMES as readonly string[]).includes(value);
+}
 
 export interface ObservationRole {
   readonly role: ObservationRoleName;
   readonly providerId: string;
   readonly modelId: string;
+  /**
+   * How far this role got, from the task's own provider events.
+   *
+   * `planned` is the routing decision; `attempted` means a provider call started and did not
+   * complete; `completed` means the provider answered. The three are different facts, and a role
+   * that was only routed must not read as one that ran.
+   */
+  readonly status?: "planned" | "attempted" | "completed";
 }
 
 export interface ObservationContext {
@@ -123,6 +143,7 @@ export function createFinalizer(deps: FinalizationDeps): TaskFinalizer {
  */
 export class InMemoryObservationWriter implements ObservationWriter {
   readonly #records = new Map<string, ObservationRecord>();
+  readonly #inputs = new Map<string, ObservationInput>();
 
   find(taskId: string): ObservationRecord | null {
     return this.#records.get(taskId) ?? null;
@@ -138,11 +159,23 @@ export class InMemoryObservationWriter implements ObservationWriter {
       reconciled: input.reconciled,
     });
     this.#records.set(input.taskId, record);
+    this.#inputs.set(input.taskId, input);
     return record;
   }
 
   list(): readonly ObservationRecord[] {
     return Object.freeze([...this.#records.values()]);
+  }
+
+  /**
+   * What was recorded for a task, in full.
+   *
+   * `list()` answers "which observations exist" with the fields a reader decides on; this answers
+   * "what did the writer say", which is what a test — or a reconciler's own audit — needs to check
+   * that an attribution survived a crash rather than being reconstructed differently.
+   */
+  recordedInput(taskId: string): ObservationInput | null {
+    return this.#inputs.get(taskId) ?? null;
   }
 }
 

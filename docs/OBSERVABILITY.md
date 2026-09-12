@@ -55,6 +55,24 @@ does not yet understand is still diagnosable afterwards from the words the provi
 text is pattern-matched into a state; `exhausted` is persisted only for a window the provider itself
 reported as refused, and it expires with that window's own reset.
 
+**Avoiding a pool is a policy, not a reading.** After a positively identified structured refusal
+(`api_error_status: 429` with `terminal_reason: api_error`, or an `is_api_error_message` line naming
+`rate_limit`), BrainGate avoids that quota pool for ten minutes — a local decision stored in its own
+append-only `refusal_backoffs` table, with `policy: operational-backoff`, an `evidence: native` basis,
+and a `policyBackoffUntil` that is never a provider reset. Routing rejects a backed-off pool with
+`quota-pool-backoff:<pool>`, never `quota-exhausted`, and `quotaState` is not moved by it. The newest
+*observed* fact wins (`observed_at`, with the append sequence only as a tie-break), so a success whose
+row is written late still ends the wait and an earlier success persisted late does not cancel a later
+refusal. A served call clears the backoff. Expiry alone also ends it: the next task probes the pool
+again, which is the only thing that can discover the provider came back.
+
+**Backoff persistence is best-effort operational state, not canonical truth.** The task ledger is the
+record of what happened; the backoff is a convenience derived from it, written by a separate statement
+to a separate store, with no cross-store transaction (SQLite in WAL mode cannot commit across
+databases). A hard kill between the ledger's refusal event and the backoff row loses the backoff and
+may cost one redundant provider probe on a later task. It cannot alter quota truth, task history, or
+what any task recorded, and a second write of the same fact is idempotent.
+
 **The decision records the belief behind it.** Every task brief carries, per role, the `quotaState`,
 `quotaHint` and `quotaObservedAt` the choice was made under, along with the candidates that lost and
 why. Without that, "dispatched to a pool we thought was fine" and "dispatched to a pool we knew was

@@ -13,6 +13,17 @@ This guide is for trying BrainGate locally against one real Git repository befor
 - Dogfood telemetry is project-local and does not persist raw task text, model answers, candidate diffs, provider reasoning, or secrets.
 - Adaptive routing in M12 can only raise project-local complexity/risk floors. It never silently lowers them or changes model scores.
 
+## Where a trial or benchmark repository may live
+
+Register the repository at a real path, not under `/tmp`. Grok's sandbox is allowed to read the
+system temporary trees (`/tmp`, `/var`, `/private`), so a project whose checkout is inside one of them
+fails Grok's isolation self-test with
+`GROK_ISOLATION_SELF_TEST_FAILED: The applied Grok sandbox would still reach the registered project
+checkout` — measured 2026-09-12 against `grok 1.0.24`. The refusal is correct, but it silently removes
+Grok from the candidate set, so a measurement taken there is biased about which providers were
+eligible rather than about how they performed. A project under `$HOME` (or any path outside the
+sandbox's readable roots) attests normally.
+
 ## 0. Proving the real path works
 
 `pnpm test` never lets a provider answer: every suite drives a fake executor that returns a
