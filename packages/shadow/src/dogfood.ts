@@ -248,6 +248,15 @@ export class ShadowDogfoodRunner {
     };
     /** Classification and prior for the record. Required; see `ShadowObservationContext`. */
     readonly observation: ShadowObservationContext;
+    /**
+     * The goal this task is a work unit of, when it continues one.
+     *
+     * Optional so every existing caller keeps compiling and every one-shot run stays standalone.
+     * It is recorded on the task row and nowhere else: the runner has no opinion about what a goal
+     * is, and the goal's own state lives in the goals store the CLI owns.
+     */
+    readonly goalId?: string | null;
+    readonly conversationId?: string | null;
     readonly optionalReview?: boolean;
     readonly dryRun?: boolean;
   }): Promise<ShadowDogfoodResult> {
@@ -346,7 +355,15 @@ export class ShadowDogfoodRunner {
       return Object.freeze({ dryRun: true, taskId: null, taskReceipt: null, workflow: null });
     }
 
-    const task = this.#ledger.createTask({ title: input.title, complexity: input.classification.complexity, risk: input.classification.risk });
+    const task = this.#ledger.createTask({
+      title: input.title,
+      complexity: input.classification.complexity,
+      risk: input.classification.risk,
+      // M20: the work unit is linked to the goal it continues. Null for a one-shot run, which is a
+      // task that stands alone rather than a task attached to an invented goal.
+      goalId: input.goalId ?? null,
+      conversationId: input.conversationId ?? null,
+    });
     // Recorded here — after the task exists, before the first provider call — so the copy a later
     // failover takes is provably of the state this task started from.
     if (snapshotMayBeNeeded && this.#snapshotStore !== undefined) {

@@ -26,6 +26,30 @@ BrainGate
        `-- Grok Build
 ```
 
+## Conversation, Goal and Task
+
+M20 put a level above the task. A **Conversation** is the session a person is having; a **Goal** is
+what they are trying to achieve in it; a **Task** is one work unit of that goal. The three are
+project-scoped and persisted in the project's own `storage_dir` (`goals.sqlite`), never shared
+across projects.
+
+The distinction that matters is between a **worker claim** and an **accepted finding**. A goal's
+state holds findings BrainGate treats as established, findings established but *not* the active
+cause, and contrary claims that have not displaced either. A worker that asserts a different root
+cause is recorded as `conflicting` beside the established one; it does not overwrite it. Replacing
+an accepted finding is reconciliation, which is a later milestone and deliberately absent here.
+
+Continuity across providers is carried by a **handoff package** derived from that state — findings
+with their evidence, what changed, what ran, what is unresolved — and by a registry of native
+provider sessions. A handoff carries engineering state and never hidden reasoning. Where a
+provider's own session can be resumed, that is recorded as a fact about the session; nothing
+resumes one yet, and the registry says so rather than implying otherwise.
+
+A follow-up also inherits the complexity of the goal it continues. `max(prompt, goal)` is the rule:
+a short follow-up can never be budgeted below the goal it belongs to, and one that introduces new
+risk still raises it. Routing, budgets, grants, isolation and finalization are unchanged and remain
+where they were.
+
 ## Execution lifecycle
 
 1. Resolve an explicit project identity.

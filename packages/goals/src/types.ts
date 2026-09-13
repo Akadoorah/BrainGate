@@ -1,0 +1,266 @@
+/**
+ * What a Goal is, and what may be believed about it.
+ *
+ * M20 moves the first-class unit of work up one level. Until now the interactive product was
+ * `user prompt -> classify -> one worker -> answer`, so a follow-up that said "how would you
+ * implement the fix you just proposed?" arrived at BrainGate with no memory of the fix, was
+ * classified on its own eight words, and could be routed to a cheaper model that then invented a
+ * different diagnosis. The diagnosis had been *accepted* — it was the conclusion of a run whose
+ * evidence was recorded — and nothing in the system had a place to say so.
+ *
+ * So the model here is deliberately two-layered, and the layer boundary is the point:
+ *
+ * - **Accepted state** is BrainGate's belief: findings the operator or the evidence established,
+ *   which a worker may not overwrite by asserting something else.
+ * - **Worker claims** are what a worker said. A claim is recorded, attributed, and *conflicts*
+ *   with an accepted finding rather than replacing it.
+ *
+ * That is the whole reason `status: "conflicting"` exists as a value. ADR 0004 says conflicting
+ * worker opinions must not silently become facts; this is the shape that keeps them from doing it
+ * without also throwing them away, which would lose the one signal that reconciliation is owed.
+ *
+ * Nothing here is a truth engine. There is no scoring, no voting and no model in this file: a
+ * finding is accepted because an operator or the recorded evidence says so, and a claim is
+ * conflicting because its text contradicts an accepted one on the same subject. Deciding what to
+ * do about that is a later milestone's job; refusing to let it disappear is this one's.
+ */
+
+import type { ProviderId } from "@braingate/providers";
+import type { TaskComplexity, TaskRisk } from "@braingate/core";
+
+/**
+ * Whether a conversation is still being added to.
+ *
+ * Narrower than the goal vocabulary on purpose: a conversation is a container for goals, and the
+ * only question asked of it is which goal is current.
+ */
+export const CONVERSATION_STATUSES = ["active", "closed"] as const;
+export type ConversationStatus = (typeof CONVERSATION_STATUSES)[number];
+
+/**
+ * Where a goal has got to.
+ *
+ * `open` and `done` are the honest ends. `diagnosed` is separate from `implementing` because the
+ * SaudiGPT turn that motivated this milestone had concluded — evidence, scope, next action — while
+ * nothing had been changed yet, and a follow-up asking how to implement it was continuing a
+ * diagnosis rather than starting a change.
+ */
+export const GOAL_STATUSES = ["open", "diagnosed", "implementing", "blocked", "done", "abandoned"] as const;
+export type GoalStatus = (typeof GOAL_STATUSES)[number];
+
+export function isGoalStatus(value: string): value is GoalStatus {
+  return (GOAL_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * How a finding stands.
+ *
+ * `accepted` is a belief. `conflicting` is a worker's contrary claim that has not displaced one.
+ * `superseded` is the older half of a deliberate replacement, kept so the change of mind is
+ * visible rather than erased. `rejected` was considered and set aside.
+ */
+export const FINDING_STATUSES = ["claim", "accepted", "conflicting", "rejected", "superseded"] as const;
+export type FindingStatus = (typeof FINDING_STATUSES)[number];
+
+export function isFindingStatus(value: string): value is FindingStatus {
+  return (FINDING_STATUSES as readonly string[]).includes(value);
+}
+
+/**
+ * What may be done about a provider's session.
+ *
+ * `unsupported` is a real value and currently the honest one almost everywhere: BrainGate's
+ * profiles have never passed a resume flag, Claude runs `--no-session-persistence`, and no
+ * provider-assigned session id is captured from any CLI's output. Recording `unsafe` or
+ * `unsupported` now is what keeps a later slice from having to guess which sessions were resumed
+ * and which were merely believed to have been.
+ */
+export const SESSION_RESUME_MODES = ["unsupported", "unsafe", "available"] as const;
+export type SessionResumeMode = (typeof SESSION_RESUME_MODES)[number];
+
+export function isSessionResumeMode(value: string): value is SessionResumeMode {
+  return (SESSION_RESUME_MODES as readonly string[]).includes(value);
+}
+
+/** One worker's claim, or one established belief. The two are the same shape and different statuses. */
+export interface Finding {
+  readonly findingId: string;
+  readonly status: FindingStatus;
+  readonly claim: string;
+  /**
+   * What supports this. Required for `accepted` because an accepted finding is a belief BrainGate
+   * will hand to the next worker as established state, and "established" with nothing behind it is
+   * how a model's guess acquires the standing of a measurement.
+   */
+  readonly evidence: readonly string[];
+  /**
+   * The provider/model that claimed it, or `operator`.
+   *
+   * Kept so a receipt can distinguish what a worker asserted from what the operator decided — the
+   * same distinction `memory note` draws when it attributes a proposal to the operator rather than
+   * to BrainGate.
+   */
+  readonly assertedBy: string;
+  /** The claim text this one contradicts, for a `conflicting` finding. */
+  readonly conflictsWith: string | null;
+  /** The finding this one replaced, for a `superseded` finding. */
+  readonly supersededBy: string | null;
+  readonly recordedAt: string;
+}
+
+/** A goal's recorded pointer at one provider's native session. The id itself lives in the registry. */
+export interface ProviderSessionRef {
+  readonly providerId: ProviderId;
+  readonly modelId: string | null;
+  readonly sessionId: string;
+  readonly resumeMode: SessionResumeMode;
+  readonly recordedAt: string;
+}
+
+/** What has been decided or asked, as of the last recorded turn. */
+export interface GoalStateUpdate {
+  readonly status?: GoalStatus | undefined;
+  readonly acceptedFindings?: readonly FindingClaim[] | undefined;
+  readonly secondaryFindings?: readonly FindingClaim[] | undefined;
+  readonly openQuestions?: readonly string[] | undefined;
+  readonly approvedScope?: readonly string[] | undefined;
+  readonly filesChanged?: readonly string[] | undefined;
+  readonly testsRun?: readonly string[] | undefined;
+  readonly nextAction?: string | null | undefined;
+  /** The provider/model the update came from, or `operator`. */
+  readonly assertedBy?: string | undefined;
+}
+
+/**
+ * A claim on its way into goal state, with whatever supports it.
+ *
+ * Evidence travels *with* the claim rather than in a parallel list, because a parallel list cannot
+ * say which citation belongs to which finding — the first version of this attached them
+ * positionally and gave the secondary finding the root cause's evidence, which is a citation that
+ * looks authoritative and supports the wrong sentence.
+ *
+ * A bare string is still accepted, because "the operator stated this" is a real and common case;
+ * it is recorded as asserted-by and never as evidence.
+ */
+export type FindingClaim = string | { readonly claim: string; readonly evidence?: readonly string[] | undefined };
+
+/**
+ * The compact current state of a goal.
+ *
+ * Every list is bounded on the way in, and the bound is a product decision rather than a
+ * limitation. The failure this milestone exists to fix was a *handoff that lost state*, and a
+ * handoff that carries two hundred findings has the same effect by a different route. So state is
+ * the current picture, not a transcript: full answers, diffs and test output belong in the result
+ * store, and the timeline keeps the history that produced this.
+ */
+export interface GoalState {
+  readonly status: GoalStatus;
+  /** Findings BrainGate holds as established, and no worker may overwrite by asserting otherwise. */
+  readonly acceptedFindings: readonly Finding[];
+  /** Established, but not the root cause — the distinction that was lost between turn 1 and turn 2. */
+  readonly secondaryFindings: readonly Finding[];
+  /** Contrary claims that have *not* displaced an accepted finding. */
+  readonly disputedFindings: readonly Finding[];
+  readonly openQuestions: readonly string[];
+  readonly approvedScope: readonly string[];
+  readonly filesChanged: readonly string[];
+  readonly testsRun: readonly string[];
+  readonly nextAction: string | null;
+  readonly providerSessions: readonly ProviderSessionRef[];
+}
+
+export interface ConversationRecord {
+  readonly conversationId: string;
+  readonly projectId: string;
+  readonly title: string;
+  readonly status: ConversationStatus;
+  readonly activeGoalId: string | null;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+export interface GoalRecord {
+  readonly goalId: string;
+  readonly conversationId: string;
+  readonly projectId: string;
+  readonly objective: string;
+  readonly state: GoalState;
+  readonly createdAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * A turn on the timeline: what was asked, and what came back.
+ *
+ * The raw conversation history the product direction asks for, stored in the project's own
+ * database rather than only in the eight-hour session thread. The thread is a convenience that
+ * expires; this is the record. Answers are kept whole here and bounded only by the store's own
+ * limit, because this is the source a handoff is derived *from* — bounding state is safe, bounding
+ * the only copy of what a worker concluded is not.
+ */
+export interface ConversationTurn {
+  readonly sequence: number;
+  readonly conversationId: string;
+  readonly projectId: string;
+  readonly goalId: string | null;
+  readonly taskId: string | null;
+  readonly request: string;
+  readonly answer: string;
+  /** `provider/model`, in the order the run used them. Empty when nothing was spent. */
+  readonly attributedTo: readonly string[];
+  readonly occurredAt: string;
+}
+
+/** One provider/model's native session, kept apart from the goal so it survives the goal that found it. */
+export interface ProviderSessionRecord {
+  readonly projectId: string;
+  readonly providerId: ProviderId;
+  readonly modelId: string | null;
+  readonly sessionId: string;
+  readonly quotaPool: string | null;
+  readonly resumeMode: SessionResumeMode;
+  readonly goalId: string | null;
+  readonly conversationId: string | null;
+  readonly recordedAt: string;
+  readonly updatedAt: string;
+}
+
+/**
+ * What a worker is told when it picks a goal up.
+ *
+ * Built from `GoalState`, never from a conversation transcript, and the difference is the whole
+ * "do not send a giant prompt every turn" requirement. It carries engineering state — findings
+ * with their evidence, what changed, what ran, what is unresolved — and no hidden reasoning: there
+ * is no field here a model's private thinking could arrive in, because none is ever read.
+ */
+export interface HandoffPackage {
+  readonly goalId: string;
+  readonly objective: string;
+  readonly status: GoalStatus;
+  readonly acceptedFindings: readonly Finding[];
+  readonly secondaryFindings: readonly Finding[];
+  readonly disputedFindings: readonly Finding[];
+  readonly openQuestions: readonly string[];
+  readonly approvedScope: readonly string[];
+  readonly filesChanged: readonly string[];
+  readonly testsRun: readonly string[];
+  readonly nextAction: string | null;
+  /** The native session per provider, when one was recorded. Absent for a provider never used. */
+  readonly providerSessions: readonly ProviderSessionRef[];
+  /** The worker being addressed, when the handoff is aimed at one. */
+  readonly addressedTo: string | null;
+  /** The work unit this handoff accompanies. */
+  readonly workUnit: string;
+  /** Which surfaces already hold this goal's detail, so a worker may look rather than be told. */
+  readonly evidenceRefs: readonly string[];
+}
+
+/** The context object a provider receives, in the layers the product direction names. */
+export interface GoalContext {
+  /** Layer 1: raw turns, most recent last, already bounded by the caller. */
+  readonly recentTurns: readonly { readonly request: string; readonly answer: string }[];
+  /** Layer 2: the handoff package, which is the compact current state. */
+  readonly handoff: HandoffPackage;
+  /** Layer 3: where artifacts and results live, without copying their bytes. */
+  readonly evidenceRefs: readonly string[];
+}

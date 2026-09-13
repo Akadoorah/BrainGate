@@ -25,6 +25,9 @@ importers:
       '@braingate/execution':
         specifier: workspace:*
         version: link:../../packages/execution
+      '@braingate/goals':
+        specifier: workspace:*
+        version: link:../../packages/goals
       '@braingate/memory':
         specifier: workspace:*
         version: link:../../packages/memory
@@ -141,6 +144,37 @@ importers:
       '@braingate/core':
         specifier: workspace:*
         version: link:../core
+      '@braingate/security':
+        specifier: workspace:*
+        version: link:../security
+      better-sqlite3:
+        specifier: ^13.0.3
+        version: 13.0.3
+    devDependencies:
+      '@types/better-sqlite3':
+        specifier: ^9.6.0
+        version: 9.6.0
+      '@types/node':
+        specifier: ^22.18.7
+        version: 22.20.1
+      tsx:
+        specifier: ^4.23.13
+        version: 4.23.13
+      typescript:
+        specifier: ^5.9.3
+        version: 5.9.3
+
+  packages/goals:
+    dependencies:
+      '@braingate/context':
+        specifier: workspace:*
+        version: link:../context
+      '@braingate/core':
+        specifier: workspace:*
+        version: link:../core
+      '@braingate/providers':
+        specifier: workspace:*
+        version: link:../providers
       '@braingate/security':
         specifier: workspace:*
         version: link:../security

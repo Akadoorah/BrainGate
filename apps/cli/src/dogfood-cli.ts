@@ -12,9 +12,11 @@ import {
   TaskLedger,
   budgetFor,
   classifyTask,
+  isTaskComplexity,
   quotaRefusalOf,
   type ProviderQuotaRefusal,
   type RegisteredProject,
+  type TaskComplexity,
   type TaskReceipt,
   type TaskClassification,
 } from "@braingate/core";
@@ -48,6 +50,7 @@ import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, gro
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
 import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
 export interface DogfoodCliDependencies {
@@ -96,6 +99,37 @@ export interface DogfoodCliDependencies {
    * persisted or promoted to memory.
    */
   readonly sessionTurns?: (contextTokenBudget: number) => readonly { readonly request: string; readonly answer: string }[];
+  /**
+   * The goal this request continues, as the layers a provider reads.
+   *
+   * M20. Supplied by the interactive session and absent for the flag interface — a one-shot command
+   * continues nothing, and inventing a goal for it would make every scripted invocation a
+   * conversation. It reaches the provider inside the payload's `context` field, beside project
+   * memory and the session turns, and it is what makes a provider switch a continuation rather
+   * than a fresh start.
+   */
+  readonly goalContext?: unknown;
+  /** The goal and conversation the task this run creates is a work unit of. */
+  readonly goalId?: string | null;
+  readonly conversationId?: string | null;
+  /**
+   * The complexity floor of the goal this request continues.
+   *
+   * Supplied by the session that owns the goal rather than read from the goals store here: a task
+   * surface takes a tier, not a second copy of the goal model. Absent, the request is classified
+   * exactly as it was before M20, which is what the flag interface and every scripted call get.
+   *
+   * It is applied to the plan as well as the run, on purpose. A plan that routed a follow-up as a
+   * standalone T1 while the run then inherited T3 would be describing a task nobody approved.
+   */
+  readonly inheritedComplexity?: TaskComplexity | null;
+  /**
+   * Told which `provider/model` actually served the run, once it has.
+   *
+   * Read from the same role-activity events the terminal already watches rather than derived a
+   * second time, so what a turn is attributed to and what the operator saw happen cannot disagree.
+   */
+  readonly onTurnAttribution?: (attributedTo: readonly string[]) => void;
   /** Set by the interactive session, which has already introduced itself and shows its own prompt. */
   readonly quiet?: boolean;
 }
@@ -162,6 +196,15 @@ function taskWasRecorded(error: unknown): boolean {
   return typeof error === "object" && error !== null && (error as Record<symbol, unknown>)[RECORDED_TASK] === true;
 }
 
+/**
+ * Prints a result, and returns it.
+ *
+ * Returning is the point. Whether a caller asked for JSON decides how a result is *rendered*, not
+ * what the result *is*: the interactive session reads a plan's classification and a run's task id
+ * back out of `data`, and the earlier version handed it nothing whenever `--json` was absent, so the
+ * session could not tell "the run recorded no task" from "the run's task id was never returned".
+ * The two are different answers and the difference decides what the operator does next.
+ */
 function emit(json: boolean, data: unknown, human: string, stdout: (text: string) => void): void {
   stdout(json ? `${JSON.stringify(data, null, 2)}\n` : `${human}\n`);
 }
@@ -658,7 +701,10 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const predicted = classifyTask({ text: task, mode: "ask" });
     const prior = store.derivePrior("ask");
     const adaptive = applyDogfoodPrior(predicted, prior);
-    const effective = adaptive.effective;
+    // The goal this request continues, applied after the project prior so both the plan and the run
+    // are priced for the work rather than for the sentence. M20.
+    const floor = deps.inheritedComplexity ?? null;
+    const effective = floor === null ? adaptive.effective : applyInheritedFloor(adaptive.effective, floor);
     const budget = budgetFor(effective, { writeRequested: false });
     const requiredContextTokens = contextTokens(task);
     const memory = collectTaskMemory(project, task, budget.maxContextTokens);
@@ -672,6 +718,9 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       // The session's earlier turns: kept with the project for a few hours, redacted, and never
       // promoted to memory.
       session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
+      // M20 layer 2 and 3: the goal this request continues, and where its detail lives. Absent for
+      // the flag interface, which continues nothing.
+      ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }),
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
     // A review needs Codex's proof, and so does a read primary on a project copy: one self-test
@@ -688,20 +737,34 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const measured = await measuredCapabilities(deps);
     const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
-    const planData = Object.freeze({ classification: view, budget, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })), providerCallsOnPlan: 0 });
+    // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
+    // terminal prints; `complexity`, `risk`, `promptComplexity` and `roleLines` are the same facts as
+    // structure, so a caller that reads the plan back — the interactive session does — gets the
+    // classification and the grants the plan actually used rather than a re-parse of its prose.
+    const planData = Object.freeze({
+      classification: view,
+      complexity: effective.complexity,
+      risk: effective.risk,
+      promptComplexity: predicted.complexity,
+      summary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+      grantLines: Object.freeze(plan.roles.map((role, index) => {
+        const grant = role.invocation.grant;
+        const refused = grant.refused.map((item) => item.capability).join(", ");
+        const name = roleLine(plan.roles).split(" · ")[index]?.split("=")[0] ?? role.role;
+        return Object.freeze(`${name}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`);
+      })),
+      budget,
+      roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })),
+      providerCallsOnPlan: 0,
+    });
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason } };
       emit(json, data, [
-        `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+        planData.summary,
         // What each role may do, and what it asked for and did not get. Read before the run,
         // where "the planner wanted the network and nobody accepted it" is still actionable.
-        ...plan.roles.map((role, index) => {
-          const grant = role.invocation.grant;
-          const refused = grant.refused.map((item) => item.capability).join(", ");
-          const name = roleLine(plan.roles).split(" · ")[index]?.split("=")[0] ?? role.role;
-          return `  ${name}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`;
-        }),
+        ...planData.grantLines.map((line) => `  ${line}`),
         "Zero provider model calls executed.",
       ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -714,10 +777,21 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // Whatever was newest before this invocation, so the task this run created can be identified on
     // the failure path — a refusal ends the run, and its backoff must be applied anyway.
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
+    // Which provider and model actually served this run. Collected from the role-activity stream the
+    // terminal already receives, so the turn's attribution is a reading rather than a second guess,
+    // and deduplicated because a task may spend several phases on the same model.
+    const servedBy: string[] = [];
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
-      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
+      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
+        if (activity.stage === "started") {
+          const attribution = `${activity.provider}/${activity.model}`;
+          if (!servedBy.includes(attribution)) servedBy.push(attribution);
+        }
+        deps.onRoleActivity?.(activity);
+      }, ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
+      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_RECEIPT_MISSING", "Executed dogfood ask did not produce a task receipt.");
+      deps.onTurnAttribution?.(Object.freeze([...servedBy]));
       // The runner recorded the outcome, the result and the observation; this reads them back
       // rather than deciding again. A second derivation here is how the screen and the ledger end
       // up disagreeing about the same task.
@@ -768,7 +842,9 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const predicted = classifyTask({ text: task, mode: "write" });
     const prior = store.derivePrior("write");
     const adaptive = applyDogfoodPrior(predicted, prior);
-    const effective = adaptive.effective;
+    // A write that continues a goal inherits the goal's floor on the same terms as a question. M20.
+    const floor = deps.inheritedComplexity ?? null;
+    const effective = floor === null ? adaptive.effective : applyInheritedFloor(adaptive.effective, floor);
     const budget = budgetFor(effective, { writeRequested: true });
     const requiredContextTokens = contextTokens(task);
     const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state, CODEX_PROBE_VERSION);
@@ -782,11 +858,35 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const acceptances = loadAcceptances(state);
     const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
-    const planData = Object.freeze({ classification: view, budget, repositoryPath, baseRef, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })), providerCallsOnPlan: 0, createsWorktree: false, mergeAvailable: false });
+    // The same structural fields the read plan carries, so a caller that continues a goal reads one
+    // shape whichever mode the request took. `summary` is what the terminal prints; the tiers are
+    // what the plan *used*, which is what the session's goal line has to agree with.
+    const planData = Object.freeze({
+      classification: view,
+      complexity: effective.complexity,
+      risk: effective.risk,
+      promptComplexity: predicted.complexity,
+      summary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+      // No grants here: a write role carries a workspace rather than a tool grant, and inventing an
+      // empty list would let a reader conclude the roles were granted nothing.
+      budget,
+      repositoryPath,
+      baseRef,
+      roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })),
+      providerCallsOnPlan: 0,
+      createsWorktree: false,
+      mergeAvailable: false,
+    });
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason }, approvalRequired: true };
-      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
+      emit(json, data, [
+        planData.summary,
+        // Which workspace each write role runs in, which is this mode's equivalent of a grant: it
+        // says where a change would land, and that the operator's checkout is not on the list.
+        ...plan.roles.map((role) => `  ${role.role}: ${role.workspace} · ${role.model.providerId}/${role.model.modelId}`),
+        "Zero provider model calls. Zero worktrees. Merge unavailable.",
+      ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
@@ -794,7 +894,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
       const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
-      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
+      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       // Read back what the runner recorded, so the screen and the ledger cannot disagree.
       const recorded = recordedOutcomeOf(result.taskReceipt);
