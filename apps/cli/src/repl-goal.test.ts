@@ -217,7 +217,14 @@ test("a follow-up continues the same goal and the next worker is handed the esta
   // The second worker's payload carried the goal: the earlier turn, and the state derived from it.
   const goalContext = runtime.lastGoalContext();
   assert.ok(goalContext !== null, "a follow-up must reach the provider with the goal attached");
-  const handoff = goalContext.handoff as { readonly goalId: string; readonly workUnit: string; readonly status: string };
+  // The cast names the fields this test reads, and `acceptedFindings` is one of them: leaving it out
+  // of the literal made the assertion two lines down a type error rather than a test.
+  const handoff = goalContext.handoff as {
+    readonly goalId: string;
+    readonly workUnit: string;
+    readonly status: string;
+    readonly acceptedFindings: readonly unknown[];
+  };
   assert.equal(handoff.workUnit, "How would you implement the proposed fix?");
   // `open`, not `diagnosed`: the turn finished and established nothing, and a status may not claim
 // more than the structured state proves. Real dogfood printed `diagnosed` directly above "Nothing

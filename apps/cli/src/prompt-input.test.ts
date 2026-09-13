@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createPromptInput, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
+import { createPromptInput, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
 
 /**
  * Prompt input correctness: paste is a boundary, not a race.
@@ -23,7 +23,7 @@ class Terminal {
   rawModes: boolean[] = [];
   readonly input: PromptInput;
 
-  constructor(options: { readonly terminal?: boolean } = {}) {
+  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void } = {}) {
     this.input = createPromptInput({
       input: {
         on: (event: string, listener: never) => {
@@ -34,7 +34,7 @@ class Terminal {
         setRawMode: (mode: boolean) => { this.rawModes.push(mode); },
         isTTY: options.terminal ?? true,
       },
-      write: (text: string) => { this.#written.push(text); },
+      write: (text: string) => { this.#written.push(text); options.onWrite?.(text); },
       terminal: options.terminal ?? true,
     });
   }
@@ -65,6 +65,89 @@ function submissions(terminal: Terminal): { readonly ask: (question: string) => 
     return answer;
   };
   return { ask, all };
+}
+
+/**
+ * A terminal that *displays* what it is written, so the screen can be asserted instead of the bytes.
+ *
+ * This is the fixture the RTL defect needed. The bug was not only in the buffer: the composer erased
+ * one cell with `\u007f \u007f`, which is a claim about where a character is on screen, and for
+ * shaped Arabic that claim is false — the erase landed beside the character and the old glyph stayed
+ * visible. No assertion about the composer's own memory can catch that, because the memory was fine.
+ *
+ * So the emitted bytes are interpreted the way a terminal interprets them: cursor up, cursor down,
+ * erase to end of display, carriage return, newline. What a row holds afterwards is what an operator
+ * would see on that row. Escape sequences that are not display movement (bracketed paste in and out)
+ * are dropped, and any other byte changes a row.
+ *
+ * Rows are never re-flowed for width, so a soft-wrapped long line is out of scope — the geometry here
+ * is the composer's own claim (one newline is one row), which is exactly the claim under test.
+ */
+class VirtualTerminal {
+  readonly #rows: string[] = [""];
+  #row = 0;
+  #column = 0;
+  /** Every byte written, so a test can also assert what was *not* emitted. */
+  #bytes = "";
+
+  write(text: string): void {
+    this.#bytes += text;
+    for (let index = 0; index < text.length;) {
+      const rest = text.slice(index);
+      const up = /^\u001b\[(\d*)A/.exec(rest);
+      if (up !== null) {
+        this.#row = Math.max(0, this.#row - Number(up[1] === "" ? "1" : up[1]));
+        this.#column = 0;
+        index += up[0].length;
+        continue;
+      }
+      if (rest.startsWith("\u001b[1B")) {
+        this.#row += 1;
+        this.#column = 0;
+        index += 4;
+        continue;
+      }
+      if (rest.startsWith("\u001b[J")) {
+        // Erase from the cursor to the end of the display: this row keeps what is left of it, every
+        // row below it is gone. This is the whole mechanism the redraw relies on.
+        this.#rows[this.#row] = (this.#rows[this.#row] ?? "").slice(0, this.#column);
+        this.#rows.length = this.#row + 1;
+        index += 3;
+        continue;
+      }
+      const char = text[index]!;
+      if (char === "\u001b") {
+        const escape = /^\u001b\[[0-9;?]*[A-Za-z]/.exec(rest);
+        assert.ok(escape !== null, `the composer emitted an escape sequence the fixture cannot read: ${JSON.stringify(rest.slice(0, 12))}`);
+        index += escape[0].length;
+        continue;
+      }
+      if (char === "\r") { this.#column = 0; index += 1; continue; }
+      if (char === "\n") { this.#row += 1; this.#column = 0; index += 1; continue; }
+      const point = String.fromCodePoint(text.codePointAt(index)!);
+      const row = this.#rows[this.#row] ?? "";
+      this.#rows[this.#row] = row.slice(0, this.#column) + point + row.slice(this.#column + point.length);
+      this.#column += point.length;
+      index += point.length;
+    }
+  }
+
+  /** What is on screen: the rows actually occupied, trailing blanks dropped, joined by newlines. */
+  screen(): string {
+    return this.#rows.join("\n").replace(/\n+$/, "");
+  }
+
+  bytes(): string { return this.#bytes; }
+
+  /** The row the cursor is on, as text — for asserting where the operator is typing. */
+  cursorRow(): string { return this.#rows[this.#row] ?? ""; }
+}
+
+/** A terminal that both records bytes and displays them. */
+function displayTerminal(): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
+  const screen = new VirtualTerminal();
+  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); } });
+  return { terminal, screen };
 }
 
 // ---------------------------------------------------------------- A. typed input
@@ -302,6 +385,242 @@ test("an ended input releases a waiting prompt", async () => {
   assert.equal(await pending, null);
 });
 
+// ---------------------------------------------------------------- RTL and grapheme correctness
+//
+// The bug these exist for: Arabic typed into macOS Terminal was deleted one UTF-16 code unit at a
+// time and erased one terminal cell at a time, and the screen kept showing letters that had been
+// deleted. English hid both faults — a Latin letter is one code unit and one cell, laid out in
+// logical order — so the tests below assert the logical buffer *and* the screen.
+
+/** `مرحبا`, spelled out so it cannot be mangled by an editor, a copy, or a terminal. */
+const MARHABA = "\u0645\u0631\u062D\u0628\u0627";
+
+test("R: Arabic letters each delete as one character", () => {
+  const letters = ["\u0645", "\u0631", "\u062D", "\u0628", "\u0627"];
+  assert.equal(MARHABA, letters.join(""), "the fixture is the five letters it claims");
+  for (const letter of letters) assert.equal(lastGrapheme(letter), letter);
+  assert.equal(lastGrapheme("x" + MARHABA), "\u0627");
+});
+
+test("R: the splitter's fallback keeps code points whole, and never a lone surrogate", () => {
+  // The fallback is what runs on an engine without `Intl.Segmenter`. It is not reachable from Node
+  // (which always has one), so it is called directly — every case here is a character that must
+  // delete as one unit, and the surrogate check is the invariant that must hold in every case.
+  const cases = ["\u0645", "\u{1F600}", "\u{1F44D}\u{1F3FD}", "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", "\u{1F1F8}\u{1F1E6}", "1\uFE0F\u20E3", "e\u0301"];
+  for (const character of cases) {
+    assert.equal(fallbackLastGrapheme(`ab${character}`), character, `${JSON.stringify(character)} is one character`);
+  }
+  assert.equal(fallbackLastGrapheme("\u0645\u064E"), "\u0645\u064E", "a letter and its fatha are one character");
+  assert.equal(fallbackLastGrapheme("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}"), "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}");
+  assert.equal(fallbackLastGrapheme(""), "");
+  for (const character of [...cases, "\u0645\u064E"]) {
+    const removed = fallbackLastGrapheme(`ab${character}`);
+    assert.equal(removed.includes("\uFFFD"), false);
+    assert.equal(/[\uD800-\uDBFF]$|^[\uDC00-\uDFFF]/.test(removed), false, `${JSON.stringify(removed)} is not half a pair`);
+  }
+});
+
+test("A: typing Arabic sets the logical draft to exactly what was typed", async () => {
+  const { terminal, screen } = displayTerminal();
+  const { ask, all } = submissions(terminal);
+  const pending = ask("> ");
+  terminal.type(MARHABA);
+  await terminal.input.idle();
+  assert.deepEqual(all, [], "nothing is submitted before Enter");
+  assert.equal(screen.screen(), `> ${MARHABA}`, "and the screen shows the draft that is held");
+  terminal.enter();
+  assert.equal(await pending, MARHABA, "the submitted request is the logical buffer, exactly");
+});
+
+test("B: five Backspaces take Arabic to the empty draft, one letter at a time", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  terminal.type(MARHABA);
+  await terminal.input.idle();
+  const expected = [MARHABA, "\u0645\u0631\u062D\u0628", "\u0645\u0631\u062D", "\u0645\u0631", "\u0645", ""];
+  for (const [index, remaining] of expected.entries()) {
+    if (index > 0) terminal.chunk("\u007f");
+    await terminal.input.idle();
+    // The screen is the assertion, not only the buffer: an erase that landed on the wrong cell left
+    // the deleted letter visible, which is precisely the reported bug.
+    assert.equal(screen.screen(), `> ${remaining}`, `after ${String(index)} deletions the screen shows exactly the draft`);
+    assert.equal(screen.cursorRow(), `> ${remaining}`, "and the cursor is at the end of it");
+  }
+  terminal.enter();
+  assert.equal(await pending, "", "Enter submits what remains, which is nothing");
+});
+
+test("B: deleting past the empty draft does nothing", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  terminal.type("\u0645");
+  terminal.chunk("\u007f");
+  terminal.chunk("\u007f");
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), "> ", "the display is not damaged by a Backspace on nothing");
+  terminal.type("\u0631");
+  terminal.enter();
+  assert.equal(await pending, "\u0631");
+});
+
+test("C: Arabic with diacritics deletes the letter and its marks together", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  const marked = "\u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B\u0627"; // مَ رْ حَ بً ا
+  terminal.type(marked);
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> ${marked}`);
+
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), "> \u0645\u064E\u0631\u0652\u062D\u064E\u0628\u064B", "the final letter goes, with both of its marks");
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), "> \u0645\u064E\u0631\u0652\u062D\u064E", "and the next one, with its fatha");
+  terminal.chunk("\u007f");
+  terminal.chunk("\u007f");
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), "> ");
+  terminal.enter();
+  assert.equal(await pending, "");
+});
+
+test("D: an emoji is one deletion, however many code points it is made of", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  const family = "\u{1F468}\u200D\u{1F469}\u200D\u{1F467}\u200D\u{1F466}";
+  // Delivered the way a terminal composes an emoji: base and modifier in one write. A modifier that
+  // arrives in a chunk of its own is a modifier with no base yet, and it deletes as the one character
+  // it currently is — `Intl.Segmenter` is right about that too, and the draft stays valid either way.
+  terminal.chunk(`ship it \u{1F44D}\u{1F3FD}`);
+  terminal.chunk(family);
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> ship it \u{1F44D}\u{1F3FD}${family}`, "every emoji is on screen as one character");
+
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> ship it \u{1F44D}\u{1F3FD}`, "the four-person ZWJ sequence goes in one Backspace");
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), "> ship it ", "and the thumbs up takes its skin tone with it");
+  terminal.enter();
+  assert.equal(await pending, "ship it ");
+});
+
+test("E: mixed-direction input mutates logically, one grapheme per Backspace", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  terminal.type("README " + MARHABA + " test");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> README ${MARHABA} test`);
+
+  const expected = [`README ${MARHABA} tes`, `README ${MARHABA} te`, `README ${MARHABA} t`, `README ${MARHABA} `, `README ${MARHABA}`, "README \u0645\u0631\u062D\u0628", "README \u0645\u0631\u062D", "README \u0645\u0631", "README \u0645", "README "];
+  for (const [index, remaining] of expected.entries()) {
+    terminal.chunk("\u007f");
+    await terminal.input.idle();
+    const label = `after ${String(index + 1)} deletions`;
+    assert.equal(screen.screen(), `> ${remaining}`, `${label} the screen shows exactly the draft, in logical order`);
+    assert.equal(screen.cursorRow(), `> ${remaining}`, `${label} and the cursor is at the end of the draft`);
+  }
+  terminal.enter();
+  assert.equal(await pending, "README ", "the request is what is left, exactly — Latin then Arabic, in order");
+});
+
+test("F: an Arabic multiline paste keeps its lines and its order", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  const content = "\u0645\u0631\u062D\u0628\u0627\n\u062C\u0631\u0628 \u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0644\u0641\n\u0644\u0627 \u062A\u0639\u0645\u0644 commit";
+  terminal.paste(content.replace(/\n/g, "\r"), { splitAt: 5 });
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> ${content}\n  [pasted 3 lines — Enter sends, Ctrl+C clears]`, "all three lines are on screen, in order, once");
+  terminal.enter();
+  assert.equal(await pending, content, "the pasted text is the draft, normalised once");
+});
+
+test("G: Backspace after an Arabic paste edits the logical draft", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  // Two different words, so what was deleted is visible in what remains.
+  const first = "\u0645\u0631\u062D\u0628\u0627";
+  const second = "\u062C\u0631\u0628";
+  terminal.paste(`${first}\n${second}`);
+  await terminal.input.idle();
+  // The notice is part of the render, not a line written once: it is reprinted with the draft, so it
+  // can never become a stale suffix, and it is still true — the draft is still the pasted text.
+  const notice = "\n  [pasted 2 lines — Enter sends, Ctrl+C clears]";
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> ${first}\n\u062C\u0631${notice}`, "the last letter of the last line goes");
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), `> ${first}\n\u062C${notice}`, "and the next, on the same line");
+  terminal.chunk("\u007f");
+  terminal.chunk("\u007f");
+  await terminal.input.idle();
+  // The fourth deletion crossed the pasted newline. The draft is one line now, so the notice must go
+  // with the line it was counting, and nothing of the second line may remain on screen.
+  assert.equal(screen.screen(), `> ${first}`, "deleting the newline takes the second line and its notice with it");
+  terminal.enter();
+  assert.equal(await pending, first);
+});
+
+test("H: an Arabic paste and a Backspace submit exactly the normalised draft", async () => {
+  const { terminal } = displayTerminal();
+  const { ask, all } = submissions(terminal);
+  const pending = ask("> ");
+  terminal.paste("\u0645\u0631\u062D\u0628\u0627\r\n\u0644\u0627 \u062A\u0639\u0645\u0644 commit\r\n");
+  await terminal.input.idle();
+  terminal.chunk("\u007f");
+  terminal.chunk("\u007f");
+  terminal.enter();
+  const expected = "\u0645\u0631\u062D\u0628\u0627\n\u0644\u0627 \u062A\u0639\u0645\u0644 commi";
+  assert.equal(await pending, expected, "the submitted request is the draft after two graphemes were removed");
+  assert.deepEqual(all, [expected], "and it is submitted once");
+  assert.doesNotMatch(expected, /\r/, "with no carriage return left in it");
+});
+
+test("I: Ctrl+C clears an Arabic draft without submitting any of it", async () => {
+  const { terminal, screen } = displayTerminal();
+  const { ask, all } = submissions(terminal);
+  const pending = ask("> ");
+  terminal.type(MARHABA);
+  await terminal.input.idle();
+  terminal.chunk("\u0003");
+  await terminal.input.idle();
+  assert.deepEqual(all, [], "Ctrl+C is not a submit");
+  assert.equal(screen.cursorRow(), "> ", "the displayed draft is empty again");
+  terminal.type("\u0644\u0627");
+  terminal.enter();
+  assert.equal(await pending, "\u0644\u0627", "and what is typed afterwards is what is submitted");
+});
+
+test("J: every edit is a fresh render from the anchor, never an incremental cell erase", async () => {
+  const { terminal, screen } = displayTerminal();
+  const pending = terminal.input.ask("> ");
+  terminal.type(MARHABA + MARHABA);
+  for (let index = 0; index < 5; index += 1) terminal.chunk("\u007f");
+  await terminal.input.idle();
+
+  const bytes = screen.bytes();
+  // The old renderer's whole mechanism, asserted gone: move the cursor left one cell, write a space,
+  // move it left again. It is only correct for single-cell left-to-right text, and that assumption is
+  // what produced the bug. A Backspace byte is input, never output, so its absence is also the check
+  // that nothing is erased in place.
+  assert.equal(bytes.includes("\u007f \u007f"), false, "no in-place cell erase is emitted");
+  assert.doesNotMatch(bytes, /\u007f/, "and no erase byte is written to the terminal at all");
+  assert.doesNotMatch(bytes, /\u001b\[[0-9]*D/, "nor a cursor-left");
+
+  // Each deletion cleared from the anchor down and reprinted the draft: one erase-to-end-of-display
+  // per edit — ten characters typed one byte at a time, then five Backspaces — and no render that
+  // reprints only part of the draft. Nothing incremental is attempted anywhere in the stream.
+  assert.equal(bytes.split("\u001b[J").length - 1, 15, "one full redraw per edit, and nothing else");
+  assert.equal(screen.screen(), `> ${MARHABA}`, "and the screen is the draft as it stands, with no stale suffix");
+  terminal.enter();
+  assert.equal(await pending, MARHABA);
+});
+
 // ---------------------------------------------------------------- the dogfood paste, exactly
 
 /**
@@ -345,17 +664,20 @@ test("P: the dogfood paste composes into exactly the text that was pasted", asyn
 });
 
 test("Q: the display shows the pasted draft rather than a re-rendering of it", async () => {
-  const terminal = new Terminal();
+  const { terminal, screen } = displayTerminal();
   const pending = terminal.input.ask("> ");
+  // Delivered the way macOS Terminal delivered it: CR for every newline.
   terminal.paste(DOGFOOD_REQUEST.replace(/\n/g, "\r"));
   await terminal.input.idle();
-  const written = terminal.written();
-  // Every line of the draft is on screen, in order, once, and with no carriage return that would
-  // overwrite the line before it.
-  assert.doesNotMatch(written, /\r/, "nothing is written that would return the cursor to column 0");
-  assert.equal(written.indexOf("1. which file you selected,") > written.indexOf("Tell me:"), true, "the list appears in order");
-  assert.equal(written.indexOf("3. one harmless") > written.indexOf("2. why it is safe"), true);
-  assert.match(written, /pasted 8 lines — Enter sends, Ctrl\+C clears/, "and the operator is told what is pending");
+  // Every line of the draft is on screen, in order, once. Before the composer normalised pasted line
+  // endings this is what broke: the CRs were kept, so each line was written over the one before it and
+  // the operator read a sentence that had never been typed.
+  assert.equal(screen.screen(), `> ${DOGFOOD_REQUEST}\n  [pasted 8 lines — Enter sends, Ctrl+C clears]`);
+  assert.equal(screen.screen().indexOf("1. which file you selected,") > screen.screen().indexOf("Tell me:"), true, "the list appears in order");
+  assert.equal(screen.screen().indexOf("3. one harmless") > screen.screen().indexOf("2. why it is safe"), true);
+  // A CR the composer writes is positioning its own output. A CR inside the *draft* is content, and
+  // every renderer downstream honours it: `/goal` spliced two paragraphs of a real objective this way.
+  assert.doesNotMatch(DOGFOOD_REQUEST, /\r/);
   terminal.enter();
   assert.equal(await pending, DOGFOOD_REQUEST);
 });
