@@ -455,6 +455,37 @@ It proposes a project id from the directory name and asks you to confirm. The id
 isolation boundary — memory, worktrees, and telemetry are scoped to it — so BrainGate never
 picks one silently. Pass `--project-id <id> --name <name>` to skip the prompt in scripts.
 
+### Execution is bound to one checkout
+
+A project is **one local checkout**, and BrainGate will not run anywhere else. The manifest is
+found by walking up from where you launched, and the repository it names is compared with the
+repository you are actually in. If they differ, the session stops before planning anything:
+
+```text
+Project `flutter-migration` is registered to a different checkout.
+  registered:  /Volumes/Lexar/Tabaq-ai-TabaqAi_31Aug_fixed_issues
+  you are in:  /Users/you/Downloads/Tabaq-ai-TabaqAi_31Aug_fixed_issues
+
+These are two local checkouts, and BrainGate will not choose between them: they can hold
+different uncommitted state, and a provider that edits one has not touched the other.
+
+  `braingate init --project-id <new-id>`  register this checkout as its own project
+  `braingate init --rebind`               move this project's registration here instead
+```
+
+Two clones of one repository are two checkouts even when they share a name, a commit or a git
+remote, because those say the clones are *related* and nothing about whether they hold the same
+uncommitted state. Nothing is inferred from a basename: the identity is the canonical path.
+
+- **Two checkouts you use for different things** — register each with its own project id. They
+  get separate memory, ledgers, goals and quota history, which is what you want.
+- **You moved the directory, or the drive came back at a different path** — `braingate init
+  --rebind` moves the project to this checkout, keeping its id, name and history.
+- **The registered checkout is unmounted** — BrainGate says so rather than guessing, because an
+  unmounted volume and a moved directory look identical from here.
+
+`/project` in an interactive session prints the binding at any time.
+
 **4. Check readiness. This spends nothing.**
 
 ```bash
@@ -563,6 +594,7 @@ rather than failing obscurely.
 The full command surface:
 
 - `braingate init --project-id <id> --name <name>`
+- `braingate init --rebind` — move this project's registration to the checkout you are in
 - `braingate discover`
 - `braingate doctor --project <manifest>`
 - `braingate models list|validate|add|remove|import-discovered|profile`
@@ -580,7 +612,7 @@ The full command surface:
 
 `plan` and `run` without `--execute` do not make provider model calls. The explicit `--execute` flag is the model-execution gate.
 
-`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path.
+`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path. The manifest names its own checkout, and that binding is what BrainGate enforces before it executes anything.
 
 See [`docs/DOGFOOD.md`](docs/DOGFOOD.md) for the real-project trial workflow.
 

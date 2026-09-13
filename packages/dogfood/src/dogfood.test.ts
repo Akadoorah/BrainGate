@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -230,4 +230,39 @@ test("every workflow role can be recorded, so none fails a task after it succeed
     const stored = store.listRuns().at(-1)!;
     assert.deepEqual(stored.roles.map((entry) => entry.role), ["planner", "primary", "reviewer", "judge"]);
   } finally { store.close(); }
+});
+
+test("a rebind moves a registration to this checkout, and only when it is asked for", () => {
+  const f = repoFixture("rebind");
+  try {
+    // Registered against a checkout that is not this one, which is what a copied clone looks like.
+    const other = join(f.root, "other-repo");
+    mkdirSync(other);
+    git(other, ["init", "-q", "-b", "main"]);
+    git(other, ["config", "user.email", "test@example.invalid"]);
+    git(other, ["config", "user.name", "BrainGate Test"]);
+
+    mkdirSync(join(f.repo, ".brain"), { recursive: true });
+    const manifest = join(f.repo, ".brain", "project.json");
+    writeFileSync(manifest, JSON.stringify({ project_id: "moved", name: "Moved", repositories: [other] }));
+
+    // Without the flag, the manifest is left exactly as it was: a conflict, not an overwrite.
+    assert.throws(
+      () => initializeDogfoodProject({ cwd: f.repo, projectId: "moved", name: "Moved" }),
+      (error: unknown) => error instanceof BrainGateInvariantError && error.code === "PROJECT_INIT_CONFLICT" && /--rebind/.test(error.message),
+      "the refusal must name the flag that would do it deliberately",
+    );
+    assert.equal(JSON.parse(readFileSync(manifest, "utf8")).repositories[0], other, "and nothing was rewritten");
+
+    // With it, the project keeps its identity and follows the operator to this checkout.
+    const rebound = initializeDogfoodProject({ cwd: f.repo, projectId: "moved", name: "Moved", rebind: true });
+    assert.equal(rebound.created, false);
+    assert.equal(rebound.projectId, "moved");
+    const document = JSON.parse(readFileSync(manifest, "utf8"));
+    assert.deepEqual(document.repositories, [".."], "the manifest is relative, so it names this checkout");
+    const registry = new ProjectRegistry(join(f.root, "rebind-home"));
+    assert.equal(registry.loadFile(manifest).repositories[0], realpathSync.native(f.repo));
+    // And the move is not visible to git, which is the property the local ignore exists for.
+    assert.equal(git(f.repo, ["status", "--porcelain"]), "");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

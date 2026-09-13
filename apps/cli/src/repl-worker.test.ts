@@ -1,10 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, type RegisteredProject } from "@braingate/core";
+import { ProjectRegistry, checkoutRootOf, type RegisteredProject } from "@braingate/core";
 import { GoalStore } from "@braingate/goals";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
@@ -111,12 +111,18 @@ class FakeCli implements ShadowProcessExecutor {
   }
 }
 
-function fixture(label: string, models: readonly { providerId: "anthropic" | "xai" | "openai"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
-  { providerId: "anthropic", modelId: "claude-sonnet", coder: 95, speed: "balanced" },
-  { providerId: "anthropic", modelId: "claude-haiku", coder: 60, speed: "fast" },
-  { providerId: "xai", modelId: "grok-fast", coder: 70, speed: "fast" },
-  { providerId: "openai", modelId: "gpt-review", coder: 80, speed: "balanced" },
-]) {
+function fixture(
+  label: string,
+  models: readonly { providerId: "anthropic" | "xai" | "openai"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
+    { providerId: "anthropic", modelId: "claude-sonnet", coder: 95, speed: "balanced" },
+    { providerId: "anthropic", modelId: "claude-haiku", coder: 60, speed: "fast" },
+    { providerId: "xai", modelId: "grok-fast", coder: 70, speed: "fast" },
+    { providerId: "openai", modelId: "gpt-review", coder: 80, speed: "balanced" },
+  ],
+  /** Two clones deliberately sharing an id is the shape that collided, so it has to be expressible. */
+  options: { readonly projectId?: string } = {},
+) {
+  const projectId = options.projectId ?? label;
   const root = mkdtempSync(join(tmpdir(), `braingate-m202-${label}-`));
   const repo = join(root, "repo");
   mkdirSync(repo);
@@ -126,7 +132,7 @@ function fixture(label: string, models: readonly { providerId: "anthropic" | "xa
   writeFileSync(join(repo, "splash_page.dart"), "// splash\n");
   git(repo, ["add", "."]);
   git(repo, ["commit", "-m", "initial"]);
-  initializeDogfoodProject({ cwd: repo, projectId: label, name: "Sample" });
+  initializeDogfoodProject({ cwd: repo, projectId, name: "Sample" });
   const home = join(root, "brain-home");
   const env = { BRAINGATE_HOME: home };
   const state = resolveOperatorState(env, repo);
@@ -802,4 +808,73 @@ test("M: an ended input releases a waiting prompt instead of hanging the session
   const waiting = terminal.prompt.ask("> ");
   terminal.end();
   assert.equal(await waiting, null, "the end of input is an answer of `no more input`");
+});
+
+// ---------------------------------------------------------------- checkout attachment
+
+test("N: a manifest bound to another checkout stops the session before anything is planned or spent", async () => {
+  // The real dogfood failure: the registration names one checkout and the operator is standing in
+  // another. Here the binding is written out directly, which is also how it arises in the world —
+  // a clone copied to a second volume carries the first one's manifest with it.
+  const registered = fixture("attach-registered", undefined, { projectId: "shared-slug" });
+  const other = fixture("attach-other", undefined, { projectId: "shared-slug" });
+  const cli = new FakeCli();
+
+  // The other clone's manifest now names the first checkout, as a copy of it would.
+  writeFileSync(
+    join(other.repo, ".brain", "project.json"),
+    JSON.stringify({ project_id: "shared-slug", name: "Sample", repositories: [registered.repo] }),
+  );
+
+  const session = sessionOf(other.repo, other.env, cli, ["Investigate the idle logout", "y"]);
+  assert.equal(await session.run(), 1, "the session must stop rather than run somewhere else");
+  assert.equal(cli.calls.length, 0, "no provider may be reached");
+  const text = session.text();
+  assert.match(text, /registered to a different checkout/);
+  assert.match(text, /registered: {2}/);
+  assert.match(text, /you are in: {2}/);
+  assert.match(text, /init --rebind/);
+  assert.match(text, /--project-id/);
+});
+
+test("N: two clones that each name themselves both attach, because a clone is self-consistent", async () => {
+  // The complement of the refusal, and the reason identity is a path rather than a slug: a second
+  // clone carrying the same project id is not itself an error. What was wrong was the *shared
+  // storage*, and that is what the refusal above prevents from being used silently.
+  const first = fixture("attach-self-a", undefined, { projectId: "shared-slug" });
+  const second = fixture("attach-self-b", undefined, { projectId: "shared-slug" });
+  for (const f of [first, second]) {
+    const cli = new FakeCli();
+    const session = sessionOf(f.repo, f.env, cli, ["/project", "/exit"]);
+    assert.equal(await session.run(), 0);
+    assert.match(session.text(), /Execution is bound to that checkout/);
+    assert.match(session.text(), /A different clone is a different checkout/);
+  }
+});
+
+test("N: /project reports the binding, and a matching checkout is attached rather than refused", async () => {
+  const f = fixture("attach-matching");
+  const cli = new FakeCli();
+  const session = sessionOf(f.repo, f.env, cli, ["/project", "/exit"]);
+  assert.equal(await session.run(), 0);
+  const text = session.text();
+  assert.match(text, /Project: {2}attach-matching/);
+  assert.match(text, /Checkout: /);
+  assert.match(text, /Execution is bound to that checkout/);
+  assert.match(text, /A different clone is a different checkout/);
+  assert.equal(cli.calls.length, 0, "looking at the binding spends nothing");
+});
+
+test("N: a session in a subdirectory is bound to the repository, not the subdirectory", async () => {
+  const f = fixture("attach-subdir");
+  const nested = join(f.repo, "flutter_migration", "tabaq_app_clean");
+  mkdirSync(nested, { recursive: true });
+  const cli = new FakeCli();
+  const session = sessionOf(nested, f.env, cli, ["/project", "/exit"]);
+  assert.equal(await session.run(), 0);
+  // The manifest is found upward and the checkout is the repository root, so a session started in a
+  // package of a monorepo attaches to the project rather than reporting none.
+  const reported = /Checkout: (.+)/.exec(session.text())?.[1] ?? "";
+  assert.equal(reported.trim(), checkoutRootOf(nested), "the checkout is the repository root");
+  assert.doesNotMatch(reported, /tabaq_app_clean/);
 });

@@ -63,6 +63,21 @@ a short follow-up can never be budgeted below the goal it belongs to, and one th
 risk still raises it. Routing, budgets, grants, isolation and finalization are unchanged and remain
 where they were.
 
+## Project identity and checkout identity
+
+A **project** is the operator's name for a body of work, and it owns memory, goals, the task ledger,
+quota history and the audit trail. A **checkout** is the local directory the work happens in, and its
+identity is its canonical path — nothing else.
+
+They are bound by the manifest beside the checkout, and BrainGate enforces the binding before it
+executes anything: the repository named by the manifest must be the repository the operator launched
+from, or the session stops. Two clones of one repository are two checkouts even when they share a
+basename, a commit or a remote URL, because those facts say the clones are related and nothing about
+whether they hold the same uncommitted state. Every path downstream — snapshots, worktrees,
+fingerprints, the provider's cwd, task evidence — derives from that one verified binding.
+
+Moving a registration to a different checkout is `braingate init --rebind`, and it is never implied.
+
 ## Execution lifecycle
 
 1. Resolve an explicit project identity, and the conversation and goal this request continues.

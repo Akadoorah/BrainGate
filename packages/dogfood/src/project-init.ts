@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, parseProjectConfig, parseProjectId } from "@braingate/core";
+import { BrainGateInvariantError, parseProjectConfig, parseProjectId, type ProjectId } from "@braingate/core";
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false, timeout: 15_000, maxBuffer: 1024 * 1024 });
@@ -66,6 +66,15 @@ export function initializeDogfoodProject(input: {
   readonly name: unknown;
   /** Create the repository here when there is none. Never implied — it writes to their disk. */
   readonly createRepository?: boolean;
+  /**
+   * Move this checkout's existing registration to here, replacing what the manifest names.
+   *
+   * The one way a registration changes which checkout it points at, and it is never implied: the
+   * operator asks for it, having been shown both directories. Without an explicit path the honest
+   * answer to "these two checkouts disagree" is a refusal, because rebinding silently would move a
+   * project's memory, ledger and goals onto a different body of work.
+   */
+  readonly rebind?: boolean;
 }): ProjectInitResult {
   const here = realpathSync.native(resolve(input.cwd));
   if (input.createRepository === true && findRepository(here) === null) {
@@ -85,26 +94,52 @@ export function initializeDogfoodProject(input: {
     try { parsed = JSON.parse(readFileSync(manifestPath, "utf8")) as unknown; }
     catch { throw new BrainGateInvariantError("PROJECT_INIT_CONFLICT", "Existing .brain/project.json is invalid and will not be overwritten."); }
     const existing = parseProjectConfig(parsed, brainDir);
-    if (existing.projectId !== projectId || existing.name !== name || existing.repositories.length !== 1 || existing.repositories[0] !== repo) {
-      throw new BrainGateInvariantError("PROJECT_INIT_CONFLICT", "Existing .brain/project.json has a different project identity or repository mapping and will not be overwritten.");
+    const same = existing.projectId === projectId && existing.name === name && existing.repositories.length === 1 && existing.repositories[0] === repo;
+    if (!same && input.rebind !== true) {
+      throw new BrainGateInvariantError("PROJECT_INIT_CONFLICT", "Existing .brain/project.json has a different project identity or repository mapping and will not be overwritten. Re-run with --rebind to move this project's registration to this checkout.");
     }
-    return Object.freeze({ created: false, projectId, projectName: name, repositoryPath: repo, manifestPath });
+    if (same) return Object.freeze({ created: false, projectId, projectName: name, repositoryPath: repo, manifestPath });
+    // A rebind keeps the *project* — its id, its name, everything filed under it — and changes only
+    // which checkout that project runs against. That is the operator's decision to make explicitly,
+    // and it is the one case where the manifest is replaced rather than created.
+    ensureLocalIgnore(repo);
+    writeManifest(manifestPath, repo, { projectId: existing.projectId, name: existing.name }, { replace: true });
+    return Object.freeze({ created: false, projectId: existing.projectId, projectName: existing.name, repositoryPath: repo, manifestPath });
   }
 
   ensureLocalIgnore(repo);
   mkdirSync(brainDir, { recursive: true, mode: 0o700 });
-  const document = { project_id: projectId, name, repositories: [".."] };
   try {
-    writeFileSync(manifestPath, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" });
-    const status = git(repo, ["status", "--porcelain", "--untracked-files=all"]);
-    if (status.split(/\r?\n/).some((line) => line.includes(".brain/"))) {
-      throw new BrainGateInvariantError("PROJECT_INIT_NOT_IGNORED", "Local .brain manifest is visible to Git; refusing unsafe onboarding state.");
-    }
+    writeManifest(manifestPath, repo, { projectId, name });
   } catch (error) {
     if (existsSync(manifestPath)) rmSync(manifestPath, { force: true });
     throw error;
   }
   return Object.freeze({ created: true, projectId, projectName: name, repositoryPath: repo, manifestPath });
+}
+
+/**
+ * Writes the manifest, and refuses to leave state Git can see.
+ *
+ * `repositories: [".."]` is relative to the manifest's own directory, which is why it reads as one
+ * level up: the file lives in `.brain/`, and the repository is its parent. Written once, here, so a
+ * create and a rebind produce the same document.
+ */
+function writeManifest(
+  manifestPath: string,
+  repo: string,
+  identity: { readonly projectId: ProjectId; readonly name: string },
+  options: { readonly replace?: boolean } = {},
+): void {
+  const document = { project_id: identity.projectId, name: identity.name, repositories: [".."] };
+  // `wx` for a create, so two processes cannot race one registration into existence; `w` only for a
+  // rebind, which is the single deliberate case of replacing a manifest that already exists.
+  const flag = options.replace === true ? "w" : "wx";
+  writeFileSync(manifestPath, `${JSON.stringify(document, null, 2)}\n`, { encoding: "utf8", mode: 0o600, flag });
+  const status = git(repo, ["status", "--porcelain", "--untracked-files=all"]);
+  if (status.split(/\r?\n/).some((line) => line.includes(".brain/"))) {
+    throw new BrainGateInvariantError("PROJECT_INIT_NOT_IGNORED", "Local .brain manifest is visible to Git; refusing unsafe onboarding state.");
+  }
 }
 
 export interface GitRepositoryState {

@@ -1,5 +1,5 @@
 import { findManifest } from "./manifest-path.js";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
@@ -9,6 +9,7 @@ import type { NativeSessionResolver, TaskSnapshotProvider } from "@braingate/sha
 import {
   BrainGateInvariantError,
   ProjectRegistry,
+  checkoutRootOf,
   TaskLedger,
   budgetFor,
   classifyTask,
@@ -239,7 +240,40 @@ function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: s
     );
   }
   const registry = new ProjectRegistry(state.home);
-  return registry.loadFile(path);
+  const project = registry.loadFile(path);
+  // The registration is honoured only for the checkout the operator is actually in. Everything this
+  // command then does — snapshots, worktrees, fingerprints, the provider's cwd, the evidence it
+  // records — derives from this handle, so this is the one place the question has to be answered.
+  assertCheckoutMatches(project, cwd);
+  return project;
+}
+
+/**
+ * Refuses to execute against a checkout other than the one named on the command line.
+ *
+ * The manifest is found by walking upward from where the operator is, so in every ordinary case these
+ * already agree. When they do not, the two clones are different working states and BrainGate will not
+ * choose between them: not the one it was told to use, and not the one it happens to be standing in.
+ */
+export function assertCheckoutMatches(project: RegisteredProject, cwd: string): void {
+  const checkoutRoot = checkoutRootOf(cwd);
+  if (checkoutRoot === null) return;
+  const registered = project.repositories[0];
+  if (registered === undefined || registered === checkoutRoot) return;
+  throw new BrainGateInvariantError(
+    "PROJECT_CHECKOUT_MISMATCH",
+    [
+      `Project \`${project.projectId}\` is registered to a different checkout.`,
+      `  registered:  ${registered}`,
+      `  you are in:  ${checkoutRoot}`,
+      "",
+      "Nothing was executed. These are two local checkouts and BrainGate will not choose between",
+      "them: they can hold different uncommitted state.",
+      "",
+      "  `braingate init --project-id <new-id>`  register this checkout as its own project",
+      "  `braingate init --rebind`               move this project's registration here instead",
+    ].join("\n"),
+  );
 }
 
 /**
@@ -324,6 +358,26 @@ async function resolveProjectIdentity(input: {
 }
 
 function manifestOption(args: string[]): string { return takeOption(args, "--project") ?? ".brain/project.json"; }
+
+/**
+ * The project a `--rebind` is moving, read straight from the manifest.
+ *
+ * Not through the registry, deliberately: the registry resolves the manifest's repository, and a
+ * rebind is precisely the case where that resolution fails — an unmounted drive, a moved directory.
+ * The id and name are readable regardless, and they are what has to survive the move.
+ */
+function existingManifestIdentity(cwd: string, manifest: string): { readonly projectId: string; readonly name: string } | null {
+  const path = findManifest(cwd, manifest);
+  if (!existsSync(path)) throw new BrainGateInvariantError("PROJECT_REBIND_NO_MANIFEST", `--rebind moves an existing registration, and there is no manifest at ${manifest} here. Run \`braingate init --project-id <id>\` to register this checkout as a new project.`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(readFileSync(path, "utf8")) as unknown; }
+  catch { throw new BrainGateInvariantError("PROJECT_REBIND_INVALID", "The existing .brain/project.json cannot be read, so there is no registration to move."); }
+  const record = parsed as { readonly project_id?: unknown; readonly name?: unknown };
+  if (typeof record.project_id !== "string" || typeof record.name !== "string") {
+    throw new BrainGateInvariantError("PROJECT_REBIND_INVALID", "The existing .brain/project.json does not name a project, so there is no registration to move.");
+  }
+  return Object.freeze({ projectId: record.project_id, name: record.name });
+}
 function contextTokens(task: string): number { return Math.max(128, conservativeTokenEstimate(task) + 64); }
 
 function attestations(copilotOauth: boolean, state: OperatorStatePaths): readonly SubscriptionAttestation[] {
@@ -942,6 +996,10 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       const flagProjectId = takeOption(args, "--project-id") ?? null;
       const flagName = takeOption(args, "--name") ?? null;
       const gitInitFlag = removeFlag(args, "--git-init");
+      // The one explicit way a project's registration moves to a different checkout. Never implied:
+      // without it, a manifest that names another checkout is a conflict rather than something to
+      // overwrite, because overwriting would silently point a project's memory at other work.
+      const rebind = removeFlag(args, "--rebind");
       noExtraArgs(args);
       // Asked first, because it decides whether the identity questions are worth asking at all.
       // A new directory is where people start, and finding out it cannot be registered only
@@ -966,8 +1024,12 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
         }
         createRepository = true;
       }
-      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask, stdout, quiet: deps.quiet === true });
-      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name, createRepository });
+      // A rebind keeps the existing project's identity and moves only what the manifest points at, so
+      // it does not ask for an id and a name: asking would invite a rename where the operator asked
+      // for a relocation.
+      const rebindTarget = rebind ? existingManifestIdentity(cwd, manifestOption(args)) : null;
+      const identity = rebindTarget ?? await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask, stdout, quiet: deps.quiet === true });
+      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name, createRepository, rebind });
       const created = (data as { created: boolean }).created;
       const manifestPath = (data as { manifestPath: string }).manifestPath;
       emit(

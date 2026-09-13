@@ -7,7 +7,7 @@ import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
-import { ProjectRegistry, TaskLedger } from "@braingate/core";
+import { ProjectRegistry, TaskLedger, resolveAttachment } from "@braingate/core";
 import {
   GoalStore,
   buildGoalContext,
@@ -579,6 +579,7 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
         "  /use <provider>/<model> [--fresh]   send the next work to this worker",
         "  /auto       let BrainGate choose again",
         "  /worker     who is selected, what the goal is, and what the next run would resume",
+        "  /project    which checkout this session is bound to, and where it is registered",
         "  /memory     what is remembered, and what is waiting for your evidence",
         "  /status     recent tasks in this project",
         "  /models     configured models and reviewer independence",
@@ -650,6 +651,28 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       deps.stdout("  Automatic selection restored. BrainGate routes each turn again — availability, quota, capability and isolation decide.\n");
       return "continue";
     }
+    case "project": {
+      // What this session is bound to, and the one explicit way to change it. Printed from the same
+      // resolution `runRepl` already performed, so the answer cannot differ from what is executing.
+      const attached = resolveAttachment({
+        cwd: deps.cwd,
+        registry: { loadFile: (manifestPath) => new ProjectRegistry(resolveOperatorState(deps.env ?? process.env).home).loadFile(manifestPath) },
+      });
+      deps.stdout("\n");
+      if (attached.kind === "attached") {
+        deps.stdout(`  Project:  ${attached.project.projectId} (${attached.project.name})\n`);
+        deps.stdout(`  Checkout: ${attached.checkout.root}\n`);
+        deps.stdout(`  Manifest: ${attached.checkout.manifestPath}\n`);
+        deps.stdout("  Execution is bound to that checkout. A different clone is a different checkout,\n  even when it shares a name or a remote.\n\n");
+        return "continue";
+      }
+      if (attached.kind === "unregistered") {
+        deps.stdout(`  No project is registered for ${attached.checkout.root}.\n  Run \`braingate init\` here to create one.\n\n`);
+        return "continue";
+      }
+      deps.stderr(`${attached.message}\n\n`);
+      return "continue";
+    }
     case "worker": {
       const goal = goals === null ? null : goals.activeGoal();
       const known = goals === null ? [] : goals.listProviderSessions(8);
@@ -714,10 +737,31 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     still: deps.animate === false,
   });
 
+  /**
+   * Which checkout this session may execute against, decided before anything else happens.
+   *
+   * The manifest is found by walking upward from here, and what it names is then compared with the
+   * repository the operator is actually standing in. Where the two disagree the session stops —
+   * before a plan, before a thread, before a goal — because every one of those would otherwise be
+   * filed under a checkout the operator is not looking at. Real dogfood produced exactly that: a
+   * session in one clone reasoning about another.
+   *
+   * A refusal here is not about permissions. Both checkouts are the operator's; they are simply not
+   * the same working state, and only the operator can say which one the project should follow.
+   */
+  const attachment = resolveAttachment({
+    cwd: deps.cwd,
+    registry: { loadFile: (manifestPath) => new ProjectRegistry(resolveOperatorState(deps.env ?? process.env).home).loadFile(manifestPath) },
+  });
+  if (attachment.kind === "refused") {
+    deps.stderr(`\n${attachment.message}\n\n`);
+    return 1;
+  }
+
   // Arriving in an unregistered directory is the ordinary first run, not an error to be turned
   // away at. The banner has already said what this is; now offer the one command that starts,
   // rather than printing an instruction and exiting.
-  if (!existsSync(findManifest(deps.cwd))) {
+  if (attachment.kind === "unregistered") {
     deps.stdout([
       `  No BrainGate project in ${basename(deps.cwd)} yet.`,
       "  The project id is the isolation boundary for memory, worktrees and telemetry,",
