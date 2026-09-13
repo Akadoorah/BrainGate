@@ -328,6 +328,9 @@ export function failureKindFromCode(code: string): FailureKind {
     case "WRITE_SYMLINK_ESCAPE":
     case "WRITE_NO_CHANGES":
       return "verification-failed";
+    // A nested repository makes the project's state something a file copy cannot represent, which is
+    // the same fact as a source that will not hold still: the snapshot cannot describe what is there.
+    case "SNAPSHOT_NESTED_REPOSITORY":
     case "SHADOW_SOURCE_MUTATED":
     case "WRITE_SOURCE_MUTATED":
     // The task's project moved between the state it started from and the copy a failover would need:

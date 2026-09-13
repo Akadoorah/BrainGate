@@ -114,7 +114,7 @@ gets the goal.
 $ braingate
 
   ▌ B R A I N G A T E
-  ▌ route each task to the cheapest worker that can do it
+  ▌ one goal, many native CLIs — the worker is swappable
 
   Dogfood preflight demo: ask=ready · write=ready · configured=4 · model calls=0
   Type a request, or /help. Nothing is spent until you confirm.

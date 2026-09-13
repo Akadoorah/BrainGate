@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { BrainGateInvariantError, ProjectRegistry, parseProjectConfig } from "@braingate/core";
-import { ProjectSnapshotter, ProjectSnapshotProvider, SNAPSHOT_LIMITS, sweepSnapshots } from "./index.js";
+import { ProjectSnapshotter, ProjectSnapshotProvider, SNAPSHOT_LIMITS, assertSnapshotPath, sweepSnapshots } from "./index.js";
 
 /**
  * The fixture lives under the operator's home, not in a system temporary directory.
@@ -55,6 +55,12 @@ function setOldSnapshot(project: { readonly storageDir: string }, snapshot: { re
 
 function cleanup(home: string): void {
   rmSync(home, { recursive: true, force: true });
+}
+
+/** Runs git in a directory that is not the fixture's root, for building a nested repository. */
+function gitIn(cwd: string, args: readonly string[]): void {
+  const result = spawnSync("git", [...args], { cwd, encoding: "utf8" });
+  if (result.status !== 0) throw new Error(`git ${args.join(" ")} failed: ${String(result.stderr)}`);
 }
 
 function codeOf(action: () => unknown): string {
@@ -464,5 +470,99 @@ test("the state that can affect the provider's copy is exactly what coherence wa
     snapshotter.discard(snapshot);
     rmSync(join(repo, ".env"));
     assert.equal(snapshotter.fingerprint(), baseline, "removing the credential file restores the watched state");
+  } finally { cleanup(home); }
+});
+
+// ---------------------------------------------------------------- nested repositories
+
+test("a nested repository is named as one, not reported as a path that escaped the root", () => {
+  // The exact shape a real project had: a tracked root containing an untracked directory that holds
+  // its own `.git`. `git ls-files --others` reports that directory as a single entry with a trailing
+  // separator — `dir/nested/` — instead of enumerating the files inside it, because it is not this
+  // repository. Measured 2026-09-13 against git 2.51.0.
+  const { home, repo, project } = setupRepo();
+  try {
+    const nested = join(repo, "flutter_migration", "tabaq_app_clean");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "main.dart"), "void main() {}\n");
+    // A *real* repository, not a `.git` file and not an empty `.git` directory: git enumerates both
+    // of those normally, and only a repository it recognises is reported as a single entry.
+    gitIn(nested, ["init", "-q", "-b", "main"]);
+    gitIn(nested, ["config", "user.email", "nested@example.invalid"]);
+    gitIn(nested, ["config", "user.name", "Nested"]);
+    gitIn(nested, ["add", "."]);
+    gitIn(nested, ["commit", "-qm", "nested"]);
+
+    // git really does emit the trailing separator for this shape. If that ever stops being true the
+    // fixture below is no longer testing what it says, so the premise is asserted rather than assumed.
+    const listed = spawnSync("git", ["ls-files", "-z", "--others", "--exclude-standard"], { cwd: repo, encoding: "utf8" });
+    const entries = String(listed.stdout ?? "").split("\u0000").filter((entry) => entry.length > 0);
+    assert.ok(entries.includes("flutter_migration/tabaq_app_clean/"), `fixture premise: expected git to list the nested repository with a trailing separator, got ${JSON.stringify(entries)}`);
+
+    const snapshotter = new ProjectSnapshotter({ project });
+    const code = codeOf(() => snapshotter.create({ taskId: "nested" }));
+    // Named for what it is. The previous behaviour was `SNAPSHOT_PATH_INVALID` claiming the path
+    // escaped the snapshot root, which sent the operator looking for a path bug that did not exist.
+    assert.equal(code, "SNAPSHOT_NESTED_REPOSITORY");
+    assert.throws(
+      () => snapshotter.create({ taskId: "nested" }),
+      (error: unknown) => error instanceof BrainGateInvariantError
+        && error.code === "SNAPSHOT_NESTED_REPOSITORY"
+        && /nested repository/.test(error.message)
+        && /\.gitignore/.test(error.message),
+      "the refusal must say what to do about it",
+    );
+    // Refused, not copied: a second repository's files never enter the copy the provider reads.
+    assert.equal(existsSync(join(ProjectSnapshotter.storageRoot(project), "workspace")), false);
+  } finally { cleanup(home); }
+});
+
+test("an ignored nested repository is not part of the project's state at all", () => {
+  const { home, repo, project } = setupRepo();
+  try {
+    const nested = join(repo, "vendor", "other");
+    mkdirSync(nested, { recursive: true });
+    writeFileSync(join(nested, "x.ts"), "export const x = 1;\n");
+    gitIn(nested, ["init", "-q", "-b", "main"]);
+    gitIn(nested, ["config", "user.email", "nested@example.invalid"]);
+    gitIn(nested, ["config", "user.name", "Nested"]);
+    gitIn(nested, ["add", "."]);
+    gitIn(nested, ["commit", "-qm", "nested"]);
+    writeFileSync(join(repo, ".gitignore"), "node_modules/\n*.log\nvendor/\n");
+
+    // Following the diagnosis the error gives: ignore it, and the project snapshots normally again.
+    const snapshotter = new ProjectSnapshotter({ project });
+    const snapshot = snapshotter.create({ taskId: "ignored" });
+    assert.equal(snapshot.manifest.entries.some((entry) => entry.path.startsWith("vendor/")), false);
+    assert.equal(existsSync(join(snapshot.root, "vendor")), false);
+    snapshotter.discard(snapshot);
+  } finally { cleanup(home); }
+});
+
+test("a genuine escape is still rejected, and the trailing separator changed nothing about that", () => {
+  // The normalization tolerates one notation and nothing else. Every shape that could aim a write
+  // outside the snapshot root is refused exactly as before, in the guard the caller still runs first.
+  const { home, project } = setupRepo();
+  try {
+    const snapshotter = new ProjectSnapshotter({ project });
+    assert.equal(snapshotter.fingerprint().length, 64, "an ordinary project still fingerprints");
+
+    // Driven through the exported guard, because a path traversal cannot be produced by git — the
+    // point is that the guard's own contract is unchanged by the normalization added beside it.
+    const rejects = (path: string): boolean => {
+      try { assertSnapshotPath(path); return false; }
+      catch (error) { return error instanceof BrainGateInvariantError && error.code === "SNAPSHOT_PATH_INVALID"; }
+    };
+    assert.equal(rejects("../outside"), true);
+    assert.equal(rejects("a/../../outside"), true);
+    assert.equal(rejects("a/./b"), true);
+    assert.equal(rejects("a//b"), true);
+    assert.equal(rejects("/etc/passwd"), true);
+    assert.equal(rejects("a\\b"), true);
+    assert.equal(rejects(""), true);
+    assert.equal(rejects(".."), true);
+    assert.equal(rejects("./"), true);
+    // And the one notation that is not an escape.
+    assert.equal(rejects("dir/nested/"), false, "a trailing separator is a directory marker, not a segment");
   } finally { cleanup(home); }
 });

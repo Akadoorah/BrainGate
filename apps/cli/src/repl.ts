@@ -530,7 +530,10 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // The exit code is reported, not interpreted. Inventing "completed but needs your review" here
   // was a guess about a task this layer never looked at: a non-zero exit can mean a blocked review,
   // a provider refusal, or a run that recorded nothing at all, and those need different responses.
-  if (result.exitCode !== 0) deps.stdout("\n  Exit 1: this task did not finish successfully. Run `tasks list` to see what was recorded.\n\n");
+  // Named as something to run *in a shell*, and paired with the command that does the same job here.
+  // The bare `tasks list` this used to suggest was read by the session as a new request, so following
+  // BrainGate's own advice spent a task on it — the guidance was the bug, not the operator.
+  if (result.exitCode !== 0) deps.stdout("\n  Exit 1: this task did not finish successfully. Use /status here to see what was recorded, or run `braingate tasks list` in your shell.\n\n");
 }
 
 /** The task id a finished run reported, or `null` when the run recorded nothing usable. */
@@ -837,21 +840,117 @@ function openLedger(cwd: string, env: NodeJS.ProcessEnv | undefined): TaskLedger
 }
 
 /** Wires the session to the real terminal. */
+/**
+ * How long a prompt waits, after its first line, to see whether the rest of a paste is still coming.
+ *
+ * A paste arrives as one burst, and Node delivers it as one `line` event per line. `rl.question`
+ * resolves on the first of those and leaves the rest queued, so the *next* prompt — the
+ * "Run it? [y/N]" — is handed the second line of the request the person had just pasted. In dogfood
+ * that is exactly what happened: a two-line request, and the confirmation boundary showing
+ * `Run it? [y/N] yKeep the answer concise…`, after which the task was skipped.
+ *
+ * It is a window rather than a queue because the two cases are otherwise indistinguishable: a human
+ * who types two lines deliberately presses Enter twice, seconds apart, and must get two prompts.
+ * Nobody notices 25 milliseconds; everybody notices their request being answered with a `y`.
+ */
+export const PASTE_BURST_MS = 25;
+
+/**
+ * Reads input one *prompt* at a time, keeping a pasted request whole.
+ *
+ * The alternative considered and rejected was to detect a bad answer at the confirmation — the
+ * prompt already shows the spilled text, and by then the request is the thing that was mangled. This
+ * keeps the request intact instead, which is the property the operator actually needs.
+ */
+export function createPromptInput(
+  options: {
+    /** Anything that emits `line`, `end` and `close`: a readline interface, or a test's input. */
+    readonly input: { on(event: "line", listener: (line: string) => void): unknown; on(event: "end" | "close", listener: () => void): unknown };
+    readonly write: (text: string) => void;
+    readonly burstMs?: number;
+  },
+): { readonly ask: (question: string) => Promise<string | null>; readonly idle: () => Promise<void> } {
+  const burstMs = options.burstMs ?? PASTE_BURST_MS;
+  let pending: string[] = [];
+  let waiter: ((line: string | null) => void) | null = null;
+
+  options.input.on("line", (line: string) => {
+    if (waiter === null) { pending.push(line); return; }
+    const resolve = waiter;
+    waiter = null;
+    resolve(line);
+  });
+  // Input ending is the end of the session, and a prompt waiting on it has to be let go: a closed
+  // pipe that leaves a promise hanging is a process that never exits.
+  const end = (): void => { const resolve = waiter; waiter = null; resolve?.(null); };
+  options.input.on("end", end);
+  options.input.on("close", end);
+
+  const nextLine = async (): Promise<string | null> => {
+    const queued = pending.shift();
+    if (queued !== undefined) return queued;
+    return await new Promise<string | null>((resolve) => { waiter = resolve; });
+  };
+
+  /**
+   * The next line of this burst, or `null` once nothing has arrived for the length of the window.
+   *
+   * The queue is consulted first, and that is not an optimization: a paste delivered synchronously
+   * puts its remaining lines in the queue *while* the first prompt is still resolving, so a window
+   * that only listened would let them sit there — which is the original bug wearing a different hat.
+   */
+  const nextInBurst = async (): Promise<string | null> => {
+    const queued = pending.shift();
+    if (queued !== undefined) return queued;
+    return await new Promise<string | null>((resolve) => {
+      const timer = setTimeout(() => { if (waiter === settle) waiter = null; resolve(null); }, burstMs);
+      const settle = (line: string | null): void => { clearTimeout(timer); resolve(line); };
+      timer.unref();
+      waiter = settle;
+    });
+  };
+
+  const ask = async (question: string): Promise<string | null> => {
+    options.write(question);
+    const first = await nextLine();
+    if (first === null) return null;
+    const rest: string[] = [];
+    // Whatever else this paste carried belongs to the same request. The window closes as soon as one
+    // has passed with nothing arriving, which is what a person typing line by line looks like.
+    for (;;) {
+      const more = await nextInBurst();
+      if (more === null) break;
+      rest.push(more);
+    }
+    return rest.length === 0 ? first : [first, ...rest].join("\n");
+  };
+
+  /** Resolves once no line is waiting to be delivered. For tests, which cannot wait on a window. */
+  const idle = async (): Promise<void> => {
+    await new Promise<void>((resolve) => { const timer = setTimeout(resolve, burstMs * 2); timer.unref(); });
+  };
+
+  return Object.freeze({ ask, idle });
+}
+
 export async function runReplOnTerminal(cwd: string): Promise<number> {
   const rl: Interface = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const env = process.env;
     const dumb = env.TERM === "dumb";
+    // The prompt is written once, before the read, so a multi-line request is echoed as the single
+    // thing the operator typed rather than as a prompt repeated per line.
+    const promptInput = createPromptInput({
+      input: rl,
+      write: (text) => { process.stdout.write(text); },
+    });
     return await runRepl({
       cwd,
       animate: !dumb && env.BRAINGATE_NO_ANIMATION !== "1",
       colour: !dumb && (env.NO_COLOR === undefined || env.NO_COLOR === ""),
       stdout: (text) => process.stdout.write(text),
       stderr: (text) => process.stderr.write(text),
-      ask: async (question) => {
-        try { return await rl.question(question); }
-        catch { return null; }
-      },
+      ask: (question) => promptInput.ask(question),
       probeCapabilities: probeCapabilitiesFor,
     });
   } finally {

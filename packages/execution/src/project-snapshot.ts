@@ -191,15 +191,38 @@ function nulList(output: string): readonly string[] {
 /**
  * A path from git is untrusted input: it is joined onto the snapshot root, so it is validated before
  * it is used rather than after something has been written through it.
+ *
+ * A trailing separator is tolerated here and removed by `normalizeSnapshotEntryPath`, because git
+ * emits one in a real and ordinary case: `git ls-files --others` reports an untracked *nested
+ * repository* as a single directory entry — `dir/nested/` — rather than enumerating the files inside
+ * it, and `.git/` is not something `--exclude-standard` hides. Measured 2026-09-13 against git 2.51.0
+ * on a project whose tracked root contained exactly that shape.
+ *
+ * Tolerating it does not weaken this check. A trailing separator adds no segment, resolves to the
+ * same location, and every segment that could actually aim a write elsewhere is still rejected
+ * exactly as before. The directory that remains after normalization is refused by the caller, which
+ * is the honest answer: a nested repository is a directory, and a snapshot holds files.
  */
 function assertSafeRelativePath(path: string, maxLength = 1_024): void {
   if (path.length === 0 || path.length > maxLength) throw new BrainGateInvariantError("SNAPSHOT_PATH_INVALID", "Snapshot entry path is empty or implausibly long.");
   if (path.includes("\u0000") || path.includes("\\")) throw new BrainGateInvariantError("SNAPSHOT_PATH_INVALID", "Snapshot entry path contains a NUL byte or a backslash.");
   if (isAbsolute(path)) throw new BrainGateInvariantError("SNAPSHOT_PATH_INVALID", "Snapshot entry path is absolute.");
-  const segments = path.split("/");
+  // The separator git uses to say "this is a directory" is not a segment. Anything else empty is.
+  const segments = (path.endsWith("/") ? path.slice(0, -1) : path).split("/");
   if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
     throw new BrainGateInvariantError("SNAPSHOT_PATH_INVALID", `Snapshot entry path escapes the snapshot root: ${path}`);
   }
+}
+
+/**
+ * The path an entry is actually copied to and recorded under.
+ *
+ * Separate from the guard so the guard can keep rejecting anything that is not a plain path, and this
+ * can do the one normalization that is not a policy decision: git's trailing separator is a notation,
+ * not a location, and every later use — `join`, `lstat`, the manifest — wants the location.
+ */
+function normalizeSnapshotEntryPath(path: string): string {
+  return path.endsWith("/") ? path.slice(0, -1) : path;
 }
 
 function inside(root: string, candidate: string): boolean {
@@ -503,8 +526,9 @@ export class ProjectSnapshotter {
     const excluded: SnapshotExclusion[] = [];
     this.#assertEnumerationSize([...tracked, ...untracked]);
 
-    for (const path of [...tracked, ...untracked]) {
-      assertSafeRelativePath(path, this.#limits.maxPathLength);
+    for (const listed of [...tracked, ...untracked]) {
+      assertSafeRelativePath(listed, this.#limits.maxPathLength);
+      const path = normalizeSnapshotEntryPath(listed);
       const parts = path.split("/");
       if (parts[0] === ".git") { excluded.push(Object.freeze({ path, reason: "vcs-metadata" as const })); continue; }
       if (parts[0] === ".brain") { excluded.push(Object.freeze({ path, reason: "brain-gate-private" as const })); continue; }
@@ -514,6 +538,26 @@ export class ProjectSnapshotter {
       if (isSensitivePath(path)) { excluded.push(Object.freeze({ path, reason: "sensitive-path" as const })); continue; }
       const absolute = join(source, path);
       const stats = lstatSync(absolute);
+      /**
+       * A directory where a file was expected, which in practice means one thing: a nested repository.
+       *
+       * `git ls-files --others` reports a directory holding its own `.git` as a single entry instead of
+       * descending into it, so this is not a malformed path — it is git declining to enumerate a
+       * repository that is not this one. Saying so is the point. The alternative, which is what
+       * happened before this branch existed, was a malformed-path error that sent the operator looking
+       * for a path bug that was not there.
+       *
+       * Refused rather than copied: following it would put a second repository's files into a copy the
+       * provider reads, under a policy the operator never agreed to for that content. If a nested
+       * repository should be part of the project's state, the answer is to register it — not to have
+       * BrainGate guess.
+       */
+      if (stats.isDirectory()) {
+        throw new BrainGateInvariantError(
+          "SNAPSHOT_NESTED_REPOSITORY",
+          `${path} is a nested repository, so git reports the directory instead of the files inside it. A snapshot copies files, so the project's state does not include it. Register that repository as its own project, or add it to .gitignore so it is not part of this one's state.`,
+        );
+      }
       if (stats.isSymbolicLink()) {
         // In-root: taken as the content it points at. Out-of-root: refused outright, because the
         // alternative is a provider reading a file the operator never placed in the project.

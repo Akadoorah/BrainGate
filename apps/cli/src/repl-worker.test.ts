@@ -10,7 +10,7 @@ import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
-import { runRepl } from "./repl.js";
+import { createPromptInput, runRepl } from "./repl.js";
 
 /**
  * M20.2 through the interactive surface: switching workers without losing the goal.
@@ -648,4 +648,158 @@ test("the worker command reports the selection, the goal and what the next run w
   assert.match(text, /Native session: new native session|Native session: resuming native session/);
   assert.match(text, /Sessions on record:/);
   assert.equal(cli.calls.length, 1, "looking at the worker state must not spend anything");
+});
+
+// ---------------------------------------------------------------- failure guidance
+
+test("L: failure guidance names a command the session will not read as a new request", async () => {
+  const f = fixture("failure-guidance");
+  const cli = new FakeCli();
+  // A run that fails after its task was created: the receipt is recorded, and the operator needs to
+  // be told how to read it.
+  const failing: ShadowProcessExecutor = {
+    async run(): Promise<ShadowProcessResult> {
+      return { spawned: true, exitCode: 1, stdout: "", stderr: "provider refused", timedOut: false, durationMs: 3, removedEnvironmentKeys: [] };
+    },
+  };
+  let out = "";
+  const answers = ["Investigate the idle logout", "y"];
+  await runRepl({
+    cwd: f.repo,
+    env: f.env,
+    animate: false,
+    colour: false,
+    stdout: (t) => { out += t; },
+    stderr: (t) => { out += t; },
+    ask: async () => answers.shift() ?? null,
+    executor: failing,
+    discoverAll: async () => [snapshot("anthropic", "Claude Code", "claude")],
+    measureCapabilities: async () => ({}),
+    probeCapabilities: async () => ({ features: { sessionIdPinning: { supported: true } } }),
+  });
+  void cli;
+
+  assert.match(out, /Exit 1: this task did not finish successfully/);
+  // The guidance must not be a bare `tasks list`: the session reads that as a request, and following
+  // BrainGate's own advice spent a task on the phrase — which is exactly what happened in dogfood.
+  assert.doesNotMatch(out, /Run `tasks list`/, "a bare tasks command is a request to this session");
+  assert.match(out, /Use \/status here/, "the interactive equivalent is named");
+  assert.match(out, /`braingate tasks list` in your shell/, "and the shell command is fully qualified");
+});
+
+test("L: /status is an observation, so following the guidance records no second task", async () => {
+  const f = fixture("status-is-an-observation");
+  const cli = new FakeCli();
+  const session = sessionOf(f.repo, f.env, cli, ["/status", "/exit"]);
+  assert.equal(await session.run(), 0);
+  assert.equal(cli.calls.length, 0, "/status must not reach a provider");
+  const store = new GoalStore(f.project);
+  try {
+    // And it must not have started a goal: a command is not a request.
+    assert.equal(store.activeGoal(), null);
+  } finally { store.close(); }
+});
+
+// ---------------------------------------------------------------- pasted input
+
+/** A terminal that can be handed one paste at a time, and drives nothing until asked. */
+class FakeTerminal {
+  readonly #listeners: ((line: string) => void)[] = [];
+  readonly #written: string[] = [];
+  // Built in the constructor rather than as a field initializer: the private collections are not
+  // installed yet when field initializers run, and `createPromptInput` subscribes immediately.
+  readonly prompt: ReturnType<typeof createPromptInput>;
+
+  constructor() {
+    this.prompt = createPromptInput({ input: this, write: (text) => { this.#written.push(text); } });
+  }
+
+  // The three events `createPromptInput` subscribes to, so it can be driven without a real tty.
+  readonly #endListeners: (() => void)[] = [];
+
+  on(event: "line", listener: (line: string) => void): this;
+  on(event: "end" | "close", listener: () => void): this;
+  on(event: string, listener: ((line: string) => void) | (() => void)): this {
+    if (event === "line") this.#listeners.push(listener as (line: string) => void);
+    else this.#endListeners.push(listener as () => void);
+    return this;
+  }
+
+  /** Input ends, as readline reports a closed stdin. */
+  end(): void { for (const listener of [...this.#endListeners]) listener(); }
+
+  read(...lines: readonly string[]): void {
+    for (const line of lines) {
+      const listeners = [...this.#listeners];
+      for (const listener of listeners) listener(line);
+    }
+  }
+
+  /**
+   * Writes a paste the way a terminal delivers one: every line emitted in the same tick, before any
+   * prompt has had a chance to resolve. This is the shape that produced the collision in dogfood.
+   */
+  paste(text: string): void { this.read(...text.split("\n")); }
+  written(): string { return this.#written.join(""); }
+}
+
+test("M: a pasted multiline request is captured whole, and its lines never answer the confirmation", async () => {
+  const terminal = new FakeTerminal();
+  const ask = terminal.prompt.ask;
+
+  const request = ask("> ");
+  terminal.paste("Find why users are logged out.\nTrace the session path.\nKeep the answer concise.");
+  const captured = await request;
+  await terminal.prompt.idle();
+
+  assert.equal(
+    captured,
+    "Find why users are logged out.\nTrace the session path.\nKeep the answer concise.",
+    "the whole paste is one request",
+  );
+
+  // The next prompt must wait for the operator rather than eating a line of the request.
+  let answered = false;
+  const confirmation = ask("  Run it? [y/N] ").then((value) => { answered = true; return value; });
+  await terminal.prompt.idle();
+  assert.equal(answered, false, "the confirmation must not be satisfied by the request's own text");
+
+  terminal.read("y");
+  assert.equal(await confirmation, "y");
+  assert.match(terminal.written(), /Run it\? \[y\/N\] /);
+});
+
+test("M: two lines typed deliberately, seconds apart, are still two answers", async () => {
+  // The window must not merge what a person typed as separate turns: otherwise a multi-line session
+  // would become one enormous request.
+  const terminal = new FakeTerminal();
+  const first = terminal.prompt.ask("> ");
+  terminal.read("first request");
+  assert.equal(await first, "first request");
+  await terminal.prompt.idle();
+
+  const second = terminal.prompt.ask("> ");
+  terminal.read("second request");
+  assert.equal(await second, "second request");
+});
+
+test("M: a paste that ends with the confirmation answered in one burst keeps both apart", async () => {
+  // What dogfood looked like: request, then `y`, all arriving together. The request keeps its lines and
+  // the `y` is left for the confirmation, which is the whole point of the window.
+  const terminal = new FakeTerminal();
+  const request = terminal.prompt.ask("> ");
+  terminal.paste("One line.\nTwo line.\ny");
+  assert.equal(await request, "One line.\nTwo line.\ny", "a single burst is one answer, verbatim");
+  // Which is why the REPL's own behaviour matters here: the `y` would be part of the request, not an
+  // answer to a prompt that has not been shown yet. A person pasting a request and its answer together
+  // is asking for that text to be the request, and BrainGate does not guess which line was which.
+  await terminal.prompt.idle();
+});
+
+test("M: an ended input releases a waiting prompt instead of hanging the session", async () => {
+  // A closed pipe must not leave a prompt waiting forever: that is a process that never exits.
+  const terminal = new FakeTerminal();
+  const waiting = terminal.prompt.ask("> ");
+  terminal.end();
+  assert.equal(await waiting, null, "the end of input is an answer of `no more input`");
 });
