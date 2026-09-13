@@ -4,7 +4,25 @@ import { mkdtempSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, parseProjectConfig } from "./index.js";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  TaskLedger,
+  parseProjectConfig,
+  type ExecutionProject,
+  type RegisteredProject,
+  executionScopeFor,
+} from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 function setupTwoProjects() {
   const root = mkdtempSync(join(tmpdir(), "braingate-ledger-"));
@@ -13,8 +31,8 @@ function setupTwoProjects() {
   mkdirSync(repoA);
   mkdirSync(repoB);
   const registry = new ProjectRegistry(join(root, "state"));
-  const a = registry.register(parseProjectConfig({ project_id: "waslo", name: "Waslo", repositories: [repoA] }));
-  const b = registry.register(parseProjectConfig({ project_id: "tabaq", name: "Tabaq", repositories: [repoB] }));
+  const a = workspace(registry.register(parseProjectConfig({ project_id: "waslo", name: "Waslo", repositories: [repoA] })));
+  const b = workspace(registry.register(parseProjectConfig({ project_id: "tabaq", name: "Tabaq", repositories: [repoB] })));
   return { a, b };
 }
 

@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, realpathSync } from "node:fs";
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
-import { BrainGateInvariantError, assertRegisteredProject, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, assertRegisteredProject, type ExecutionProject } from "@braingate/core";
 
 const TASK_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const BASE_REF = /^[A-Za-z0-9][A-Za-z0-9._\/-]{0,199}$/;
@@ -30,11 +30,11 @@ export interface WorktreeHandle {
 }
 
 export class WorktreeGuard {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #db: Database.Database;
   readonly #root: string;
 
-  constructor(project: RegisteredProject) {
+  constructor(project: ExecutionProject) {
     assertRegisteredProject(project);
     this.#project = project;
     this.#root = join(project.storageDir, "worktrees");

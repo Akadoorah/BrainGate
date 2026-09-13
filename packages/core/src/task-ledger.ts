@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { BrainGateInvariantError } from "./errors.js";
-import { assertRegisteredProject, type RegisteredProject } from "./project-registry.js";
+import { assertRegisteredProject, type ExecutionProject } from "./project-registry.js";
 import type { TaskComplexity, TaskRisk, TaskState } from "./task-outcome.js";
 
 // The vocabularies live in `task-outcome.ts` as runtime lists, so a validator and the type it
@@ -164,11 +164,15 @@ function mapTask(row: TaskRow): TaskRecord {
 }
 
 export class TaskLedger {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #db: Database.Database;
   readonly databasePath: string;
 
-  constructor(project: RegisteredProject) {
+  /**
+   * Takes the workspace's execution handle, never the project's: the ledger describes work done in
+   * one directory, and `storageDir` here is that workspace's own.
+   */
+  constructor(project: ExecutionProject) {
     assertRegisteredProject(project);
     this.#project = project;
     mkdirSync(project.storageDir, { recursive: true });
@@ -237,7 +241,9 @@ export class TaskLedger {
 
   listTasks(): readonly TaskRecord[] {
     const rows = this.#db.prepare(
-      "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC, task_id ASC",
+      // `rowid` breaks a tie on `created_at`, which two tasks created in the same millisecond share.
+      // A random tiebreak would make "the tasks under this goal" a different list on every read.
+      "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC, rowid ASC",
     ).all(this.#project.projectId) as TaskRow[];
     return rows.map(mapTask);
   }
@@ -251,7 +257,7 @@ export class TaskLedger {
    */
   listTasksForGoal(goalId: string): readonly TaskRecord[] {
     const rows = this.#db.prepare(
-      "SELECT * FROM tasks WHERE project_id = ? AND goal_id = ? ORDER BY created_at ASC, task_id ASC",
+      "SELECT * FROM tasks WHERE project_id = ? AND goal_id = ? ORDER BY created_at ASC, rowid ASC",
     ).all(this.#project.projectId, goalId) as TaskRow[];
     return rows.map(mapTask);
   }

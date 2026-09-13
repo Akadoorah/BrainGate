@@ -1,5 +1,5 @@
 import { findManifest } from "./manifest-path.js";
-import { projectFromManifest } from "./project-attachment.js";
+import { attachFromManifest } from "./project-attachment.js";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { conservativeTokenEstimate } from "@braingate/context";
@@ -9,6 +9,7 @@ import {
   TaskLedger,
   budgetFor,
   classifyTask,
+  type ExecutionScope,
   type RegisteredProject,
 } from "@braingate/core";
 import { startDashboardServer } from "@braingate/dashboard";
@@ -362,11 +363,11 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
   } finally { store.close(); }
 }
 
-function snapshotProvider(state: OperatorStatePaths, project: RegisteredProject): () => DashboardSnapshot {
+function snapshotProvider(state: OperatorStatePaths, scope: ExecutionScope): () => DashboardSnapshot {
   return () => {
-    const ledger = new TaskLedger(project);
+    const ledger = new TaskLedger(scope.project);
     const quota = new GlobalQuotaStore(state.globalDir);
-    try { return buildDashboardSnapshot({ projects: [{ project, ledger }], quotaStore: quota }); }
+    try { return buildDashboardSnapshot({ projects: [{ project: scope.project, ledger }], quotaStore: quota }); }
     finally { ledger.close(); quota.close(); }
   };
 }
@@ -605,7 +606,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     if (command === "doctor") {
       const manifest = takeOption(args, "--project", true)!;
       noExtraArgs(args);
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const snapshots = await discovery(deps, state);
       const entries = new ModelCatalog(state.modelCatalogPath).load();
       const isolation = await codexIsolationStatus(snapshots, deps, env, true, state, CODEX_PROBE_VERSION);
@@ -674,8 +675,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     if (command === "status") {
       const manifest = takeOption(args, "--project", true)!;
       noExtraArgs(args);
-      const project = projectFromManifest(state, manifest, cwd);
-      data = snapshotProvider(state, project)();
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
+      data = snapshotProvider(state, scope)();
       const dashboard = data as DashboardSnapshot;
       // "who planned, who wrote, who reviewed" is the question this command exists to answer,
       // and every part of it was already in the data and shown as a count.
@@ -707,9 +708,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       // A read that finds something unfinished says so, and stops there: repairing is a separate,
       // explicit command. Saying nothing would leave the operator reading a summary of tasks that
       // are not finished being written.
-      const ledger = new TaskLedger(project);
+      const ledger = new TaskLedger(scope.project);
       try {
-        const notice = reconciliationNotice(project, ledger);
+        const notice = reconciliationNotice(scope, ledger);
         if (notice !== null) lines.push("", notice);
       } finally { ledger.close(); }
       emit(json, data, lines.join("\n"), stdout);
@@ -720,11 +721,11 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const manifest = takeOption(args, "--project", true)!;
       const portRaw = takeOption(args, "--port");
       noExtraArgs(args);
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const port = portRaw === undefined ? 0 : Number(portRaw);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new BrainGateInvariantError("CLI_PORT_INVALID", "--port must be an integer from 0 to 65535.");
       const starter = deps.startDashboard ?? (async (provider, options) => await startDashboardServer(provider, options));
-      const started = await starter(snapshotProvider(state, project), { host: "127.0.0.1", port });
+      const started = await starter(snapshotProvider(state, scope), { host: "127.0.0.1", port });
       data = { url: started.url, projectId: project.projectId };
       emit(json, data, `BrainGate dashboard: ${started.url}`, stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -745,7 +746,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `write run`.");
 
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
       const snapshots = await discovery(deps, state);
       const hydrated = runtimeFor(state, snapshots);
@@ -822,13 +823,13 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       }
 
       if (!json) stdout(`${classification.complexity}/${classification.risk} · creating isolated worktree · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
-      const ledger = new TaskLedger(project);
-      const store = new DogfoodStore(project);
+      const ledger = new TaskLedger(scope.project);
+      const store = new DogfoodStore(scope.project);
       try {
         const runner = new WriteDogfoodRunner({
-          project,
+          project: scope.project,
           ledger,
-          finalizer: projectFinalizer({ project, ledger, store }),
+          finalizer: projectFinalizer({ project: scope.project, ledger, store }),
           router: hydrated.router,
           providers: snapshots,
           attestations,
@@ -890,7 +891,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const attestations = attestation(args, state);
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `shadow run`.");
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const snapshots = await discovery(deps, state);
       const hydrated = runtimeFor(state, snapshots);
       const classification = classifyTask({ text: task, mode: "ask" });
@@ -908,7 +909,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
       const acceptances = loadAcceptances(state);
       const plan = buildShadowTaskPlan({
-        project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
+        project: scope.project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
         classification, budget, requiredContextTokens, optionalReview, acceptances,
         ...(codexIsolation === undefined ? {} : { codexIsolation }),
         ...(grokIsolation === undefined ? {} : { grokIsolation }),
@@ -923,16 +924,16 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       }
 
       if (!json) stdout(`${classification.complexity}/${classification.risk} · executing ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
-      const ledger = new TaskLedger(project);
-      const store = new DogfoodStore(project);
+      const ledger = new TaskLedger(scope.project);
+      const store = new DogfoodStore(scope.project);
       try {
         const runner = new ShadowDogfoodRunner({
-          project,
+          project: scope.project,
           ledger,
-          finalizer: projectFinalizer({ project, ledger, store }),
+          finalizer: projectFinalizer({ project: scope.project, ledger, store }),
           router: hydrated.router,
           snapshots,
-          snapshotStore: new ProjectSnapshotProvider(project),
+          snapshotStore: new ProjectSnapshotProvider(scope.project),
           attestations,
           acceptances,
           ...(codexIsolation === undefined ? {} : { codexIsolation }),

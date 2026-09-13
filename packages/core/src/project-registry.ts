@@ -12,9 +12,55 @@ export interface ProjectConfig {
 
 const REGISTERED_PROJECT_MARKER = Symbol("braingate.registered-project");
 
+/**
+ * The mark of a handle whose `storageDir` is one workspace's execution storage.
+ *
+ * The value is the workspace id, so a handle that carries it can also say *which* workspace it is.
+ * The ordinary handle's storage is the project's own, which is where durable knowledge lives; this
+ * one's is `<project>/workspaces/<workspaceId>`, which is where execution truth lives. Two handles
+ * that differ only in storage are exactly the kind of implicit difference that caused the earlier
+ * defects, so they are different *types*: an execution store cannot be handed a project handle, and
+ * durable memory refuses an execution handle.
+ */
+export const EXECUTION_SCOPE_MARKER = Symbol("braingate.execution-scope");
+
 export interface RegisteredProject extends ProjectConfig {
   readonly storageDir: string;
   readonly [REGISTERED_PROJECT_MARKER]: true;
+}
+
+/**
+ * A project handle scoped to one workspace.
+ *
+ * What every store that describes *local execution* takes: the task ledger, goals and conversations,
+ * the dogfood corpus, results and evidence, snapshots and worktrees. `storageDir` is the workspace's,
+ * so those files cannot be written beside the project's durable knowledge even by accident.
+ */
+export type ExecutionProject = RegisteredProject & { readonly [EXECUTION_SCOPE_MARKER]: string };
+
+export function isExecutionProject(project: RegisteredProject): project is ExecutionProject {
+  return (project as Partial<ExecutionProject>)[EXECUTION_SCOPE_MARKER] !== undefined;
+}
+
+/** The workspace an execution handle belongs to, or `null` for a project-level handle. */
+export function executionWorkspaceId(project: RegisteredProject): string | null {
+  return isExecutionProject(project) ? project[EXECUTION_SCOPE_MARKER] : null;
+}
+
+/**
+ * Mints the execution handle for one workspace.
+ *
+ * The one seam that decides where execution state lives: `executionScopeFor` in `workspace.ts` is its
+ * only caller, and every store that takes an `ExecutionProject` inherits that decision rather than
+ * making one of its own.
+ */
+export function asExecutionProject(project: RegisteredProject, storageDir: string, workspaceId: string): ExecutionProject {
+  assertRegisteredProject(project);
+  return Object.freeze({
+    ...project,
+    storageDir,
+    [EXECUTION_SCOPE_MARKER]: workspaceId,
+  }) as ExecutionProject;
 }
 
 const PROJECT_ID_PATTERN = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;

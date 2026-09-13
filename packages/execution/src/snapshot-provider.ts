@@ -9,7 +9,7 @@
  * lives in the process only — the ledger records the manifest hash, the counts, the policy version
  * and the source fingerprint, never the path.
  */
-import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, type ExecutionProject } from "@braingate/core";
 import { ProjectSnapshotter, sweepSnapshots, type ProjectSnapshot } from "./project-snapshot.js";
 
 /**
@@ -39,12 +39,12 @@ export interface SnapshotSweepSummary {
 }
 
 export class ProjectSnapshotProvider {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #snapshotter: ProjectSnapshotter;
   readonly #byTask = new Map<string, ProjectSnapshot>();
   readonly #taskStart = new Map<string, string>();
 
-  constructor(project: RegisteredProject) {
+  constructor(project: ExecutionProject) {
     this.#project = project;
     this.#snapshotter = new ProjectSnapshotter({ project });
   }

@@ -4,13 +4,30 @@ import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, parseProjectConfig } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  parseProjectConfig,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 function git(cwd: string, args: string[]) { const r = spawnSync("git", args, { cwd, encoding: "utf8" }); if (r.status !== 0) throw new Error(String(r.stderr)); }
 function setup() {
   const root = mkdtempSync(join(tmpdir(), "braingate-runner-")); const repo = join(root, "repo"); mkdirSync(repo); git(repo, ["init", "-b", "main"]); writeFileSync(join(repo, "a.txt"), "hello\n"); git(repo, ["add", "."]); git(repo, ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init"]);
-  const registry = new ProjectRegistry(join(root, "state")); const project = registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] }));
+  const registry = new ProjectRegistry(join(root, "state")); const project = workspace(registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] })));
   return { root, repo, project };
 }
 

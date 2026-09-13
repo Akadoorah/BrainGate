@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 import {
   BrainGateInvariantError,
   assertRegisteredProject,
+  isExecutionProject,
   type RegisteredProject,
 } from "@braingate/core";
 import { defaultMemoryTtlDays } from "./retention.js";
@@ -190,6 +191,13 @@ export class ProjectMemory {
 
   constructor(project: RegisteredProject, options: { clock?: () => Date } = {}) {
     assertRegisteredProject(project);
+    // Canonical memory is durable project knowledge: it outlives every workspace and is the one
+    // thing an operator promotes *out of* local work. An execution handle carries a workspace's
+    // storage, so accepting one would file project memory under whichever directory happened to be
+    // current — which is how knowledge silently becomes local.
+    if (isExecutionProject(project)) {
+      throw new BrainGateInvariantError("MEMORY_SCOPE_INVALID", "Durable memory is project-scoped; a workspace execution handle cannot own it.");
+    }
     this.#project = project;
     this.projectId = project.projectId;
     this.#clock = options.clock ?? (() => new Date());

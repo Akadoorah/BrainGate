@@ -118,15 +118,22 @@ Two milestones that exist because dogfooding found them, not because a plan pred
     all of it: the native runtime is the default execution mechanism, and BrainGate coordinates it
     rather than replacing it.
   - **M20.3 — Workspace identity, and Git as metadata.** A project gained workspaces: the identity of
-    a workspace is its canonical path, the directory the operator launched in *is* the workspace, and
-    `braingate init` registers a plain directory, a subdirectory of a repository, or a repository —
-    Git is recorded as evidence (`gitRoot`, branch, `HEAD`, remote) and decides nothing. The
-    provider's `cwd`, the attachment refusal and `/project` speak in workspaces now, and every
-    command resolves the same binding through one implementation. ADR
-    [0015](adr/0015-workspace-identity.md). Deliberately still open, each its own slice: routing the
-    ledger, goals and session thread to per-workspace storage; binding a goal to a workspace so a
-    cross-workspace resume is fresh-plus-handoff by construction; and the DIRECT/NATIVE mode that
-    makes a write in a workspace with no repository possible without a worktree.
+    a workspace is its canonical path, `braingate init` registers a plain directory, a subdirectory of
+    a repository, or a repository — Git is recorded as evidence (`gitRoot`, branch, `HEAD`, remote)
+    and decides nothing. The provider's `cwd`, the attachment refusal and `/project` speak in
+    workspaces now, and every command resolves the same binding through one implementation. ADR
+    [0015](adr/0015-workspace-identity.md).
+  - **M20.4 — Workspace-scoped execution state and goal binding.** Every store that describes local
+    execution moved to `<home>/projects/<projectId>/workspaces/<workspaceId>/`: the task ledger,
+    conversations and goals, the dogfood corpus, results and evidence, snapshots, worktrees and the
+    session thread. A goal records the workspace it belongs to and refuses by id when it is not this
+    one; a provider session is bound to project, workspace, goal, provider and model, so continuing
+    the same work elsewhere is a handoff and a fresh session rather than a native resume. Durable
+    knowledge stayed project-scoped, and memory refuses a workspace handle. State written before
+    workspaces existed is preserved read-only, never read and never migrated on a guess. ADR
+    [0016](adr/0016-workspace-scoped-execution-state.md). Still open, and next: the DIRECT/NATIVE
+    execution mode that makes a write in a workspace with no repository possible without a worktree,
+    and an explicit import tool for legacy state if one is ever wanted.
 
 ## Immediate technical hardening
 

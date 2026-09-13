@@ -11,7 +11,7 @@ import {
   type FailureKind,
   type FinalizationPlan,
   type ObservationRole,
-  type RegisteredProject,
+  type ExecutionProject,
   type TaskClassification,
   type TaskFinalizer,
   type TaskLedger,
@@ -153,7 +153,7 @@ export interface ShadowDogfoodResult {
 }
 
 export class ShadowDogfoodRunner {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #ledger: TaskLedger;
   readonly #router: CapabilityRouter;
   readonly #snapshots: readonly ProviderSnapshot[];
@@ -173,7 +173,7 @@ export class ShadowDogfoodRunner {
   readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
 
   constructor(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly ledger: TaskLedger;
     readonly router: CapabilityRouter;
     readonly snapshots: readonly ProviderSnapshot[];

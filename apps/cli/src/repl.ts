@@ -7,7 +7,7 @@ import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
-import { ProjectRegistry, TaskLedger, resolveAttachment } from "@braingate/core";
+import { ProjectRegistry, TaskLedger, executionScopeFor, gitMetadataFor, legacyExecutionState, resolveAttachment, type ExecutionScope } from "@braingate/core";
 import {
   GoalStore,
   buildGoalContext,
@@ -112,22 +112,15 @@ function firstLine(text: string): string {
 }
 
 /**
- * Where this directory's session thread belongs, or nowhere.
+ * Where this workspace's session thread belongs, or nowhere.
  *
- * A thread is project state, so it needs a registered project to belong to. Without one — or if
- * anything about resolving it fails — the session simply keeps its thread in memory, which is
- * what it always did.
+ * A thread holds turns that name local files, so it belongs to the workspace they were produced in.
+ * Without one — or if anything about resolving it fails — the session keeps its thread in memory,
+ * which is what it always did.
  */
-function threadOptions(cwd: string, env: NodeJS.ProcessEnv | undefined): { readonly path?: string } {
-  try {
-    const state = resolveOperatorState(env ?? process.env);
-    const manifest = findManifest(cwd);
-    if (!existsSync(manifest)) return {};
-    const project = new ProjectRegistry(state.home).loadFile(manifest);
-    return { path: sessionThreadPath(project.storageDir) };
-  } catch {
-    return {};
-  }
+function threadOptions(scope: ExecutionScope | null): { readonly path?: string } {
+  if (scope === null) return {};
+  try { return { path: sessionThreadPath(scope.storageDir) }; } catch { return {}; }
 }
 
 /**
@@ -553,7 +546,7 @@ export function answerOf(data: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-async function runSlash(line: string, deps: ReplDeps, session: SessionContext, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<"continue" | "exit"> {
+async function runSlash(line: string, deps: ReplDeps, session: SessionContext, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState, workspaceScope: ExecutionScope | null): Promise<"continue" | "exit"> {
   const [command, ...rest] = line.slice(1).trim().split(/\s+/);
   const io = { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr };
 
@@ -617,7 +610,17 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
     case "goal": {
       if (goals === null) { deps.stderr("  No goal store here. Goals need a registered project and a readable operator state.\n"); return "continue"; }
       const goal = goals.activeGoal();
-      if (goal === null) { deps.stdout("  No goal yet. The next request starts one.\n"); return "continue"; }
+      // A goal belongs to the workspace whose files it reasons about, so the workspace is part of
+      // what this report has to say — and a goal found here that belongs to another one is named
+      // rather than hidden, because otherwise it looks like the goal simply vanished.
+      const foreign = goals.goalsFromAnotherWorkspace();
+      if (goal === null) {
+        deps.stdout(foreign.length === 0
+          ? "  No goal yet. The next request starts one.\n"
+          : `  No goal in this workspace. ${String(foreign.length)} goal(s) here belong to another workspace and are not used.\n`);
+        return "continue";
+      }
+      if (workspaceScope !== null) deps.stdout(`  Workspace: ${workspaceScope.workspacePath} · ${workspaceScope.workspaceId}\n`);
       deps.stdout("\n");
       deps.stdout(`${renderHandoff(buildGoalContext({ goal, workUnit: "(nothing yet — this is the current state)", recentTurns: [] }).handoff).split("\nYour current task:")[0]!}\n`);
       // What has actually been run under this goal, read from the ledger rather than from the goal's
@@ -663,15 +666,28 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       });
       deps.stdout("\n");
       if (attached.kind === "attached") {
-        deps.stdout(`  Project:   ${attached.project.projectId} (${attached.project.name})\n`);
-        deps.stdout(`  Workspace: ${attached.checkout.root}\n`);
-        deps.stdout(`  Manifest:  ${attached.checkout.manifestPath}\n`);
+        // The workspace id is the key every piece of execution state is filed under, so it is worth
+        // showing: an operator who wants to know which ledger, goal store and sessions this session
+        // is using has one line to read rather than a directory to guess at.
+        // The registered workspace, not the directory they happen to be in: state is filed under the
+        // former, and `Directory` below reports the latter when they differ.
+        const scope = executionScopeFor(attached.project, attached.registeredRoot);
+        const git = gitMetadataFor(scope.workspacePath) ?? scope.git;
+        deps.stdout(`  Project:      ${attached.project.projectId} (${attached.project.name})\n`);
+        deps.stdout(`  Workspace:    ${scope.workspacePath}\n`);
+        deps.stdout(`  Workspace ID: ${scope.workspaceId}\n`);
+        // Where workers actually run, when that is below the workspace: the state is filed under the
+        // workspace and the native CLI still starts in the directory the operator launched from.
+        if (attached.checkout.root !== scope.workspacePath) deps.stdout(`  Directory:    ${attached.checkout.root}\n`);
+        deps.stdout(`  State:        ${scope.storageDir}\n`);
+        deps.stdout(`  Manifest:     ${attached.checkout.manifestPath ?? "none"}\n`);
         // Reported because it is useful evidence, and labelled because it is not the identity: the
         // directory above is where the native CLIs run whether or not there is a repository above it.
-        deps.stdout(attached.checkout.gitRoot === null
-          ? "  Git:       none — this workspace is not inside a repository\n"
-          : `  Git:       ${attached.checkout.gitRoot} (metadata, not the identity)\n`);
-        deps.stdout("  Execution is bound to this workspace. A different directory is a different workspace,\n  even when it shares a name, a remote or a repository.\n\n");
+        deps.stdout(git === null
+          ? "  Git:          none — this workspace is not inside a repository\n"
+          : `  Git:          ${git.gitRoot} · ${git.branch ?? "(detached)"}${git.head === null ? " · no commits yet" : ` @ ${git.head.slice(0, 8)}`}${git.dirty ? " · uncommitted changes" : " · clean"}\n`);
+        deps.stdout("  Execution is bound to this workspace: the ledger, goals, sessions and evidence above.\n");
+        deps.stdout("  A different directory is a different workspace, even when it shares a name, a remote or a\n  repository, and it does not inherit any unfinished work from this one.\n\n");
         return "continue";
       }
       if (attached.kind === "unregistered") {
@@ -691,6 +707,9 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       const goal = goals === null ? null : goals.activeGoal();
       const known = goals === null ? [] : goals.listProviderSessions(8);
       for (const line of describeWorker({ selection: worker.selection, goal, lastRun: worker.lastRun, knownSessions: known })) deps.stdout(`${line}\n`);
+      // Native continuity is per workspace as well as per provider and model, so which workspace
+      // these sessions belong to is part of the answer to "what would resume".
+      if (workspaceScope !== null) deps.stdout(`  workspace: ${workspaceScope.workspacePath} · ${workspaceScope.workspaceId}\n`);
       return "continue";
     }
     case "new": {
@@ -797,22 +816,62 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     deps.stdout("\n");
   }
 
+  /**
+   * The workspace this session executes in, resolved once.
+   *
+   * Resolved *after* the first-run branch, because `init` writes the manifest the attachment above
+   * could not find. Everything the session files — the thread, the conversation, the goal, the
+   * ledger, the sessions — goes under this workspace's storage, and the provider's cwd is this
+   * directory. Two workspaces of one project therefore share durable memory and nothing else.
+   *
+   * `null` when even the second attempt cannot attach, which leaves the session running in memory
+   * rather than refusing to start.
+   */
+  const resolved = attachment.kind === "unregistered"
+    ? resolveAttachment({
+      cwd: deps.cwd,
+      registry: { loadFile: (manifestPath) => new ProjectRegistry(resolveOperatorState(deps.env ?? process.env).home).loadFile(manifestPath) },
+    })
+    : attachment;
+  const workspaceScope: ExecutionScope | null = resolved.kind === "attached" || resolved.kind === "inspecting"
+    ? executionScopeFor(resolved.project, resolved.kind === "inspecting" ? resolved.registeredRoot : resolved.checkout.root)
+    : null;
+
+  // State written before a workspace was part of the identity cannot be assigned to one: it is the
+  // history of a project id, and two directories shared it. It is preserved where it is, never read
+  // here, and never injected into this workspace's goals — so the operator is told once, at the top,
+  // rather than left wondering where their earlier tasks went.
+  if (workspaceScope !== null) {
+    const legacy = legacyExecutionState(workspaceScope.projectStorageDir);
+    if (legacy.length > 0) {
+      deps.stdout([
+        "  Execution state from before workspaces were part of the identity is present at:",
+        `    ${workspaceScope.projectStorageDir}`,
+        `    ${legacy.join(", ")}`,
+        "  It is preserved and not used: it cannot say which directory it came from. This workspace",
+        "  starts empty, and nothing from the above is carried into it.",
+        "",
+      ].join("\n"));
+    }
+  }
+
   const header: string[] = [];
   await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t), ...runtimeDeps(deps) });
   deps.stdout(`  ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
 
-  // The thread from earlier today, if there is one. It lives with the project's own state, so a
-  // different project in another terminal has its own and neither can see the other's.
-  const session = new SessionContext(threadOptions(deps.cwd, deps.env));
+  // The thread from earlier today, if there is one. It lives with this workspace's own state, so
+  // another workspace in another terminal has its own and neither can see the other's.
+  const session = new SessionContext(threadOptions(workspaceScope));
   if (session.resumed > 0) {
     deps.stdout(`  Continuing a thread of ${String(session.resumed)} earlier ${session.resumed === 1 ? "turn" : "turns"}. /forget starts fresh.\n\n`);
   }
   const providers = new ProviderSnapshotCache();
-  // The goal this session continues. One conversation per project, opened on the first run and
+  // The goal this session continues. One conversation per workspace, opened on the first run and
   // resumed by every run after it, which is what makes closing the terminal not the same as
-  // changing the subject. Everything it holds is project state, in the project's own storage dir.
-  const goals = openGoalStore(deps.cwd, deps.env);
-  const ledger = openLedger(deps.cwd, deps.env);
+  // changing the subject. Everything it holds is this workspace's execution state: what was asked,
+  // what came back, which files it touched. Another workspace of the same project has its own.
+  const goals = openGoalStore(workspaceScope);
+  const ledger = openLedger(workspaceScope);
   let current: GoalRecord | null = null;
   let activeGoalId: string | null = null;
   if (goals !== null) {
@@ -838,7 +897,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
       const input = line.trim();
       if (input.length === 0) continue;
       if (input.startsWith("/")) {
-        if (await runSlash(input, deps, session, goals, ledger, worker) === "exit") return 0;
+        if (await runSlash(input, deps, session, goals, ledger, worker, workspaceScope) === "exit") return 0;
         // `/new` abandons the current goal, so the cached record must follow it rather than
         // describing a goal this session no longer continues.
         if (goals !== null && activeGoalId !== null && goals.getGoal(activeGoalId)?.state.status === "abandoned") {
@@ -871,34 +930,23 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
 }
 
 /**
- * Where this directory's goals live, or nowhere.
+ * Where this workspace's goals live, or nowhere.
  *
- * A goal is project state, so it needs a registered project to belong to. Without one — or if
- * resolving it fails — the session runs exactly as it did before M20, in memory, rather than
- * refusing to start because a store could not be opened. A feature that is missing is a smaller
- * problem than a terminal that will not open.
+ * A goal belongs to a workspace — the directory whose files it reasons about — so it needs a
+ * registered project *and* the workspace scope that project is running in here. Without one, or if
+ * resolving it fails, the session runs exactly as it did before M20, in memory, rather than refusing
+ * to start because a store could not be opened. A feature that is missing is a smaller problem than
+ * a terminal that will not open.
  */
-function openGoalStore(cwd: string, env: NodeJS.ProcessEnv | undefined): GoalStore | null {
-  try {
-    const state = resolveOperatorState(env ?? process.env);
-    const manifest = findManifest(cwd);
-    if (!existsSync(manifest)) return null;
-    return new GoalStore(new ProjectRegistry(state.home).loadFile(manifest));
-  } catch {
-    return null;
-  }
+function openGoalStore(scope: ExecutionScope | null): GoalStore | null {
+  if (scope === null) return null;
+  try { return new GoalStore(scope.project); } catch { return null; }
 }
 
 /** The task ledger, for reading which work units belong to a goal. Same availability rules. */
-function openLedger(cwd: string, env: NodeJS.ProcessEnv | undefined): TaskLedger | null {
-  try {
-    const state = resolveOperatorState(env ?? process.env);
-    const manifest = findManifest(cwd);
-    if (!existsSync(manifest)) return null;
-    return new TaskLedger(new ProjectRegistry(state.home).loadFile(manifest));
-  } catch {
-    return null;
-  }
+function openLedger(scope: ExecutionScope | null): TaskLedger | null {
+  if (scope === null) return null;
+  try { return new TaskLedger(scope.project); } catch { return null; }
 }
 
 /** Wires the session to the real terminal. */

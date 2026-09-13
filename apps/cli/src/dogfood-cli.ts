@@ -1,5 +1,5 @@
 import { findManifest } from "./manifest-path.js";
-import { projectFromManifest } from "./project-attachment.js";
+import { attachFromManifest } from "./project-attachment.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -634,7 +634,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const state = resolveOperatorState(env);
   const manifest = manifestOption(args);
   noExtraArgs(args);
-  const project = projectFromManifest(state, manifest, cwd);
+  const { project, scope } = attachFromManifest(state, manifest, cwd);
   const repositories = project.repositories.map(inspectGitRepository);
   const snapshots = await discovery(deps, state);
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
@@ -711,10 +711,10 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
   const state = resolveOperatorState(env);
   const oauth = attestations(copilotOauth, state);
-  const project = projectFromManifest(state, manifest, cwd);
+  const { project, scope } = attachFromManifest(state, manifest, cwd);
   const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
-  const store = new DogfoodStore(project);
+  const store = new DogfoodStore(scope.project);
   try {
     const predicted = classifyTask({ text: task, mode: "ask" });
     const prior = store.derivePrior("ask");
@@ -753,7 +753,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
-    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
+    const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
     // terminal prints; `complexity`, `risk`, `promptComplexity` and `roleLines` are the same facts as
@@ -791,7 +791,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // Collected during the run and written once it ends: a provider reports every window on
     // every call, and only the fullest of them should decide where the next task goes.
     const pendingQuotaReadings: (QuotaReading & { readonly quotaPool: string })[] = [];
-    const ledger = new TaskLedger(project);
+    const ledger = new TaskLedger(scope.project);
     // Whatever was newest before this invocation, so the task this run created can be identified on
     // the failure path — a refusal ends the run, and its backoff must be applied anyway.
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
@@ -800,7 +800,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // and deduplicated because a task may spend several phases on the same model.
     const servedBy: string[] = [];
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
+      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
         if (activity.stage === "started") {
           const attribution = `${activity.provider}/${activity.model}`;
           if (!servedBy.includes(attribution)) servedBy.push(attribution);
@@ -851,11 +851,11 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
 
   const state = resolveOperatorState(env);
   const oauth = attestations(copilotOauth, state);
-  const project = projectFromManifest(state, manifest, cwd);
+  const { project, scope } = attachFromManifest(state, manifest, cwd);
   const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
   const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
-  const store = new DogfoodStore(project);
+  const store = new DogfoodStore(scope.project);
   try {
     const predicted = classifyTask({ text: task, mode: "write" });
     const prior = store.derivePrior("write");
@@ -908,10 +908,10 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       return Object.freeze({ exitCode: 0, data });
     }
 
-    const ledger = new TaskLedger(project);
+    const ledger = new TaskLedger(scope.project);
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       // Read back what the runner recorded, so the screen and the ledger cannot disagree.
@@ -1020,8 +1020,8 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
 
     const state = resolveOperatorState(env);
     const manifest = manifestOption(args);
-    const project = projectFromManifest(state, manifest, cwd);
-    const store = new DogfoodStore(project);
+    const { project, scope } = attachFromManifest(state, manifest, cwd);
+    const store = new DogfoodStore(scope.project);
     try {
       if (subcommand === "feedback") {
         const taskId = takeOption(args, "--task-id", true)!;

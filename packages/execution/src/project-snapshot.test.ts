@@ -4,8 +4,25 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, parseProjectConfig } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  parseProjectConfig,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { ProjectSnapshotter, ProjectSnapshotProvider, SNAPSHOT_LIMITS, assertSnapshotPath, sweepSnapshots } from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 /**
  * The fixture lives under the operator's home, not in a system temporary directory.
@@ -37,7 +54,7 @@ function setupRepo(options: { readonly files?: Readonly<Record<string, string>> 
   git(["add", "."]);
   git(["commit", "-m", "init"]);
   const registry = new ProjectRegistry(join(home, "state"));
-  const project = registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] })));
   return { home, repo, project, git };
 }
 

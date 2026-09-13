@@ -26,7 +26,7 @@ import { chmodSync, copyFileSync, existsSync, lstatSync, mkdirSync, readFileSync
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { BrainGateInvariantError } from "@braingate/core";
 import { isSensitivePath } from "@braingate/security";
-import type { RegisteredProject } from "@braingate/core";
+import type { ExecutionProject } from "@braingate/core";
 
 /** The policy document version. Any change to the rules below belongs in this string. */
 export const SNAPSHOT_POLICY_VERSION = "2026-09-12.1";
@@ -169,7 +169,7 @@ export interface SnapshotLimits {
 }
 
 export interface SnapshotterOptions {
-  readonly project: RegisteredProject;
+  readonly project: ExecutionProject;
   readonly limits?: SnapshotLimits;
   readonly now?: () => Date;
   /** One retry by default: a source that changed mid-copy is retried once, then refused. */
@@ -259,7 +259,7 @@ interface SourceListing {
 }
 
 export class ProjectSnapshotter {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #limits: SnapshotLimits;
   readonly #now: () => Date;
   readonly #attempts: number;
@@ -272,7 +272,7 @@ export class ProjectSnapshotter {
   }
 
   /** Where snapshots live: inside the project's private storage, never in a system temp tree. */
-  static storageRoot(project: RegisteredProject): string {
+  static storageRoot(project: ExecutionProject): string {
     return join(project.storageDir, "snapshots");
   }
 
@@ -644,7 +644,7 @@ function pidIsAlive(pid: number): boolean {
  * It is idempotent: a second sweep finds nothing to remove.
  */
 export function sweepSnapshots(input: {
-  readonly project: RegisteredProject;
+  readonly project: ExecutionProject;
   readonly now?: number;
   readonly graceMs?: number;
   /** Whether the task a snapshot belongs to is finished. `undefined` when the caller cannot say. */

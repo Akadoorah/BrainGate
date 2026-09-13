@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { BrainGateInvariantError, assertRegisteredProject, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, assertRegisteredProject, executionWorkspaceId, type ExecutionProject } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import type { ProviderId } from "@braingate/providers";
 import { EMPTY_GOAL_STATE, applyGoalStateUpdate } from "./goal-state.js";
@@ -50,7 +50,7 @@ export const MAX_STORED_TURN_CHARS = 8_000;
  * nothing reaches `ProjectMemory` except through the existing proposal gate. Keeping that line
  * visible is what stops an unverified answer acquiring the standing of a verified one.
  */
-export const GOALS_SCHEMA_VERSION = 1;
+export const GOALS_SCHEMA_VERSION = 2;
 
 interface ConversationRow {
   conversation_id: string;
@@ -66,6 +66,7 @@ interface GoalRow {
   goal_id: string;
   conversation_id: string;
   project_id: string;
+  workspace_id: string | null;
   objective: string;
   status: string;
   state_json: string;
@@ -95,6 +96,7 @@ interface SessionRow {
   status: SessionStatus;
   runtime_version: string | null;
   workspace: string | null;
+  workspace_id: string | null;
   goal_id: string | null;
   conversation_id: string | null;
   last_task_id: string | null;
@@ -118,6 +120,7 @@ const SESSION_ADDED_COLUMNS: readonly { readonly name: string; readonly ddl: str
   { name: "status", ddl: "status TEXT NOT NULL DEFAULT 'active'" },
   { name: "runtime_version", ddl: "runtime_version TEXT" },
   { name: "workspace", ddl: "workspace TEXT" },
+  { name: "workspace_id", ddl: "workspace_id TEXT" },
   { name: "last_task_id", ddl: "last_task_id TEXT" },
   { name: "last_turn_sequence", ddl: "last_turn_sequence INTEGER" },
   { name: "created_at", ddl: "created_at TEXT" },
@@ -139,6 +142,7 @@ function mapSession(row: SessionRow): ProviderSessionRecord {
     status: isSessionStatus(row.status) ? row.status : "active",
     runtimeVersion: row.runtime_version,
     workspace: row.workspace,
+    workspaceId: row.workspace_id,
     goalId: row.goal_id,
     conversationId: row.conversation_id,
     lastTaskId: row.last_task_id,
@@ -208,6 +212,7 @@ function mapGoal(row: GoalRow): GoalRecord {
     goalId: row.goal_id,
     conversationId: row.conversation_id,
     projectId: row.project_id,
+    workspaceId: row.workspace_id,
     objective: row.objective,
     state: parseState(row.state_json),
     createdAt: row.created_at,
@@ -216,15 +221,28 @@ function mapGoal(row: GoalRow): GoalRecord {
 }
 
 export class GoalStore {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
+  readonly #workspaceId: string;
   readonly #db: Database.Database;
   readonly #now: () => string;
   readonly #newId: () => string;
   readonly databasePath: string;
 
-  constructor(project: RegisteredProject, options: { readonly now?: () => string; readonly newId?: () => string } = {}) {
+  /**
+   * Takes the workspace's execution handle: a goal belongs to the directory it is working in.
+   *
+   * The handle carries both halves of that — the workspace id stamped on every goal, and the storage
+   * directory the database lives in — so a goal store cannot be opened for one workspace and read
+   * another's rows.
+   */
+  constructor(project: ExecutionProject, options: { readonly now?: () => string; readonly newId?: () => string } = {}) {
     assertRegisteredProject(project);
+    const workspaceId = executionWorkspaceId(project);
+    if (workspaceId === null) {
+      throw new BrainGateInvariantError("GOAL_SCOPE_INVALID", "A goal store is workspace-scoped; a project-level handle cannot own one.");
+    }
     this.#project = project;
+    this.#workspaceId = workspaceId;
     this.#now = options.now ?? nowIso;
     this.#newId = options.newId ?? randomUUID;
     mkdirSync(project.storageDir, { recursive: true, mode: 0o700 });
@@ -294,9 +312,9 @@ export class GoalStore {
     const timestamp = this.#now();
     const transaction = this.#db.transaction(() => {
       this.#db.prepare(`
-        INSERT INTO goals (goal_id, conversation_id, project_id, objective, status, state_json, created_at, updated_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-      `).run(goalId, input.conversationId, this.#project.projectId, objective, EMPTY_GOAL_STATE.status, JSON.stringify(EMPTY_GOAL_STATE), timestamp, timestamp);
+        INSERT INTO goals (goal_id, conversation_id, project_id, workspace_id, objective, status, state_json, created_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(goalId, input.conversationId, this.#project.projectId, this.#workspaceId, objective, EMPTY_GOAL_STATE.status, JSON.stringify(EMPTY_GOAL_STATE), timestamp, timestamp);
       this.#db.prepare("UPDATE conversations SET active_goal_id = ?, updated_at = ? WHERE conversation_id = ? AND project_id = ?")
         .run(goalId, timestamp, input.conversationId, this.#project.projectId);
       this.#db.prepare(`
@@ -308,12 +326,61 @@ export class GoalStore {
     return this.requireGoal(goalId);
   }
 
-  /** The goal a follow-up continues, or `null` before the first one exists. */
+  /**
+   * The goal a follow-up continues, or `null` before the first one exists.
+   *
+   * A goal belonging to another workspace is not returned. The database is this workspace's, so the
+   * only way to meet one is a file that arrived from somewhere else, and continuing it here would
+   * execute one workspace's goal against another's files. It is reported by
+   * `goalsFromAnotherWorkspace()` instead of being silently skipped, because an operator whose goal
+   * vanished deserves to be told why.
+   */
   activeGoal(conversationId?: string): GoalRecord | null {
     const conversation = conversationId === undefined ? this.activeConversation() : this.getConversation(conversationId);
     if (conversation === null || conversation === undefined) return null;
     if (conversation.activeGoalId === null) return null;
-    return this.getGoal(conversation.activeGoalId) ?? null;
+    const goal = this.getGoal(conversation.activeGoalId);
+    if (goal === undefined || !this.#belongsHere(goal)) return null;
+    return goal;
+  }
+
+  /**
+   * Goals in this database that belong to a different workspace.
+   *
+   * Preserved, never executed, and named so the refusal can say which workspace they came from.
+   */
+  goalsFromAnotherWorkspace(): readonly GoalRecord[] {
+    const rows = this.#db.prepare("SELECT * FROM goals WHERE project_id = ?").all(this.#project.projectId) as GoalRow[];
+    return Object.freeze(rows.map(mapGoal).filter((goal) => !this.#belongsHere(goal)));
+  }
+
+  /**
+   * The goal, refusing in the terms the operator needs when it is not this workspace's.
+   *
+   * Used by anything that resumes by id rather than by "the active goal": an explicit id is how a
+   * goal gets continued across a restart, and it is also how one would be continued from the wrong
+   * directory.
+   */
+  requireGoalInWorkspace(goalId: string): GoalRecord {
+    const goal = this.requireGoal(goalId);
+    if (!this.#belongsHere(goal)) {
+      throw new BrainGateInvariantError(
+        "GOAL_WORKSPACE_MISMATCH",
+        [
+          `Goal ${goalId} belongs to workspace ${goal.workspaceId ?? "unknown"}, which is not this one.`,
+          `  this workspace: ${this.#workspaceId}`,
+          "",
+          "BrainGate will not run one workspace's goal against another's files. The goal and its",
+          "record are preserved where they are; continue it from the workspace that owns it.",
+        ].join("\n"),
+      );
+    }
+    return goal;
+  }
+
+  /** Whether a stored goal belongs to the workspace this store is open for. */
+  #belongsHere(goal: GoalRecord): boolean {
+    return goal.workspaceId === null || goal.workspaceId === this.#workspaceId;
   }
 
   /**
@@ -333,7 +400,17 @@ export class GoalStore {
     // so a session holding a stale copy cannot continue a goal that has since been changed or
     // closed — the read is what decides, and the caller's id only chooses which row to read.
     const selected = input.goalId ?? conversation.activeGoalId;
+    // Named explicitly and owned elsewhere: refused in the operator's terms rather than quietly
+    // starting a new goal, because "continue this one" and "start another" are different requests.
+    if (input.goalId !== undefined && input.goalId !== null && this.getGoal(input.goalId) !== undefined) {
+      this.requireGoalInWorkspace(input.goalId);
+    }
     const current = selected === null ? null : this.getGoal(selected);
+    if (current !== undefined && current !== null && !this.#belongsHere(current)) {
+      // The conversation's own active goal came from another workspace. It is not the goal this
+      // request continues, so a new one is created here — the foreign row is left alone.
+      return this.createGoal({ conversationId: input.conversationId, objective: input.request });
+    }
     if (current !== null && current !== undefined && current.state.status !== "done" && current.state.status !== "abandoned") return current;
     return this.createGoal({ conversationId: input.conversationId, objective: input.request });
   }
@@ -501,6 +578,8 @@ export class GoalStore {
     readonly status?: SessionStatus | undefined;
     readonly runtimeVersion?: string | null;
     readonly workspace?: string | null;
+    /** Defaults to this store's workspace, which is the only one a session here can belong to. */
+    readonly workspaceId?: string | null;
     readonly goalId?: string | null;
     readonly conversationId?: string | null;
     readonly lastTaskId?: string | null;
@@ -517,7 +596,9 @@ export class GoalStore {
     if (sessionId.length === 0) {
       throw new BrainGateInvariantError("GOAL_SESSION_ID_INVALID", "A provider session needs a non-empty id.");
     }
-    const goal = input.goalId == null ? null : this.requireGoal(input.goalId);
+    // A session is continuity for one goal in one workspace, so a goal named from another workspace
+    // is refused rather than attached to.
+    const goal = input.goalId == null ? null : this.requireGoalInWorkspace(input.goalId);
     const turn = input.lastTurnSequence ?? null;
     if (turn !== null && (!Number.isInteger(turn) || turn < 0)) {
       throw new BrainGateInvariantError("GOAL_SESSION_TURN_INVALID", "lastTurnSequence must be a non-negative integer.");
@@ -529,15 +610,16 @@ export class GoalStore {
     this.#db.prepare(`
       INSERT INTO provider_sessions (
         project_id, provider_id, model_id, session_id, quota_pool, resume_mode, status,
-        runtime_version, workspace, goal_id, conversation_id, last_task_id, last_turn_sequence,
+        runtime_version, workspace, workspace_id, goal_id, conversation_id, last_task_id, last_turn_sequence,
         created_at, last_used_at, recorded_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (project_id, provider_id, model_id, session_id) DO UPDATE SET
         quota_pool = excluded.quota_pool,
         resume_mode = excluded.resume_mode,
         status = excluded.status,
         runtime_version = excluded.runtime_version,
         workspace = excluded.workspace,
+        workspace_id = excluded.workspace_id,
         goal_id = excluded.goal_id,
         conversation_id = excluded.conversation_id,
         last_task_id = excluded.last_task_id,
@@ -554,6 +636,7 @@ export class GoalStore {
       status,
       input.runtimeVersion ?? null,
       input.workspace ?? null,
+      input.workspaceId ?? this.#workspaceId,
       goal?.goalId ?? null,
       input.conversationId ?? goal?.conversationId ?? null,
       input.lastTaskId ?? null,
@@ -586,9 +669,11 @@ export class GoalStore {
    * a Haiku run is pinned would hand Haiku a conversation it never had.
    */
   latestSessionFor(providerId: ProviderId, modelId: string | null): ProviderSessionRecord | null {
+    // A session with no workspace id is one written before M20.4 into this workspace's own file, so
+    // it is this workspace's. One that names a different workspace is not, and is not resumed.
     const row = this.#db.prepare(
-      "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id IS ? ORDER BY last_used_at DESC, session_id DESC LIMIT 1",
-    ).get(this.#project.projectId, providerId, modelId) as SessionRow | undefined;
+      "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id IS ? AND (workspace_id IS NULL OR workspace_id = ?) ORDER BY last_used_at DESC, session_id DESC LIMIT 1",
+    ).get(this.#project.projectId, providerId, modelId, this.#workspaceId) as SessionRow | undefined;
     return row === undefined ? null : mapSession(row);
   }
 
@@ -716,6 +801,7 @@ export class GoalStore {
         goal_id TEXT PRIMARY KEY,
         conversation_id TEXT NOT NULL,
         project_id TEXT NOT NULL,
+        workspace_id TEXT,
         objective TEXT NOT NULL,
         status TEXT NOT NULL CHECK (status IN (${GOAL_STATUSES.map((value) => `'${value}'`).join(", ")})),
         state_json TEXT NOT NULL,
@@ -759,6 +845,7 @@ export class GoalStore {
         status TEXT NOT NULL DEFAULT 'active',
         runtime_version TEXT,
         workspace TEXT,
+        workspace_id TEXT,
         goal_id TEXT,
         conversation_id TEXT,
         last_task_id TEXT,
@@ -797,8 +884,25 @@ export class GoalStore {
       CREATE INDEX IF NOT EXISTS idx_turns_conversation_sequence ON conversation_turns(project_id, conversation_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_sessions_project_provider ON provider_sessions(project_id, provider_id, updated_at);
     `);
+    this.#addGoalWorkspaceColumn();
     this.#addSessionColumns();
     if (version < GOALS_SCHEMA_VERSION) this.#db.pragma(`user_version = ${String(GOALS_SCHEMA_VERSION)}`);
+  }
+
+  /**
+   * Adds `goals.workspace_id` to a file written before M20.4, and binds its rows to their workspace.
+   *
+   * The file already lives in one workspace's storage, so a row with no workspace id *is* a row of
+   * that workspace: `NULL` here can only mean "written before the column existed", never "belongs
+   * somewhere else". Binding it is therefore the one reading that is not a guess. A row that names a
+   * different workspace is left exactly as it is and refuses at read time instead.
+   */
+  #addGoalWorkspaceColumn(): void {
+    const columns = new Set(
+      (this.#db.pragma("table_info(goals)") as readonly { readonly name: string }[]).map((column) => column.name),
+    );
+    if (!columns.has("workspace_id")) this.#db.exec("ALTER TABLE goals ADD COLUMN workspace_id TEXT");
+    this.#db.prepare("UPDATE goals SET workspace_id = ? WHERE workspace_id IS NULL").run(this.#workspaceId);
   }
 
   /**

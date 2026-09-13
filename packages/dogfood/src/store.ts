@@ -10,7 +10,7 @@ import {
   type FailureKind,
   type ObservationInput,
   type ObservationRecord,
-  type RegisteredProject,
+  type ExecutionProject,
   type TaskComplexity,
   type TaskReceipt,
   type TaskRisk,
@@ -281,11 +281,11 @@ function mapFeedback(row: FeedbackRow): DogfoodFeedbackRecord {
 }
 
 export class DogfoodStore {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #db: Database.Database;
   readonly databasePath: string;
 
-  constructor(project: RegisteredProject) {
+  constructor(project: ExecutionProject) {
     assertRegisteredProject(project);
     this.#project = project;
     mkdirSync(project.storageDir, { recursive: true, mode: 0o700 });

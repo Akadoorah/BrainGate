@@ -4,13 +4,29 @@ import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSy
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, checkoutRootOf, type RegisteredProject } from "@braingate/core";
+import {
+  ProjectRegistry,
+  checkoutRootOf,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { GoalStore } from "@braingate/goals";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import { createPromptInput, runRepl } from "./repl.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 /**
  * M20.2 through the interactive surface: switching workers without losing the goal.
@@ -69,7 +85,7 @@ class FakeCli implements ShadowProcessExecutor {
   readonly calls: Recorded[] = [];
   constructor(private readonly answers: Readonly<Record<string, string>> = {}) {}
 
-  async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan; onText?: (text: string) => void }): Promise<ShadowProcessResult> {
+  async run(input: { project: ExecutionProject; plan: ShadowInvocationPlan; onText?: (text: string) => void }): Promise<ShadowProcessResult> {
     const body = input.plan.stdin ?? input.plan.attachmentContent ?? "";
     const payload = JSON.parse(body) as { readonly role?: string; readonly task?: string; readonly context?: Record<string, unknown> };
     const args = [...input.plan.args];
@@ -152,7 +168,7 @@ function fixture(
       underlyingFamily: null,
     });
   }
-  return { root, repo, env, home, project: new ProjectRegistry(home).loadFile(join(repo, ".brain", "project.json")) };
+  return { root, repo, env, home, project: workspace(new ProjectRegistry(home).loadFile(join(repo, ".brain", "project.json"))) };
 }
 
 interface SessionPlan {
@@ -858,9 +874,9 @@ test("N: /project reports the binding, and a matching workspace is attached rath
   const session = sessionOf(f.repo, f.env, cli, ["/project", "/exit"]);
   assert.equal(await session.run(), 0);
   const text = session.text();
-  assert.match(text, /Project: {3}attach-matching/);
+  assert.match(text, /Project: +attach-matching/);
   assert.match(text, /Workspace: /);
-  assert.match(text, /Git: {7}.+metadata, not the identity/);
+  assert.match(text, /Git: +\S+ · main @ [0-9a-f]{8} · clean/, "the git metadata is shown, and labelled as metadata");
   assert.match(text, /Execution is bound to this workspace/);
   assert.match(text, /A different directory is a different workspace/);
   assert.equal(cli.calls.length, 0, "looking at the binding spends nothing");
@@ -876,9 +892,15 @@ test("N: a session in a subdirectory attaches, and the workspace is the subdirec
   // The manifest is found upward, so a session started in a package of a monorepo still attaches to
   // the project. The workspace, though, is the directory they launched in: `git rev-parse
   // --show-toplevel` is not what a native CLI's cwd should be, and widening to it was the defect.
+  // The manifest was written at the repository, so that is the workspace this project has: launching
+  // from a package inside it does not mint a second one, and the ledger one directory up is the one
+  // this session reads.
   const reported = (/Workspace: (.+)/.exec(session.text())?.[1] ?? "").trim();
-  assert.equal(reported, realpathSync.native(nested), "the workspace is the directory the operator selected");
-  assert.notEqual(reported, checkoutRootOf(nested), "and not the repository Git reports above it");
+  assert.equal(reported, realpathSync.native(f.repo), "the workspace is the directory that was registered");
+  assert.equal(reported, checkoutRootOf(nested), "which here is the repository Git reports above it");
+  // And the worker still runs where the operator launched, which is the M20.3 promise this keeps.
+  const directory = (/Directory: (.+)/.exec(session.text())?.[1] ?? "").trim();
+  assert.equal(directory, realpathSync.native(nested), "the directory workers run in is the one they launched from");
 });
 
 test("N: a workspace with no repository attaches and reports Git as metadata it does not have", async () => {
@@ -889,7 +911,7 @@ test("N: a workspace with no repository attaches and reports Git as metadata it 
     const cli = new FakeCli();
     const session = sessionOf(root, { BRAINGATE_HOME: join(root, "brain-home") }, cli, ["/project", "/exit"]);
     assert.equal(await session.run(), 0, session.text());
-    assert.match(session.text(), /Project: {3}plain/);
-    assert.match(session.text(), /Git: {7}none — this workspace is not inside a repository/);
+    assert.match(session.text(), /Project: +plain/);
+    assert.match(session.text(), /Git: +none — this workspace is not inside a repository/);
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

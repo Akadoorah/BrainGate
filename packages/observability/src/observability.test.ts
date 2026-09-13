@@ -11,9 +11,12 @@ import {
   classifyTask,
   parseProjectConfig,
   type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
 } from "@braingate/core";
 import type { RouteResult } from "@braingate/router";
 import {
+
   GlobalQuotaStore,
   buildDashboardSnapshot,
   buildTaskBrief,
@@ -22,12 +25,21 @@ import {
   recordTaskBrief,
 } from "./index.js";
 
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 function setupProject(name = "Waslo", id = "waslo") {
   const root = mkdtempSync(join(tmpdir(), "braingate-observe-"));
   const repo = join(root, "repo");
   mkdirSync(repo);
   const registry = new ProjectRegistry(join(root, "registry"));
-  const project = registry.register(parseProjectConfig({ project_id: id, name, repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: id, name, repositories: [repo] })));
   const ledger = new TaskLedger(project);
   return { root, project, ledger };
 }

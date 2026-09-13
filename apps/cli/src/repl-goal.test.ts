@@ -4,13 +4,28 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, type RegisteredProject } from "@braingate/core";
+import {
+  ProjectRegistry,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { GoalStore } from "@braingate/goals";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import { runRepl, taskIdOf } from "./repl.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 /**
  * M20's behavioural test: a follow-up continues its goal, across providers.
@@ -61,7 +76,7 @@ class FakeRuntime implements ShadowProcessExecutor {
    */
   constructor(private readonly answers: Readonly<Record<string, string>>) {}
 
-  async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan; onText?: (text: string) => void }): Promise<ShadowProcessResult> {
+  async run(input: { project: ExecutionProject; plan: ShadowInvocationPlan; onText?: (text: string) => void }): Promise<ShadowProcessResult> {
     this.calls.push(input.plan);
     const body = input.plan.stdin ?? input.plan.attachmentContent ?? "";
     const payload = JSON.parse(body) as { readonly role?: string; readonly task?: string };
@@ -140,7 +155,7 @@ function fixture(label: string) {
     reasoning: 55,
     underlyingFamily: null,
   });
-  return { root, repo, env, project: new ProjectRegistry(home).loadFile(join(repo, ".brain", "project.json")) };
+  return { root, repo, env, project: workspace(new ProjectRegistry(home).loadFile(join(repo, ".brain", "project.json"))) };
 }
 
 function sessionOf(repo: string, env: NodeJS.ProcessEnv, runtime: FakeRuntime, answers: readonly string[]) {

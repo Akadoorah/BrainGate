@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { ProjectRegistry, type RegisteredProject } from "./project-registry.js";
+import type { ExecutionProject } from "./project-registry.js";
+import { executionScopeFor } from "./workspace.js";
 import { TaskLedger } from "./task-ledger.js";
+
+
 
 /**
  * M20 adds two nullable columns to `tasks`, on a database that has existed since M0.
@@ -15,15 +19,23 @@ import { TaskLedger } from "./task-ledger.js";
  * the `CREATE TABLE` path, which is the path that was never at risk.
  */
 
-function project(label: string): RegisteredProject {
+function project(label: string): ExecutionProject {
   const root = mkdtempSync(join(tmpdir(), `braingate-ledger-m20-${label}-`));
   const repo = join(root, "repo");
   mkdirSync(repo);
-  return new ProjectRegistry(join(root, "brain-home")).register({ projectId: label as never, name: label, repositories: [repo] });
+  const registered = new ProjectRegistry(join(root, "brain-home")).register({ projectId: label as never, name: label, repositories: [repo] });
+  return executionScopeFor(registered, repo).project;
 }
 
-/** The `tasks` table as it was written before the goal link existed. */
-function legacyDatabase(target: RegisteredProject, rows: readonly { readonly taskId: string; readonly title: string }[]): void {
+/**
+ * The `tasks` table as an earlier build wrote it, at the path this build reads.
+ *
+ * It is the *schema* that is being migrated, not a project-level file: a store written by an earlier
+ * build into this same workspace directory must still open with every row intact. State written
+ * before workspaces existed lives somewhere else entirely and is never opened at all — see the
+ * legacy test in `checkout.test.ts`.
+ */
+function legacyDatabase(target: ExecutionProject, rows: readonly { readonly taskId: string; readonly title: string }[]): void {
   mkdirSync(target.storageDir, { recursive: true });
   const db = new Database(join(target.storageDir, "tasks.sqlite"));
   db.exec(`

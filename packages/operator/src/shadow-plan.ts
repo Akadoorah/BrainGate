@@ -1,5 +1,5 @@
 import { BrainGateInvariantError } from "@braingate/core";
-import type { ExecutionBudget, RegisteredProject, TaskClassification } from "@braingate/core";
+import type { ExecutionBudget, ExecutionProject, TaskClassification } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
 import {
   type RoutePin, CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
@@ -122,7 +122,7 @@ function excludedProviders(input: {
 }
 
 export function buildShadowTaskPlan(input: {
-  readonly project: RegisteredProject;
+  readonly project: ExecutionProject;
   readonly cwd: string;
   readonly router: CapabilityRouter;
   readonly providers: readonly ProviderSnapshot[];

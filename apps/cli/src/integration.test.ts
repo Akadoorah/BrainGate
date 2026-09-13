@@ -5,6 +5,9 @@ import { copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync,
 import { homedir, tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { ProjectRegistry, executionScopeFor } from "@braingate/core";
+
+
 
 /**
  * The only tests in this repository that let a provider actually answer.
@@ -196,7 +199,7 @@ test("each staged provider satisfies the role contract from its own CLI", { skip
     register(cli);
 
     const registry = new ProjectRegistry(cli.home);
-    const project = registry.loadFile(join(cli.repo, ".brain", "project.json"));
+    const project = executionScopeFor(registry.loadFile(join(cli.repo, ".brain", "project.json")), cli.repo).project;
 
     const snapshots = await new ProviderDiscovery().discoverAll();
     const catalogue = JSON.parse(readFileSync(join(cli.home, "global", "models.json"), "utf8")) as {
@@ -323,7 +326,7 @@ test("a streamed provider writes its answer while it is still working", { skip: 
   try {
     register(cli);
     const registry = new ProjectRegistry(cli.home);
-    const project = registry.loadFile(join(cli.repo, ".brain", "project.json"));
+    const project = executionScopeFor(registry.loadFile(join(cli.repo, ".brain", "project.json")), cli.repo).project;
     const snapshots = await new ProviderDiscovery().discoverAll();
     const catalogue = JSON.parse(readFileSync(join(cli.home, "global", "models.json"), "utf8")) as {
       entries: readonly { readonly definition: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string; readonly capabilities: Record<string, number> } }[];
@@ -426,7 +429,7 @@ test("a planner granted the network can search, and one without it cannot", { sk
     const { loadAcceptances } = await import("./provider-proof.js");
 
     const state = resolveOperatorState({ ...process.env, BRAINGATE_HOME: cli.home });
-    const project = new ProjectRegistry(cli.home).loadFile(join(cli.repo, ".brain", "project.json"));
+    const project = executionScopeFor(new ProjectRegistry(cli.home).loadFile(join(cli.repo, ".brain", "project.json")), cli.repo).project;
     const snapshots = await new ProviderDiscovery().discoverAll();
     const snapshot = snapshots.find((item) => item.providerId === "anthropic");
     assert.ok(snapshot?.available.value === true, "Claude must be installed for this test");

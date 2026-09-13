@@ -1,4 +1,4 @@
-import type { RegisteredProject } from "@braingate/core";
+import type { ExecutionProject } from "@braingate/core";
 import type { ProviderId } from "@braingate/providers";
 import type { WorkflowRole } from "@braingate/workflows";
 import type { StreamDialect } from "./streaming.js";
@@ -254,7 +254,7 @@ export interface ShadowProcessResult {
 
 export interface ShadowProcessExecutor {
   run(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly plan: ShadowInvocationPlan;
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;

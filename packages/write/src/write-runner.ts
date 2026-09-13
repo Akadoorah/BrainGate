@@ -11,7 +11,7 @@ import {
   type FailureKind,
   type FinalizationPlan,
   type ObservationRole,
-  type RegisteredProject,
+  type ExecutionProject,
   type TaskClassification,
   type TaskFinalizer,
   type TaskLedger,
@@ -227,7 +227,7 @@ export function buildWriteTaskPlan(input: {
 }
 
 export class WriteDogfoodRunner {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #ledger: TaskLedger;
   readonly #router: CapabilityRouter;
   readonly #pin: RoutePin | undefined;
@@ -243,7 +243,7 @@ export class WriteDogfoodRunner {
   readonly #visualExecutor: ShadowProcessExecutor | undefined;
 
   constructor(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly ledger: TaskLedger;
     readonly router: CapabilityRouter;
     /** The worker the operator named by hand, applied to every route this runner makes. */

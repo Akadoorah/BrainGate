@@ -66,32 +66,41 @@ where they were.
 ## Project identity and workspace identity
 
 A **project** is the operator's name for a body of work, and it owns durable knowledge: memory,
-preferences, goals, the task ledger, quota history and the audit trail. A **workspace** is the local
-directory the work happens in, and its identity is its canonical path — nothing else.
+preferences, the project identity, quota history. A **workspace** is the local directory the work
+happens in, and its identity is its canonical path — nothing else.
 
 ```text
 Project      — the operator's name for a body of work. Owns durable knowledge.
   └── Workspace  — a concrete local directory. Owns execution truth.
-        └── Goal ──► Tasks ──► native workers, whose cwd is this directory
+        └── Conversation ──► Goal ──► Tasks ──► native workers, whose cwd is the directory
+                                             the operator launched from
 ```
 
 They are bound by the manifest in the workspace (`.brain/project.json`), and BrainGate enforces the
-binding before it executes anything: the path named by the manifest must be the directory the
+binding before it executes anything: the path named by the manifest must contain the directory the
 operator launched from, or the session stops. **Git is metadata a workspace may have**, recorded as
 `gitRoot`, `branch`, `HEAD` and `remote` and used as evidence — never as identity, and never as a
-precondition for registering a directory. A registration naming a *parent* of the selected directory
-is accepted, and the workspace remains the selected directory rather than being widened to the
-parent: the provider's `cwd` is where the operator is.
+precondition for registering a directory.
+
+The workspace is the directory the *manifest* names, not the one the shell happens to be in. Launching
+from `repo/src` reads and writes `repo`'s state, so a project has the workspaces it was registered
+with and no others; a directory registered on its own — `braingate init` inside
+`repo/flutter_migration` — is its own workspace. The provider's `cwd` is always the directory the
+operator launched from, and is never widened to the workspace or to a repository root.
 
 Two workspaces of one project are two workspaces even when they share a basename, a commit or a
 remote URL, because those facts say the directories are related and nothing about whether they hold
-the same uncommitted state. Execution truth — changed files, tests run, native sessions, snapshots
-and fingerprints — belongs to the directory it happened in, and a workspace id derived from the path
-is what keys it. Every path downstream — snapshots, worktrees, fingerprints, the provider's `cwd`,
-task evidence — derives from that one verified binding.
+the same uncommitted state. Execution truth — the ledger, goals and conversations, native sessions,
+the dogfood corpus, results and evidence, snapshots, worktrees and fingerprints — belongs to the
+workspace it happened in, keyed by an id derived from the path, and is stored under
+`<home>/projects/<projectId>/workspaces/<workspaceId>/`. A goal records the workspace it belongs to,
+and a provider session is bound to project, workspace, goal, provider and model: continuing the same
+logical work in another workspace is a fresh native session plus a goal handoff, never a native
+resume. State written before workspaces existed belongs to no identifiable workspace; it is preserved
+untouched, never read, and never migrated on a guess.
 
 Moving a registration to a different workspace is `braingate init --rebind`, and it is never implied.
-See `docs/adr/0015-workspace-identity.md`.
+See `docs/adr/0015-workspace-identity.md` and `docs/adr/0016-workspace-scoped-execution-state.md`.
 
 ## Execution lifecycle
 

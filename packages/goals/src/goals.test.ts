@@ -4,12 +4,31 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { BrainGateInvariantError, ProjectRegistry, type RegisteredProject, type TaskClassification, type TaskComplexity, type TaskRisk } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  type RegisteredProject,
+  type TaskClassification,
+  type TaskComplexity,
+  type TaskRisk,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { effectiveClassification, inheritedComplexityFloor, riskFloor } from "./inheritance.js";
 import { buildGoalContext, buildHandoffPackage, renderHandoff, MAX_CONTEXT_TURNS } from "./handoff.js";
 import { MAX_HANDOFF_CHARS, applyGoalStateUpdate, sameSubject } from "./goal-state.js";
 import { GOALS_SCHEMA_VERSION, GoalStore } from "./store.js";
 import type { GoalRecord, GoalState } from "./types.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 /**
  * M20's foundation, tested without a provider.
@@ -20,13 +39,13 @@ import type { GoalRecord, GoalState } from "./types.js";
  * on a model, and a suite that needed one could not be run on a machine with no subscriptions.
  */
 
-function project(label: string): RegisteredProject {
+function project(label: string): ExecutionProject {
   const root = mkdtempSync(join(tmpdir(), `braingate-goals-${label}-`));
   const repo = join(root, "repo");
   mkdirSync(repo);
   const registry = new ProjectRegistry(join(root, "brain-home"));
   // The registry is what issues a project id; a test may not mint one itself.
-  return registry.register({ projectId: label as never, name: label, repositories: [repo] });
+  return workspace(registry.register({ projectId: label as never, name: label, repositories: [repo] }));
 }
 
 /** Monotonic ids, so a failure names the same finding twice. */
@@ -35,7 +54,7 @@ function ids(): () => string {
   return () => `id-${String(++counter).padStart(4, "0")}`;
 }
 
-function openStore(label: string, now?: () => string): { store: GoalStore; project: RegisteredProject } {
+function openStore(label: string, now?: () => string): { store: GoalStore; project: ExecutionProject } {
   const target = project(label);
   return { store: new GoalStore(target, { newId: ids(), ...(now === undefined ? {} : { now }) }), project: target };
 }
@@ -542,6 +561,7 @@ function goalRecord(state: GoalState): GoalRecord {
     goalId: "goal-1",
     conversationId: "conversation-1",
     projectId: "sample",
+    workspaceId: null,
     objective: "fix idle logout in SaudiGPT",
     state,
     createdAt: "2026-09-12T00:00:00.000Z",

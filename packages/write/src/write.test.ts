@@ -4,7 +4,22 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject, InMemoryObservationWriter, ResultStore, createFinalizer, type TaskClassification, type TaskFinalizer } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  TaskLedger,
+  budgetFor,
+  classifyTask,
+  parseProjectConfig,
+  type RegisteredProject,
+  InMemoryObservationWriter,
+  ResultStore,
+  createFinalizer,
+  type TaskClassification,
+  type TaskFinalizer,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
@@ -12,11 +27,21 @@ import { assertSourceCheckoutUnchanged, codexIsolationProfileHash, sourceCheckou
 import { WriteDogfoodRunner, assertSourceCheckoutClean, buildWriteTaskPlan, planClaudeWriteInvocation, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
 
 /**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
+
+/**
  * The finalization seam the runner requires: a ledger, a result directory, and an observation
  * writer. A runner cannot be constructed without one, which is the point — an execution package
  * that could skip its record is how a task ends up with nothing said about it.
  */
-function finalizerFor(project: RegisteredProject, ledger: TaskLedger): TaskFinalizer {
+function finalizerFor(project: ExecutionProject, ledger: TaskLedger): TaskFinalizer {
   return createFinalizer({
     ledger,
     results: new ResultStore(project.storageDir, { redact: redactSecrets }),
@@ -34,7 +59,7 @@ function git(cwd: string, args: readonly string[]): string {
   return String(result.stdout ?? "").trim();
 }
 
-function fixture(): { root: string; repo: string; project: RegisteredProject } {
+function fixture(): { root: string; repo: string; project: ExecutionProject } {
   const root = mkdtempSync(join(tmpdir(), "braingate-write-test-"));
   const repo = join(root, "repo");
   mkdirSync(repo);
@@ -44,7 +69,7 @@ function fixture(): { root: string; repo: string; project: RegisteredProject } {
   writeFileSync(join(repo, "app.txt"), "before\n");
   git(repo, ["add", "app.txt"]); git(repo, ["commit", "-m", "initial"]);
   const registry = new ProjectRegistry(join(root, "brain"));
-  const project = registry.register(parseProjectConfig({ project_id: "write-test", name: "Write Test", repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "write-test", name: "Write Test", repositories: [repo] })));
   return { root, repo, project };
 }
 
@@ -84,7 +109,7 @@ class FakeWriter implements WriteProviderExecutor {
 
 class FakeReviewExecutor implements ShadowProcessExecutor {
   readonly calls: ShadowInvocationPlan[] = [];
-  async run(input: { project: RegisteredProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
+  async run(input: { project: ExecutionProject; plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
     this.calls.push(input.plan);
     const review = JSON.stringify({ kind: "review", verdict: "approve", findings: [] });
     return { spawned: true, exitCode: 0, stdout: JSON.stringify({ type: "item.completed", item: { type: "agent_message", text: review } }), stderr: "", timedOut: false, durationMs: 6, removedEnvironmentKeys: [] };

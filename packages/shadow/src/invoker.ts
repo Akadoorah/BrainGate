@@ -1,4 +1,4 @@
-import { BrainGateInvariantError, ProviderQuotaRefusalError, failureKindFromCode, type RegisteredProject, type TaskLedger } from "@braingate/core";
+import { BrainGateInvariantError, ProviderQuotaRefusalError, failureKindFromCode, type ExecutionProject, type TaskLedger } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
@@ -389,7 +389,7 @@ export type NativeSessionResolver = (input: {
 }) => Promise<NativeSessionResolution | null>;
 
 export class SubscriptionShadowAgentInvoker implements AgentInvoker {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #cwd: string;
   readonly #snapshots: ReadonlyMap<string, ProviderSnapshot>;
   readonly #attestations: ReadonlyMap<string, SubscriptionAttestation>;
@@ -424,7 +424,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   #lastSessionNote: string | null = null;
 
   constructor(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly cwd: string;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];

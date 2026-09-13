@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync }
 import { isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, type ExecutionProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import { GROK_SNAPSHOT_READ_SANDBOX, createIsolatedGrokHome, grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
 import { trackChild } from "./child-registry.js";
@@ -29,7 +29,7 @@ function inside(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
-export function assertShadowProjectCwd(project: RegisteredProject, cwdInput: string): string {
+export function assertShadowProjectCwd(project: ExecutionProject, cwdInput: string): string {
   let cwd: string;
   try { cwd = realpathSync.native(resolve(cwdInput)); }
   catch { throw new BrainGateInvariantError("SHADOW_CWD_INVALID", "Shadow working directory does not exist or cannot be resolved."); }
@@ -56,7 +56,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
   readonly #secretGuard = new SecretGuard();
 
   async run(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly plan: ShadowInvocationPlan;
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;

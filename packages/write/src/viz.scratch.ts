@@ -1,4 +1,4 @@
-import { ProjectRegistry } from "@braingate/core";
+import { ProjectRegistry, executionScopeFor } from "@braingate/core";
 import { ProviderDiscovery } from "@braingate/providers";
 import { CodexIsolationVerifier, NodeShadowProcessExecutor, planCodexVisualInvocation, extractCodexAgentMessage } from "@braingate/shadow";
 import { mkdtempSync, mkdirSync } from "node:fs";
@@ -11,7 +11,9 @@ const attestation = await new CodexIsolationVerifier().verify(codex);
 
 const registry = new ProjectRegistry(mkdtempSync(join(tmpdir(), "bg-viz-")));
 const repo = "/private/tmp/viz";
-const project = registry.register({ projectId: "viz", name: "Viz", repositories: [repo] } as never);
+const registered = registry.register({ projectId: "viz", name: "Viz", repositories: [repo] } as never);
+// Execution state is workspace-scoped: this scratch script's workspace is the repository it points at.
+const project = executionScopeFor(registered, repo).project;
 const work = join(project.storageDir, "worktrees", "probe");
 mkdirSync(work, { recursive: true });
 

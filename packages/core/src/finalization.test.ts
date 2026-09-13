@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as activeRuns from "./active-run.js";
 import {
+
   InMemoryObservationWriter,
   executionAttribution,
   executionRecord,
@@ -19,10 +20,21 @@ import {
   reconcile,
   type FinalizationDeps,
   type FinalizationPlan,
+  type ExecutionProject,
   type ReconciliationDeps,
   type RegisteredProject,
   type TaskOutcome,
+  executionScopeFor,
 } from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
 
 /**
  * A project with a ledger, a result directory and a corpus, all in a temporary directory.
@@ -30,12 +42,12 @@ import {
  * The three destinations are the reason this file exists: finalization spans them, and the point
  * of the exercise is what survives a process dying between one of them and the next.
  */
-function fixture(label: string): { project: RegisteredProject; ledger: TaskLedger; results: ResultStore; observations: InMemoryObservationWriter; close: () => void } {
+function fixture(label: string): { project: ExecutionProject; ledger: TaskLedger; results: ResultStore; observations: InMemoryObservationWriter; close: () => void } {
   const root = mkdtempSync(join(tmpdir(), `braingate-finalization-${label}-`));
   const repository = join(root, "repo");
   mkdirSync(repository);
   const registry = new ProjectRegistry(join(root, "home"));
-  const project = registry.register({ projectId: parseProjectId(label), name: label, repositories: [repository] });
+  const project = workspace(registry.register({ projectId: parseProjectId(label), name: label, repositories: [repository] }));
   const ledger = new TaskLedger(project);
   return {
     project,

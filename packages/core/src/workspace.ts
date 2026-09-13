@@ -4,6 +4,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import { BrainGateInvariantError } from "./errors.js";
+import { asExecutionProject, assertRegisteredProject, type ExecutionProject, type ProjectId, type RegisteredProject } from "./project-registry.js";
 
 /**
  * A workspace: the local directory native workers actually run in.
@@ -234,4 +235,85 @@ export function workspaceStorageDir(projectStorageDir: string, workspaceId: Work
 /** The project-level half of the same directory: durable knowledge, valid across workspaces. */
 export function projectStateDir(projectStorageDir: string): string {
   return projectStorageDir;
+}
+
+/**
+ * Where one command executes, and which workspace it is executing in.
+ *
+ * Resolved once, from the attachment, and then handed to every store that describes local execution.
+ * The point of the type is that `storageDir` and `project.projectId` agree by construction: a store
+ * cannot be constructed for a workspace and then read another one's files.
+ */
+export interface ExecutionScope {
+  readonly projectId: ProjectId;
+  readonly workspaceId: WorkspaceId;
+  /** The canonical directory native workers run in. */
+  readonly workspacePath: string;
+  /** Execution truth for this workspace: ledger, goals, corpus, results, snapshots, worktrees. */
+  readonly storageDir: string;
+  /** The same project, holding this workspace's storage. What execution stores take. */
+  readonly project: ExecutionProject;
+  /** Durable project knowledge: memory, preferences. Never the workspace's. */
+  readonly projectStorageDir: string;
+  readonly git: WorkspaceGitMetadata | null;
+}
+
+/**
+ * The scope for one workspace of one project, registering it if it is new.
+ *
+ * Registration is idempotent on the canonical path, so calling this on every attach cannot mint a
+ * second identity for a directory — and a symlinked path and its target are one workspace, because
+ * both canonicalize to the same id before anything is read or written.
+ */
+export function executionScopeFor(project: RegisteredProject, workspacePath: string): ExecutionScope {
+  assertRegisteredProject(project);
+  const canonical = canonicalDirectory(workspacePath);
+  if (canonical === null) {
+    throw new BrainGateInvariantError("WORKSPACE_PATH_INVALID", `A workspace must be an existing directory: ${workspacePath}`);
+  }
+  const record = new WorkspaceRegistry(project.storageDir).register({ projectId: project.projectId, path: canonical });
+  const storageDir = workspaceStorageDir(project.storageDir, record.workspaceId);
+  return Object.freeze({
+    projectId: project.projectId,
+    workspaceId: record.workspaceId,
+    workspacePath: record.path,
+    storageDir,
+    project: asExecutionProject(project, storageDir, record.workspaceId),
+    projectStorageDir: project.storageDir,
+    git: record.git,
+  });
+}
+
+/** A workspace's execution state lives under this directory name, beside the project's own files. */
+export const WORKSPACES_DIRNAME = "workspaces";
+
+/**
+ * Execution state written before a workspace was part of the identity, if any of it is present.
+ *
+ * `<projectStorageDir>/{tasks,goals,dogfood}.sqlite` and the directories beside them were keyed by a
+ * project id alone, so two directories carrying that id wrote one ledger. Nothing can say which
+ * workspace a given row came from, so this state has no workspace to belong to: it is reported, never
+ * opened by the code that follows, and never migrated on a guess. See `LEGACY_AMBIGUOUS_STATE`.
+ */
+export const LEGACY_EXECUTION_STATE = Object.freeze([
+  "tasks.sqlite",
+  "tasks.sqlite-wal",
+  "tasks.sqlite-shm",
+  "goals.sqlite",
+  "goals.sqlite-wal",
+  "goals.sqlite-shm",
+  "dogfood.sqlite",
+  "dogfood.sqlite-wal",
+  "dogfood.sqlite-shm",
+  "execution.sqlite",
+  "results",
+  "session",
+  "snapshots",
+  "worktrees",
+  "write-schemas",
+]);
+
+/** Which of the legacy paths are actually present, for a message that names them. */
+export function legacyExecutionState(projectStorageDir: string): readonly string[] {
+  return Object.freeze(LEGACY_EXECUTION_STATE.filter((name) => existsSync(join(projectStorageDir, name))));
 }

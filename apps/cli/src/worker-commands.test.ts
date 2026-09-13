@@ -3,9 +3,15 @@ import assert from "node:assert/strict";
 import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProjectRegistry } from "@braingate/core";
+import {
+  ProjectRegistry,
+  type RegisteredProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { GoalStore, computeGoalDelta, renderGoalDelta, resolveSessionDecision } from "@braingate/goals";
 import { createNativeSessionResolver, recordSessionUse, parseUseTarget, pinFor, AUTO_WORKER, describeWorker } from "./worker-commands.js";
+
+
 
 /**
  * The returning-worker delta, as a unit.
@@ -21,7 +27,9 @@ function project(label: string) {
   const repo = join(root, "repo");
   mkdirSync(repo);
   const registered = new ProjectRegistry(join(root, "home")).register({ projectId: label as never, name: label, repositories: [repo] });
-  return { project: registered, repo };
+  // Goals and sessions are this workspace's execution state, so the fixture hands out the handle a
+  // command would resolve rather than the project-level one.
+  return { project: executionScopeFor(registered, repo).project, repo };
 }
 
 function resolverFor(store: GoalStore, goalId: string, conversationId: string) {

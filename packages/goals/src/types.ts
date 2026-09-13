@@ -220,6 +220,16 @@ export interface GoalRecord {
   readonly goalId: string;
   readonly conversationId: string;
   readonly projectId: string;
+  /**
+   * The workspace this goal belongs to.
+   *
+   * A goal reasons about local files and asks workers to change them, so it belongs to one concrete
+   * directory rather than to the project as a whole. Two workspaces of one project hold two goal
+   * stores, and this field is what makes a goal that arrives in the wrong one — a copied database,
+   * say — refuse rather than execute. `null` only for a row written before workspaces existed, which
+   * the migration binds to the workspace whose file it is already in.
+   */
+  readonly workspaceId: string | null;
   readonly objective: string;
   readonly state: GoalState;
   readonly createdAt: string;
@@ -271,6 +281,8 @@ export interface ProviderSessionRecord {
   readonly runtimeVersion: string | null;
   /** Where the session was created, when the runtime scopes sessions by directory. */
   readonly workspace: string | null;
+  /** The workspace identity of that directory, so a copied database cannot be resumed into. */
+  readonly workspaceId: string | null;
   readonly goalId: string | null;
   readonly conversationId: string | null;
   /** The BrainGate task that last used this session, so a receipt and a session can be joined. */

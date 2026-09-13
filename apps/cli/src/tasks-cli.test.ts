@@ -3,7 +3,15 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ProjectRegistry, TaskLedger, finalizeTask, finalizedSnapshotOf, type FinalizationPlan, type RegisteredProject } from "@braingate/core";
+import {
+  ProjectRegistry,
+  TaskLedger,
+  finalizeTask,
+  finalizedSnapshotOf,
+  type FinalizationPlan,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { DogfoodStore } from "@braingate/dogfood";
 import { resolveOperatorState } from "@braingate/operator";
 import { redactSecrets } from "@braingate/security";
@@ -11,7 +19,9 @@ import { ResultStore, type ObservationInput, type ObservationRecord, type Observ
 import { runCli } from "./cli.js";
 import { runTasksCli } from "./tasks-cli.js";
 
-function fixture(): { root: string; repo: string; manifest: string; env: NodeJS.ProcessEnv; project: RegisteredProject } {
+
+
+function fixture(): { root: string; repo: string; manifest: string; env: NodeJS.ProcessEnv; project: ExecutionProject } {
   const root = mkdtempSync(join(tmpdir(), "braingate-tasks-"));
   const repo = join(root, "repo");
   mkdirSync(repo);
@@ -23,7 +33,9 @@ function fixture(): { root: string; repo: string; manifest: string; env: NodeJS.
   writeFileSync(join(repo, ".brain", "project.json"), JSON.stringify({ project_id: "sample", name: "Sample", repositories: [".."] }));
   const env = { BRAINGATE_HOME: join(root, "brain-home") };
   const state = resolveOperatorState(env, root);
-  const project = new ProjectRegistry(state.home).loadFile(manifest);
+  // The ledger and the corpus belong to the workspace, so the fixture resolves what a command
+  // resolves rather than handing the project handle to a store that would file state at project level.
+  const project = executionScopeFor(new ProjectRegistry(state.home).loadFile(manifest), repo).project;
   return { root, repo, manifest, env, project };
 }
 
@@ -50,7 +62,7 @@ function corpusWriter(store: DogfoodStore, ledger: TaskLedger): ObservationWrite
  * Three tasks in the ledger: one recorded properly, one an older BrainGate left terminal with
  * nothing recorded, and one that stopped while it was still running.
  */
-function seed(project: RegisteredProject): { readonly recorded: string; readonly legacy: string; readonly abandoned: string } {
+function seed(project: ExecutionProject): { readonly recorded: string; readonly legacy: string; readonly abandoned: string } {
   const ledger = new TaskLedger(project);
   const store = new DogfoodStore(project);
   try {

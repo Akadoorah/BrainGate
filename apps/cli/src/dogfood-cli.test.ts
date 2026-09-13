@@ -4,13 +4,20 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFi
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, type RegisteredProject } from "@braingate/core";
+import {
+  ProjectRegistry,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { DogfoodStore, initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "@braingate/write";
 import { runDogfoodCli, suggestedProjectId, roleLine } from "./dogfood-cli.js";
+
+
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -94,9 +101,15 @@ function io() {
   return { stdout: (value: string) => { stdout += value; }, stderr: (value: string) => { stderr += value; }, out: () => stdout, err: () => stderr };
 }
 
-function projectFor(f: ReturnType<typeof fixture>): RegisteredProject {
+/**
+ * The workspace execution handle for a fixture, resolved the way a command resolves it.
+ *
+ * A store that describes local execution takes this, not the project handle: the ledger, the corpus
+ * and the results belong to the fixture's directory.
+ */
+function projectFor(f: ReturnType<typeof fixture>): ExecutionProject {
   const registry = new ProjectRegistry(f.home);
-  return registry.loadFile(f.manifest);
+  return executionScopeFor(registry.loadFile(f.manifest), f.repo).project;
 }
 
 test("braingate init is idempotent and keeps the source checkout clean", async () => {

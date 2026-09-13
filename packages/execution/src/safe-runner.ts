@@ -1,7 +1,7 @@
 import { realpathSync } from "node:fs";
 import { basename, isAbsolute, relative, resolve, sep } from "node:path";
 import { spawn } from "node:child_process";
-import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, type ExecutionProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import type { WorktreeHandle } from "./worktree-guard.js";
 
@@ -35,7 +35,7 @@ export class SafeCommandRunner {
   }
 
   async run(input: {
-    project: RegisteredProject;
+    project: ExecutionProject;
     profile: ExecutionProfile;
     command: StructuredCommand;
     worktree?: WorktreeHandle;

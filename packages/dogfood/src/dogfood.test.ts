@@ -5,8 +5,19 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, type RegisteredProject, type TaskClassification, type TaskComplexity, type TaskRisk } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  TaskLedger,
+  executionScopeFor,
+  type ExecutionProject,
+  type TaskClassification,
+  type TaskComplexity,
+  type TaskRisk,
+} from "@braingate/core";
 import { applyDogfoodPrior, DogfoodStore, emptyDogfoodPrior, initializeDogfoodProject, inspectGitRepository, repositoryReadiness } from "./index.js";
+
+
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -26,18 +37,18 @@ function repoFixture(label: string): { root: string; repo: string } {
   return { root, repo };
 }
 
-function registered(label: string): { root: string; repo: string; project: RegisteredProject } {
+function registered(label: string): { root: string; repo: string; project: ExecutionProject } {
   const f = repoFixture(label);
   const registry = new ProjectRegistry(join(f.root, "brain-home"));
   const project = registry.register({ projectId: `${label}` as never, name: label, repositories: [f.repo] });
-  return { ...f, project };
+  return { ...f, project: executionScopeFor(project, f.repo).project };
 }
 
 function classification(complexity: TaskComplexity, risk: TaskRisk): TaskClassification {
   return Object.freeze({ complexity, risk, confidence: 0.8, requiresScout: complexity !== "T0", reasons: Object.freeze(["test"]), sensitiveDomains: Object.freeze([]), ruleVersion: "test-rule" });
 }
 
-function receipt(project: RegisteredProject, complexity: TaskComplexity, risk: TaskRisk) {
+function receipt(project: ExecutionProject, complexity: TaskComplexity, risk: TaskRisk) {
   const ledger = new TaskLedger(project);
   const task = ledger.createTask({ title: `Dogfood ${complexity}`, complexity, risk });
   ledger.transition(task.taskId, "running");
@@ -48,7 +59,7 @@ function receipt(project: RegisteredProject, complexity: TaskComplexity, risk: T
   return result;
 }
 
-function record(store: DogfoodStore, project: RegisteredProject, complexity: TaskComplexity = "T1", risk: TaskRisk = "low") {
+function record(store: DogfoodStore, project: ExecutionProject, complexity: TaskComplexity = "T1", risk: TaskRisk = "low") {
   const predicted = classification(complexity, risk);
   const taskReceipt = receipt(project, complexity, risk);
   return store.recordObservation({

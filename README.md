@@ -459,13 +459,24 @@ directory either way.
 
 ### Projects and workspaces
 
-A **project** is your name for a piece of work. A **workspace** is the directory you run BrainGate
-in, and it is where the native CLIs actually run. One project can have more than one workspace.
+A **project** is your name for a piece of work: it owns durable memory and preferences, and it can
+span more than one directory. A **workspace** is one of those directories — the one you register —
+and it owns everything that describes work *done* there: the conversation, the goals, the task
+ledger, the evidence, the native sessions, the snapshots and the worktrees.
 
-The workspace is **the directory you launched from**, canonicalized. It is not widened to the
-repository root: if you run BrainGate in `repo/flutter_migration`, that is the `cwd` Claude Code,
-Codex, Antigravity or Grok gets, and their own project files — `CLAUDE.md`, `.cursor/rules`, an
-`AGENTS.md` in that folder — are found exactly where they would be if you ran the CLI yourself.
+The workspace is the directory your manifest names, canonicalized. It is never widened to the
+repository root: if you `braingate init` inside `repo/flutter_migration`, then that is the workspace,
+with its own ledger and its own goals, separate from `repo`. And you can launch from deeper inside
+it — a package, a subdirectory — without changing which state you are reading or minting a new
+workspace: workers still run in the directory you launched from, so their `cwd` is never moved and
+their own project files — `CLAUDE.md`, `.cursor/rules`, an `AGENTS.md` in that folder — are found
+exactly where they would be if you ran the CLI yourself.
+
+**Two workspaces of one project do not share unfinished work.** A goal belongs to the workspace whose
+files it is about, a task receipt is filed under the directory it ran in, and a native session is
+bound to the workspace as well as to the provider and model. Moving the same logical work to another
+workspace gives the next worker a goal handoff and a fresh native session, never a resume of a
+conversation that happened somewhere else. What they *do* share is durable project memory.
 
 **Git is optional.** A workspace can be a repository, a subdirectory of one, or a plain directory
 with no repository anywhere above it; `braingate init` registers all three. What a missing repository
@@ -473,7 +484,8 @@ costs is the worktree-isolated write modes, and they say so at the point where t
 than at the door.
 
 The manifest is found by walking up from where you launched, and the workspace it names is compared
-with the directory you are actually in. If they differ, the session stops before planning anything:
+with the directory you are actually in. If you are not inside it, the session stops before planning
+anything:
 
 ```text
 Project `flutter-migration` is registered to a different workspace.
@@ -488,17 +500,24 @@ the other.
 Two clones of one repository are two workspaces even when they share a name, a commit or a git
 remote, because those say the clones are *related* and nothing about whether they hold the same
 uncommitted state. Nothing is inferred from a basename, a remote or a repository: the identity is the
-canonical path. Registering a repository and then working in one of its subdirectories is fine too —
-that attaches, and the workspace is still the directory you are standing in.
+canonical path.
+
+State written before workspaces were part of the identity — an older `tasks.sqlite`, `goals.sqlite`
+or corpus directly under `<home>/projects/<id>` — belongs to no directory that can be identified, so
+it is preserved exactly where it is and never used. The session says so once at startup if it finds
+any, and new work starts a clean workspace.
 
 - **Two directories you use for different things** — register each with its own project id. They
   get separate memory, ledgers, goals and quota history, which is what you want.
+- **One project, several directories** — register each as its own workspace (its own `braingate
+  init`), and they share memory while keeping their own execution state.
 - **You moved the directory, or the drive came back at a different path** — `braingate init
   --rebind` moves the project to this workspace, keeping its id, name and history.
 - **The registered workspace is unmounted** — BrainGate says so rather than guessing, because an
   unmounted volume and a moved directory look identical from here.
 
-`/project` in an interactive session prints the binding at any time.
+`/project` in an interactive session prints the project, the workspace, its id, the directory workers
+run in, and where the state lives — so you can verify where BrainGate is operating at any time.
 
 **4. Check readiness. This spends nothing.**
 
