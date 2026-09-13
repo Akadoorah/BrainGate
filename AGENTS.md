@@ -17,7 +17,11 @@ These rules apply to every coding agent working in this repository.
 - Canonical memory must have a single validated write path.
 - Provider/model names must not be hard-coded into core routing policy.
 - Council/multi-agent execution is opt-in by policy, not the default.
-- Agents must not write directly to a registered project's primary checkout.
+- Agents must not write to a registered workspace's primary checkout **unless the operator selected
+  the DIRECT policy for an attended run** (ADR 0017). The strict modes are still isolated: a
+  worktree write never touches the workspace, and a snapshot read cannot. Unattended work is never
+  DIRECT-by-default in the sense of unobserved — it runs under `unattended`, and its changes are
+  reported, never committed.
 - Usage values must be labelled `native`, `measured`, `estimated`, or `unknown`; estimated values must never be presented as authoritative.
 
 ## Engineering standards

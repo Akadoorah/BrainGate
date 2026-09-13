@@ -79,6 +79,14 @@ function assertCommonEligibility(snapshot: ProviderSnapshot, model: ModelRef): v
 export interface WriteEligibilityProof {
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
+  /**
+   * Whether this write runs in the workspace itself under the DIRECT policy (ADR 0017).
+   *
+   * Only Claude has an invocation that can honour it: the Codex and Grok write argv are built
+   * around a task worktree and a sandbox profile earned against one, so they refuse rather than
+   * silently running with a boundary they were not proven under.
+   */
+  readonly nativeHarness?: boolean;
   readonly now?: Date;
 }
 
@@ -117,11 +125,13 @@ export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef,
  * without a current proof — is enforced by the code that reads the proof instead of by a
  * constant that happens to match it today.
  */
-function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
+function writeGrant(providerId: ProviderId, attested: boolean, nativeHarness = false): ToolGrant {
   return resolveToolGrant({
     role: "primary",
     providerId,
-    workspaceMode: "task-worktree",
+    // The mode this invocation actually uses, so the plan and the receipt report the boundary the
+    // run had rather than the one the strict modes have.
+    workspaceMode: nativeHarness ? "project" : "task-worktree",
     writeMode: true,
     surface: {
       isolatedPerInvocation: true,
@@ -142,8 +152,14 @@ function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
 export interface WriteInvocationInput {
   readonly snapshot: ProviderSnapshot;
   readonly model: ModelRef;
-  /** The task worktree. Never the registered checkout. */
+  /**
+   * Where the worker runs: a task worktree under the worktree policy, the selected workspace under
+   * DIRECT. Which one it is decides the boundary, so the caller states it rather than leaving it to
+   * be inferred from the path.
+   */
   readonly cwd: string;
+  /** Whether the runtime keeps its own harness here, which only DIRECT asks for. */
+  readonly nativeHarness?: boolean;
   readonly task: string;
   readonly context: unknown;
   readonly findings?: readonly string[];
@@ -187,9 +203,16 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
   // Claude's write boundary is its settings file and tool allowlist, not a kernel sandbox, so
   // there is no sandbox attestation to hold and none is claimed: the grant withholds `shell` on
   // exactly that ground.
+  if (input.nativeHarness === true && input.snapshot.providerId !== "anthropic") {
+    throw new BrainGateInvariantError(
+      "WRITE_NATIVE_HARNESS_UNSUPPORTED",
+      `${input.snapshot.displayName} has no write profile for the workspace itself: its write invocation is confined by a sandbox proven against a task worktree. Choose the worktree policy for it, or a Claude model for a direct write.`,
+    );
+  }
+
   if (input.snapshot.providerId === "anthropic") {
     const plan = planClaudeWriteInvocation(input);
-    return Object.freeze({ ...plan, grant: writeGrant("anthropic", false) });
+    return Object.freeze({ ...plan, grant: writeGrant("anthropic", false, input.nativeHarness === true) });
   }
 
   const body = brief(input);

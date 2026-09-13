@@ -315,10 +315,39 @@ export function planShadowInvocation(input: {
    * to persist one — which is what every caller before M20.2 gets.
    */
   readonly nativeSession?: PlannedNativeSession;
+  /**
+   * Whether the runtime keeps its own harness rather than a BrainGate-declared subset of it.
+   *
+   * Set by the DIRECT policy (ADR 0017). What it removes is exactly the set ADR 0014 classifies as
+   * legacy: the tool allowlist BrainGate wrote, the universal MCP refusal, and the declared
+   * subagents that stood in for the runtime's own. What it does *not* do is grant anything: the
+   * runtime's own permission mode still decides, and in a headless run a tool that would have
+   * prompted is still refused — by the CLI, for its own reasons, rather than by BrainGate for a
+   * reason it invented.
+   *
+   * Providers whose invocation is built around a staged copy refuse it rather than ignoring it,
+   * because a plan that says `nativeHarness` and an argv that ignores user config is a lie.
+   */
+  readonly nativeHarness?: boolean;
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
   const snapshotPrimary = input.snapshotPrimary === true;
+  const nativeHarness = input.nativeHarness === true;
+  if (nativeHarness && input.snapshot.providerId !== "anthropic") {
+    // Not a capability judgement about the CLI: it is about BrainGate's own argv for it. Codex and
+    // Grok are invoked with `--ignore-user-config`, `--ignore-rules` and a sandbox profile that was
+    // earned against a staged copy, and Antigravity with `--sandbox`; none of those is the runtime's
+    // normal harness, and re-deriving each one needs a measurement against the installed build that
+    // this slice did not take. Reported, not silently downgraded.
+    throw new BrainGateInvariantError(
+      "SHADOW_NATIVE_HARNESS_UNSUPPORTED",
+      `${input.snapshot.displayName} cannot yet run its own harness in the workspace through BrainGate: its invocation is built around a staged copy and a sandbox proof earned against it. Use the snapshot or worktree policy for it, or select a Claude model for a direct run.`,
+    );
+  }
+  if (nativeHarness && snapshotPrimary) {
+    throw new BrainGateInvariantError("SHADOW_NATIVE_HARNESS_CONFLICT", "A snapshot-primary run is the strict read posture; it cannot also be a native-harness run.");
+  }
   if (snapshotPrimary && input.payload.role !== "primary") {
     throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROLE_INVALID", "A project snapshot is offered to the read-primary role only.");
   }
@@ -388,18 +417,27 @@ export function planShadowInvocation(input: {
       // only when the grant and the budget both permit helpers — and the helpers are the ones
       // BrainGate defined, read-only and named. Search appears only where the operator has said
       // this provider may reach the network.
-      "--tools", [
-        "Read", "Glob", "Grep",
-        ...(subagents === null ? [] : ["Agent"]),
-        ...(grants(grant, "web") ? ["WebSearch", "WebFetch"] : []),
-      ].join(","),
-      ...(subagents === null ? [] : ["--agents", subagents]),
-      "--disallowedTools", "mcp__*",
-      // Denying the tools is not the same as not loading the servers: a run's own init event
-      // listed the operator's MCP servers as connected while every mcp__ tool was denied. The
-      // guarantee this profile publishes is `noMcp`, so the servers do not get to be there.
-      "--strict-mcp-config",
-      "--mcp-config", "{\"mcpServers\":{}}",
+      // Under the DIRECT policy the runtime keeps its own tool set, its own MCP servers and its
+      // own subagents: BrainGate wrote the allowlist, the `mcp__*` denial and the declared helpers
+      // when it was substituting its own harness for the CLI's, and none of the three is a boundary
+      // the operator asked for (ADR 0014, ADR 0017). The permission mode is the CLI's own, so a
+      // headless run still refuses what it would have prompted for.
+      ...(nativeHarness
+        ? ["--permission-mode", "default"]
+        : [
+          "--tools", [
+            "Read", "Glob", "Grep",
+            ...(subagents === null ? [] : ["Agent"]),
+            ...(grants(grant, "web") ? ["WebSearch", "WebFetch"] : []),
+          ].join(","),
+          ...(subagents === null ? [] : ["--agents", subagents]),
+          "--disallowedTools", "mcp__*",
+          // Denying the tools is not the same as not loading the servers: a run's own init event
+          // listed the operator's MCP servers as connected while every mcp__ tool was denied. The
+          // guarantee this profile publishes is `noMcp`, so the servers do not get to be there.
+          "--strict-mcp-config",
+          "--mcp-config", "{\"mcpServers\":{}}",
+        ]),
       "--max-turns", String(maxTurns),
       "--model", input.model.modelId,
       "--json-schema", schema,
@@ -424,7 +462,21 @@ export function planShadowInvocation(input: {
       grant,
       nativeSession: session,
       streamDialect: "anthropic",
-      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: !session.persistent, isolatedUserConfig: true })),
+      // The guarantees are the ones this argv actually earns. `noMcp` and `noNetworkTools` were
+      // properties of the denial flags, so with the native harness they are not claimed: what holds
+      // is that the run is confined to the workspace (`--restricted`, the settings deny list for
+      // secrets and version-control internals) and that the runtime's own permission mode decides
+      // everything else.
+      guarantees: guaranteesFor(grant, Object.freeze({
+        projectOnlyRead: true,
+        noProjectWrites: !nativeHarness,
+        noShell: !nativeHarness,
+        noNetworkTools: !nativeHarness,
+        noMcp: !nativeHarness,
+        noSessionPersistence: !session.persistent,
+        isolatedUserConfig: !nativeHarness,
+      })),
+      ...(nativeHarness ? { nativeHarness: true } : {}),
       minimumVersion: profile.minimumVersion,
     });
   }

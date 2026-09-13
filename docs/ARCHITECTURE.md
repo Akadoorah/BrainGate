@@ -102,6 +102,34 @@ untouched, never read, and never migrated on a guess.
 Moving a registration to a different workspace is `braingate init --rebind`, and it is never implied.
 See `docs/adr/0015-workspace-identity.md` and `docs/adr/0016-workspace-scoped-execution-state.md`.
 
+## Role, execution policy and harness
+
+Three things that were once one setting:
+
+```text
+ROLE             = purpose     (plan, execute, review, judge)
+EXECUTION POLICY = boundary    (direct, read-only, worktree, snapshot, unattended)
+NATIVE CLI       = harness     (its tools, shell, subagents, MCP servers, permissions)
+```
+
+The **policy** is chosen, not inferred, and it is the only thing that decides where a worker runs.
+`direct` — the ordinary interactive boundary — runs the native CLI in the selected workspace, with
+the workspace as its `cwd`, no worktree, no snapshot and no commit. `read-only` runs there and is
+verified afterwards to have changed nothing. `worktree` and `snapshot` are the strict modes and are
+unchanged in what they guarantee; they are selected explicitly. `unattended` runs in the workspace
+with BrainGate's own bounds standing in for the runtime's approvals.
+
+The **intent** of a request decides what is wanted — a read or a change — and can only ever narrow
+the policy, never widen it. A request that says "do not modify anything" is read-only whatever is
+selected.
+
+The **harness** belongs to the runtime. Under `direct` the invocation stops substituting BrainGate's
+tool allowlist, MCP refusal and declared subagents for the CLI's own, and passes the CLI's own
+permission mode instead; the guarantees published on the plan are updated to describe what the argv
+actually earns. Where a provider's invocation cannot yet honour that — Grok, Codex and Antigravity
+are built around a staged copy and a sandbox proof earned against it — the plan refuses rather than
+running with an unmeasured boundary. See `docs/adr/0017-direct-execution.md`.
+
 ## Execution lifecycle
 
 1. Resolve an explicit project identity, and the conversation and goal this request continues.

@@ -7,7 +7,22 @@ import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
-import { ProjectRegistry, TaskLedger, executionScopeFor, gitMetadataFor, legacyExecutionState, resolveAttachment, type ExecutionScope } from "@braingate/core";
+import {
+  DEFAULT_EXECUTION_POLICY,
+  EXECUTION_POLICY_IDS,
+  ProjectRegistry,
+  TaskLedger,
+  describeExecutionPolicy,
+  executionPolicyAvailability,
+  executionPolicyForIntent,
+  executionScopeFor,
+  gitMetadataFor,
+  isExecutionPolicyId,
+  legacyExecutionState,
+  resolveAttachment,
+  type ExecutionScope,
+  type ExecutionPolicyId,
+} from "@braingate/core";
 import {
   GoalStore,
   buildGoalContext,
@@ -351,6 +366,14 @@ function runtimeDeps(deps: ReplDeps): Record<string, unknown> {
 
 interface WorkerLoopState {
   selection: WorkerSelection;
+  /**
+   * The execution boundary for this session.
+   *
+   * Chosen by the operator with `/policy`, defaulting to DIRECT: the workspace itself, shared with
+   * every worker and with them, which is what ordinary interactive work means. Nothing infers it
+   * from the request — the classifier decides what is wanted, this decides where it may happen.
+   */
+  policy: ExecutionPolicyId;
   /** Mutated by `/use --fresh`: consumed by exactly one run. */
   freshRequested: boolean;
   /** What the last run did about a native session, for `/worker`. */
@@ -362,6 +385,7 @@ interface WorkerLoopState {
 
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
+  const spec = executionPolicyForIntent({ policy: worker.policy, intent: mode === "write" ? "write" : "read" });
   const captured: string[] = [];
   const capture = (text: string): void => { captured.push(text); };
   const sessionTurns = (budget: number) => session.recent(budget);
@@ -425,7 +449,9 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   const planJson = readPlan(plan.data);
   const planSummary = planJson === null ? "the plan produced no readable output" : planJson.summary;
 
-  deps.stdout(`\n  ${mode === "write" ? "write · isolated worktree" : "read-only"} · ${planSummary}\n`);
+  // What the run will be, in the policy's own words. "write · isolated worktree" was the only
+  // answer this line had, and it was wrong for every DIRECT run — which is now the ordinary one.
+  deps.stdout(`\n  ${mode === "write" ? "write" : "read-only"} · ${spec.label} · ${spec.isolation === "none" ? "in your workspace" : spec.isolation === "worktree" ? "isolated worktree" : spec.isolation === "snapshot" ? "reading a copy" : "no writes"} · ${planSummary}\n`);
   // The goal the request continues, said before anything is spent. This is the line that was
   // missing when a follow-up was silently treated as a brand-new task.
   if (goal !== null) {
@@ -436,7 +462,11 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // that used to be dropped, and it is the half that answers "why is this reading less than I
   // expected" before the run rather than after it.
   for (const line of planJson?.grantLines ?? []) deps.stdout(`  ${line}\n`);
-  const answer = await deps.ask(mode === "write" ? "  Run it? This changes a task worktree, never your checkout. [y/N] " : "  Run it? [y/N] ");
+  const answer = await deps.ask(mode === "write" && spec.isolation === "worktree"
+    ? "  Run it? This changes a task worktree, never your checkout. [y/N] "
+    : mode === "write" && spec.allowWrites
+      ? "  Run it? This changes files in your workspace, and nothing is committed. [y/N] "
+      : "  Run it? [y/N] ");
   if (answer === null || !/^y(es)?$/i.test(answer.trim())) { deps.stdout("  Skipped. Nothing was spent.\n\n"); return; }
 
   deps.stdout("\n");
@@ -451,7 +481,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   let attributed: readonly string[] = Object.freeze([]);
   // The run's record — task id, outcome, usage, the answer — comes back as data without asking for
   // JSON, and the human-readable answer is what the operator sees.
-  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--execute"], {
+  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--policy", worker.policy, "--execute"], {
     cwd: deps.cwd,
     stdout: (text) => {
       working.stop();
@@ -708,8 +738,32 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       const known = goals === null ? [] : goals.listProviderSessions(8);
       for (const line of describeWorker({ selection: worker.selection, goal, lastRun: worker.lastRun, knownSessions: known })) deps.stdout(`${line}\n`);
       // Native continuity is per workspace as well as per provider and model, so which workspace
-      // these sessions belong to is part of the answer to "what would resume".
+      // these sessions belong to is part of the answer to "what would resume". The policy is the
+      // other half: it is the boundary the next run happens inside.
       if (workspaceScope !== null) deps.stdout(`  workspace: ${workspaceScope.workspacePath} · ${workspaceScope.workspaceId}\n`);
+      deps.stdout(`  policy:    ${describeExecutionPolicy(worker.policy)}\n`);
+      return "continue";
+    }
+    case "policy": {
+      const requested = rest[0];
+      if (requested === undefined) {
+        deps.stdout(`  Execution policy: ${describeExecutionPolicy(worker.policy)}\n`);
+        deps.stdout("  Choose with /policy direct | read-only | worktree | snapshot | unattended.\n");
+        return "continue";
+      }
+      if (!isExecutionPolicyId(requested)) {
+        deps.stderr(`  Unknown policy \`${requested}\`. Known: ${EXECUTION_POLICY_IDS.join(", ")}.\n`);
+        return "continue";
+      }
+      const availability = executionPolicyAvailability({ policy: requested, hasRepository: workspaceScope?.git !== null && workspaceScope !== null });
+      if (!availability.available) { deps.stderr(`  ${availability.reason ?? "That policy is not available here."}\n`); return "continue"; }
+      worker.policy = requested;
+      // Changing the boundary spends nothing and reaches no provider: it is a local decision about
+      // where the next run happens, which is why it can be made mid-conversation.
+      deps.stdout(`  Execution policy: ${describeExecutionPolicy(requested)}\n`);
+      if (requested === "worktree") deps.stdout("  A write under this policy is proposed in an isolated worktree and merged by you.\n");
+      if (requested === "snapshot") deps.stdout("  A read under this policy runs against a copy, so it cannot touch the workspace.\n");
+      if (requested === "read-only") deps.stdout("  Writes are refused while this is selected.\n");
       return "continue";
     }
     case "new": {
@@ -889,7 +943,9 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   // is cheap, instead of resuming into a format this build may no longer read.
   const versions = new Map<string, string | null>();
   const probe = new SessionCapabilityProbe(deps.probeCapabilities, (providerId) => versions.get(providerId) ?? null);
-  const worker: WorkerLoopState = { selection: AUTO_WORKER, freshRequested: false, lastRun: null, probe, versions };
+  // DIRECT is the ordinary interactive boundary: the workspace itself, no worktree, no snapshot
+  // (ADR 0017). The strict modes remain one command away and are never chosen for the operator.
+  const worker: WorkerLoopState = { selection: AUTO_WORKER, policy: DEFAULT_EXECUTION_POLICY, freshRequested: false, lastRun: null, probe, versions };
   try {
     for (;;) {
       const line = await deps.ask("> ");

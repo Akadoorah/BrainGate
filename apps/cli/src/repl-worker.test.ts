@@ -631,8 +631,10 @@ test("K: a read turn and the write turn that follows it stay one conversation, o
   assert.equal(await session.run(), 0);
 
   const text = session.text();
-  // The second turn is planned as a write, at the same goal, and declining it spends nothing.
-  assert.match(text, /write · isolated worktree/);
+  // The second turn is planned as a write, at the same goal, and declining it spends nothing. Under
+  // the default DIRECT policy that write happens in the workspace, so the line says so rather than
+  // promising a worktree the run would never create (ADR 0017).
+  assert.match(text, /write · direct · in your workspace/);
   assert.match(text, /continues goal/);
   assert.match(text, /Skipped\. Nothing was spent\./);
 

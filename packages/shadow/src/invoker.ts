@@ -413,6 +413,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
   readonly #timeoutMs: number | undefined;
   readonly #snapshotStore: TaskSnapshotProvider | undefined;
+  readonly #nativeHarness: boolean;
   readonly #nativeSession: NativeSessionResolver | undefined;
   /**
    * The last plan this invoker built, so a caller can read back what actually ran.
@@ -453,6 +454,11 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
      * session is pinned, none is resumed, and nothing is persisted — the pre-M20.2 behaviour.
      */
     readonly nativeSession?: NativeSessionResolver;
+    /**
+     * Whether this run keeps the runtime's own harness (the DIRECT policy, ADR 0017). One flag for
+     * one decision: the plan builder is the only place that turns it into argv.
+     */
+    readonly nativeHarness?: boolean;
     /** Tool-use turns a read-only inspection may spend; from the task's execution budget. */
     readonly maxTurns?: number;
     /** Wall-clock allowance for one invocation; from the task's execution budget. */
@@ -515,6 +521,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#onQuotaReading = input.onQuotaReading;
     this.#timeoutMs = input.timeoutMs;
     this.#snapshotStore = input.snapshotStore;
+    this.#nativeHarness = input.nativeHarness === true;
     this.#nativeSession = input.nativeSession;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
@@ -581,6 +588,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       snapshot,
       model: request.model,
       ...(session === null ? {} : { nativeSession: session }),
+      ...(this.#nativeHarness ? { nativeHarness: true } : {}),
       cwd: this.#cwd,
       ...(snapshotEvidence === null ? {} : { snapshotPrimary: true, workspaceRoot: snapshotEvidence.root }),
       ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),

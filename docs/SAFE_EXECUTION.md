@@ -1,4 +1,26 @@
-# Safe execution boundaries
+# Safe execution
+
+## Execution policy
+
+Where a worker runs is chosen, and it is separate from what the request is about: the classifier
+decides whether the operator wants a read or a change, the policy decides where that may happen.
+Intent can only narrow the boundary, never widen it.
+
+| Policy | Where the worker runs | Writes | Git |
+|---|---|---|---|
+| `direct` (default) | the selected workspace itself | allowed | observed only |
+| `read-only` | the selected workspace | refused, and verified afterwards | observed only |
+| `worktree` | an isolated task worktree | proposed, never applied | required |
+| `snapshot` | an immutable copy taken for the run | refused | required |
+| `unattended` | the selected workspace, nobody present | allowed, under BrainGate's own bounds | observed only |
+
+DIRECT is what ordinary interactive work means: the native CLI runs in the workspace you selected,
+its changes are there when it finishes, and the next worker reads the same files. Nothing is
+committed, merged, reset or cleaned, and uncommitted changes are a normal outcome rather than a
+failure. The strict modes are one `/policy` away and are never chosen for you. See ADR
+[0017](adr/0017-direct-execution.md).
+
+## Boundaries
 
 BrainGate distinguishes **change isolation** from **process isolation**.
 

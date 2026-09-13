@@ -33,6 +33,12 @@ switch workers — Claude to Grok to Codex — the new worker is handed what the
 established rather than starting from nothing. If you switch back, BrainGate continues that worker's
 own session where its runtime supports it, and tells it only what changed while it was away.
 
+**Work happens in your workspace, where you can see it.** BrainGate runs the native CLI in the
+directory you selected: a change it makes is in your files when it finishes, the next worker reads
+those same files, and nothing is committed, merged, reset or cleaned behind your back. Worktrees and
+snapshots are still there — as *policies you choose* (`/policy worktree`, `/policy snapshot`) when
+you want a change proposed rather than applied, or a read that cannot touch what it reads.
+
 **Each runtime stays itself.** BrainGate launches `claude`, `codex`, `agy` or `grok` and lets them
 work the way they normally work: their tools, their shell, their subagents, their MCP servers, their
 browser, their worktrees, their own permission prompts. When Claude Code decides to spawn three
@@ -518,6 +524,19 @@ any, and new work starts a clean workspace.
 
 `/project` in an interactive session prints the project, the workspace, its id, the directory workers
 run in, and where the state lives — so you can verify where BrainGate is operating at any time.
+`/policy` shows and changes the execution boundary, and changing it spends nothing:
+
+```text
+/policy                       the current boundary
+/policy direct                run in this workspace (the default)
+/policy read-only             read it, change nothing, and verify that
+/policy worktree              propose a write in an isolated Git worktree
+/policy snapshot              read an immutable copy of the workspace
+```
+
+**A worker may leave uncommitted changes, and that is normal.** In the default policy the CLI edits
+your files directly. BrainGate tells you which files changed, by whom, and under which policy, and
+makes no commit. Committing stays your decision, in your own shell.
 
 **4. Check readiness. This spends nothing.**
 

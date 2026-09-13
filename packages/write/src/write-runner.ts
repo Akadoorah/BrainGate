@@ -27,6 +27,8 @@ import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
 import { assertWriteEligible, planWriteInvocation } from "./write-profiles.js";
+import { changedPaths, snapshotWorkspace, workspaceChangesSince, type WorkspaceSnapshot } from "@braingate/shadow";
+import type { ExecutionPolicyId } from "@braingate/core";
 import { collectGuardedDiff } from "./diff-guard.js";
 import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
 import type { PlannedWriteRole, VisualRequest, WriteProviderExecutor, WriteRunResult, WriteTaskPlan, WriteVerificationResult } from "./types.js";
@@ -161,6 +163,14 @@ export function buildWriteTaskPlan(input: {
   readonly requiredContextTokens: number;
   readonly repositoryPath: string;
   readonly baseRef: string;
+  /**
+   * The execution boundary this write runs inside (ADR 0017).
+   *
+   * `worktree` is the strict mode: an isolated worktree the operator merges. `direct` edits the
+   * workspace itself, which is what ordinary interactive work means — and it is why
+   * `createsWorktree` is false and no merge is ever offered for it.
+   */
+  readonly policy?: ExecutionPolicyId;
   readonly review?: boolean;
   /**
    * The worker the operator named by hand, when there is one.
@@ -191,10 +201,17 @@ export function buildWriteTaskPlan(input: {
       }
     })
     .map((snapshot) => snapshot.providerId);
-  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: primaryExcluded, ...(input.pin === undefined ? {} : { pin: input.pin }) });
+  const direct = input.policy === "direct" || input.policy === "unattended";
+  if (direct) {
+    // Only the providers whose invocation can honestly run in the workspace. The rest are not
+    // refused here but excluded from routing, so the answer to "which model" is decided by the
+    // router among the ones that can, and the operator sees that in the plan.
+    primaryExcluded.push("openai", "xai");
+  }
+  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);
   assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProof);
-  const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: "task-worktree" })];
+  const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: direct ? "workspace" : "task-worktree" })];
 
   const wantsReview = input.review ?? true;
   if (wantsReview) {
@@ -219,9 +236,12 @@ export function buildWriteTaskPlan(input: {
     requiredContextTokens: input.requiredContextTokens,
     repositoryPath: input.repositoryPath,
     baseRef: input.baseRef,
+    policy: direct ? "direct" : "worktree",
     roles: Object.freeze(roles),
     providerCallsOnPlan: 0,
     createsWorktree: false,
+    // A change made in the workspace is already where the operator works. There is nothing to
+    // merge, and offering a merge would imply the edit had been held somewhere.
     mergeAvailable: false,
   });
 }
@@ -282,6 +302,8 @@ export class WriteDogfoodRunner {
     readonly task: string;
     readonly repositoryPath: string;
     readonly baseRef?: string;
+    /** Defaults to `worktree`: the strict mode, and the one this path shipped with. */
+    readonly policy?: ExecutionPolicyId;
     readonly classification: TaskClassification;
     readonly budget: ExecutionBudget;
     readonly requiredContextTokens: number;
@@ -316,8 +338,12 @@ export class WriteDogfoodRunner {
       ...(this.#pin === undefined ? {} : { pin: this.#pin }),
       repositoryPath: input.repositoryPath,
       baseRef: input.baseRef ?? "HEAD",
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
       review: input.review ?? true,
     });
+    // The DIRECT policy: the worker runs in the workspace itself. No worktree is prepared, nothing
+    // is merged, and what it changed is reported by comparing the workspace before and after.
+    const direct = plan.policy === "direct";
     if (input.dryRun ?? false) return Object.freeze({ dryRun: true, taskId: null, worktree: null, changedFiles: Object.freeze([]), diff: "", verification: Object.freeze([]), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: null });
 
     const task = this.#ledger.createTask({ title: taskTitleFor(input.task), complexity: input.classification.complexity, risk: input.classification.risk });
@@ -395,16 +421,25 @@ export class WriteDogfoodRunner {
     });
 
     const worktrees = new WorktreeGuard(this.#project);
-    let handle;
+    let handle: { readonly repositoryPath: string; readonly worktreePath: string; readonly branch: string | null; readonly baseRef: string; readonly worktree?: import("@braingate/execution").WorktreeHandle };
     try {
-      handle = worktrees.prepare({ taskId: task.taskId, repositoryPath: input.repositoryPath, baseRef: plan.baseRef });
+      handle = direct
+        // The workspace itself. `worktreePath` is the same directory, because in this policy there
+        // is no second place for the work to happen — and every reader below that says "the
+        // worktree" is reading the operator's own files, which is the point of the policy.
+        ? { repositoryPath: input.repositoryPath, worktreePath: input.repositoryPath, branch: null, baseRef: plan.baseRef }
+        : (() => { const prepared = worktrees.prepare({ taskId: task.taskId, repositoryPath: input.repositoryPath, baseRef: plan.baseRef }); return { repositoryPath: prepared.repositoryPath, worktreePath: prepared.worktreePath, branch: prepared.branch, baseRef: prepared.baseRef, worktree: prepared }; })();
       // The state of the source checkout before anything ran, as a hash of everything a provider
       // could touch: HEAD, the index, tracked changes, and the *content* of untracked and
       // ignored files — which is where a `.env` lives, and where `git status` alone sees nothing.
       // Every check below compares against this rather than merely asking whether the tree is
       // clean, because a run that rewrote an ignored file would leave it clean and changed.
-      const sourceBefore = sourceCheckoutFingerprint(handle.repositoryPath);
-      this.#ledger.transition(task.taskId, "running", { write: true, branch: handle.branch, workspace: "task-worktree" });
+      // The state the workspace was in before the worker touched it. In DIRECT that is what the
+      // change report is computed from; in the worktree mode it is what proves the source checkout
+      // was never the thing being edited.
+      const workspaceBefore: WorkspaceSnapshot = snapshotWorkspace(direct ? handle.worktreePath : handle.repositoryPath);
+      const sourceBefore = direct ? null : sourceCheckoutFingerprint(handle.repositoryPath);
+      this.#ledger.transition(task.taskId, "running", { write: true, branch: handle.branch, workspace: direct ? "workspace" : "task-worktree", executionPolicy: plan.policy });
       const primary = plan.roles[0]!;
       const primarySnapshot = snapshotFor(this.#providers, primary.model.providerId);
       // Turns and wall clock come from the task's own budget rather than a fixed ceiling, for
@@ -415,6 +450,7 @@ export class WriteDogfoodRunner {
       const schemaPath = join(this.#project.storageDir, "write-schemas", `${task.taskId}.json`);
       const invocation = planWriteInvocation({
         snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath,
+        ...(direct ? { nativeHarness: true } : {}),
         task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
         ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
         // The write profile's proof, not the reviewer's: they are different policies.
@@ -461,19 +497,48 @@ export class WriteDogfoodRunner {
         artifacts = await this.#runVisual({ input, task, handle, visual: input.visual });
       }
 
-      const guarded = collectGuardedDiff(handle.worktreePath, artifacts);
-      assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
-      this.#ledger.appendEvent(task.taskId, "write.changes_collected", { changedFiles: guarded.changedFiles, changedFileCount: guarded.changedFiles.length, diffBytes: Buffer.byteLength(guarded.diff, "utf8") });
+      // What changed, observed rather than taken on the worker's word. In DIRECT this is the whole
+      // report: there is no diff against a base to take, because the workspace may already have
+      // carried the operator's own uncommitted work before the run started.
+      const observed = workspaceChangesSince(workspaceBefore, snapshotWorkspace(handle.worktreePath));
+      const observedFiles = observed === null ? Object.freeze([]) : changedPaths(observed);
+      const guarded = direct
+        ? Object.freeze({ changedFiles: observedFiles, diff: "" })
+        : collectGuardedDiff(handle.worktreePath, artifacts);
+      if (sourceBefore !== null) assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
+      this.#ledger.appendEvent(task.taskId, "write.changes_collected", {
+        changedFiles: guarded.changedFiles,
+        changedFileCount: guarded.changedFiles.length,
+        diffBytes: Buffer.byteLength(guarded.diff, "utf8"),
+        executionPolicy: plan.policy,
+        ...(direct ? { observedInPlace: true } : {}),
+        ...(direct && observed !== null && observed.changedTotal > observedFiles.length ? { changedFilesTruncatedFrom: observed.changedTotal } : {}),
+      });
       if (artifacts.length > 0) {
         // Path, media type, size and hash: what a reviewer needs to judge a file they cannot read.
         this.#ledger.appendEvent(task.taskId, "write.artifacts_collected", { artifacts: artifacts.map((artifact) => ({ path: artifact.path, mediaType: artifact.mediaType, bytes: artifact.bytes, sha256: artifact.sha256 })) });
       }
 
+      // In DIRECT the workspace is not a diff against a base, so `git diff --check` would be
+      // checking the operator's own uncommitted work as much as this run's. Nothing is claimed:
+      // an empty verification list is the honest answer, and the changed-file list is the evidence.
+      // `git diff --check` over the task's own worktree, once. The real handle is passed rather
+      // than a rebuilt one: the runner validates it against the project, and a hand-made object
+      // would be refused by that check rather than by anything being wrong.
       const verifier = new SafeCommandRunner([{ executable: "git", args: ["diff", "--check"] }]);
-      const verifyResult = await verifier.run({ project: this.#project, profile: "verify", worktree: handle, command: { executable: "git", args: ["diff", "--check"], cwd: handle.worktreePath }, ...(input.env === undefined ? {} : { env: input.env }), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 });
-      const verification: WriteVerificationResult[] = [Object.freeze({ command: "git diff --check", passed: !verifyResult.timedOut && verifyResult.exitCode === 0, exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut })];
-      if (!verification[0]!.passed) {
-        this.#ledger.appendEvent(task.taskId, "write.verification_failed", { command: "git diff --check", exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut });
+      const verifyResult = direct ? null : await verifier.run({
+        project: this.#project, profile: "verify",
+        ...(handle.worktree === undefined ? {} : { worktree: handle.worktree }),
+        command: { executable: "git", args: ["diff", "--check"], cwd: handle.worktreePath },
+        ...(input.env === undefined ? {} : { env: input.env }),
+        timeoutMs: 30_000, maxOutputBytes: 256 * 1024,
+      });
+      const whitespace = verifyResult === null ? null : { exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut };
+      const verification: readonly WriteVerificationResult[] = whitespace === null
+        ? Object.freeze([])
+        : Object.freeze([Object.freeze({ command: "git diff --check", passed: !whitespace.timedOut && whitespace.exitCode === 0, exitCode: whitespace.exitCode, timedOut: whitespace.timedOut })]);
+      if (verification.length > 0 && !verification[0]!.passed) {
+        this.#ledger.appendEvent(task.taskId, "write.verification_failed", { command: "git diff --check", exitCode: verification[0]!.exitCode, timedOut: verification[0]!.timedOut });
         finalization = planFor({ writeCompleted: false, writeReviewRan: false, writeVerdict: null, failureKind: "verification-failed", result: Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }) });
         return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: finish() });
       }
@@ -490,18 +555,24 @@ export class WriteDogfoodRunner {
           acceptances: this.#acceptances,
           ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
           ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
-          context: { changedFiles: guarded.changedFiles, mode: "worktree-diff-review" },
+          context: {
+            changedFiles: guarded.changedFiles,
+            mode: direct ? "workspace-change-review" : "worktree-diff-review",
+            ...(direct ? { note: "The worker edited the workspace in place; read the files listed here for the current content." } : {}),
+          },
           ...(this.#reviewExecutor === undefined ? {} : { executor: this.#reviewExecutor }),
           ledger: this.#ledger,
           taskId: task.taskId,
         });
-        const response = await invoker.invoke({ role: "reviewer", model: reviewerRole.model, phase: "write-review", task: input.task, findings: Object.freeze([]), candidateOutput: guarded.diff });
+        const response = await invoker.invoke({ role: "reviewer", model: reviewerRole.model, phase: "write-review", task: input.task, findings: Object.freeze([]), candidateOutput: direct ? null : guarded.diff });
         if (response.kind !== "review") throw new BrainGateInvariantError("WRITE_REVIEW_INVALID", "Write reviewer did not return a review verdict.");
         review = Object.freeze({ providerId: reviewerRole.model.providerId, modelId: reviewerRole.model.modelId, verdict: response.verdict, findings: response.findings });
         this.#ledger.appendEvent(task.taskId, `write.review.${response.verdict}`, { provider: reviewerRole.model.providerId, model: reviewerRole.model.modelId, findingCount: response.findings.length });
       }
 
-      assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
+      // Only the worktree mode asserts the source checkout is untouched. In DIRECT the source
+      // *is* what changed, which is why the observation above is the record rather than a failure.
+      if (sourceBefore !== null) assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
       const readyForApproval = review === null || review.verdict === "approve";
       finalization = planFor({
         writeCompleted: true,
@@ -514,7 +585,25 @@ export class WriteDogfoodRunner {
           ? Object.freeze({ kind: "diff" as const, text: guarded.diff, evidence: "redacted" as const })
           : Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }),
       });
-      return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review, readyForApproval, approvalRequired: true, mergePerformed: false, taskReceipt: finish() });
+      return Object.freeze({
+        dryRun: false,
+        taskId: task.taskId,
+        // The plan and the receipt both name the boundary: `worktree` is null for a DIRECT run,
+        // because there is no second directory and pretending there is one would be the lie.
+        worktree: direct ? null : Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }),
+        executionPolicy: plan.policy,
+        providerCwd: handle.worktreePath,
+        changedFiles: guarded.changedFiles,
+        diff: guarded.diff,
+        verification: Object.freeze(verification),
+        review,
+        // Nothing to approve and nothing to merge: the operator reviews their own working tree, and
+        // no commit was made — a DIRECT run leaves the workspace exactly as the worker left it.
+        readyForApproval: direct ? false : readyForApproval,
+        approvalRequired: !direct,
+        mergePerformed: false,
+        taskReceipt: finish(),
+      });
     } catch (error) {
       // No transition here: the finalizer owns the terminal state, and it derives it from the same
       // evidence a reconciler would find — so a run that dies right now is repaired to the state

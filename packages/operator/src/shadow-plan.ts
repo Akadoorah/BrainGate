@@ -138,6 +138,8 @@ export function buildShadowTaskPlan(input: {
   readonly grokIsolation?: GrokIsolationAttestation;
   readonly acceptances?: readonly OperatorProviderAcceptance[];
   readonly task: string;
+  /** Whether this plan keeps the runtime's own harness: the DIRECT policy (ADR 0017). */
+  readonly nativeHarness?: boolean;
   readonly context: unknown;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
@@ -177,7 +179,9 @@ export function buildShadowTaskPlan(input: {
     ...(proof.grokIsolation === undefined ? {} : { grokIsolation: proof.grokIsolation }),
     ...(proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: proof.grokSnapshotIsolation }),
   }).eligible;
+  const nativeHarness = input.nativeHarness === true ? { nativeHarness: true } : {};
   const primaryInvocation = planShadowInvocation({
+    ...nativeHarness,
     snapshot: primarySnapshot,
     model: primaryModel,
     cwd,
@@ -208,6 +212,7 @@ export function buildShadowTaskPlan(input: {
       model,
       route,
       invocation: previewShadowInvocation(planShadowInvocation({
+        ...nativeHarness,
         snapshot: snapshotFor(input.providers, model.providerId),
         model,
         cwd,
@@ -259,6 +264,7 @@ export function buildShadowTaskPlan(input: {
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({
+      ...nativeHarness,
       snapshot: snapshotFor(input.providers, reviewerModel.providerId),
       model: reviewerModel,
       cwd,

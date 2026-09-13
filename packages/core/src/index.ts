@@ -2,6 +2,7 @@ export * from "./errors.js";
 export * from "./project-registry.js";
 export * from "./manifest-path.js";
 export * from "./workspace.js";
+export * from "./execution-policy.js";
 export * from "./checkout.js";
 export * from "./task-outcome.js";
 export * from "./quota-refusal.js";

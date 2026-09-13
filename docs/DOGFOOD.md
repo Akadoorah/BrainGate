@@ -298,3 +298,32 @@ tests run, open questions — and that is what a later worker is handed, whether
 the same model or immediately on a different one. A worker whose own native session can be resumed is
 given only what changed while it was away. None of this reaches canonical memory: an answer is a
 worker's claim until the operator or the evidence makes it a finding, exactly as before.
+
+## Trying DIRECT execution on a disposable copy
+
+The ordinary loop is: run BrainGate in a directory, ask for something, and see it in your files. Use a
+throwaway clone for the first run, and expect uncommitted changes rather than a worktree:
+
+```bash
+git clone <repo> /tmp/braingate-direct && cd /tmp/braingate-direct
+braingate init --project-id direct-trial --name "Direct trial"
+braingate                      # the session; DIRECT is the default policy
+```
+
+Inside the session:
+
+```text
+/policy                                            the boundary the next run happens inside
+/use anthropic/claude-sonnet-5
+what does the auth flow do when the session expires?      a read, in your workspace
+/use google/<configured-model>
+review that answer against the code                        a second opinion, same files
+/use anthropic/claude-sonnet-5
+implement the smallest fix you proposed                    a write, in your workspace
+/policy worktree
+the same change again, proposed instead of applied          the strict mode, on request
+```
+
+Afterwards, `git status --short` in the clone is the record: BrainGate made no commit, and nothing
+was merged. `braingate tasks list` shows the tasks, and their receipts name the policy, the provider
+`cwd` and the files each run changed.

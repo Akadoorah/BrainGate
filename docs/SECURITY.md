@@ -164,3 +164,26 @@ Task ledgers record classification, routing, provider/model role, permission gra
 - Provider CLI behavior changing unexpectedly.
 - Compromised or malicious third-party skills.
 - Unsafe adaptation caused by a small or noisy dogfood sample.
+
+## DIRECT execution and the security model
+
+The default interactive policy runs the native CLI in the workspace the operator selected (ADR
+[0017](adr/0017-direct-execution.md)). That is a deliberate change to where the boundary sits, and it
+is worth stating exactly what it does and does not claim.
+
+- **It is the operator's own runtime, in the operator's own directory, on purpose.** The runtime's
+  permission model is the one they accepted when they installed and signed into it, and under DIRECT
+  BrainGate stops substituting its own tool allowlist, MCP refusal and declared subagents for it.
+- **Nothing is granted that the runtime would have asked about.** In a headless run there is nobody to
+  answer a prompt, so a tool the CLI would prompt for is refused by the CLI. BrainGate reports that as
+  the runtime's decision rather than presenting it as a BrainGate guarantee.
+- **What is still enforced by BrainGate**: the secret and version-control deny list in the Claude
+  settings file (`.env`, credentials, keys, `.git` internals, agent/control-plane configuration); no
+  commit, no merge, no branch switch, no reset, no clean; and the read-only intent check, which
+  fingerprints the workspace before and after and refuses a read that changed it.
+- **The strict modes still exist and still mean what they meant.** A worktree write never touches the
+  workspace; a snapshot read cannot. Both are selected explicitly, and an unattended workflow uses
+  them or the `unattended` policy rather than inheriting the interactive default.
+- **A DIRECT write leaves uncommitted changes in the workspace.** That is the point of the policy, and
+  it is reported: which files changed, by which worker, under which policy, and that nothing was
+  committed.

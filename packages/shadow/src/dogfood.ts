@@ -28,7 +28,7 @@ import type { QuotaReading } from "./quota-readings.js";
 import { planShadowInvocation, shadowProviderRoleStatus, snapshotPrimaryEligibility } from "./profiles.js";
 import type { TaskSnapshotProvider } from "./snapshot-provider.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
-import { assertSourceCheckoutUnchanged, sourceCheckoutFingerprint } from "./source-guard.js";
+import { assertWorkspaceUnchanged, snapshotWorkspace } from "./workspace-changes.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 function modelRef(route: RouteResult): ModelRef {
@@ -164,6 +164,7 @@ export class ShadowDogfoodRunner {
   readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
   readonly #pin: RoutePin | undefined;
+  readonly #nativeHarness: boolean;
   readonly #nativeSession: NativeSessionResolver | undefined;
   readonly #snapshotStore: TaskSnapshotProvider | undefined;
   readonly #finalizer: TaskFinalizer;
@@ -223,6 +224,8 @@ export class ShadowDogfoodRunner {
     readonly onThinking?: () => void;
     /** Told what a provider said about its own remaining window, when it says anything. */
     readonly onQuotaReading?: (reading: QuotaReading & { readonly quotaPool: string }) => void;
+    /** Whether this run keeps the runtime's own harness: the DIRECT policy (ADR 0017). */
+    readonly nativeHarness?: boolean;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
@@ -235,6 +238,7 @@ export class ShadowDogfoodRunner {
     this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
     this.#executor = input.executor;
     this.#pin = input.pin;
+    this.#nativeHarness = input.nativeHarness === true;
     this.#nativeSession = input.nativeSession;
     this.#snapshotStore = input.snapshotStore;
     this.#finalizer = input.finalizer;
@@ -326,6 +330,7 @@ export class ShadowDogfoodRunner {
       ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),
     }).eligible;
     planShadowInvocation({
+      ...(this.#nativeHarness ? { nativeHarness: true } : {}),
       snapshot: primarySnapshot,
       model: primaryRef,
       cwd,
@@ -349,6 +354,7 @@ export class ShadowDogfoodRunner {
       routes.push(reviewerRoute);
       const reviewerRef = modelRef(reviewerRoute);
       planShadowInvocation({
+        ...(this.#nativeHarness ? { nativeHarness: true } : {}),
         snapshot: snapshotFor(this.#snapshots, reviewerRef.providerId),
         model: reviewerRef,
         cwd,
@@ -475,11 +481,13 @@ export class ShadowDogfoodRunner {
     });
 
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }), ...(this.#nativeSession === undefined ? {} : { nativeSession: this.#nativeSession }) });
-      const sourceBefore = sourceCheckoutFingerprint(cwd);
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }), ...(this.#nativeSession === undefined ? {} : { nativeSession: this.#nativeSession }), ...(this.#nativeHarness ? { nativeHarness: true } : {}) });
+      // The state the workspace was in before this run, for the verification below. Taken with or
+      // without Git, because a workspace is a directory rather than a repository.
+      const sourceBefore = snapshotWorkspace(cwd);
       const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, ...(this.#pin === undefined ? {} : { pin: this.#pin }), excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       workflowReceipt = workflow;
-      assertSourceCheckoutUnchanged(cwd, sourceBefore);
+      assertWorkspaceUnchanged(cwd, sourceBefore, "this read-only run");
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });
       // The receipt is the canonical source of the outcome, and it is durable before finalization
       // begins — which is what lets a second process derive exactly the same record.

@@ -130,6 +130,14 @@ export interface ShadowInvocationPlan {
    * nobody accepted network access" is exactly the sentence that used to be missing.
    */
   readonly grant: ToolGrant;
+  /**
+   * Set when the runtime is running its own harness rather than a BrainGate-declared subset of it.
+   *
+   * Published on the plan because three readers need it and must not infer it: the receipt reports
+   * the policy the run executed under, the guarantees say which of them are no longer claimed, and a
+   * reader of the plan can see whether the argv in front of them is the CLI's normal one.
+   */
+  readonly nativeHarness?: boolean;
   /** The stream shape this invocation produces, for the providers whose shape was measured. */
   readonly streamDialect: StreamDialect | null;
   /**

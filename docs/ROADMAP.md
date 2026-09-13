@@ -135,6 +135,18 @@ Two milestones that exist because dogfooding found them, not because a plan pred
     execution mode that makes a write in a workspace with no repository possible without a worktree,
     and an explicit import tool for legacy state if one is ever wanted.
 
+  - **M20.5 — DIRECT/NATIVE workspace execution.** Execution policy became a first-class, chosen
+    concept — `direct`, `read-only`, `worktree`, `snapshot`, `unattended` — with DIRECT as the
+    ordinary interactive boundary: the native CLI runs in the selected workspace, shares the
+    filesystem with every other worker, leaves its changes there and commits nothing. Intent decides
+    what is wanted and can only narrow the boundary; the strict modes are unchanged and are selected
+    explicitly; and the workspace-change guard works with or without Git. Under DIRECT the Claude
+    invocation stops substituting BrainGate's tool allowlist, MCP refusal and declared subagents for
+    the CLI's own harness, and the plan's guarantees are updated to what the argv actually earns.
+    Grok, Codex and Antigravity refuse DIRECT with a named reason rather than running under an
+    unmeasured boundary. ADR [0017](adr/0017-direct-execution.md). Next: re-measuring those three
+    invocations against the installed builds, and an explicit commit workflow.
+
 ## Immediate technical hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.

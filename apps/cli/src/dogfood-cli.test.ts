@@ -247,10 +247,12 @@ test("dogfood ask execute records sanitized observation then feedback/report", a
   assert.doesNotMatch(JSON.stringify(report.data), /safe dogfood answer|Where is the theme config/);
 });
 
-test("dogfood write execute mutates only worktree and records a run", async () => {
+// The strict mode is now chosen rather than assumed: DIRECT is the default (ADR 0017), so this
+// test names the policy it is about instead of relying on it being the only one.
+test("dogfood write execute under the worktree policy mutates only the worktree", async () => {
   const f = fixture(); const writer = new FakeWriteExecutor(); const out = io();
-  const result = await runDogfoodCli(["dogfood", "write", "run", "--task", "change the button label", "--no-review", "--execute", "--json"], { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: out.stdout, stderr: out.stderr });
-  assert.equal(result.exitCode, 0); assert.equal(writer.calls.length, 1);
+  const result = await runDogfoodCli(["dogfood", "write", "run", "--policy", "worktree", "--task", "change the button label", "--no-review", "--execute", "--json"], { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: out.stdout, stderr: out.stderr });
+  assert.equal(result.exitCode, 0, out.err()); assert.equal(writer.calls.length, 1);
   assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), "before\n"); assert.equal(git(f.repo, ["status", "--porcelain"]), "");
   assert.equal((result.data as { readyForApproval: boolean; mergePerformed: boolean }).readyForApproval, true); assert.equal((result.data as { mergePerformed: boolean }).mergePerformed, false);
   const store = new DogfoodStore(projectFor(f)); try { assert.equal(store.report().runs, 1); } finally { store.close(); }

@@ -239,7 +239,7 @@ test("a short follow-up is planned as continuing its goal, not as an isolated lo
   // T2, not T3: M20.2 refined the floor so a goal with findings is budgeted for the work it is
   // doing rather than frozen at the highest tier it ever reached.
   assert.match(text, /continues goal [0-9a-f]+ · diagnosed · raised to T2 by this goal/, "the plan must route the follow-up at the goal's tier, not the sentence's");
-  assert.match(text, /read-only · T2\/low/, "and the plan line must show the tier the run will use");
+  assert.match(text, /read-only · direct · in your workspace · T2\/low/, "and the plan line must show the boundary and the tier the run will use");
   // The second plan was declined, so nothing was spent on it: the gate still holds.
   assert.match(text, /Skipped\. Nothing was spent\./);
 });

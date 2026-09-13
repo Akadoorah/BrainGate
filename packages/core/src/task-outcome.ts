@@ -332,6 +332,9 @@ export function failureKindFromCode(code: string): FailureKind {
     // the same fact as a source that will not hold still: the snapshot cannot describe what is there.
     case "SNAPSHOT_NESTED_REPOSITORY":
     case "SHADOW_SOURCE_MUTATED":
+    // The same fact, reported by the guard that works without Git: a run that was supposed to
+    // change nothing changed something (ADR 0017).
+    case "WORKSPACE_MUTATED":
     case "WRITE_SOURCE_MUTATED":
     // The task's project moved between the state it started from and the copy a failover would need:
     // the same fact as a guarded source changing under a run, and named the same way.
