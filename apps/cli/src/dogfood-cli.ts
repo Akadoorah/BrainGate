@@ -31,7 +31,7 @@ import {
   inspectGitRepository,
   repositoryReadiness,
 } from "@braingate/dogfood";
-import { GlobalQuotaStore, WINDOW_UTILIZATION_METRIC, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
+import { WINDOW_UTILIZATION_METRIC, openQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
 import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
@@ -440,7 +440,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
     spend.set(key, current);
   }
   if (spend.size === 0) return;
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     recordPoolSpend(store, [...spend.values()]);
     recordPoolLoad(store);
@@ -450,7 +450,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
 function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnapshot[]): { readonly router: CapabilityRouter; readonly runtimes: readonly unknown[] } {
   const entries = new ModelCatalog(state.modelCatalogPath).load();
   if (!entries.some((entry) => entry.configured)) throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Import/discover then add scored model definitions before dogfood execution.");
-  const quota = new GlobalQuotaStore(state.globalDir);
+  const quota = openQuotaStore(state.globalDir);
   try {
     // The refusal backoff is applied here, where a task is about to be routed: a pool a provider
     // refused minutes ago is avoided before the call rather than after it. It does not touch
@@ -538,7 +538,7 @@ function recordRefusalBackoffs(state: OperatorStatePaths, receipt: TaskReceipt, 
   const refusals = refusalsIn(receipt.events);
   const served = providerCalls.filter((call) => call.completed);
   if (refusals.length === 0 && served.length === 0) return;
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     for (const refusal of refusals) {
       store.recordRefusalBackoff({
@@ -598,7 +598,7 @@ function recordQuotaReading(state: OperatorStatePaths, readings: readonly (Quota
   // Every window is kept, because a receipt should be able to say what the provider reported.
   // Which of them decides a routing hint is the reader's question, and the reader takes the fullest:
   // a five-hour window at 0.9 matters whatever the weekly figure says.
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     for (const reading of readings) {
       store.record({
@@ -985,6 +985,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
         // conversation turn worth continuing from.
         answer: result.report ?? null,
         noChange,
+        sessionRecovered: result.sessionRecovered === true,
         readyForApproval: result.readyForApproval,
         approvalRequired: result.approvalRequired,
         mergePerformed: false,

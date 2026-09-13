@@ -123,7 +123,7 @@ export function resolveManualWorker(input: {
 export function describeWorker(input: {
   readonly selection: WorkerSelection;
   readonly goal: GoalRecord | null;
-  readonly lastRun: { readonly label: string | null; readonly session: NativeSessionDecision | null } | null;
+  readonly lastRun: RunSessionSummary | null;
   readonly knownSessions: readonly {
     readonly providerId: string;
     readonly modelId: string | null;
@@ -142,7 +142,14 @@ export function describeWorker(input: {
   lines.push(`  Goal: ${input.goal === null ? "none yet — the next request starts one" : `${input.goal.goalId.slice(0, 8)} · ${input.goal.objective}`}`);
   if (input.lastRun !== null) {
     lines.push(`  Last run: ${input.lastRun.label ?? "unknown worker"}`);
-    if (input.lastRun.session !== null) lines.push(`  Native session: ${describeSessionDecision(input.lastRun.session)}`);
+    if (input.lastRun.session !== null) {
+      // What the runtime did with the session, not only what was chosen for it. A run that had to
+      // start fresh because the stored session was gone did not resume anything, and a view that
+      // says it did is the one place the operator would look to find out.
+      lines.push(input.lastRun.recovered === true
+        ? "  Native session: that session was not found by the runtime — a fresh one carried the goal handoff."
+        : `  Native session: ${describeSessionDecision(input.lastRun.session)}`);
+    }
   }
   if (pin !== undefined) {
     const policy = RUNTIME_SESSION_POLICIES[pin.providerId as ProviderId];
@@ -171,6 +178,13 @@ export interface RunSessionSummary {
   readonly label: string | null;
   readonly session: NativeSessionDecision | null;
   readonly delta: GoalDelta | null;
+  /**
+   * True when the session this run resolved was not found by the runtime, and a fresh one carried it.
+   *
+   * The decision and the outcome are different facts, and only the second is known after the run:
+   * `session` says what BrainGate chose to resume, this says what the runtime then did with it.
+   */
+  readonly recovered?: boolean;
 }
 
 /**

@@ -97,6 +97,18 @@ class FakeClis {
   answering(answer: string): this { this.#answer = answer; return this; }
   reporting(report: string): this { this.#report = report; return this; }
 
+  /**
+   * Makes the runtime answer a resumed write the way a CLI whose session file is gone does.
+   *
+   * A session id BrainGate stores can outlive the runtime's copy of it — a cleaned cache, a
+   * different machine, a CLI that does not write one for this kind of invocation. The first resume
+   * fails with this, and the retry it triggers is a fresh invocation carrying the goal handoff.
+   */
+  losingResumedSessions(): this { this.#loseResumed = true; return this; }
+  #loseResumed = false;
+  #recoveries = 0;
+  readonly recoveries = () => this.#recoveries;
+
   readonly shadow: ShadowProcessExecutor = {
     run: async (input: { readonly plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> => {
       this.reads.push({ cwd: input.plan.cwd, args: [...input.plan.args] });
@@ -110,6 +122,15 @@ class FakeClis {
   readonly writer: WriteProviderExecutor = {
     run: async (input: { readonly plan: WriteProviderPlan }): Promise<WriteProviderResult> => {
       this.writes.push({ cwd: input.plan.cwd, args: [...input.plan.args] });
+      const resumed = input.plan.args.includes("--resume");
+      if (this.#loseResumed && resumed) {
+        this.#recoveries += 1;
+        return {
+          spawned: true, exitCode: 1, timedOut: false, durationMs: 5, removedEnvironmentKeys: Object.freeze([]),
+          stdout: "",
+          stderr: `No conversation found with session ID: ${String(input.plan.args[input.plan.args.indexOf("--resume") + 1] ?? "")}`,
+        };
+      }
       this.#edit?.(input.plan.cwd);
       return {
         spawned: true, exitCode: 0, timedOut: false, durationMs: 5, stderr: "", removedEnvironmentKeys: Object.freeze([]),
@@ -292,5 +313,56 @@ test("a pre-existing untracked file neither blocks the write nor is attributed t
       assert.deepEqual((collected!.payload as { changedFiles: readonly string[] }).changedFiles, [README], "only the file the worker touched is attributed to it");
       assert.equal(readFileSync(join(f.repo, "AGENTS.md"), "utf8"), "# Project guidance\n\nUse pnpm.\n", "the operator's untracked file is untouched");
     } finally { ledger.close(); }
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a write whose stored session the runtime no longer has says so, rather than claiming a resume", async () => {
+  // Measured on this machine: Claude 2.1.270 honours a pinned session id and performs the edit, but
+  // left no transcript for a write-shaped invocation, so `--resume` on it fails and the run recovers
+  // with a fresh session. Both the receipt line and `/worker` must report that as what it is. The
+  // failure this pins against is a surface that keeps saying "resuming native session X" for a run
+  // that in fact started a new conversation, which is the terminal disagreeing with the ledger.
+  const f = fixture("session-gone");
+  const clis = new FakeClis().losingResumedSessions();
+  const appended: string[] = [];
+  clis.onWrite((cwd) => {
+    const target = join(cwd, README);
+    const line = `<!-- marker ${String(appended.length + 1)} -->\n`;
+    appended.push(line);
+    writeFileSync(target, `${readFileSync(target, "utf8")}${line}`);
+  });
+  const session = sessionOf(f.repo, f.env, clis, [
+    "/use anthropic/claude-sonnet-5",
+    "Append a comment line to the launch image README. Do not commit.", "y",
+    "Add a second comment line in the same style.", "y",
+    "/worker",
+    "/exit",
+  ]);
+  try {
+    assert.equal(await session.run(), 0, session.text());
+    const text = session.text();
+
+    assert.equal(clis.writes.length, 3, "the resume was attempted, failed, and was retried once");
+    assert.equal(clis.recoveries(), 1, "the runtime lost the session exactly once");
+    assert.equal(appended.length, 2, "and both writes landed");
+    assert.match(readFileSync(f.readme, "utf8"), /marker 1[\s\S]*marker 2/, "the file carries both markers");
+
+    // The receipt line tells the truth about the outcome...
+    assert.match(text, /that session was not found by the runtime/, "the run says the session was gone");
+    assert.doesNotMatch(text, /session: resuming native session/, "and does not claim it resumed one");
+    // ...and `/worker` reads the same fact rather than repeating the decision made before the run.
+    assert.match(text, /Native session: that session was not found by the runtime/, "the worker view agrees with the receipt");
+
+    const scope = scopeOf(f);
+    const goals = new GoalStore(scope.project);
+    const ledger = new (await import("@braingate/core")).TaskLedger(scope.project);
+    try {
+      const events = ledger.listTasks().flatMap((task) => ledger.receipt(task.taskId).events);
+      assert.ok(events.some((event) => event.kind === "session.unavailable"), "the missing session is on the record");
+      // The recovery is a fresh session, not a reuse: the stored one is what it is, and a new one
+      // exists beside it for the next write to continue from.
+      const writes = goals.listProviderSessions().filter((stored) => stored.envelope?.intent === "write");
+      assert.equal(writes.length >= 1, true, "a write session is still on record to continue from");
+    } finally { ledger.close(); goals.close(); }
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

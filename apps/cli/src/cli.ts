@@ -13,7 +13,7 @@ import {
   type RegisteredProject,
 } from "@braingate/core";
 import { startDashboardServer } from "@braingate/dashboard";
-import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot, type RefusalBackoff } from "@braingate/observability";
+import { buildDashboardSnapshot, openQuotaStore, recordPoolLoad, recordPoolSpend, type DashboardSnapshot, type GlobalQuotaStore, type RefusalBackoff } from "@braingate/observability";
 import {
   ModelCatalog,
   NETWORK_ACCESS_RISK,
@@ -321,7 +321,7 @@ function runtimeFor(
   if (entries.filter((entry) => entry.configured).length === 0) {
     throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Add a scored model definition with `braingate models add --definition <file>`. ");
   }
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     const quota = store.latest();
     const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota, backoff: store.activeRefusalBackoffs() });
@@ -356,7 +356,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
     spend.set(key, current);
   }
   if (spend.size === 0) return;
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     recordPoolSpend(store, [...spend.values()]);
     recordPoolLoad(store);
@@ -366,7 +366,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
 function snapshotProvider(state: OperatorStatePaths, scope: ExecutionScope): () => DashboardSnapshot {
   return () => {
     const ledger = new TaskLedger(scope.project);
-    const quota = new GlobalQuotaStore(state.globalDir);
+    const quota = openQuotaStore(state.globalDir);
     try { return buildDashboardSnapshot({ projects: [{ project: scope.project, ledger }], quotaStore: quota }); }
     finally { ledger.close(); quota.close(); }
   };
@@ -613,7 +613,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const grok = await grokProof(state, snapshots, deps, env, project);
       const grokSnapshot = await grokProof(state, snapshots, deps, env, project, "snapshot-read");
       const acceptances = loadAcceptances(state);
-      const store = new GlobalQuotaStore(state.globalDir);
+      const store = openQuotaStore(state.globalDir);
       let runtimes: readonly unknown[] = [];
       let backoffs: readonly RefusalBackoff[] = [];
       try {

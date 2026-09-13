@@ -90,6 +90,14 @@ export interface WriteRunResult {
   readonly report?: string | null;
   /** True when the run finished and the workspace did not change: a truthful no-change result. */
   readonly noChange?: boolean;
+  /**
+   * True when the session the run resumed turned out not to exist, and a fresh one carried it.
+   *
+   * The decision to resume was still the right one at the time it was made; this says what the
+   * runtime then did. Without it a surface prints "resuming session X" for a run that in fact
+   * started a new conversation, which is the ledger and the terminal telling different stories.
+   */
+  readonly sessionRecovered?: boolean;
   readonly changedFiles: readonly string[];
   readonly diff: string;
   readonly verification: readonly WriteVerificationResult[];

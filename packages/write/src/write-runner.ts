@@ -664,6 +664,7 @@ export class WriteDogfoodRunner {
           mergePerformed: false,
           report,
           noChange: true,
+          sessionRecovered: recoveredFromMissingSession,
           taskReceipt: finish(),
         });
       }
@@ -760,6 +761,7 @@ export class WriteDogfoodRunner {
         review,
         report,
         noChange: false,
+        sessionRecovered: recoveredFromMissingSession,
         // Nothing to approve and nothing to merge: the operator reviews their own working tree, and
         // no commit was made — a DIRECT run leaves the workspace exactly as the worker left it.
         readyForApproval: direct ? false : readyForApproval,

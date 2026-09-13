@@ -524,12 +524,21 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
   // premise of the next follow-up.
   if (result.exitCode === 0) session.record(input, spoken.join("").replace(/\n*Task [0-9a-f-]{36}.*$/s, "").trim());
+  // The decision was made before the run; whether the runtime honoured it is known only now, and
+  // the receipt line and `/worker` both read it from the same place so they cannot tell two stories.
+  if (result.exitCode === 0 && worker.lastRun !== null && (result.data as { readonly sessionRecovered?: boolean } | null)?.sessionRecovered === true) {
+    worker.lastRun = Object.freeze({ ...worker.lastRun, recovered: true });
+  }
   // The goal's own record of the turn, on the same terms: a clean result, and nothing at all when
   // the run failed. What this buys is that the *next* turn — tomorrow, on another provider, after
   // this process is gone — is a continuation rather than a new question.
   if (result.exitCode === 0 && goal !== null && worker.lastRun?.session != null) {
     const decision = worker.lastRun.session;
-    if (decision.kind !== "disabled") {
+    if (worker.lastRun.recovered === true) {
+      // The decision to resume was right when it was made; the runtime did not have that session.
+      // Saying so is the difference between the terminal and the ledger agreeing and not.
+      deps.stdout("  session: that session was not found by the runtime — a fresh native session carried the goal handoff.\n");
+    } else if (decision.kind !== "disabled") {
       deps.stdout(`  session: ${describeSessionDecision(decision)}${worker.lastRun.delta === null ? "" : ` · delta: ${describeGoalDelta(worker.lastRun.delta)}`}\n`);
     }
   }

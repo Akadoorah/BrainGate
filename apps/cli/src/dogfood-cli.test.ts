@@ -469,3 +469,24 @@ test("failures that are not quota refusals never create a backoff", async () => 
     } finally { store.close(); }
   }
 });
+
+test("a quota store that cannot be opened is named with its path, not turned into CLI_UNEXPECTED", async () => {
+  // Operator state is not always writable, and when it is not, the run used to fail as
+  // CLI_UNEXPECTED with the details suppressed: the operator saw a bug where there was a directory
+  // they could fix. The failure is the same failure; it now says which file and what to do.
+  const f = fixture("quota-blocked");
+  const globalDir = resolveOperatorState(f.env, f.repo).globalDir;
+  // A file where the database goes is the one thing that can fail here: the state directory is
+  // writable and the catalogue is present, so routing has everything it needs but its history.
+  mkdirSync(join(globalDir, "quota.sqlite"), { recursive: true });
+  const out = io();
+  const result = await runDogfoodCli(
+    ["dogfood", "ask", "plan", "--task", "Where is the theme config?"],
+    { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], stdout: out.stdout, stderr: out.stderr },
+  );
+  assert.equal(result.exitCode, 1);
+  assert.match(out.err(), /QUOTA_STORE_UNAVAILABLE/, "the failure must have a name");
+  assert.match(out.err(), /quota\.sqlite/, "and name the file");
+  assert.match(out.err(), /BRAINGATE_HOME/, "and the way out");
+  assert.doesNotMatch(out.err(), /CLI_UNEXPECTED/, "a suppressed failure would say nothing");
+});

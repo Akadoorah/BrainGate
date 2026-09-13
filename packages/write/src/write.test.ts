@@ -336,6 +336,7 @@ test("a resumed session the runtime no longer has is retried with a fresh one", 
     });
     assert.equal(call, 2, "the write was retried once");
     assert.equal(result.changedFiles.includes("app.txt"), true, "and the retry did the work");
+    assert.equal(result.sessionRecovered, true, "and the result says the resume was recovered, not completed");
     const events = ledger.receipt(result.taskId!).events;
     assert.ok(events.some((event) => event.kind === "session.unavailable"), "the missing session is recorded rather than swallowed");
   } finally { ledger.close(); rmSync(f.root, { recursive: true, force: true }); }
