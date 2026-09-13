@@ -1,7 +1,7 @@
 import { existsSync } from "node:fs";
+import { createPromptInput } from "./prompt-input.js";
 import { basename, join } from "node:path";
 import { findManifest } from "./manifest-path.js";
-import { createInterface, type Interface } from "node:readline/promises";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
@@ -1005,111 +1005,26 @@ function openLedger(scope: ExecutionScope | null): TaskLedger | null {
   try { return new TaskLedger(scope.project); } catch { return null; }
 }
 
-/** Wires the session to the real terminal. */
-/**
- * How long a prompt waits, after its first line, to see whether the rest of a paste is still coming.
- *
- * A paste arrives as one burst, and Node delivers it as one `line` event per line. `rl.question`
- * resolves on the first of those and leaves the rest queued, so the *next* prompt — the
- * "Run it? [y/N]" — is handed the second line of the request the person had just pasted. In dogfood
- * that is exactly what happened: a two-line request, and the confirmation boundary showing
- * `Run it? [y/N] yKeep the answer concise…`, after which the task was skipped.
- *
- * It is a window rather than a queue because the two cases are otherwise indistinguishable: a human
- * who types two lines deliberately presses Enter twice, seconds apart, and must get two prompts.
- * Nobody notices 25 milliseconds; everybody notices their request being answered with a `y`.
- */
-export const PASTE_BURST_MS = 25;
-
-/**
- * Reads input one *prompt* at a time, keeping a pasted request whole.
- *
- * The alternative considered and rejected was to detect a bad answer at the confirmation — the
- * prompt already shows the spilled text, and by then the request is the thing that was mangled. This
- * keeps the request intact instead, which is the property the operator actually needs.
- */
-export function createPromptInput(
-  options: {
-    /** Anything that emits `line`, `end` and `close`: a readline interface, or a test's input. */
-    readonly input: { on(event: "line", listener: (line: string) => void): unknown; on(event: "end" | "close", listener: () => void): unknown };
-    readonly write: (text: string) => void;
-    readonly burstMs?: number;
-  },
-): { readonly ask: (question: string) => Promise<string | null>; readonly idle: () => Promise<void> } {
-  const burstMs = options.burstMs ?? PASTE_BURST_MS;
-  let pending: string[] = [];
-  let waiter: ((line: string | null) => void) | null = null;
-
-  options.input.on("line", (line: string) => {
-    if (waiter === null) { pending.push(line); return; }
-    const resolve = waiter;
-    waiter = null;
-    resolve(line);
-  });
-  // Input ending is the end of the session, and a prompt waiting on it has to be let go: a closed
-  // pipe that leaves a promise hanging is a process that never exits.
-  const end = (): void => { const resolve = waiter; waiter = null; resolve?.(null); };
-  options.input.on("end", end);
-  options.input.on("close", end);
-
-  const nextLine = async (): Promise<string | null> => {
-    const queued = pending.shift();
-    if (queued !== undefined) return queued;
-    return await new Promise<string | null>((resolve) => { waiter = resolve; });
-  };
-
-  /**
-   * The next line of this burst, or `null` once nothing has arrived for the length of the window.
-   *
-   * The queue is consulted first, and that is not an optimization: a paste delivered synchronously
-   * puts its remaining lines in the queue *while* the first prompt is still resolving, so a window
-   * that only listened would let them sit there — which is the original bug wearing a different hat.
-   */
-  const nextInBurst = async (): Promise<string | null> => {
-    const queued = pending.shift();
-    if (queued !== undefined) return queued;
-    return await new Promise<string | null>((resolve) => {
-      const timer = setTimeout(() => { if (waiter === settle) waiter = null; resolve(null); }, burstMs);
-      const settle = (line: string | null): void => { clearTimeout(timer); resolve(line); };
-      timer.unref();
-      waiter = settle;
-    });
-  };
-
-  const ask = async (question: string): Promise<string | null> => {
-    options.write(question);
-    const first = await nextLine();
-    if (first === null) return null;
-    const rest: string[] = [];
-    // Whatever else this paste carried belongs to the same request. The window closes as soon as one
-    // has passed with nothing arriving, which is what a person typing line by line looks like.
-    for (;;) {
-      const more = await nextInBurst();
-      if (more === null) break;
-      rest.push(more);
-    }
-    return rest.length === 0 ? first : [first, ...rest].join("\n");
-  };
-
-  /** Resolves once no line is waiting to be delivered. For tests, which cannot wait on a window. */
-  const idle = async (): Promise<void> => {
-    await new Promise<void>((resolve) => { const timer = setTimeout(resolve, burstMs * 2); timer.unref(); });
-  };
-
-  return Object.freeze({ ask, idle });
-}
-
 export async function runReplOnTerminal(cwd: string): Promise<number> {
-  const rl: Interface = createInterface({ input: process.stdin, output: process.stdout });
+  const env = process.env;
+  const dumb = env.TERM === "dumb";
+  /**
+   * The session's input, taken over rather than read through readline.
+   *
+   * Node's readline cannot tell a newline inside a paste from an Enter: with `terminal: true` it
+   * strips the bracketed-paste markers and emits one `line` event per newline, so a pasted
+   * paragraph looks exactly like somebody pressing Enter repeatedly. Measured on this stack before
+   * this was written; see `prompt-input.ts`. The composer below reads the raw stream, where the
+   * markers still exist, so the paste boundary is a fact rather than a guess.
+   */
+  const promptInput = createPromptInput({
+    input: process.stdin,
+    write: (text) => { process.stdout.write(text); },
+    terminal: !dumb && process.stdin.isTTY === true,
+  });
   try {
-    const env = process.env;
-    const dumb = env.TERM === "dumb";
-    // The prompt is written once, before the read, so a multi-line request is echoed as the single
-    // thing the operator typed rather than as a prompt repeated per line.
-    const promptInput = createPromptInput({
-      input: rl,
-      write: (text) => { process.stdout.write(text); },
-    });
+    // A dumb terminal gets no escape sequences: no bracketed paste, no raw mode. Typing still works,
+    // and a pipe still delivers one line per Enter.
     return await runRepl({
       cwd,
       animate: !dumb && env.BRAINGATE_NO_ANIMATION !== "1",
@@ -1120,6 +1035,6 @@ export async function runReplOnTerminal(cwd: string): Promise<number> {
       probeCapabilities: probeCapabilitiesFor,
     });
   } finally {
-    rl.close();
+    promptInput.close();
   }
 }

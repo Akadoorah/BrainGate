@@ -16,7 +16,8 @@ import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
-import { createPromptInput, runRepl } from "./repl.js";
+import { runRepl } from "./repl.js";
+import { createPromptInput, PASTE_END, PASTE_START } from "./prompt-input.js";
 
 /**
  * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
@@ -726,98 +727,136 @@ test("L: /status is an observation, so following the guidance records no second 
 
 // ---------------------------------------------------------------- pasted input
 
-/** A terminal that can be handed one paste at a time, and drives nothing until asked. */
+/**
+ * A terminal fixture that speaks the bytes a terminal actually sends.
+ *
+ * Not a line emitter: the whole defect was that lines are what readline reduces a paste to, so a
+ * fixture that hands over lines cannot express the difference between a paste and held-down Enter.
+ * This one delivers raw chunks, brackets included, and can split a chunk anywhere.
+ */
 class FakeTerminal {
-  readonly #listeners: ((line: string) => void)[] = [];
+  readonly #dataListeners: ((chunk: string) => void)[] = [];
+  readonly #endListeners: (() => void)[] = [];
   readonly #written: string[] = [];
-  // Built in the constructor rather than as a field initializer: the private collections are not
-  // installed yet when field initializers run, and `createPromptInput` subscribes immediately.
   readonly prompt: ReturnType<typeof createPromptInput>;
 
-  constructor() {
-    this.prompt = createPromptInput({ input: this, write: (text) => { this.#written.push(text); } });
+  constructor(options: { readonly terminal?: boolean } = {}) {
+    this.prompt = createPromptInput({
+      input: this as never,
+      write: (text: string) => { this.#written.push(text); },
+      terminal: options.terminal ?? true,
+    });
   }
 
-  // The three events `createPromptInput` subscribes to, so it can be driven without a real tty.
-  readonly #endListeners: (() => void)[] = [];
-
-  on(event: "line", listener: (line: string) => void): this;
+  on(event: "data", listener: (chunk: string) => void): this;
   on(event: "end" | "close", listener: () => void): this;
-  on(event: string, listener: ((line: string) => void) | (() => void)): this {
-    if (event === "line") this.#listeners.push(listener as (line: string) => void);
+  on(event: string, listener: ((chunk: string) => void) | (() => void)): this {
+    if (event === "data") this.#dataListeners.push(listener as (chunk: string) => void);
     else this.#endListeners.push(listener as () => void);
     return this;
   }
 
-  /** Input ends, as readline reports a closed stdin. */
-  end(): void { for (const listener of [...this.#endListeners]) listener(); }
+  setRawMode(): void { /* the fixture has no modes; the API is what is under test */ }
 
-  read(...lines: readonly string[]): void {
-    for (const line of lines) {
-      const listeners = [...this.#listeners];
-      for (const listener of listeners) listener(line);
-    }
-  }
+  /** A chunk exactly as the kernel would deliver it. */
+  chunk(text: string): void { for (const listener of [...this.#dataListeners]) listener(text); }
+
+  /** Typing: one character at a time, as the terminal sends it. */
+  type(text: string): void { for (const character of text) this.chunk(character); }
+
+  /** Enter. */
+  enter(): void { this.chunk("\r"); }
 
   /**
-   * Writes a paste the way a terminal delivers one: every line emitted in the same tick, before any
-   * prompt has had a chance to resolve. This is the shape that produced the collision in dogfood.
+   * A paste, exactly as a terminal in bracketed-paste mode delivers one.
+   *
+   * The content goes between the markers with its newlines intact — including a trailing one, which
+   * is the case that used to submit the request before the operator pressed anything.
    */
-  paste(text: string): void { this.read(...text.split("\n")); }
+  paste(content: string, options: { readonly splitAt?: number } = {}): void {
+    const framed = `${PASTE_START}${content}${PASTE_END}`;
+    const splitAt = options.splitAt;
+    if (splitAt === undefined) { this.chunk(framed); return; }
+    // A split marker, so the parser has to hold a partial escape sequence rather than assume chunks.
+    this.chunk(framed.slice(0, splitAt));
+    this.chunk(framed.slice(splitAt));
+  }
+
+  end(): void { for (const listener of [...this.#endListeners]) listener(); }
+
   written(): string { return this.#written.join(""); }
 }
 
-test("M: a pasted multiline request is captured whole, and its lines never answer the confirmation", async () => {
-  const terminal = new FakeTerminal();
-  const ask = terminal.prompt.ask;
-
-  const request = ask("> ");
-  terminal.paste("Find why users are logged out.\nTrace the session path.\nKeep the answer concise.");
-  const captured = await request;
-  await terminal.prompt.idle();
-
-  assert.equal(
-    captured,
-    "Find why users are logged out.\nTrace the session path.\nKeep the answer concise.",
-    "the whole paste is one request",
-  );
-
-  // The next prompt must wait for the operator rather than eating a line of the request.
-  let answered = false;
-  const confirmation = ask("  Run it? [y/N] ").then((value) => { answered = true; return value; });
-  await terminal.prompt.idle();
-  assert.equal(answered, false, "the confirmation must not be satisfied by the request's own text");
-
-  terminal.read("y");
-  assert.equal(await confirmation, "y");
-  assert.match(terminal.written(), /Run it\? \[y\/N\] /);
-});
-
-test("M: two lines typed deliberately, seconds apart, are still two answers", async () => {
-  // The window must not merge what a person typed as separate turns: otherwise a multi-line session
-  // would become one enormous request.
-  const terminal = new FakeTerminal();
-  const first = terminal.prompt.ask("> ");
-  terminal.read("first request");
-  assert.equal(await first, "first request");
-  await terminal.prompt.idle();
-
-  const second = terminal.prompt.ask("> ");
-  terminal.read("second request");
-  assert.equal(await second, "second request");
-});
-
-test("M: a paste that ends with the confirmation answered in one burst keeps both apart", async () => {
-  // What dogfood looked like: request, then `y`, all arriving together. The request keeps its lines and
-  // the `y` is left for the confirmation, which is the whole point of the window.
+test("M: a pasted multiline request stays pending until Enter, then submits once", async () => {
   const terminal = new FakeTerminal();
   const request = terminal.prompt.ask("> ");
-  terminal.paste("One line.\nTwo line.\ny");
-  assert.equal(await request, "One line.\nTwo line.\ny", "a single burst is one answer, verbatim");
-  // Which is why the REPL's own behaviour matters here: the `y` would be part of the request, not an
-  // answer to a prompt that has not been shown yet. A person pasting a request and its answer together
-  // is asking for that text to be the request, and BrainGate does not guess which line was which.
+  // The paste the operator actually made, trailing newline and all. Nothing is submitted by it.
+  terminal.paste("Find why users are logged out.\nTrace the session path.\nKeep the answer concise.\n");
   await terminal.prompt.idle();
+  // Four lines, not three: the paste ended with a newline, so its last line is empty — and that is
+  // kept rather than trimmed, because it is what the operator pasted.
+  assert.match(terminal.written(), /4 lines pending — Enter sends, Ctrl\+C clears/, "the draft is visible as pending");
+  assert.match(terminal.written(), /Find why users are logged out/, "and the pasted text is echoed as the lines it is");
+
+  // The explicit submit, and only then.
+  terminal.enter();
+  assert.equal(
+    await request,
+    "Find why users are logged out.\nTrace the session path.\nKeep the answer concise.\n",
+    "the whole paste is one request, exactly as pasted",
+  );
+});
+
+test("M: a paste followed by typing and one Enter is still one request", async () => {
+  const terminal = new FakeTerminal();
+  const request = terminal.prompt.ask("> ");
+  terminal.paste("Inspect auth.dart.\n");
+  await terminal.prompt.idle();
+  terminal.type("Do not modify anything.");
+  terminal.enter();
+  assert.equal(await request, "Inspect auth.dart.\nDo not modify anything.", "typing continues the draft after a paste");
+});
+
+test("M: the request never answers the confirmation, and the confirmation never joins the next request", async () => {
+  const terminal = new FakeTerminal();
+  const request = terminal.prompt.ask("> ");
+  terminal.paste("One line.\nTwo lines.\n");
+  await terminal.prompt.idle();
+  terminal.enter();
+  assert.equal(await request, "One line.\nTwo lines.\n");
+
+  // The confirmation is a different ask, and only the bytes that arrive while it is waiting count.
+  const confirmation = terminal.prompt.ask("  Run it? [y/N] ");
+  await terminal.prompt.idle();
+  terminal.type("y");
+  terminal.enter();
+  assert.equal(await confirmation, "y");
+
+  // And the next request starts empty rather than inheriting anything from either.
+  const next = terminal.prompt.ask("> ");
+  terminal.type("/status");
+  terminal.enter();
+  assert.equal(await next, "/status");
+});
+
+test("M: Ctrl+C clears a pending draft instead of sending it", async () => {
+  const terminal = new FakeTerminal();
+  const request = terminal.prompt.ask("> ");
+  terminal.paste("half a request\n");
+  await terminal.prompt.idle();
+  terminal.chunk("\u0003");
+  terminal.type("a different request");
+  terminal.enter();
+  assert.equal(await request, "a different request", "what was cleared is not part of what is sent");
+});
+
+test("M: an escape sequence is consumed rather than pasted into the request", async () => {
+  const terminal = new FakeTerminal();
+  const request = terminal.prompt.ask("> ");
+  terminal.chunk("\u001b[A");          // Up arrow
+  terminal.type("real request");
+  terminal.enter();
+  assert.equal(await request, "real request");
 });
 
 test("M: an ended input releases a waiting prompt instead of hanging the session", async () => {
