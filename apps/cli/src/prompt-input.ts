@@ -158,10 +158,25 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     if (pasted && lines > 0) {
       // Said once, at the end of a paste: what is pending, and what will send it. The next prompt is
       // reprinted so typing continues on the last line, the way a multiline composer behaves.
-      write(`${LF}${continuation}[${String(lines + 1)} lines pending — Enter sends, Ctrl+C clears]${LF}${prompt ?? ""}`);
+      write(`${LF}${continuation}[pasted ${String(lines + 1)} lines — Enter sends, Ctrl+C clears]${LF}${prompt ?? ""}`);
       renderedLines += 1;
     }
   };
+
+  /**
+   * Paste content, with its line endings normalised and nothing else touched.
+   *
+   * A terminal is free to send CR for a pasted newline — macOS Terminal does — and a CR left in the
+   * stored request is not a cosmetic problem: every renderer that follows honours it, so the cursor
+   * returns to column 0 and the next line is written *over* the previous one. Real dogfood stored a
+   * goal objective containing `\r\r` where its blank lines were, and `/goal` displayed a spliced
+   * sentence ("…reversible DIRECT-mod" + "3. one harmless…") that never existed in what was pasted.
+   *
+   * So the normalisation happens here, once, on the way in: CRLF and lone CR become LF. Everything
+   * else — blank lines, numbered lists, punctuation, a trailing newline — is kept exactly, because
+   * the draft that is submitted has to be the text that was pasted.
+   */
+  const normalisePaste = (text: string): string => text.replace(/\r\n?/g, LF);
 
   const backspace = (): void => {
     if (draft.length === 0) return;
@@ -179,7 +194,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
       if (pasting) {
         const end = pending.indexOf(PASTE_END);
         if (end >= 0) {
-          append(pending.slice(0, end), true);
+          append(normalisePaste(pending.slice(0, end)), true);
           pending = pending.slice(end + PASTE_END.length);
           pasting = false;
           continue;
@@ -188,11 +203,14 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
         // pasted as text.
         const held = partialMarkerPrefix(pending, PASTE_END);
         if (held.length > 0) {
-          append(pending.slice(0, pending.length - held.length), true);
+          append(normalisePaste(pending.slice(0, pending.length - held.length)), true);
           pending = held;
         } else {
-          append(pending, true);
-          pending = "";
+          // A CR at the very end of a chunk may be half of a CRLF, so it is held until the next
+          // chunk says which it was.
+          const heldCr = pending.endsWith(CR) ? CR : "";
+          append(normalisePaste(heldCr.length > 0 ? pending.slice(0, -1) : pending), true);
+          pending = heldCr;
         }
         return;
       }

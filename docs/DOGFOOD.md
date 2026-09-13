@@ -327,3 +327,17 @@ the same change again, proposed instead of applied          the strict mode, on 
 Afterwards, `git status --short` in the clone is the record: BrainGate made no commit, and nothing
 was merged. `braingate tasks list` shows the tasks, and their receipts name the policy, the provider
 `cwd` and the files each run changed.
+
+### Reading a session listing
+
+`/worker` lists the sessions on record with the envelope each was created under:
+
+```text
+  Sessions on record:
+    anthropic/claude-sonnet-5 · 8a7862ad · read/direct · told not to modify files · available · last used …
+    anthropic/claude-sonnet-5 · abc12345 · write/direct · available · last used …
+  A read session is never resumed for a write: the instruction it was created with lasts as long as it does.
+```
+
+A read request resumes the read session; a write request gets the write session, or a fresh one plus
+the goal handoff if there is none yet. Both belong to the same goal, and the operator repeats nothing.

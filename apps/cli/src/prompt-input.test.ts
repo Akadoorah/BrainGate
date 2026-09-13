@@ -101,7 +101,7 @@ test("B: a paste with no trailing newline does not submit, and the next Enter se
   terminal.paste("Which file is safe?\nExplain why.");
   await terminal.input.idle();
   assert.deepEqual(all, [], "the end of a paste is not a submit");
-  assert.match(terminal.written(), /2 lines pending/, "and the operator is told it is pending");
+  assert.match(terminal.written(), /pasted 2 lines — Enter sends, Ctrl\+C clears/, "and the operator is told it is pending");
 
   terminal.enter();
   assert.equal(await pending, "Which file is safe?\nExplain why.");
@@ -300,4 +300,98 @@ test("an ended input releases a waiting prompt", async () => {
   const pending = terminal.input.ask("> ");
   terminal.end();
   assert.equal(await pending, null);
+});
+
+// ---------------------------------------------------------------- the dogfood paste, exactly
+
+/**
+ * The two failures the dogfood session actually produced.
+ *
+ * The request below is the one from the session, and it arrived from macOS Terminal with CR for
+ * every pasted newline. The old composer kept them, so the stored goal objective contained `\r\r`
+ * where its blank lines were — and every renderer that follows honoured the CR, returning the cursor
+ * to column 0 and writing the next line *over* the previous one. `/goal` then displayed a sentence
+ * that had never been typed ("…reversible DIRECT-mod" + "3. one harmless…"), and the operator could
+ * not tell whether the draft matched what was pasted.
+ *
+ * So: the draft is the pasted text with its line endings normalised, nothing else, and the display
+ * is the draft rather than a re-rendering of it.
+ */
+const DOGFOOD_REQUEST = [
+  "Inspect this repository and identify one small, easy-to-understand source file or documentation file that would be safe to use for a reversible DIRECT-mode test.",
+  "",
+  "Do not modify anything yet.",
+  "",
+  "Tell me:",
+  "1. which file you selected,",
+  "2. why it is safe for this disposable test,",
+  "3. one harmless comment-only change we could make later.",
+].join("\n");
+
+test("P: the dogfood paste composes into exactly the text that was pasted", async () => {
+  const terminal = new Terminal();
+  const pending = terminal.input.ask("> ");
+  // Delivered the way the terminal delivered it: CR line endings, in three chunks.
+  const framed = `${PASTE_START}${DOGFOOD_REQUEST.replace(/\n/g, "\r")}${PASTE_END}`;
+  terminal.chunk(framed.slice(0, 60));
+  terminal.chunk(framed.slice(60, 200));
+  terminal.chunk(framed.slice(200));
+  await terminal.input.idle();
+  terminal.enter();
+  const answer = await pending;
+  assert.equal(answer, DOGFOOD_REQUEST, "CR and CRLF become newlines; everything else is untouched");
+  assert.doesNotMatch(answer ?? "", /\r/, "no carriage return survives into the draft");
+  assert.match(answer ?? "", /\n\nDo not modify anything yet\.\n\nTell me:\n1\. which file you selected,\n2\. /, "blank lines and numbers survive in order");
+});
+
+test("Q: the display shows the pasted draft rather than a re-rendering of it", async () => {
+  const terminal = new Terminal();
+  const pending = terminal.input.ask("> ");
+  terminal.paste(DOGFOOD_REQUEST.replace(/\n/g, "\r"));
+  await terminal.input.idle();
+  const written = terminal.written();
+  // Every line of the draft is on screen, in order, once, and with no carriage return that would
+  // overwrite the line before it.
+  assert.doesNotMatch(written, /\r/, "nothing is written that would return the cursor to column 0");
+  assert.equal(written.indexOf("1. which file you selected,") > written.indexOf("Tell me:"), true, "the list appears in order");
+  assert.equal(written.indexOf("3. one harmless") > written.indexOf("2. why it is safe"), true);
+  assert.match(written, /pasted 8 lines — Enter sends, Ctrl\+C clears/, "and the operator is told what is pending");
+  terminal.enter();
+  assert.equal(await pending, DOGFOOD_REQUEST);
+});
+
+test("a long paste keeps its order, its blank lines and its trailing newline", async () => {
+  const terminal = new Terminal();
+  const pending = terminal.input.ask("> ");
+  const long = Array.from({ length: 200 }, (_, index) => (index % 7 === 0 ? "" : `line ${String(index + 1)}.`)).join("\r\n") + "\r\n";
+  terminal.paste(long);
+  await terminal.input.idle();
+  terminal.enter();
+  const answer = await pending;
+  assert.equal(answer, long.replace(/\r\n/g, "\n"), "the whole paste, normalised once");
+  assert.equal(answer?.startsWith("\nline 2."), true, "the first blank line is where it was");
+  assert.equal(answer?.endsWith("line 200.\n"), true);
+});
+
+test("two consecutive pastes keep their order and submit as one draft", async () => {
+  const terminal = new Terminal();
+  const pending = terminal.input.ask("> ");
+  terminal.paste("first\r\nblock\r\n");
+  await terminal.input.idle();
+  terminal.paste("second\r\nblock\r\n");
+  await terminal.input.idle();
+  terminal.enter();
+  assert.equal(await pending, "first\nblock\nsecond\nblock\n");
+});
+
+test("the request that reaches the caller is the composed draft, exactly", async () => {
+  const terminal = new Terminal();
+  const pending = terminal.input.ask("> ");
+  terminal.paste(`${DOGFOOD_REQUEST}\r\n`);
+  await terminal.input.idle();
+  terminal.enter();
+  const delivered = await pending;
+  // This string is what the REPL stores as the conversation turn, the task request and the goal's
+  // objective. It is the draft; nothing downstream re-derives or trims it.
+  assert.equal(delivered, `${DOGFOOD_REQUEST}\n`);
 });

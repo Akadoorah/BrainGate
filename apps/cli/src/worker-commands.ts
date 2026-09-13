@@ -12,6 +12,9 @@ import {
   type GoalRecord,
   type GoalStore,
   type NativeSessionDecision,
+  sessionEnvelopeFor,
+  sessionEnvelopeReason,
+  type SessionExecutionEnvelope,
 } from "@braingate/goals";
 import type { NativeSessionResolver } from "@braingate/shadow";
 import type { ProviderId } from "@braingate/providers";
@@ -121,7 +124,14 @@ export function describeWorker(input: {
   readonly selection: WorkerSelection;
   readonly goal: GoalRecord | null;
   readonly lastRun: { readonly label: string | null; readonly session: NativeSessionDecision | null } | null;
-  readonly knownSessions: readonly { readonly providerId: string; readonly modelId: string | null; readonly sessionId: string; readonly resumeMode: string; readonly lastUsedAt: string }[];
+  readonly knownSessions: readonly {
+    readonly providerId: string;
+    readonly modelId: string | null;
+    readonly sessionId: string;
+    readonly resumeMode: string;
+    readonly lastUsedAt: string;
+    readonly envelope?: SessionExecutionEnvelope | null;
+  }[];
 }): readonly string[] {
   const lines: string[] = [];
   const pin = pinFor(input.selection);
@@ -141,10 +151,17 @@ export function describeWorker(input: {
       : `a fresh invocation with the goal handoff — ${describeReason(policy?.notOfferedBecause ?? "provider-does-not-expose-session-ids")}.`}`);
   }
   if (input.knownSessions.length > 0) {
+    // The envelope is part of what a session *is*, so it is part of what this listing says. One
+    // worker can hold several sessions for one goal — a read/direct one and a write/direct one — and
+    // which is which is the operator's answer to "what will my next request resume".
     lines.push("  Sessions on record:");
     for (const session of input.knownSessions.slice(0, 6)) {
-      lines.push(`    ${session.providerId}/${session.modelId ?? "-"} · ${session.sessionId.slice(0, 8)} · ${session.resumeMode} · last used ${session.lastUsedAt}`);
+      const envelope = session.envelope === null || session.envelope === undefined
+        ? "envelope unrecorded"
+        : `${session.envelope.intent}/${session.envelope.policy}${session.envelope.readOnlyInstructions ? " · told not to modify files" : ""}`;
+      lines.push(`    ${session.providerId}/${session.modelId ?? "-"} · ${session.sessionId.slice(0, 8)} · ${envelope} · ${session.resumeMode} · last used ${session.lastUsedAt}`);
     }
+    lines.push("  A read session is never resumed for a write: the instruction it was created with lasts as long as it does.");
   }
   return Object.freeze(lines);
 }
@@ -180,6 +197,15 @@ export function createNativeSessionResolver(input: {
   readonly probedPinning: (providerId: string) => Promise<boolean | "unknown" | null> | boolean | "unknown" | null;
   readonly runtimeVersion: (providerId: string) => string | null;
   readonly workspace: () => string | null;
+  /**
+   * What this run is for: the requested effect, and the boundary it runs inside (ADR 0017).
+   *
+   * Read here rather than inferred, because it decides whether a stored native session may be
+   * resumed at all. The session a read-only request created was told not to modify anything, and
+   * that instruction lives as long as the session does.
+   */
+  readonly intent: () => "read" | "write";
+  readonly policy: () => string;
   readonly onResolved: (summary: RunSessionSummary) => void;
 }): NativeSessionResolver {
   return async ({ role, model, task, context }) => {
@@ -190,7 +216,16 @@ export function createNativeSessionResolver(input: {
     const policy = RUNTIME_SESSION_POLICIES[providerId];
     if (policy === undefined) return null;
 
-    const stored = input.goals.latestSessionFor(providerId, model.modelId);
+    // The envelope this run will execute under, computed the same way it was when any stored session
+    // was created. Compatibility is then a comparison of two values produced by one function.
+    const envelope = sessionEnvelopeFor({ intent: input.intent(), policy: input.policy(), role, providerId });
+    // Newest *compatible*, never newest regardless: a worker can hold a read session and a write
+    // session for one goal, and the right one is the one that matches what this run is for.
+    const compatible = input.goals.latestCompatibleSessionFor(providerId, model.modelId, envelope);
+    // Nothing compatible, but something recorded: passed as the stored session anyway so the decision
+    // says *why* continuity is breaking — "fresh, because that session was created for a read-only
+    // request" rather than "fresh, nothing recorded here", which would be false and unhelpful.
+    const stored = compatible ?? input.goals.latestSessionFor(providerId, model.modelId);
     const fresh = input.freshRequested();
     const decision = resolveSessionDecision({
       providerId,
@@ -201,6 +236,7 @@ export function createNativeSessionResolver(input: {
       runtimeVersion: input.runtimeVersion(providerId),
       workspace: input.workspace(),
       goalId: goal.goalId,
+      envelope,
       stored,
     });
     if (fresh) input.consumeFresh();
@@ -224,6 +260,7 @@ export function createNativeSessionResolver(input: {
         status: "active",
         runtimeVersion: input.runtimeVersion(providerId),
         workspace: input.workspace(),
+        envelope,
         goalId: goal.goalId,
         conversationId: input.conversationId(),
       });

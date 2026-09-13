@@ -795,7 +795,7 @@ test("M: a pasted multiline request stays pending until Enter, then submits once
   await terminal.prompt.idle();
   // Four lines, not three: the paste ended with a newline, so its last line is empty — and that is
   // kept rather than trimmed, because it is what the operator pasted.
-  assert.match(terminal.written(), /4 lines pending — Enter sends, Ctrl\+C clears/, "the draft is visible as pending");
+  assert.match(terminal.written(), /pasted 4 lines — Enter sends, Ctrl\+C clears/, "the draft is visible as pending");
   assert.match(terminal.written(), /Find why users are logged out/, "and the pasted text is echoed as the lines it is");
 
   // The explicit submit, and only then.

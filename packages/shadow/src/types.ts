@@ -185,6 +185,12 @@ export const PLANNED_SESSION_REASONS = [
   "runtime-version-changed",
   "workspace-changed",
   "goal-mismatch",
+  // The execution-envelope class: the session is sound, and it was initialized for other work. A
+  // session created under a read-only standing instruction is not a write session (ADR 0018).
+  "envelope-intent-changed",
+  "envelope-policy-changed",
+  "envelope-role-changed",
+  "envelope-permission-changed",
   "superseded",
   "stale-session",
   "not-yet-used",

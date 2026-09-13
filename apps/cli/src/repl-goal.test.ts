@@ -219,7 +219,11 @@ test("a follow-up continues the same goal and the next worker is handed the esta
   assert.ok(goalContext !== null, "a follow-up must reach the provider with the goal attached");
   const handoff = goalContext.handoff as { readonly goalId: string; readonly workUnit: string; readonly status: string };
   assert.equal(handoff.workUnit, "How would you implement the proposed fix?");
-  assert.equal(handoff.status, "diagnosed", "the goal's status is what the follow-up inherits");
+  // `open`, not `diagnosed`: the turn finished and established nothing, and a status may not claim
+// more than the structured state proves. Real dogfood printed `diagnosed` directly above "Nothing
+// has been established about this goal yet" (ADR 0018's sibling fix in M20.6).
+  assert.equal(handoff.status, "open", "a finished turn with no accepted finding is not a diagnosis");
+  assert.deepEqual([...handoff.acceptedFindings], [], "and the state says so");
   const turns = goalContext.recentTurns as readonly { readonly request: string; readonly answer: string }[];
   assert.ok(turns.some((turn) => turn.answer.includes("cold-start splash routing race")), "the diagnosis must travel with the follow-up");
 });
@@ -236,10 +240,15 @@ test("a short follow-up is planned as continuing its goal, not as an isolated lo
   assert.equal(await session.run(), 0);
   const text = session.text();
   assert.match(text, /continues goal/, "the operator must see that this request continues a goal");
-  // T2, not T3: M20.2 refined the floor so a goal with findings is budgeted for the work it is
-  // doing rather than frozen at the highest tier it ever reached.
-  assert.match(text, /continues goal [0-9a-f]+ · diagnosed · raised to T2 by this goal/, "the plan must route the follow-up at the goal's tier, not the sentence's");
-  assert.match(text, /read-only · direct · in your workspace · T2\/low/, "and the plan line must show the boundary and the tier the run will use");
+  // T2, and continued rather than isolated. A goal with nothing established inherits no floor —
+  // `T0` is "no floor", which is the honest reading of an `open` goal — so the tier here is the
+  // follow-up's own: it is a write request. The floor *with* findings is covered by the goals
+  // package's own tests, where a state with accepted findings can be built directly.
+  assert.match(text, /continues goal [0-9a-f]+ · open/, "the follow-up continues the goal");
+  assert.match(text, /write · direct · in your workspace · T2\/low/, "and is planned as the write it is");
+  // The first turn: a read request, planned at its own tier (T1 — a goal with nothing established
+  // inherits no floor), and shown with the boundary it will run inside.
+  assert.match(text, /read-only · direct · in your workspace · T1\/low/, "the plan line shows the boundary and the tier of the read");
   // The second plan was declined, so nothing was spent on it: the gate still holds.
   assert.match(text, /Skipped\. Nothing was spent\./);
 });

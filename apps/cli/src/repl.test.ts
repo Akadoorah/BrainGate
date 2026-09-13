@@ -186,3 +186,26 @@ test("an answer that was streamed live is not printed a second time", () => {
   // Nothing recognisable to keep is better than repeating the whole answer.
   assert.equal(withoutStreamedAnswer("just an answer with no receipt"), "");
 });
+
+// ---------------------------------------------------------------- output is printed once
+
+/** What a run prints when the answer streamed live: the receipt, and the answer only once. */
+test("R: a streamed answer is not printed a second time by the final block", () => {
+  const block = "The theme is read from config.yml.\n\nTask 4f2c1a77-1111-4111-8111-111111111111 · observed=1 · outcome=SUCCESS\n";
+  const kept = withoutStreamedAnswer(block);
+  assert.doesNotMatch(kept, /The theme is read/, "the streamed answer is not repeated");
+  assert.match(kept, /Task 4f2c1a77/, "and the receipt survives");
+  // Nothing to keep when the run printed no receipt at all: printing the answer again would be the
+  // duplication this exists to prevent.
+  assert.equal(withoutStreamedAnswer("The theme is read from config.yml.\n"), "");
+});
+
+test("S: text a provider repeated itself is stored and printed once, not duplicated again", () => {
+  // The provider's own output is the provider's; BrainGate does not edit it. What it must not do is
+  // add a second copy on the way out. The receipt boundary is the whole mechanism.
+  const providerText = "The flag is unused.\nThe flag is unused.\n";
+  const block = `${providerText}\nTask 4f2c1a77-1111-4111-8111-111111111111 · observed=1 · outcome=SUCCESS\n`;
+  const kept = withoutStreamedAnswer(block);
+  assert.equal(kept.match(/The flag is unused\./g), null, "the answer stays out of the receipt block");
+  assert.equal(providerText.match(/The flag is unused\./g)?.length, 2, "and the provider's text is preserved as it was");
+});

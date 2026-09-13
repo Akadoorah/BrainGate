@@ -22,7 +22,9 @@ import {
   type ProviderSessionRef,
   type SessionResumeMode,
   type SessionStatus,
+  type SessionExecutionEnvelope,
 } from "./types.js";
+import { sessionEnvelopeReason } from "./session.js";
 
 /** How much of a turn is kept. Bounds the store, not the fidelity of the state derived from it. */
 export const MAX_STORED_TURN_CHARS = 8_000;
@@ -104,6 +106,7 @@ interface SessionRow {
   created_at: string | null;
   last_used_at: string | null;
   state_snapshot_json: string | null;
+  envelope_json: string | null;
   recorded_at: string;
   updated_at: string;
 }
@@ -129,6 +132,10 @@ const SESSION_ADDED_COLUMNS: readonly { readonly name: string; readonly ddl: str
   // worker's delta a *diff* rather than a second full handoff, and it is stored per session because
   // two workers on one goal have two different "last seen" states.
   { name: "state_snapshot_json", ddl: "state_snapshot_json TEXT" },
+  // The envelope a session was initialized under (M20.6). Nullable, and a null is *not* compatible
+  // with a write: a row from before this column existed cannot be shown to have been created for a
+  // change, so the conservative reading is that it was not.
+  { name: "envelope_json", ddl: "envelope_json TEXT" },
 ]);
 
 function mapSession(row: SessionRow): ProviderSessionRecord {
@@ -147,6 +154,7 @@ function mapSession(row: SessionRow): ProviderSessionRecord {
     conversationId: row.conversation_id,
     lastTaskId: row.last_task_id,
     lastTurnSequence: row.last_turn_sequence,
+    envelope: parseEnvelope(row.envelope_json),
     // A row written before these columns existed has no creation time; its own recorded_at is the
     // closest true statement, rather than null or "now".
     createdAt: row.created_at ?? row.recorded_at,
@@ -162,6 +170,29 @@ function nowIso(): string {
 function bounded(text: string): string {
   const redacted = redactSecrets(text);
   return redacted.length > MAX_STORED_TURN_CHARS ? `${redacted.slice(0, MAX_STORED_TURN_CHARS)}…` : redacted;
+}
+
+/**
+ * The envelope as it was stored, or `null` when it was not.
+ *
+ * Validated on the way in rather than trusted: an envelope whose shape is wrong is treated as
+ * absent, which refuses a write rather than permitting one on a malformed record.
+ */
+function parseEnvelope(value: string | null): SessionExecutionEnvelope | null {
+  if (value === null) return null;
+  const parsed = parseJson(value);
+  if (typeof parsed !== "object" || parsed === null) return null;
+  const record = parsed as Partial<SessionExecutionEnvelope>;
+  if (record.intent !== "read" && record.intent !== "write") return null;
+  if (typeof record.policy !== "string" || typeof record.role !== "string") return null;
+  if (typeof record.readOnlyInstructions !== "boolean") return null;
+  return Object.freeze({
+    intent: record.intent,
+    policy: record.policy,
+    role: record.role,
+    readOnlyInstructions: record.readOnlyInstructions,
+    permissionMode: typeof record.permissionMode === "string" ? record.permissionMode : null,
+  });
 }
 
 function parseJson(value: string): unknown {
@@ -580,6 +611,14 @@ export class GoalStore {
     readonly workspace?: string | null;
     /** Defaults to this store's workspace, which is the only one a session here can belong to. */
     readonly workspaceId?: string | null;
+    /**
+     * The envelope this session is being created under.
+     *
+     * Written once, at creation, and never replaced by a later use: it describes what the session
+     * *is*, and a session that was created for a read does not become a write session by being
+     * resumed. `COALESCE` in the upsert is that rule expressed in one word.
+     */
+    readonly envelope?: SessionExecutionEnvelope | null;
     readonly goalId?: string | null;
     readonly conversationId?: string | null;
     readonly lastTaskId?: string | null;
@@ -611,8 +650,8 @@ export class GoalStore {
       INSERT INTO provider_sessions (
         project_id, provider_id, model_id, session_id, quota_pool, resume_mode, status,
         runtime_version, workspace, workspace_id, goal_id, conversation_id, last_task_id, last_turn_sequence,
-        created_at, last_used_at, recorded_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        envelope_json, created_at, last_used_at, recorded_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (project_id, provider_id, model_id, session_id) DO UPDATE SET
         quota_pool = excluded.quota_pool,
         resume_mode = excluded.resume_mode,
@@ -624,6 +663,7 @@ export class GoalStore {
         conversation_id = excluded.conversation_id,
         last_task_id = excluded.last_task_id,
         last_turn_sequence = excluded.last_turn_sequence,
+        envelope_json = COALESCE(excluded.envelope_json, envelope_json),
         last_used_at = excluded.last_used_at,
         updated_at = excluded.updated_at
     `).run(
@@ -641,6 +681,7 @@ export class GoalStore {
       input.conversationId ?? goal?.conversationId ?? null,
       input.lastTaskId ?? null,
       turn,
+      input.envelope === undefined || input.envelope === null ? null : JSON.stringify(input.envelope),
       timestamp,
       timestamp,
       timestamp,
@@ -668,6 +709,28 @@ export class GoalStore {
    * for: Sonnet and Haiku on one subscription are two workers, and resuming Sonnet's session while
    * a Haiku run is pinned would hand Haiku a conversation it never had.
    */
+  /**
+   * The newest session that may serve this request, or `null`.
+   *
+   * Newest *compatible*, which is the whole point: a worker that holds a read session and a write
+   * session for one goal must be handed the right one, and "the newest row" would hand a read
+   * request the write session and a write request the read session — the second of which real
+   * dogfood turned into a refusal from the CLI rather than a mistake by BrainGate.
+   *
+   * With no envelope given, the newest session is returned as before: callers that do not describe
+   * an envelope are asking the old question and get the old answer.
+   */
+  latestCompatibleSessionFor(providerId: ProviderId, modelId: string | null, envelope: SessionExecutionEnvelope): ProviderSessionRecord | null {
+    const rows = this.#db.prepare(
+      "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id IS ? AND (workspace_id IS NULL OR workspace_id = ?) ORDER BY last_used_at DESC, session_id DESC LIMIT 20",
+    ).all(this.#project.projectId, providerId, modelId, this.#workspaceId) as SessionRow[];
+    for (const row of rows) {
+      const record = mapSession(row);
+      if (sessionEnvelopeReason(record.envelope, envelope) === null) return record;
+    }
+    return null;
+  }
+
   latestSessionFor(providerId: ProviderId, modelId: string | null): ProviderSessionRecord | null {
     // A session with no workspace id is one written before M20.4 into this workspace's own file, so
     // it is this workspace's. One that names a different workspace is not, and is not resumed.

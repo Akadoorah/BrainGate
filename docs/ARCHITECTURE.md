@@ -130,6 +130,24 @@ actually earns. Where a provider's invocation cannot yet honour that — Grok, C
 are built around a staged copy and a sandbox proof earned against it — the plan refuses rather than
 running with an unmeasured boundary. See `docs/adr/0017-direct-execution.md`.
 
+## Native session continuity and its envelope
+
+A native session is a conversation the provider's CLI remembers, and the instruction it was created
+with lasts as long as it does. BrainGate's read profile tells the CLI not to modify files; a session
+created under it is therefore a *read* session, and resuming it for a write asks the model to
+contradict itself. Real dogfood showed the refusal that produces, twice.
+
+So continuity is decided per **execution envelope** — the requested effect, the execution policy,
+the role, whether the invocation told the runtime not to modify anything, and the native permission
+mode — and the newest *compatible* session is the one resumed. One worker can hold several sessions
+for one goal (`read/direct` and `write/direct`), and none of them is deleted when another is created.
+When nothing is compatible the run gets a fresh session and the goal handoff, which is what keeps
+**goal continuity broader than native-session continuity**: the session is an optimisation, the goal
+is the continuity. See `docs/adr/0018-session-execution-envelopes.md`.
+
+Intent is decided by the requested effect and nothing else (`apps/cli/src/request-intent.ts`). A
+constraint like "do not commit" bounds *how* a change is made; it does not turn a write into a read.
+
 ## Execution lifecycle
 
 1. Resolve an explicit project identity, and the conversation and goal this request continues.

@@ -1,6 +1,6 @@
 import type { ProviderId } from "@braingate/providers";
 import { randomUUID } from "node:crypto";
-import { isNativeSessionKind, type NativeSessionDecision, type NativeSessionKind, type ProviderSessionRecord, type SessionUnusableReason } from "./types.js";
+import { isNativeSessionKind, type NativeSessionDecision, type NativeSessionKind, type ProviderSessionRecord, type SessionExecutionEnvelope, type SessionUnusableReason } from "./types.js";
 
 /**
  * What one runtime can actually do about native sessions, as measured.
@@ -173,6 +173,56 @@ export function legacyRestrictions(): readonly RestrictionClassification[] {
   return Object.freeze(RESTRICTION_CLASSIFICATIONS.filter((item) => item.classification === "legacy"));
 }
 
+/**
+ * The envelope a run is about to execute under, from what the run is for.
+ *
+ * Computed from the same inputs both times — intent, policy, role, provider — so the envelope
+ * recorded when a session is created and the envelope compared when it is resumed are the same
+ * function of the same facts. That is what makes compatibility a comparison rather than a guess.
+ */
+export function sessionEnvelopeFor(input: {
+  readonly intent: "read" | "write";
+  readonly policy: string;
+  readonly role: string;
+  readonly providerId: ProviderId;
+}): SessionExecutionEnvelope {
+  // What the invocation tells the runtime, per provider and intent. The read profile's prompt is a
+  // standing instruction the session carries for its whole life, and it is the reason a read session
+  // cannot be handed a write: the CLI would be refusing its own earlier instruction, not ours.
+  const readOnlyInstructions = input.intent === "read";
+  const permissionMode = input.providerId === "anthropic"
+    ? (input.intent === "write" ? "acceptEdits" : "default")
+    : input.role === "primary" ? "acceptEdits" : null;
+  return Object.freeze({ intent: input.intent, policy: input.policy, role: input.role, readOnlyInstructions, permissionMode });
+}
+
+/**
+ * Whether a stored session may be resumed for a request with this envelope, and why not.
+ *
+ * The rule, stated once so every surface reports the same answer:
+ *
+ * - a **read** session may serve a read request in the same role, policy and permission posture;
+ * - a **write** session may serve a write request on the same terms;
+ * - **any change of intent is refused**, in both directions. A read session carries a standing
+ *   instruction not to modify anything, and asking it to modify would have it contradict itself; a
+ *   write session was told to apply edits, which is not obviously the right conversation to ask for
+ *   a read-only opinion. Both are cheap to replace and neither is worth guessing about;
+ * - a session with no recorded envelope is resumed only for a read, because a row from before
+ *   envelopes existed cannot be shown to have been created for a change.
+ */
+export function sessionEnvelopeReason(
+  stored: SessionExecutionEnvelope | null,
+  requested: SessionExecutionEnvelope,
+): SessionUnusableReason | null {
+  if (stored === null) return requested.intent === "write" ? "envelope-intent-changed" : null;
+  if (stored.intent !== requested.intent) return "envelope-intent-changed";
+  if (stored.policy !== requested.policy) return "envelope-policy-changed";
+  if (stored.role !== requested.role) return "envelope-role-changed";
+  if (stored.permissionMode !== requested.permissionMode) return "envelope-permission-changed";
+  if (stored.readOnlyInstructions !== requested.readOnlyInstructions) return "envelope-intent-changed";
+  return null;
+}
+
 export interface SessionResolutionRequest {
   readonly providerId: ProviderId;
   readonly modelId: string;
@@ -184,6 +234,11 @@ export interface SessionResolutionRequest {
   readonly runtimeVersion: string | null;
   readonly workspace: string | null;
   readonly goalId: string | null;
+  /**
+   * The envelope this request executes under. Absent, the request is treated as a plain read with no
+   * restrictions — the behaviour every caller before envelopes had.
+   */
+  readonly envelope?: SessionExecutionEnvelope;
 }
 
 /**
@@ -242,7 +297,7 @@ export function resolveSessionDecision(input: SessionResolutionRequest & { reado
     });
   }
 
-  const unusable = sessionUnusableReason({ stored, goalId: input.goalId, runtimeVersion: input.runtimeVersion, workspace: input.workspace });
+  const unusable = sessionUnusableReason({ stored, goalId: input.goalId, runtimeVersion: input.runtimeVersion, workspace: input.workspace, ...(input.envelope === undefined ? {} : { envelope: input.envelope }) });
   if (unusable !== null) {
     return Object.freeze({
       ...base,
@@ -276,6 +331,7 @@ export function sessionUnusableReason(input: {
   readonly goalId: string | null;
   readonly runtimeVersion: string | null;
   readonly workspace: string | null;
+  readonly envelope?: SessionExecutionEnvelope;
 }): SessionUnusableReason | null {
   const { stored } = input;
   if (stored.status === "closed") return "superseded";
@@ -287,6 +343,12 @@ export function sessionUnusableReason(input: {
   // assumed either way.
   if (stored.runtimeVersion !== null && input.runtimeVersion !== null && stored.runtimeVersion !== input.runtimeVersion) return "runtime-version-changed";
   if (stored.workspace !== null && input.workspace !== null && stored.workspace !== input.workspace) return "workspace-changed";
+  // Asked last, because it is the newest reason and the least about the session's own health: the
+  // session is fine, it was simply initialized for different work.
+  if (input.envelope !== undefined) {
+    const envelope = sessionEnvelopeReason(stored.envelope, input.envelope);
+    if (envelope !== null) return envelope;
+  }
   return null;
 }
 
@@ -351,6 +413,10 @@ export function describeReason(reason: SessionUnusableReason | null): string {
     case "recorded-unresumable": return "the recorded session cannot be resumed";
     case "runtime-version-changed": return "the installed runtime version changed since that session";
     case "workspace-changed": return "that session belongs to a different workspace";
+    case "envelope-intent-changed": return "that session was created for a read-only request, and this one asks for a change";
+    case "envelope-policy-changed": return "that session was created under a different execution policy";
+    case "envelope-role-changed": return "that session was created for a different role";
+    case "envelope-permission-changed": return "that session was created with different native permissions";
     case "goal-mismatch": return "that session belongs to a different goal";
     case "superseded": return "that session is closed";
     case "stale-session": return "that session has gone stale";

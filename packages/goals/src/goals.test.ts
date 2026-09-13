@@ -581,3 +581,49 @@ test("the fold is usable on its own, so a caller that is not a store can reason 
   assert.equal(next.acceptedFindings.length, 2);
   assert.equal(next.disputedFindings.length, 0);
 });
+
+// ---------------------------------------------------------------------------- goal status truth
+
+test("a finished turn with nothing established does not make the goal diagnosed", () => {
+  const { store, project: target } = openStore("status-truth");
+  try {
+    const conversation = store.openConversation();
+    const goal = store.createGoal({ conversationId: conversation.conversationId, objective: "which file is safe to change?" });
+    assert.equal(goal.state.status, "open");
+    assert.deepEqual([...goal.state.acceptedFindings], []);
+
+    // What a completed read turn does to the goal: progress, and nothing more. Real dogfood printed
+    // `Status: diagnosed` directly above "Nothing has been established about this goal yet", because
+    // a finished turn was treated as a diagnosis. A status may not claim more than the structured
+    // state proves, and the structured state is `acceptedFindings`.
+    store.updateGoalState(goal.goalId, {
+      status: goal.state.status === "open" && goal.state.acceptedFindings.length > 0 ? "diagnosed" : goal.state.status,
+      openQuestions: goal.state.openQuestions,
+      nextAction: "review README.md",
+      assertedBy: "operator",
+    });
+    const after = store.getGoal(goal.goalId)!;
+    assert.equal(after.state.status, "open", "a finished turn is not a diagnosis");
+    assert.equal(after.state.nextAction, "review README.md", "but the progress is recorded");
+    assert.deepEqual([...after.state.acceptedFindings], []);
+  } finally { store.close(); }
+});
+
+test("a goal with an accepted finding is the one that becomes diagnosed", () => {
+  const { store } = openStore("status-diagnosed");
+  try {
+    const conversation = store.openConversation();
+    const goal = store.createGoal({ conversationId: conversation.conversationId, objective: "why does the session expire?" });
+    store.updateGoalState(goal.goalId, {
+      status: "diagnosed",
+      // The shape `applyGoalStateUpdate` accepts: what the finding is, not how it is stored.
+      acceptedFindings: [{ claim: "the refresh stub never runs", evidence: ["lib/auth.dart:41"] }],
+      openQuestions: [],
+      nextAction: null,
+      assertedBy: "operator",
+    });
+    const after = store.getGoal(goal.goalId)!;
+    assert.equal(after.state.status, "diagnosed");
+    assert.equal(after.state.acceptedFindings.length, 1, "the status is backed by the finding it names");
+  } finally { store.close(); }
+});

@@ -42,6 +42,9 @@ function resolverFor(store: GoalStore, goalId: string, conversationId: string) {
     probedPinning: () => true,
     runtimeVersion: () => "2.1.269",
     workspace: () => "/a/stable/workspace",
+    // The envelope this run executes under. A test that is about a write says so by overriding it.
+    intent: () => "read",
+    policy: () => "direct",
     onResolved: () => { /* the summary is asserted in the scenario tests */ },
   });
 }

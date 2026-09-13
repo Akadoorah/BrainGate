@@ -283,6 +283,14 @@ export interface ProviderSessionRecord {
   readonly workspace: string | null;
   /** The workspace identity of that directory, so a copied database cannot be resumed into. */
   readonly workspaceId: string | null;
+  /**
+   * The envelope this session was initialized under, or `null` for a row written before it existed.
+   *
+   * `null` is not compatible with anything that carries a restriction: a session from before
+   * envelopes were recorded cannot be shown to have been created for this kind of work, and the
+   * conservative reading of "unknown" is "do not resume it for a write".
+   */
+  readonly envelope: SessionExecutionEnvelope | null;
   readonly goalId: string | null;
   readonly conversationId: string | null;
   /** The BrainGate task that last used this session, so a receipt and a session can be joined. */
@@ -294,16 +302,66 @@ export interface ProviderSessionRecord {
   readonly updatedAt: string;
 }
 
-/** Why a stored session will not be resumed, in the terms a user is shown. */
-export type SessionUnusableReason =
-  | "provider-does-not-expose-session-ids"
-  | "recorded-unresumable"
-  | "runtime-version-changed"
-  | "workspace-changed"
-  | "goal-mismatch"
-  | "superseded"
-  | "stale-session"
-  | "not-yet-used";
+/**
+ * Why a stored session will not be resumed, in the terms a user is shown.
+ *
+ * The `envelope-*` reasons are the execution-envelope class: the session exists, belongs to this
+ * goal and workspace, and is readable by this build — and it was still initialized under a
+ * different boundary. A session created for a read-only request carries a standing instruction not
+ * to modify anything; handing it a write is not continuity, it is asking it to break its own
+ * instructions, and Claude refused exactly that in real dogfood.
+ */
+export const SESSION_UNUSABLE_REASONS = [
+  "provider-does-not-expose-session-ids",
+  "recorded-unresumable",
+  "runtime-version-changed",
+  "workspace-changed",
+  "goal-mismatch",
+  "envelope-intent-changed",
+  "envelope-policy-changed",
+  "envelope-role-changed",
+  "envelope-permission-changed",
+  "superseded",
+  "stale-session",
+  "not-yet-used",
+] as const;
+export type SessionUnusableReason = (typeof SESSION_UNUSABLE_REASONS)[number];
+
+export function isSessionUnusableReason(value: string): value is SessionUnusableReason {
+  return (SESSION_UNUSABLE_REASONS as readonly string[]).includes(value);
+}
+
+/**
+ * The constraints a native session was initialized under.
+ *
+ * A native session is not a generic attachment to a provider: it is a conversation whose first
+ * message told the CLI what it was for. Claude Code, given the read-only profile, is told
+ * "Analyze only; do not modify files, run commands, access the network, or use external tools" —
+ * and it keeps that instruction for the life of the session, because that is what a session is.
+ * Resuming it for a write asks the model to contradict the standing instruction it was given, which
+ * is why the request was refused twice in dogfood rather than mis-executed.
+ *
+ * So continuity is decided per envelope. One worker may hold several sessions for one goal — a
+ * read/direct one and a write/direct one — and the newest *compatible* one is the one to resume.
+ */
+export interface SessionExecutionEnvelope {
+  /** The effect the session was created to produce. */
+  readonly intent: "read" | "write";
+  /** The boundary it was created under (ADR 0017). */
+  readonly policy: string;
+  /** The workflow role whose standing instructions were injected. */
+  readonly role: string;
+  /**
+   * Whether the invocation told the runtime, in its own words, not to modify anything.
+   *
+   * Separate from `intent` because it is the field that makes the refusal explicable: a session can
+   * be a read session and still be safe to reuse for a small write, but not when the CLI was told
+   * not to touch files.
+   */
+  readonly readOnlyInstructions: boolean;
+  /** The native permission posture the invocation ran with, when the profile sets one. */
+  readonly permissionMode: string | null;
+}
 
 /**
  * Whether the next invocation may resume, and what happens instead.

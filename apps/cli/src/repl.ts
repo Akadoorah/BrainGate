@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import { createPromptInput } from "./prompt-input.js";
+import { classifyRequestIntent } from "./request-intent.js";
 import { basename, join } from "node:path";
 import { findManifest } from "./manifest-path.js";
 import { runCli } from "./cli.js";
@@ -105,17 +106,14 @@ interface ReplDeps {
   readonly colour?: boolean;
 }
 
-const WRITE_INTENT = /^\s*(add|append|change|convert|correct|create|delete|drop|edit|extract|fix|implement|inline|insert|migrate|move|refactor|remove|rename|reorder|replace|rewrite|set|split|swap|update|write)\b/i;
-
 /**
- * Guesses whether free text asks for a change rather than an answer.
+ * Whether free text asks for a change rather than an answer.
  *
- * A wrong guess is safe by construction: the mode is named in the confirmation line before
- * anything runs, so the operator sees "write" and can decline. Detection is a convenience, and
- * the confirmation — not this regular expression — is what protects the checkout.
+ * The rule lives in `request-intent.ts`, where the reasoning and the adversarial cases are. This
+ * function is the name the session has always used for the question.
  */
 export function looksLikeWriteRequest(text: string): boolean {
-  return WRITE_INTENT.test(text);
+  return classifyRequestIntent(text) === "write";
 }
 
 function progressStyle(deps: ReplDeps): { style: typeof PLAIN_PROGRESS; animate: boolean } {
@@ -309,9 +307,13 @@ function goalContextFor(store: GoalStore, goal: GoalRecord, input: string, budge
  * finished at all, and what the next action now is. Everything the worker actually concluded stays
  * in the turn's answer, on the timeline, where the next handoff quotes it verbatim.
  *
- * Marking the goal `diagnosed` is therefore an evidence claim and not a reading of the prose: a goal
- * with a finished turn has a result, which is the same threshold ADR 0013's coherence check uses.
- * Nothing is inferred from whether the answer *sounds* like a diagnosis.
+ * A finished turn therefore makes the goal *progress*, and nothing more. It used to mark the goal
+ * `diagnosed`, on the theory that "a goal with a finished turn has a result" — and real dogfood
+ * showed the contradiction that produced: `Status: diagnosed` printed directly above "Nothing has
+ * been established about this goal yet." A status may not claim more than the structured state
+ * proves, and the structured state is `acceptedFindings`, which only `applyGoalStateUpdate` writes.
+ * `diagnosed` is therefore reachable only from an accepted finding, and a goal whose turn finished
+ * with nothing established stays `open`.
  *
  * What this deliberately does not do is accept a finding. Going from "a turn finished" to "this is
  * what is true" is `applyGoalStateUpdate`'s gate, and a worker cannot reach it from here: a
@@ -319,8 +321,11 @@ function goalContextFor(store: GoalStore, goal: GoalRecord, input: string, budge
  * distinction this whole layer exists to keep.
  */
 function recordGoalProgress(store: GoalStore, goal: GoalRecord, input: string): void {
+  // The evidence, not the prose: a diagnosis is a finding someone established, and a turn that
+  // finished is not one.
+  const established = goal.state.acceptedFindings.length > 0;
   store.updateGoalState(goal.goalId, {
-    status: goal.state.status === "open" ? "diagnosed" : goal.state.status,
+    status: established && goal.state.status === "open" ? "diagnosed" : goal.state.status,
     openQuestions: goal.state.openQuestions,
     nextAction: input,
     assertedBy: "operator",
@@ -386,6 +391,9 @@ interface WorkerLoopState {
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const spec = executionPolicyForIntent({ policy: worker.policy, intent: mode === "write" ? "write" : "read" });
+  // The requested effect, in the vocabulary the session registry uses. Policy and intent are
+  // separate: DIRECT with a write is a valid pair, and so is DIRECT with a read.
+  const requestIntent: "read" | "write" = mode === "write" ? "write" : "read";
   const captured: string[] = [];
   const capture = (text: string): void => { captured.push(text); };
   const sessionTurns = (budget: number) => session.recent(budget);
@@ -420,6 +428,10 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     // attachment above verified, and the same one a native CLI gets as its cwd. A session recorded
     // in another workspace is not resumed on a guess (ADR 0015).
     workspace: () => deps.cwd,
+    // What the run about to happen is for. Read at resolution time, because the envelope decides
+    // whether a stored session may be resumed at all: a read-only session is not a write session.
+    intent: () => requestIntent,
+    policy: () => worker.policy,
     onResolved: (summary) => { worker.lastRun = summary; },
   });
   const goalDeps = {
