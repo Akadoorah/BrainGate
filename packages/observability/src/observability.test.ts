@@ -225,3 +225,21 @@ test("the brief records the quota belief behind a choice, and who else could hav
     assert.deepEqual(stored?.route[0]?.rejected, brief.route[0]?.rejected);
   } finally { ledger.close(); }
 });
+
+// A write task has no brief and no workflow receipt, so the planned route is empty for it. The
+// executed roles are the same evidence the card's `execution` field is built from, so `/status`
+// reading the route from them cannot disagree with the receipt — before this it printed "no route
+// recorded" about a task whose own record named primary and reviewer (M20.7).
+test("a task with no planned route reports the roles its own events show answering", () => {
+  const { project, ledger } = setupProject();
+  try {
+    const task = ledger.createTask({ title: "Direct write", complexity: "T2", risk: "low" });
+    ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: "anthropic", model: "claude-sonnet-5", quotaPool: "claude-subscription" });
+    ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: "anthropic", model: "claude-sonnet-5", quotaPool: "claude-subscription", durationMs: 5 });
+
+    const card = buildTaskCard(project, normalizeTaskReceipt(ledger.receipt(task.taskId)));
+    assert.deepEqual(card.route.map((entry) => `${entry.role}=${entry.providerId}/${entry.modelId}`), ["primary=anthropic/claude-sonnet-5"]);
+    assert.equal(card.route[0]?.quotaPool, null, "an executed role carries no pool of its own, and none is invented");
+    assert.deepEqual(card.execution.map((entry) => entry.role), ["primary"], "and the route agrees with the execution record");
+  } finally { ledger.close(); }
+});

@@ -84,8 +84,12 @@ M20.2 is the *default posture*, and it is worth stating precisely because it is 
 - **Interactive work runs the way the runtime runs.** The provider's own permission prompts remain the
   approval mechanism, exactly as when the operator starts the CLI themselves. BrainGate does not
   stand in front of them.
-- **A boundary the operator asks for is applied.** A read-only request is a read-only task; a write
-  goes to a worktree the operator reviews and never lands in their checkout.
+- **A boundary the operator asks for is applied.** A read-only request is a read-only task. A write
+  runs under the selected execution policy — `direct` in the workspace, `worktree` in an isolated
+  worktree the operator reviews — and BrainGate neither commits nor merges on its own (ADR 0017).
+- **Effort follows the budget, not a blanket rule.** A T0–T2 write is one worker unless the operator
+  asks for a reviewer or the budget requires one; a write that changes nothing is reported as a
+  no-change result rather than sent to a reviewer.
 - **Unattended execution is constrained more.** Where nobody is present to approve a runtime action,
   BrainGate's own policy is what stands in for that approval.
 - **The strict modes remain available** and are chosen, not assumed: project snapshots, isolated

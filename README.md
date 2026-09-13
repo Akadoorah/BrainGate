@@ -186,7 +186,9 @@ separate decisions:
 - **Ordinary interactive work runs the way the runtime normally runs.** Its own permission prompts
   are the approval mechanism, exactly as when you start it yourself.
 - **A boundary you ask for is applied.** "Review this and do not modify files" is a read-only task.
-  A write goes to an isolated worktree you review; it never lands in your checkout.
+  A write happens under the execution policy you selected: `direct` edits your workspace in place and
+  leaves the change uncommitted for you to keep, amend or discard; `worktree` stages it in an
+  isolated worktree you review and never merges for you.
 - **Autonomous and unattended execution is constrained more, not less.** When nobody is there to
   approve a runtime action, BrainGate's own policy is what stands in for that approval.
 - **Strict modes remain available**: project snapshots, isolated worktrees, and the Codex and Grok
@@ -207,14 +209,15 @@ has been spent; quota readings are recorded only when a provider states them, ma
 
 | | |
 |---|---|
-| **Working now** | Conversation and goal continuity; cross-provider handoff; returning-worker delta; manual switching (`/use`, `/auto`, `/worker`, `--fresh`); routing with eligibility, quota, budget and isolation gates; worktree writes with review; task ledger, receipts and reconciliation; memory with a single validated write path; per-project isolation |
+| **Working now** | Conversation and goal continuity; cross-provider handoff; returning-worker delta; manual switching (`/use`, `/auto`, `/worker`, `--fresh`); routing with eligibility, quota, budget and isolation gates; DIRECT and worktree writes with native session continuity and a reviewer only when policy or the operator asks; task ledger, receipts and reconciliation; memory with a single validated write path; per-project isolation |
 | **Native session resume** | Claude and Grok, where the installed build publishes a session-id flag (verified by a zero-cost capability probe) and the session belongs to the same workspace and build. Codex, Antigravity and Copilot have resume but no way to name a *new* session, so each turn is a fresh invocation with the goal handoff — recorded as such, never faked |
 | **Planned** | Automated review and council execution beyond the current T4 disagreement path; a web dashboard; the broader native-capability overlays ADR 0014 classifies |
 
 Known limitations a new user should expect: a worker whose runtime cannot be resumed starts from the
 goal handoff rather than its own memory; a resumed session is given a delta, so if nothing changed it
-is told exactly that; and `write · isolated worktree` means the change is staged for your review,
-never merged for you.
+is told exactly that; a T0–T2 DIRECT write uses one worker unless you ask for a reviewer (`--review`)
+or the budget requires one; and a run that changes nothing says so, in the worker's own words, rather
+than reporting a review of a diff that never existed.
 
 ---
 

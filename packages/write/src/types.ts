@@ -80,6 +80,16 @@ export interface WriteRunResult {
   readonly executionPolicy?: ExecutionPolicyId;
   /** The directory the worker ran in, recorded so the cwd a run actually used can be audited. */
   readonly providerCwd?: string;
+  /**
+   * What the worker said it did, when it said anything.
+   *
+   * A write's result is its diff, so a run that changed nothing used to leave no trace of the
+   * worker's own words at all — and "the worker reported success and changed nothing" was
+   * indistinguishable from "the worker was never asked". Recorded, bounded and redacted.
+   */
+  readonly report?: string | null;
+  /** True when the run finished and the workspace did not change: a truthful no-change result. */
+  readonly noChange?: boolean;
   readonly changedFiles: readonly string[];
   readonly diff: string;
   readonly verification: readonly WriteVerificationResult[];

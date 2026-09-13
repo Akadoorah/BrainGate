@@ -690,11 +690,14 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     return snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription";
   });
   const blockers: string[] = [];
+  const notes: string[] = [];
   if (configured.length === 0) blockers.push("No scored models are configured in the model catalog.");
   if (askCandidates.length === 0) blockers.push("No authenticated configured model is eligible as a read-only primary.");
   if (!writeCandidate) blockers.push("No authenticated configured Claude model is eligible for M11 restricted writes.");
-  if (!cleanForWrite) blockers.push("At least one registered repository is dirty; worktree writes require a clean source checkout.");
-  if (uncommitted.length > 0) blockers.push("No commit yet in this repository; make a first commit before asking for a change, since worktree writes branch from one. Questions work now.");
+  // Not blockers for the default policy: they are what the worktree policy needs, and a DIRECT write
+  // is unaffected by either. Kept visible so an operator choosing `worktree` knows what it requires.
+  if (!cleanForWrite) notes.push("At least one registered repository has uncommitted or untracked files; worktree writes require a clean source checkout, DIRECT writes do not.");
+  if (uncommitted.length > 0) notes.push("No commit yet in this repository; worktree writes branch from one. DIRECT writes and questions work now.");
 
   const data = Object.freeze({
     project: { projectId: project.projectId, name: project.name, manifest: resolve(cwd, manifest) },
@@ -702,11 +705,25 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     catalog: { entries: catalog.length, configured: configured.length, unscored: catalog.length - configured.length },
     providers: snapshots.map((snapshot) => ({ providerId: snapshot.providerId, available: snapshot.available.value, version: snapshot.version.value, authState: snapshot.authState.value, authMode: snapshot.authMode.value })),
     ask: { ready: askCandidates.length > 0, candidates: askCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
-    write: { ready: writeCandidate && cleanForWrite && uncommitted.length === 0, primaryReady: writeCandidate, sourceClean: cleanForWrite, reviewerReady: reviewerCandidates.length > 0, reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
+    write: {
+      // DIRECT is the ordinary interactive policy, and it does not need a clean checkout: it edits
+      // the workspace the operator is working in, alongside whatever they already had uncommitted.
+      // The cleanliness requirement belongs to the worktree policy, so it is reported separately
+      // rather than gating a DIRECT write — which is how preflight came to print `write=blocked`
+      // beside a write that then ran (M20.7).
+      ready: writeCandidate,
+      primaryReady: writeCandidate,
+      direct: true,
+      sourceClean: cleanForWrite,
+      worktreeReady: cleanForWrite && uncommitted.length === 0,
+      reviewerReady: reviewerCandidates.length > 0,
+      reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`),
+    },
     codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason },
     grokIsolation: { attempted: grok.attempted, eligible: grok.eligible, reason: grok.reason },
     acceptedProviders: acceptances.map((item) => item.providerId),
     blockers,
+    notes,
     providerModelCalls: 0,
   });
   emit(json, data, `Dogfood preflight ${project.projectId}: ask=${data.ask.ready ? "ready" : "blocked"} · write=${data.write.ready ? "ready" : "blocked"} · configured=${configured.length} · model calls=0${blockers.length > 0 ? `\n${blockers.map((item) => `- ${item}`).join("\n")}` : ""}`, stdout);
@@ -860,7 +877,12 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
   const requestedRepo = takeOption(args, "--repo");
   const baseRef = takeOption(args, "--base") ?? "HEAD";
   const execute = removeFlag(args, "--execute");
-  const review = !removeFlag(args, "--no-review");
+  // Tri-state: unset follows the budget's reviewer policy, and the flags are how the operator
+  // overrides it. `true` by default meant every write bought a second subscription, which for a
+  // T0-T2 DIRECT documentation edit is one worker too many (M20.7).
+  const wantsReview = removeFlag(args, "--review");
+  const declinesReview = removeFlag(args, "--no-review");
+  const reviewPreference: boolean | null = wantsReview ? true : declinesReview ? false : null;
   const copilotOauth = removeFlag(args, "--attest-copilot-oauth");
   // Read before the leftover-argument check: a flag the command accepts is not an extra argument.
   const policy = policyOption(args);
@@ -886,6 +908,9 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const floor = deps.inheritedComplexity ?? null;
     const effective = floor === null ? adaptive.effective : applyInheritedFloor(adaptive.effective, floor);
     const budget = budgetFor(effective, { writeRequested: true });
+    // The decision, after the budget: required reviews always run, and a reviewer the budget only
+    // permits runs when the operator asked for one.
+    const review = reviewPreference ?? budget.reviewerPolicy === "required";
     const requiredContextTokens = contextTokens(task);
     const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state, CODEX_PROBE_VERSION);
     const codexIsolation = isolation.attestation ?? undefined;
@@ -933,17 +958,53 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const ledger = new TaskLedger(scope.project);
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
-      const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
-      const result = await runner.run({ task, repositoryPath, baseRef, policy, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
+      const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const result = await runner.run({ task, repositoryPath, baseRef, policy, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       // Read back what the runner recorded, so the screen and the ledger cannot disagree.
       const recorded = recordedOutcomeOf(result.taskReceipt);
       const observationSequence = store.find(result.taskId)?.sequence ?? null;
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
       recordRefusalBackoffs(state, result.taskReceipt, servedPools(result.taskReceipt.events));
-      const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence, outcome: recorded?.outcome ?? null, reviewStatus: recorded?.reviewStatus ?? null, failureKind: recorded?.failureKind ?? null, worktree: result.worktree, changedFiles: result.changedFiles, diff: result.diff, verification: result.verification, review: result.review, readyForApproval: result.readyForApproval, approvalRequired: true, mergePerformed: false, usage: result.taskReceipt.usage });
-      emit(json, data, `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
-      return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
+      const noChange = result.noChange === true;
+      const data = Object.freeze({
+        plan: planData,
+        taskId: result.taskId,
+        observationSequence,
+        outcome: recorded?.outcome ?? null,
+        reviewStatus: recorded?.reviewStatus ?? null,
+        failureKind: recorded?.failureKind ?? null,
+        worktree: result.worktree,
+        executionPolicy: result.executionPolicy ?? policy,
+        providerCwd: result.providerCwd ?? repositoryPath,
+        changedFiles: result.changedFiles,
+        diff: result.diff,
+        verification: result.verification,
+        review: result.review,
+        // What the worker said it did, so a run that changed nothing still has an explanation and a
+        // conversation turn worth continuing from.
+        answer: result.report ?? null,
+        noChange,
+        readyForApproval: result.readyForApproval,
+        approvalRequired: result.approvalRequired,
+        mergePerformed: false,
+        usage: result.taskReceipt.usage,
+      });
+      const boundary = result.worktree === null ? `workspace=${result.providerCwd ?? repositoryPath}` : `branch=${result.worktree.branch}`;
+      emit(json, data, [
+        `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · ${boundary}`,
+        noChange
+          // The worker finished and the workspace did not change. Said plainly, with its own words,
+          // rather than as a review outcome about a diff that never existed.
+          ? `No change was made. The worker reported: ${result.report ?? "nothing"}`
+          : `Changed: ${result.changedFiles.join(", ")}`,
+        ...(noChange ? [] : [`Ready for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`]),
+      ].join("\n"), stdout);
+      // A no-change run is a completed observation, not a command failure: the record is written,
+      // the operator is told the truth, and the follow-up ("try again, or say what blocked you")
+      // needs the turn to exist. Every other unusable outcome still exits non-zero.
+      const exitCode = noChange ? 0 : recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1;
+      return Object.freeze({ exitCode, data });
     } catch (error) {
       // The task exists and the runner has already recorded what became of it, so this is an
       // execution failure rather than a preflight one. Marked so the operator is never told that

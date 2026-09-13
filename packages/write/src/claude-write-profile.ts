@@ -93,9 +93,14 @@ export function planClaudeWriteInvocation(input: {
    * restrictions ADR 0014 classifies as legacy (ADR 0017).
    */
   readonly nativeHarness?: boolean;
+  /** The native session this write runs in, when one was resolved. */
+  readonly session?: { readonly kind: string; readonly sessionId: string | null; readonly persistent: boolean } | null;
 }): WriteProviderPlan {
   assertClaudeWriteEligible(input.snapshot, input.model);
   const nativeHarness = input.nativeHarness === true;
+  const session = input.session ?? null;
+  // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns.
+  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
   const body = JSON.stringify(Object.freeze({
     schemaVersion: 1,
     task: input.task,
@@ -109,20 +114,28 @@ export function planClaudeWriteInvocation(input: {
       noNetwork: !nativeHarness,
       noSecrets: true,
       noAgentConfigChanges: true,
+      // Recorded in the brief as well as the argv, so a worker that is resuming knows it is.
+      resumedNativeSession: session !== null && session.kind === "resumed",
     }),
     responseContract: WRITE_SCHEMA,
   }));
   if (body.length === 0 || body.length > 2_000_000) throw new BrainGateInvariantError("WRITE_PAYLOAD_INVALID", "Write payload must be between 1 and 2,000,000 characters.");
   // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
   // lower than the budget asks for would silently reimpose the limit this stopped being.
-  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
+
   const args = Object.freeze([
     "--restricted",
     "--safe-mode",
     "-p", GENERIC_WRITE_PROMPT,
     "--output-format", "json",
     "--json-schema", JSON.stringify(WRITE_SCHEMA),
-    "--no-session-persistence",
+    // A write that is continuing a goal keeps its session, and a write that is not leaves none
+    // behind. Both halves were hard-coded before: the flag was always here, so a DIRECT write could
+    // never be resumed by the next compatible write — which is the continuity the M20 architecture
+    // promises and the reason S2 did not exist in dogfood.
+    ...(session !== null && session.kind === "resumed" && session.sessionId !== null ? ["--resume", session.sessionId] : []),
+    ...(session !== null && session.kind === "fresh" && session.sessionId !== null ? ["--session-id", session.sessionId] : []),
+    ...(session !== null && session.persistent ? [] : ["--no-session-persistence"]),
     "--no-chrome",
     "--disable-slash-commands",
     "--permission-mode", "acceptEdits",

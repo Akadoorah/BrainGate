@@ -87,7 +87,22 @@ export interface WriteEligibilityProof {
    * silently running with a boundary they were not proven under.
    */
   readonly nativeHarness?: boolean;
+  /**
+   * The native session this write runs in, when one was resolved.
+   *
+   * Structural rather than imported: the decision is made above this layer and passed down as data,
+   * exactly as the read path does it. Absent, the write profile behaves as it always did — no id
+   * pinned, no session resumed, and the run told not to persist one.
+   */
+  readonly session?: WriteNativeSession | null;
   readonly now?: Date;
+}
+
+/** The subset of the session decision a write profile needs to write its flags. */
+export interface WriteNativeSession {
+  readonly kind: "fresh" | "resumed" | "handoff" | "unsupported" | "disabled";
+  readonly sessionId: string | null;
+  readonly persistent: boolean;
 }
 
 /**

@@ -91,3 +91,20 @@ test("asking whether something can be done is a request", () => {
   assert.equal(classifyRequestIntent("Can you apply the fix?"), "write");
   assert.equal(classifyRequestIntent("Could you add a comment to the README?"), "write");
 });
+
+test("a question about which file to change is a read", () => {
+  assert.equal(classifyRequestIntent("Which file in this repository is safest to change for a reversible test?"), "read");
+  assert.equal(classifyRequestIntent("What should I update to make the banner shorter?"), "read");
+  assert.equal(classifyRequestIntent("Which files would I need to edit?"), "read");
+  // And the same words as an instruction are still a write.
+  assert.equal(classifyRequestIntent("Change the banner text in README.md."), "write");
+  assert.equal(classifyRequestIntent("Which file is safest to change? Now change it."), "write");
+});
+
+test("a noun that happens to be a write verb does not make a read a write", () => {
+  // "comment" is a verb in a wiki and a noun in every code review. These are reads.
+  assert.equal(classifyRequestIntent("Read that README from disk and confirm the comment is there."), "read");
+  assert.equal(classifyRequestIntent("Is the comment in the file the same as the one you proposed?"), "read");
+  // And asking for one is still a write.
+  assert.equal(classifyRequestIntent("Append a comment line to the README."), "write");
+});

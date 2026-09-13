@@ -33,7 +33,10 @@
 
 /** Verbs whose object is a change to the workspace. */
 const WRITE_VERBS: readonly string[] = Object.freeze([
-  "add", "adjust", "annotate", "append", "apply", "bump", "change", "clean", "cleanup", "comment",
+  // `comment` is deliberately absent: as a noun it is everywhere ("confirm the comment is there"),
+  // and as a verb it is rare enough that the surrounding words — add, append, insert, apply — carry
+  // the directive. It produced a false WRITE on a read request in the acceptance scenario.
+  "add", "adjust", "annotate", "append", "apply", "bump", "change", "clean", "cleanup",
   "convert", "correct", "create", "delete", "document", "drop", "edit", "extract", "fix", "format",
   "implement", "improve", "inline", "insert", "migrate", "modify", "move", "patch", "polish",
   "refactor", "remove", "rename", "reorder", "replace", "restore", "rewrite", "set", "simplify",
@@ -78,9 +81,18 @@ function clauses(text: string): readonly string[] {
   return Object.freeze(text.split(/[\n;.•]|(?<=[.!?])\s+|,\s+(?=(?:and\s+)?(?:do not|don't|never|without|but)\b)/i).map((clause) => clause.trim()).filter((clause) => clause.length > 0));
 }
 
+/** Whether the clause is a question rather than an instruction. */
+function isInterrogative(clause: string): boolean {
+  return /\?\s*$/.test(clause.trim()) || /^\s*(which|what|where|who|when|why|how|is|are|does|do|can|could|should|would)\b/i.test(clause);
+}
+
 /** Whether the write verb at `index` is governed by a negation or a hypothetical frame. */
 function isBounded(clause: string, index: number): boolean {
   const before = clause.slice(0, index);
+  // A write verb in the infinitive, inside a question, is what the question is *about*: "which file
+  // is safest to change?" asks for an answer, not for a change. Real usage produced exactly that
+  // phrasing, and it was the first turn of the acceptance scenario.
+  if (isInterrogative(clause) && /\bto\s*$/i.test(before)) return true;
   // A negation in the same clause, close enough to govern this verb: "do not use git reset", "without
   // creating a branch". Distance is bounded so an earlier constraint cannot silence a later verb.
   if (NEGATIONS.some((pattern) => pattern.test(before))) return true;
