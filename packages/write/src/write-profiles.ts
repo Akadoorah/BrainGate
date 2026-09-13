@@ -175,6 +175,8 @@ export interface WriteInvocationInput {
   readonly cwd: string;
   /** Whether the runtime keeps its own harness here, which only DIRECT asks for. */
   readonly nativeHarness?: boolean;
+  /** The native session this write runs in, when one was resolved. */
+  readonly session?: WriteNativeSession | null;
   readonly task: string;
   readonly context: unknown;
   readonly findings?: readonly string[];

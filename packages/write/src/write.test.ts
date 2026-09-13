@@ -24,7 +24,7 @@ import { redactSecrets } from "@braingate/security";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
 import { assertSourceCheckoutUnchanged, codexIsolationProfileHash, sourceCheckoutFingerprint, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
-import { WriteDogfoodRunner, assertSourceCheckoutClean, buildWriteTaskPlan, planClaudeWriteInvocation, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
+import { WriteDogfoodRunner, assertSourceCheckoutClean, buildWriteTaskPlan, planClaudeWriteInvocation, planWriteInvocation, sessionMissingFrom, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
 
 /**
  * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
@@ -267,5 +267,76 @@ test("A/C/E: an inert documentation edit is admitted, including the dogfood targ
       .run({ task, repositoryPath: f.repo, policy: "direct", classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500, context: {}, observation: observationFor(classification), review: false, dryRun: true });
     assert.equal(result.dryRun, true);
     assert.equal(writer.calls.length, 0);
+  } finally { ledger.close(); rmSync(f.root, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------- the real DIRECT permission contract
+
+/**
+ * The workspace profile must leave the runtime's own permission mode in force.
+ *
+ * `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is a BrainGate hardening, and Claude Code reacts to it by
+ * forcing the permission mode back to `default` — so `--permission-mode acceptEdits` stops taking
+ * effect and every Edit waits for an approval a headless run cannot give. Real dogfood produced the
+ * CLI's own warning, and a write that could not edit. The worktree profile compensates with an
+ * explicit allowlist; the DIRECT profile has none on purpose, so it must not set the scrub.
+ */
+test("DIRECT does not set the subprocess env scrub, and the worktree profile still does", () => {
+  const snapshotAnthropic = snapshot("anthropic");
+  const model = { providerId: "anthropic" as const, modelId: "claude-sonnet-5", quotaPool: "claude-subscription" };
+  const direct = planWriteInvocation({
+    snapshot: snapshotAnthropic, model, cwd: "/workspace", nativeHarness: true,
+    task: "add a comment", context: {},
+    session: { kind: "fresh", sessionId: "session-1", persistent: true },
+  });
+  assert.equal(direct.envOverrides.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, undefined, "the workspace keeps the CLI's permission mode");
+  assert.equal(direct.allowedEnvKeys.includes("CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"), false);
+  assert.ok(direct.args.includes("--permission-mode") && direct.args.includes("acceptEdits"), "and the approved write is auto-approved");
+  assert.ok(direct.args.includes("--session-id") && direct.args.includes("session-1"), "a fresh write names its session");
+  assert.equal(direct.args.includes("--no-session-persistence"), false, "and is allowed to persist it");
+
+  const worktree = planWriteInvocation({
+    snapshot: snapshotAnthropic, model, cwd: "/worktree", task: "add a comment", context: {},
+    session: { kind: "resumed", sessionId: "session-1", persistent: true },
+  });
+  assert.equal(worktree.envOverrides.CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, "1", "the isolated mode keeps the hardening it was earned under");
+  assert.ok(worktree.args.includes("--tools"), "and compensates with its explicit allowlist");
+  assert.ok(worktree.args.includes("--resume") && worktree.args.includes("session-1"));
+});
+
+test("a resumed session the runtime no longer has is retried with a fresh one", async () => {
+  assert.equal(sessionMissingFrom("No conversation found with session ID: abc"), true);
+  assert.equal(sessionMissingFrom("all good"), false);
+
+  const f = fixture(); const ledger = new TaskLedger(f.project);
+  let call = 0;
+  const writer: WriteProviderExecutor = {
+    run: async (input) => {
+      call += 1;
+      if (call === 1) {
+        return { spawned: true, exitCode: 1, timedOut: false, durationMs: 5, removedEnvironmentKeys: Object.freeze([]), stdout: "", stderr: "No conversation found with session ID: gone-1" };
+      }
+      writeFileSync(join(input.plan.cwd, "app.txt"), "after\n");
+      return { spawned: true, exitCode: 0, timedOut: false, durationMs: 5, removedEnvironmentKeys: Object.freeze([]), stdout: JSON.stringify({ result: JSON.stringify({ summary: "changed app.txt" }) }), stderr: "" };
+    },
+  };
+  const classification = classifyTask({ text: "change the button label", mode: "write" });
+  try {
+    const result = await new WriteDogfoodRunner({
+      project: f.project, ledger, router: router(), providers: [snapshot("anthropic")], writer,
+      finalizer: finalizerFor(f.project, ledger),
+      nativeSession: async () => ({
+        decision: { providerId: "anthropic", modelId: "claude-sonnet-5", kind: "resumed", sessionId: "gone-1", resumeMode: "available", reason: null, persistent: true },
+        note: "resumed",
+      }),
+    }).run({
+      task: "change the button label", repositoryPath: f.repo, policy: "direct", classification,
+      budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500, context: {},
+      observation: { predicted: classification, effective: classification, prior: null }, review: false,
+    });
+    assert.equal(call, 2, "the write was retried once");
+    assert.equal(result.changedFiles.includes("app.txt"), true, "and the retry did the work");
+    const events = ledger.receipt(result.taskId!).events;
+    assert.ok(events.some((event) => event.kind === "session.unavailable"), "the missing session is recorded rather than swallowed");
   } finally { ledger.close(); rmSync(f.root, { recursive: true, force: true }); }
 });

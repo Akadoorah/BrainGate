@@ -121,6 +121,19 @@ function workerReportOf(stdout: string): string {
   return redactSecrets(summary.trim()).slice(0, 2_000);
 }
 
+/**
+ * Whether the CLI said the session we resumed does not exist.
+ *
+ * Measured against Claude Code 2.1.270: a `--resume <id>` for a session it has never heard of ends
+ * with `No conversation found with session ID: <id>` and a non-zero exit. Sessions are the runtime's
+ * own state — an operator can clear them, and a run that dies before the CLI persists one leaves a
+ * reference to nothing — so this is an ordinary condition to recover from rather than a task
+ * failure. The recorded reference is kept: it is evidence of what was attempted.
+ */
+export function sessionMissingFrom(output: string): boolean {
+  return /no conversation found with session id|session (?:id )?not found|unknown session/i.test(output);
+}
+
 function isNoEligibleModel(error: unknown): boolean {
   return error instanceof BrainGateInvariantError && error.code === "ROUTE_NO_ELIGIBLE_MODEL";
 }
@@ -547,7 +560,32 @@ export class WriteDogfoodRunner {
       // came back empty left nothing saying a call had happened. These are the same event kinds
       // the read path emits, so one reader understands both.
       this.#ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool });
-      const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
+      let result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
+      // A session the runtime no longer has is not a reason to fail the task: the goal handoff is
+      // what the next worker needs, so the run is retried once without the session reference. The
+      // alternative is what real dogfood produced — a write that cannot proceed because a reference
+      // to a session that never came into existence is resumed forever.
+      let recoveredFromMissingSession = false;
+      if (!result.spawned || result.timedOut || result.exitCode !== 0) {
+        const missing = sessionMissingFrom(`${result.stdout}\n${result.stderr}`);
+        if (missing && session !== null && session.decision.kind === "resumed") {
+          recoveredFromMissingSession = true;
+          this.#ledger.appendEvent(task.taskId, "session.unavailable", {
+            role: "primary", phase: "write",
+            kind: session.decision.kind, sessionId: session.decision.sessionId,
+            note: "the runtime no longer has this session; retried with a fresh one and the goal handoff",
+          });
+          const freshInvocation = planWriteInvocation({
+            snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath,
+            ...(direct ? { nativeHarness: true } : {}),
+            session: Object.freeze({ kind: "fresh" as const, sessionId: session.decision.sessionId, persistent: session.decision.persistent }),
+            task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
+            ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+            ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
+          });
+          result = await this.#writer.run({ plan: freshInvocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
+        }
+      }
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         // Recognised and recorded even though this path will not act on it: a write that was refused
         // is a fact the operator needs, whether or not a failover is safe here (it is not — the
@@ -571,7 +609,7 @@ export class WriteDogfoodRunner {
         });
         throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `${primary.model.providerId} write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
       }
-      this.#ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool, durationMs: result.durationMs });
+      this.#ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool, durationMs: result.durationMs, ...(recoveredFromMissingSession ? { recoveredFromMissingSession: true } : {}) });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });

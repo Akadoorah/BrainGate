@@ -182,8 +182,25 @@ export function planClaudeWriteInvocation(input: {
     modelId: input.model.modelId,
     quotaPool: input.model.quotaPool,
     stdin: body,
-    allowedEnvKeys: Object.freeze(["CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_SKIP_PROMPT_HISTORY", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]),
-    envOverrides: Object.freeze({ CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" }),
+    // `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is a BrainGate-invented hardening, and in the workspace it
+    // is self-defeating: the CLI reacts to it by forcing the permission mode back to `default`, so
+    // `--permission-mode acceptEdits` stops taking effect and every Edit waits for an approval that
+    // a headless run can never give. Real dogfood showed it, in the CLI's own words:
+    //
+    //   ⚠ Permission mode forced to default — CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set
+    //     (allowed_non_write_users hardening). Declare allowedTools explicitly, or set
+    //     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0 to opt out.
+    //
+    // The worktree profile compensates with an explicit tool allowlist; the DIRECT profile
+    // deliberately has none, because there the runtime keeps its own harness. So the scrub stays
+    // where it was earned — the isolated worktree — and is not set in the operator's workspace,
+    // where the operator has already approved the change at BrainGate's own prompt.
+    allowedEnvKeys: Object.freeze(nativeHarness
+      ? ["CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_SKIP_PROMPT_HISTORY"]
+      : ["CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_SKIP_PROMPT_HISTORY", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]),
+    envOverrides: Object.freeze(nativeHarness
+      ? { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1" }
+      : { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" }),
   });
 }
 
