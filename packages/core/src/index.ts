@@ -9,6 +9,7 @@ export * from "./quota-refusal.js";
 export * from "./role-attribution.js";
 export * from "./task-ledger.js";
 export * from "./classifier.js";
+export * from "./artifact.js";
 export * from "./budget.js";
 export * from "./result-store.js";
 export * from "./finalization.js";

@@ -1,4 +1,5 @@
 import type { TaskComplexity, TaskRisk } from "./task-outcome.js";
+import { PATH_TOKEN, classifyArtifacts, type ArtifactAssessment } from "./artifact.js";
 
 // Bumped because the rules changed, not the code: a receipt written under the old version
 // classified a read-only question about a sensitive area three tiers higher than this one does.
@@ -36,7 +37,7 @@ export interface TaskClassification {
   readonly ruleVersion: string;
 }
 
-const COMPLEXITY_ORDER: readonly TaskComplexity[] = ["T0", "T1", "T2", "T3", "T4"];
+export const COMPLEXITY_ORDER: readonly TaskComplexity[] = ["T0", "T1", "T2", "T3", "T4"];
 const RISK_ORDER: readonly TaskRisk[] = ["low", "medium", "high", "critical"];
 
 const QUESTION_TERMS = ["where is", "what does", "explain", "find", "which file", "وين", "اين", "أين", "شو", "ما هو", "اشرح", "دور لي"];
@@ -80,12 +81,12 @@ const BREADTH_TERMS = [
 const FEATURE_TERMS = ["feature", "refactor", "integration", "endpoint", "workflow", "ميزة", "خاصية", "تكامل", "واجهة"];
 
 const DOMAIN_TERMS = {
-  payments: ["payment", "billing", "stripe", "subscription", "charge", "refund", "checkout", "دفع", "فوترة", "اشتراك", "خصم", "سترايب", "فاتورة", "مدفوعات"],
-  auth: ["auth", "login", "oauth", "jwt", "token", "password", "permission", "role", "تسجيل الدخول", "مصادقة", "توكن", "كلمة المرور", "صلاحيات"],
-  database: ["database", "schema", "migration", "migrate", "sql", "database migration", "قاعدة البيانات", "داتا بيس", "سكيمة", "ترحيل", "مايغريشن"],
-  production: ["production", "prod", "deploy", "release", "live environment", "برودكشن", "انتاج", "إنتاج", "نشر", "ديبلوي"],
-  security: ["security", "vulnerability", "secret", "credential", "encryption", "امن", "أمن", "ثغرة", "سر", "مفتاح", "تشفير"],
-  destructive: ["delete", "drop", "truncate", "wipe", "remove all", "حذف", "احذف", "امسح", "مسح كامل", "دروب"],
+  payments: ["payment", "payments", "billing", "stripe", "subscription", "subscriptions", "charge", "charges", "charged", "refund", "refunds", "checkout", "invoice", "invoices", "دفع", "فوترة", "اشتراك", "خصم", "سترايب", "فاتورة", "مدفوعات"],
+  auth: ["auth", "authentication", "authenticate", "authorization", "authorize", "login", "signin", "oauth", "jwt", "token", "password", "permission", "permissions", "role", "roles", "session", "تسجيل الدخول", "مصادقة", "توكن", "كلمة المرور", "صلاحيات"],
+  database: ["database", "schema", "migration", "migrations", "migrate", "sql", "database migration", "قاعدة البيانات", "داتا بيس", "سكيمة", "ترحيل", "مايغريشن"],
+  production: ["production", "prod", "deploy", "deploys", "deployment", "deployments", "release", "releases", "live environment", "برودكشن", "انتاج", "إنتاج", "نشر", "ديبلوي"],
+  security: ["security", "secure", "vulnerability", "vulnerabilities", "secret", "secrets", "credential", "credentials", "encryption", "encrypt", "امن", "أمن", "ثغرة", "سر", "مفتاح", "تشفير"],
+  destructive: ["delete", "deletes", "drop", "drops", "truncate", "wipe", "remove all", "حذف", "احذف", "امسح", "مسح كامل", "دروب"],
 } as const;
 
 function normalize(text: string): string {
@@ -101,6 +102,46 @@ function hasAny(text: string, terms: readonly string[]): boolean {
   return terms.some((term) => text.includes(normalize(term)));
 }
 
+/**
+ * A cue that has to *start* a word.
+ *
+ * `hasAny` is a substring test, and that is right for phrases ("every ", "across the"). It is wrong
+ * for domain and architecture cues, and real dogfood showed both halves of the mistake in one
+ * request: `flutter_migration` contains `migration`, so a Markdown comment was rated a database
+ * migration and raised to T4. A project named `flutter_migration` is a name, not an operation, and
+ * a cue that only ever matched inside a longer identifier was never evidence of anything.
+ *
+ * Both ends are anchored. Leaving the suffix open was the same mistake one level up: `auth` matched
+ * `author` and `key` matched `keyboard`, so a request about an author byline read as authentication
+ * work. The inflections that mean the domain — `authentication`, `charges`, `migrations`, `deploys` —
+ * are listed as the words they are, which is a vocabulary rather than a guess about where a word ends.
+ */
+function hasCue(text: string, terms: readonly string[]): boolean {
+  return terms.some((term) => {
+    const cue = normalize(term).trim();
+    if (cue.length === 0) return false;
+    // A cue that is not Latin text keeps plain substring matching. Arabic attaches its definite
+    // article and its conjunctions to the word — `الدفع`, `والاشتراكات` — so a word-start rule that
+    // is right for `flutter_migration` silently stopped the classifier seeing payment work in
+    // Arabic, which is a real request in this product and not a false positive to trade away.
+    if (!/^[\x20-\x7e]+$/.test(cue)) return text.includes(cue);
+    const escaped = cue.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(^|[^\\p{L}\\p{N}_])${escaped}([^\\p{L}\\p{N}_]|$)`, "u").test(text);
+  });
+}
+
+/**
+ * The request with its negative constraints removed.
+ *
+ * "Do not commit, do not create a branch, do not use git checkout" is a boundary on *how* the change
+ * is made, and it contains `checkout` — which is also a payments word. Read as evidence, the
+ * constraint made a documentation edit look like payment work. A constraint says what may not
+ * happen; it is not part of what is being asked for.
+ */
+function withoutConstraints(text: string): string {
+  return text.replace(/\b(?:do not|don't|does not|doesn't|never|without|avoid)\b[^.;\n]*/gi, " ");
+}
+
 function maxComplexity(a: TaskComplexity, b: TaskComplexity): TaskComplexity {
   return COMPLEXITY_ORDER[Math.max(COMPLEXITY_ORDER.indexOf(a), COMPLEXITY_ORDER.indexOf(b))]!;
 }
@@ -109,19 +150,31 @@ function maxRisk(a: TaskRisk, b: TaskRisk): TaskRisk {
   return RISK_ORDER[Math.max(RISK_ORDER.indexOf(a), RISK_ORDER.indexOf(b))]!;
 }
 
-function detectDomains(text: string, inspection?: InspectionSignals): Set<string> {
-  const domains = new Set<string>();
-  if (hasAny(text, DOMAIN_TERMS.payments) || inspection?.payments) domains.add("payments");
-  if (hasAny(text, DOMAIN_TERMS.auth) || inspection?.auth) domains.add("auth");
-  if (hasAny(text, DOMAIN_TERMS.database) || inspection?.databaseSchema) domains.add("database");
-  if (hasAny(text, DOMAIN_TERMS.production) || inspection?.production) domains.add("production");
-  if (hasAny(text, DOMAIN_TERMS.security) || inspection?.security) domains.add("security");
-  if (hasAny(text, DOMAIN_TERMS.destructive) || inspection?.destructive) domains.add("destructive");
+/**
+ * The domains a request touches, from its wording and from the artifacts it names.
+ *
+ * The artifact pass is what separates a domain *word* from a domain *fact*: `auth/login.ts` is
+ * authentication work because of what the file is, while a README under a directory called
+ * `payments/` is documentation and contributes nothing. Paths are removed from the wording scan so a
+ * directory name cannot vote twice, and the remaining prose is read with the constraints stripped.
+ */
+function detectDomains(text: string, artifact: ArtifactAssessment, inspection?: InspectionSignals): Set<string> {
+  const domains = new Set<string>(artifact.domains);
+  const prose = withoutConstraints(text.replace(PATH_TOKEN, " "));
+  if (hasCue(prose, DOMAIN_TERMS.payments) || inspection?.payments) domains.add("payments");
+  if (hasCue(prose, DOMAIN_TERMS.auth) || inspection?.auth) domains.add("auth");
+  if (hasCue(prose, DOMAIN_TERMS.database) || inspection?.databaseSchema) domains.add("database");
+  if (hasCue(prose, DOMAIN_TERMS.production) || inspection?.production) domains.add("production");
+  if (hasCue(prose, DOMAIN_TERMS.security) || inspection?.security) domains.add("security");
+  if (hasCue(prose, DOMAIN_TERMS.destructive) || inspection?.destructive) domains.add("destructive");
   return domains;
 }
 
 export function classifyTask(input: ClassificationInput): TaskClassification {
   const text = normalize(input.text);
+  // What the request names, before anything is inferred from how it is phrased. The artifact pass
+  // answers "what would change"; the cue passes below answer "what is this about".
+  const artifact = classifyArtifacts(text);
   const mode = input.mode ?? "ask";
   const inspection = input.inspection;
   const reasons: string[] = [];
@@ -166,7 +219,9 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
     reasons.push("breadth-cue");
   }
 
-  if (hasAny(text, ARCHITECTURE_TERMS)) {
+  // A schema artifact is architecture-level work whatever the sentence says; a directory whose name
+  // merely contains the word is not. Both halves are needed, and they are different questions.
+  if (hasCue(withoutConstraints(text.replace(PATH_TOKEN, " ")), ARCHITECTURE_TERMS) || artifact.schemaMigration) {
     complexity = "T4";
     confidence = Math.max(confidence, 0.95);
     reasons.push("architecture-or-migration-cue");
@@ -212,7 +267,7 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
     reasons.push("tests-missing");
   }
 
-  const domains = detectDomains(text, inspection);
+  const domains = detectDomains(text, artifact, inspection);
   /**
    * Risk is what a task could damage, and a question damages nothing.
    *
@@ -241,6 +296,10 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
   }
 
   for (const domain of domains) reasons.push(`sensitive-domain:${domain}`);
+  // The artifacts are recorded as evidence, so a refusal can be traced to what was named rather than
+  // to a word that happened to appear. A documentation-only request says so in its own reason.
+  if (artifact.documentationOnly) reasons.push("documentation-only");
+  else if (artifact.kind !== "unknown") reasons.push(`artifact:${artifact.kind}`);
 
   // A broad question that also asks for a judgement — an opinion, an assessment, a comparison —
   // has to survey before it can conclude, which is the most turn-hungry shape a read task takes.

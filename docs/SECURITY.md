@@ -165,6 +165,38 @@ Task ledgers record classification, routing, provider/model role, permission gra
 - Compromised or malicious third-party skills.
 - Unsafe adaptation caused by a small or noisy dogfood sample.
 
+## Write risk follows the artifact, not the vocabulary
+
+The M11 write-scope guard refuses T3+, high and critical risk. What it is given comes from the
+classifier, and the classifier used to decide risk by matching words anywhere in the request — as
+substrings. Real dogfood showed what that costs: a request to append one inert comment line to
+
+```text
+flutter_migration/…/LaunchImage.imageset/README.md
+```
+
+was refused as high-risk migration work, because `flutter_migration` contains `migration`. The same
+request also read as payment work, because `do not use git checkout` contains `checkout`. Neither
+word said anything about the change.
+
+Risk is now decided by the requested effect and by the **artifact** the request names
+(`packages/core/src/artifact.ts`):
+
+- a documentation artifact — `.md`, `.mdx`, `.txt`, `.rst`, or a `README`/`LICENSE`/`CHANGELOG`
+  basename — contributes **no** domain and never raises the architecture tier, whatever directory it
+  sits in;
+- a `.sql` file, or any file under a `migrations/`, `schema/`, `alembic/`, `flyway/`, `ddl/` or
+  `seeds/` directory, is a schema migration and stays architecture-level and high risk;
+- everything else is judged by the file and directory names it actually lives under, so
+  `auth/login.ts` is authentication work and `payments/processor.ts` is payment work;
+- negative constraints are removed before the wording is read, because "do not commit" bounds *how*
+  a change is made rather than describing it;
+- domain cues match at word starts, so `flutter_migration` is not `migration` and `subscription` is
+  not `auth`.
+
+The gate itself is unchanged, and the tests run through it: real migration, auth and payment writes
+are refused with `WRITE_SCOPE_BLOCKED`, and an inert documentation edit is admitted at T2/low.
+
 ## DIRECT execution and the security model
 
 The default interactive policy runs the native CLI in the workspace the operator selected (ADR

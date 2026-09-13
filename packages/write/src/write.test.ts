@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
@@ -214,4 +214,58 @@ test("a write task compares the checkout against a fingerprint, not against bein
     (error: unknown) => error instanceof BrainGateInvariantError,
     "the fingerprint must notice a rewritten ignored file",
   );
+});
+
+// ---------------------------------------------------------------- the write-scope gate, both ways
+
+/**
+ * The M11 guard is unchanged: it still refuses T3+, high and critical risk. What changed is the
+ * classification that feeds it, so the tests here run *through the guard* — a request that reaches
+ * the runner and is refused, or reaches it and is planned.
+ */
+test("H: the write-scope gate still refuses real migration, auth and payment work", async () => {
+  const highRisk = [
+    "Apply this to migrations/001_add_users.sql: ALTER TABLE users ADD COLUMN email TEXT;",
+    "Change the authentication acceptance logic in auth/login.ts.",
+    "Change the charge and refund behaviour in payments/processor.ts.",
+  ];
+  for (const task of highRisk) {
+    const f = fixture(); const writer = new FakeWriter(() => { throw new Error("must not run"); });
+    const classification = classifyTask({ text: task, mode: "write" });
+    try {
+      await assert.rejects(
+        () => new WriteDogfoodRunner({ project: f.project, ledger: new TaskLedger(f.project), router: router(), providers: [snapshot("anthropic")], writer, finalizer: finalizerFor(f.project, new TaskLedger(f.project)) })
+          .run({ task, repositoryPath: f.repo, classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500, context: {}, observation: observationFor(classification), review: false }),
+        // The code, not the prose: the message is the operator's explanation and may be reworded.
+        (error: unknown) => (error as { readonly code?: string }).code === "WRITE_SCOPE_BLOCKED",
+        task,
+      );
+      assert.equal(writer.calls.length, 0, `${task}: no provider may be reached`);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
+});
+
+test("A/C/E: an inert documentation edit is admitted, including the dogfood target", async () => {
+  const f = fixture(); const writer = new FakeWriter(() => { throw new Error("dry run must not run"); });
+  const ledger = new TaskLedger(f.project);
+  const task = [
+    "Apply the agreed harmless comment-only change to the selected README file:",
+    "flutter_migration/tabaq_onboarding/ios/Runner/Assets.xcassets/LaunchImage.imageset/README.md",
+    "",
+    "Append one inert comment line.",
+    "",
+    "Modify only that file, do not commit, do not create a branch,",
+    "do not use git reset, do not use git clean, do not use git stash, do not use git checkout.",
+  ].join("\n");
+  const classification = classifyTask({ text: task, mode: "write" });
+  assert.equal(classification.complexity, "T2");
+  assert.equal(classification.risk, "low");
+  try {
+    // A dry run is enough to prove the guard admitted it: the plan is built, which is where the
+    // scope check lives, and nothing is dispatched.
+    const result = await new WriteDogfoodRunner({ project: f.project, ledger, router: router(), providers: [snapshot("anthropic")], writer, finalizer: finalizerFor(f.project, ledger) })
+      .run({ task, repositoryPath: f.repo, policy: "direct", classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500, context: {}, observation: observationFor(classification), review: false, dryRun: true });
+    assert.equal(result.dryRun, true);
+    assert.equal(writer.calls.length, 0);
+  } finally { ledger.close(); rmSync(f.root, { recursive: true, force: true }); }
 });

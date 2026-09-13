@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { classifyTask, reclassifyTask } from "./classifier.js";
+import { COMPLEXITY_ORDER } from "./classifier.js";
 import { budgetFor } from "./budget.js";
 
 test("tiny Arabic question stays cheap", () => {
@@ -166,4 +167,96 @@ test("an Arabic review or coverage request reads as broad, like its English coun
       `"${text}" read as ${classification.complexity} with reasons: ${classification.reasons.join(", ")}`,
     );
   }
+});
+
+// ---------------------------------------------------------------- risk is about the artifact
+
+/**
+ * Real dogfood rated a Markdown comment a database migration, twice over.
+ *
+ * ```text
+ * Apply the agreed harmless comment-only change to the selected README file:
+ * flutter_migration/…/LaunchImage.imageset/README.md
+ * … do not use git checkout …
+ * ```
+ *
+ * `flutter_migration` contains `migration` (substring match → T4, `sensitive-domain:database`), and
+ * `do not use git checkout` contains `checkout` (a payments term → `sensitive-domain:payments`). The
+ * request was refused with WRITE_SCOPE_BLOCKED before a task existed, and the operator was told a
+ * Markdown file was high-risk migration work.
+ *
+ * Risk now follows the requested effect and the artifact it names. These cases are the boundary in
+ * both directions, and the safety gate they feed (`assertM11Scope`) is unchanged.
+ */
+const DOGFOOD_WRITE = [
+  "Apply the agreed harmless comment-only change to the selected README file:",
+  "flutter_migration/tabaq_onboarding/ios/Runner/Assets.xcassets/LaunchImage.imageset/README.md",
+  "",
+  "Append one inert comment line:",
+  "<!-- DIRECT-mode test marker: no functional content changed -->",
+  "",
+  "Modify only that file, do not commit, do not create a branch,",
+  "do not use git reset, do not use git clean, do not use git stash, do not use git checkout,",
+  "and report exactly which file changed.",
+].join("\n");
+
+test("A: a comment in a README under flutter_migration is an ordinary T2 write", () => {
+  const classification = classifyTask({ text: DOGFOOD_WRITE, mode: "write" });
+  assert.equal(classification.complexity, "T2");
+  assert.equal(classification.risk, "low");
+  assert.ok(classification.reasons.includes("documentation-only"));
+  assert.equal(classification.reasons.some((reason) => reason.startsWith("sensitive-domain:")), false, "a path name is not a domain");
+  assert.equal(classification.reasons.includes("architecture-or-migration-cue"), false, "and a project named flutter_migration is not a migration");
+});
+
+test("B: a real schema migration is still architecture-level and high risk", () => {
+  const classification = classifyTask({ text: "Apply this to migrations/001_add_users.sql: ALTER TABLE users ADD COLUMN email TEXT;", mode: "write" });
+  assert.equal(classification.complexity, "T4");
+  assert.equal(classification.risk, "high");
+  assert.ok(classification.reasons.includes("sensitive-domain:database"));
+  assert.ok(classification.reasons.includes("artifact:schema"));
+});
+
+test("C/E: documentation under a sensitive directory name is still documentation", () => {
+  for (const text of ["Fix a typo in security/README.md. Do not commit.", "Update the wording in payments/README.md. Do not commit.", "Add a note to auth/docs/notes.md."]) {
+    const classification = classifyTask({ text, mode: "write" });
+    assert.equal(classification.risk, "low", text);
+    assert.ok(classification.complexity === "T1" || classification.complexity === "T2", text);
+    assert.equal(classification.reasons.some((reason) => reason.startsWith("sensitive-domain:")), false, text);
+  }
+});
+
+test("D/F: code in a sensitive area is still sensitive, from what the file is", () => {
+  const auth = classifyTask({ text: "Change the authentication acceptance logic in auth/login.ts.", mode: "write" });
+  assert.equal(auth.risk, "high");
+  assert.ok(COMPLEXITY_ORDER.indexOf(auth.complexity) >= COMPLEXITY_ORDER.indexOf("T3"));
+  assert.ok(auth.reasons.includes("sensitive-domain:auth"));
+
+  const payments = classifyTask({ text: "Change the charge and refund behaviour in payments/processor.ts.", mode: "write" });
+  assert.equal(payments.risk, "critical");
+  assert.equal(payments.complexity, "T4");
+  assert.ok(payments.reasons.includes("sensitive-domain:payments"));
+});
+
+test("a constraint about a git command is not payment work", () => {
+  // `checkout` is a payments word and a git command; only the second reading is available here.
+  const withConstraint = classifyTask({ text: "Append a comment to docs/README.md. Do not use git checkout or git reset.", mode: "write" });
+  assert.equal(withConstraint.reasons.some((reason) => reason === "sensitive-domain:payments"), false);
+  // Asked for, rather than forbidden, it is still payment work.
+  const realWork = classifyTask({ text: "Fix the checkout flow in payments/checkout.ts.", mode: "write" });
+  assert.equal(realWork.risk, "critical");
+});
+
+test("G: a path containing 'migration' says nothing about a read", () => {
+  const classification = classifyTask({ text: "Explain what flutter_migration/tabaq_onboarding/README.md documents.", mode: "ask" });
+  assert.equal(classification.risk, "low");
+  assert.equal(classification.reasons.some((reason) => reason.startsWith("sensitive-domain:")), false);
+});
+
+test("a domain word that merely contains another domain word is not that domain", () => {
+  // `session` is an auth word; `subscription` is a payments word. Both are real, and neither makes
+  // the other fire from a substring.
+  const payments = classifyTask({ text: "Change the subscription renewal date in billing/plan.ts.", mode: "write" });
+  assert.ok(payments.reasons.includes("sensitive-domain:payments"));
+  assert.equal(payments.reasons.includes("sensitive-domain:auth"), false);
 });
