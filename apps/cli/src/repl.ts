@@ -399,6 +399,9 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     consumeFresh: () => { worker.freshRequested = false; },
     probedPinning: (providerId) => worker.probe.pinning(providerId),
     runtimeVersion: (providerId) => worker.probe.runtimeVersion(providerId),
+    // The workspace a session is bound to is the directory this session runs in — the same one the
+    // attachment above verified, and the same one a native CLI gets as its cwd. A session recorded
+    // in another workspace is not resumed on a guess (ADR 0015).
     workspace: () => deps.cwd,
     onResolved: (summary) => { worker.lastRun = summary; },
   });
@@ -660,14 +663,25 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       });
       deps.stdout("\n");
       if (attached.kind === "attached") {
-        deps.stdout(`  Project:  ${attached.project.projectId} (${attached.project.name})\n`);
-        deps.stdout(`  Checkout: ${attached.checkout.root}\n`);
-        deps.stdout(`  Manifest: ${attached.checkout.manifestPath}\n`);
-        deps.stdout("  Execution is bound to that checkout. A different clone is a different checkout,\n  even when it shares a name or a remote.\n\n");
+        deps.stdout(`  Project:   ${attached.project.projectId} (${attached.project.name})\n`);
+        deps.stdout(`  Workspace: ${attached.checkout.root}\n`);
+        deps.stdout(`  Manifest:  ${attached.checkout.manifestPath}\n`);
+        // Reported because it is useful evidence, and labelled because it is not the identity: the
+        // directory above is where the native CLIs run whether or not there is a repository above it.
+        deps.stdout(attached.checkout.gitRoot === null
+          ? "  Git:       none — this workspace is not inside a repository\n"
+          : `  Git:       ${attached.checkout.gitRoot} (metadata, not the identity)\n`);
+        deps.stdout("  Execution is bound to this workspace. A different directory is a different workspace,\n  even when it shares a name, a remote or a repository.\n\n");
         return "continue";
       }
       if (attached.kind === "unregistered") {
         deps.stdout(`  No project is registered for ${attached.checkout.root}.\n  Run \`braingate init\` here to create one.\n\n`);
+        return "continue";
+      }
+      if (attached.kind === "inspecting") {
+        // Unreachable from a session, which never names a manifest explicitly — the manifest is the
+        // one found by walking up from here. A total switch still says what it found.
+        deps.stdout(`  Project:   ${attached.project.projectId} (${attached.project.name})\n  Workspace: ${attached.registeredRoot}\n  This session is not attached to it.\n\n`);
         return "continue";
       }
       deps.stderr(`${attached.message}\n\n`);
@@ -738,16 +752,20 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   });
 
   /**
-   * Which checkout this session may execute against, decided before anything else happens.
+   * Which workspace this session may execute against, decided before anything else happens.
    *
-   * The manifest is found by walking upward from here, and what it names is then compared with the
-   * repository the operator is actually standing in. Where the two disagree the session stops —
-   * before a plan, before a thread, before a goal — because every one of those would otherwise be
-   * filed under a checkout the operator is not looking at. Real dogfood produced exactly that: a
-   * session in one clone reasoning about another.
+   * The manifest is found by walking upward from here, and the workspace it names is then compared
+   * with the directory the operator is actually standing in. Where the two disagree the session
+   * stops — before a plan, before a thread, before a goal — because every one of those would
+   * otherwise be filed under a workspace the operator is not looking at. Real dogfood produced
+   * exactly that: a session in one clone reasoning about another.
    *
-   * A refusal here is not about permissions. Both checkouts are the operator's; they are simply not
-   * the same working state, and only the operator can say which one the project should follow.
+   * The directory they are in *is* the workspace, even when a manifest further up names a parent of
+   * it: the provider's cwd is where they launched, which is what makes a native CLI behave the way
+   * it does when they run it themselves.
+   *
+   * A refusal here is not about permissions. Both directories are the operator's; they are simply
+   * not the same working state, and only the operator can say which one the project should follow.
    */
   const attachment = resolveAttachment({
     cwd: deps.cwd,

@@ -117,6 +117,16 @@ Two milestones that exist because dogfooding found them, not because a plan pred
     losing the goal. ADR [0014](adr/0014-native-runtime-preservation.md) states the principle behind
     all of it: the native runtime is the default execution mechanism, and BrainGate coordinates it
     rather than replacing it.
+  - **M20.3 — Workspace identity, and Git as metadata.** A project gained workspaces: the identity of
+    a workspace is its canonical path, the directory the operator launched in *is* the workspace, and
+    `braingate init` registers a plain directory, a subdirectory of a repository, or a repository —
+    Git is recorded as evidence (`gitRoot`, branch, `HEAD`, remote) and decides nothing. The
+    provider's `cwd`, the attachment refusal and `/project` speak in workspaces now, and every
+    command resolves the same binding through one implementation. ADR
+    [0015](adr/0015-workspace-identity.md). Deliberately still open, each its own slice: routing the
+    ledger, goals and session thread to per-workspace storage; binding a goal to a workspace so a
+    cross-workspace resume is fresh-plus-handoff by construction; and the DIRECT/NATIVE mode that
+    makes a write in a workspace with no repository possible without a worktree.
 
 ## Immediate technical hardening
 

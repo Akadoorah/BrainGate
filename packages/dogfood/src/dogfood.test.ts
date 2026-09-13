@@ -73,47 +73,73 @@ test("project init is local-only, idempotent, and refuses identity conflicts", (
   assert.equal(git(repo, ["status", "--porcelain"]), "");
   const manifest = JSON.parse(readFileSync(first.manifestPath, "utf8")) as { project_id: string; repositories: string[] };
   assert.equal(manifest.project_id, "waslo");
-  assert.deepEqual(manifest.repositories, [".."]);
+  assert.deepEqual(manifest.repositories, [realpathSync.native(repo)]);
   const second = initializeDogfoodProject({ cwd: repo, projectId: "waslo", name: "Waslo" });
   assert.equal(second.created, false);
   assert.throws(() => initializeDogfoodProject({ cwd: repo, projectId: "other", name: "Other" }), /will not be overwritten/);
   assert.equal(git(repo, ["status", "--porcelain"]), "");
 });
 
-// A brand-new directory is where people start, and it was the one place BrainGate turned them
-// away — with git's own error, after it had already asked for a project id and a display name.
-test("a directory with no repository is told what it needs, not handed a git error", () => {
+// A directory with no repository is a workspace. Git is a capability one may have, not a
+// precondition for being registered, and this used to be the one place BrainGate turned people away
+// — with git's own error, after it had already asked for a project id and a display name.
+test("a directory with no repository is registered as a workspace, not turned away", () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-no-repo-"));
-  assert.equal(repositoryReadiness(bare).repositoryPath, null);
-  assert.throws(
-    () => initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh" }),
-    (error: unknown) => error instanceof BrainGateInvariantError
-      && error.code === "PROJECT_NOT_A_REPOSITORY"
-      && /worktree/.test(error.message)
-      && /git init/.test(error.message),
-  );
-  assert.equal(existsSync(join(bare, ".git")), false, "refusing must not leave a repository behind");
+  try {
+    assert.equal(repositoryReadiness(bare).repositoryPath, null);
+    const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh" });
+    assert.equal(result.created, true);
+    assert.equal(result.hasRepository, false);
+    assert.equal(result.repositoryPath, realpathSync.native(bare), "the workspace is the directory they are in");
+    assert.deepEqual(JSON.parse(readFileSync(result.manifestPath, "utf8")).repositories, [realpathSync.native(bare)]);
+    assert.equal(existsSync(join(bare, ".git")), false, "registering must not create a repository");
+    // Registration is what the manifest says; nothing above it is consulted.
+    const registry = new ProjectRegistry(join(bare, "..", "fresh-home"));
+    assert.equal(registry.loadFile(result.manifestPath).repositories[0], realpathSync.native(bare));
+    assert.equal(initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh" }).created, false);
+  } finally { rmSync(bare, { recursive: true, force: true }); }
+});
+
+test("a subdirectory of a repository is registered as itself, not widened to the repository root", () => {
+  const f = repoFixture("subdir-init");
+  try {
+    const workspace = join(f.repo, "flutter_migration");
+    mkdirSync(workspace);
+    writeFileSync(join(workspace, "main.dart"), "void main() {}\n");
+    const result = initializeDogfoodProject({ cwd: workspace, projectId: "flutter-migration", name: "Flutter Migration" });
+    assert.equal(result.hasRepository, true, "a repository is still metadata it has");
+    assert.equal(result.repositoryPath, realpathSync.native(workspace), "and the workspace is the selected directory");
+    assert.deepEqual(JSON.parse(readFileSync(result.manifestPath, "utf8")).repositories, [realpathSync.native(workspace)]);
+    // The manifest still stays out of Git: the ignore is written to the repository's own exclude,
+    // which is found from the subdirectory. The untracked source file is the operator's, not ours.
+    assert.doesNotMatch(git(f.repo, ["status", "--porcelain", "--untracked-files=all"]), /\.brain\//);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("creating the repository is something BrainGate is asked to do, never something it assumes", () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-git-init-"));
-  const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
-  assert.equal(result.created, true);
-  assert.equal(existsSync(join(bare, ".git")), true);
-  // The manifest is registered against the repository that was just made, and stays out of it.
-  assert.equal(git(result.repositoryPath, ["status", "--porcelain"]), "");
-  assert.equal(repositoryReadiness(bare).repositoryPath, result.repositoryPath);
+  try {
+    const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
+    assert.equal(result.created, true);
+    assert.equal(result.hasRepository, true);
+    assert.equal(existsSync(join(bare, ".git")), true);
+    // The manifest is registered against the repository that was just made, and stays out of it.
+    assert.equal(git(result.repositoryPath, ["status", "--porcelain"]), "");
+    assert.equal(repositoryReadiness(bare).repositoryPath, result.repositoryPath);
+  } finally { rmSync(bare, { recursive: true, force: true }); }
 });
 
 test("a repository with no commit yet is a state to report, not a crash", () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-unborn-"));
-  const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
-  // `git rev-parse HEAD` fails on an unborn branch, which is exactly where someone who just ran
-  // `git init` is standing. Questions work there; worktree writes need a commit to branch from.
-  const state = inspectGitRepository(result.repositoryPath);
-  assert.equal(state.head, null);
-  assert.equal(state.clean, true);
-  assert.notEqual(state.branch, null);
+  try {
+    const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
+    // `git rev-parse HEAD` fails on an unborn branch, which is exactly where someone who just ran
+    // `git init` is standing. Questions work there; worktree writes need a commit to branch from.
+    const state = inspectGitRepository(result.repositoryPath);
+    assert.equal(state.head, null);
+    assert.equal(state.clean, true);
+    assert.notEqual(state.branch, null);
+  } finally { rmSync(bare, { recursive: true, force: true }); }
 });
 
 test("dogfood telemetry is physically project scoped and append-only", () => {
@@ -259,7 +285,9 @@ test("a rebind moves a registration to this checkout, and only when it is asked 
     assert.equal(rebound.created, false);
     assert.equal(rebound.projectId, "moved");
     const document = JSON.parse(readFileSync(manifest, "utf8"));
-    assert.deepEqual(document.repositories, [".."], "the manifest is relative, so it names this checkout");
+    // Absolute, so it names the directory the operator was in rather than inferring the repository
+    // from where the file sits. A workspace can be a subdirectory, and `..` could not say so.
+    assert.deepEqual(document.repositories, [realpathSync.native(f.repo)], "the manifest names this workspace");
     const registry = new ProjectRegistry(join(f.root, "rebind-home"));
     assert.equal(registry.loadFile(manifest).repositories[0], realpathSync.native(f.repo));
     // And the move is not visible to git, which is the property the local ignore exists for.

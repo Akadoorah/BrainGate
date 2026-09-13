@@ -2,7 +2,6 @@ import { existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   BrainGateInvariantError,
-  ProjectRegistry,
   ResultStore,
   TaskLedger,
   finalizedSnapshotOf,
@@ -25,6 +24,7 @@ import { quotaRefusalFromEvents } from "@braingate/observability";
 import { redactSecrets } from "@braingate/security";
 import { resolveOperatorState } from "@braingate/operator";
 import { DEFAULT_MANIFEST, findManifest } from "./manifest-path.js";
+import { projectFromManifest } from "./project-attachment.js";
 import { reviewerVerdictOf } from "./finalization.js";
 
 /**
@@ -81,17 +81,6 @@ function noExtraArgs(args: string[]): void {
 
 function emit(json: boolean, data: unknown, human: string, stdout: (text: string) => void): void {
   stdout(json ? `${JSON.stringify(data, null, 2)}\n` : `${human}\n`);
-}
-
-function projectFromManifest(state: { readonly home: string }, manifest: string, cwd: string): RegisteredProject {
-  const path = findManifest(cwd, manifest);
-  if (!existsSync(path)) {
-    throw new BrainGateInvariantError(
-      "CLI_PROJECT_NOT_FOUND",
-      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
-    );
-  }
-  return new ProjectRegistry(state.home).loadFile(path);
 }
 
 /**

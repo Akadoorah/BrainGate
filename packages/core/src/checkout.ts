@@ -3,50 +3,66 @@ import { basename, dirname, join, resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { BrainGateInvariantError } from "./errors.js";
 import { assertRegisteredProject, parseProjectConfig, type ProjectConfig, type ProjectId, type RegisteredProject } from "./project-registry.js";
+import { canonicalDirectory } from "./workspace.js";
 import { findManifest } from "./manifest-path.js";
 
 /**
- * Which local checkout BrainGate is attached to, and whether it is the one it would execute against.
+ * Which workspace BrainGate is attached to, and whether it is the one it would execute against.
  *
- * The defect this exists to remove: a project's identity was a *slug* — a directory name, written
- * into a manifest, resolving to `<home>/projects/<slug>` — and nothing ever compared that with the
- * repository the operator had actually launched from. Two clones of one repository, on two volumes,
- * could both carry `project_id: flutter-migration`, write to the same ledger, and be one project as
- * far as BrainGate was concerned. In real dogfood the operator launched from a clone in `Downloads`
- * and found BrainGate reasoning about a different clone on `Lexar`, which is the failure this makes
- * unrepresentable.
+ * Two defects meet here, and the model has to answer both.
  *
- * The distinction the model needs is narrow and worth stating exactly, because over-modelling it is
- * as wrong as not modelling it:
+ * The first: a project's identity was a *slug* — a directory name, resolving to
+ * `<home>/projects/<slug>` — and nothing compared it with the directory the operator had launched
+ * from. Two clones of one repository could both carry `project_id: flutter-migration`, write to the
+ * same ledger, and be one project. In real dogfood the operator launched from a clone in `Downloads`
+ * and found BrainGate reasoning about a clone on `Lexar`.
  *
- * - **Project identity** is the operator's name for the work — `flutter-migration`. It owns memory,
- *   goals, the ledger, quota history and the audit trail.
- * - **Checkout identity** is the local directory the work happens in. It is a canonical absolute path
- *   and nothing else. Two clones of one repository are two checkouts even when they share a basename,
- *   a remote URL and a project id, because they hold different uncommitted state and a provider that
- *   edits one has not touched the other.
+ * The second, and the reason this module no longer speaks of checkouts: identity was also made to be
+ * `git rev-parse --show-toplevel`. That is not what a native CLI runs in. An operator who launches
+ * inside `repo/flutter_migration` wants Claude Code's `cwd` to be `repo/flutter_migration`, and Git
+ * had silently widened it to `repo`. Git is a capability a workspace may have; it is not how a
+ * workspace is identified.
  *
- * What binds them is a decision the operator made, recorded in the manifest beside the checkout.
- * BrainGate's job is to enforce it, and to refuse instead of guessing when the two disagree.
+ * So identity is the selected directory, canonicalized, and nothing else:
+ *
+ * - **Project identity** is the operator's name for the work. It owns durable memory and preferences.
+ * - **Workspace identity** is a canonical absolute path. Two directories are two workspaces even when
+ *   they share a basename, a git remote, a repository and a project id, because they hold different
+ *   files and a worker that edits one has not touched the other.
+ *
+ * The manifest records which workspace the project is bound to, and this module enforces that
+ * binding: the execution path must be the workspace the operator selected.
  */
 
-/** A local checkout, identified by its canonical path and nothing else. */
+/**
+ * The local directory the operator is working in, and what is known about it.
+ *
+ * `path` is the selected workspace itself — the directory they launched from, canonicalized — and it
+ * is the identity. `gitRoot` is metadata that may or may not exist: a workspace inside a repository
+ * has one, a workspace that is not a repository does not, and neither fact changes which directory
+ * the native CLIs will run in.
+ */
 export interface Checkout {
-  /** `git rev-parse --show-toplevel`, canonicalized. The identity of the checkout. */
+  /** The selected directory, canonicalized. The workspace identity and the execution boundary. */
   readonly root: string;
-  /** The manifest that named it, or `null` for a checkout that has never been registered. */
+  /** The repository this directory sits in, when Git is present. Evidence, never identity. */
+  readonly gitRoot: string | null;
+  /** The manifest that named it, or `null` for a workspace that has never been registered. */
   readonly manifestPath: string | null;
 }
 
 /**
- * The repository root of the directory the operator is working in.
+ * The repository a directory sits in, when it sits in one.
  *
- * `git rev-parse --show-toplevel` rather than a walk for a `.git` directory: worktrees, submodules
- * and a `.git` *file* all resolve correctly through git and not through a directory name, and the
- * question being asked is git's to answer.
+ * Metadata. It decides nothing: not whether a workspace exists, not whether one may be registered,
+ * and not where a native CLI runs. It is recorded because branch, HEAD and dirty state are useful
+ * evidence, and because the strict snapshot and worktree policies need to know whether there is a
+ * repository to work with.
  *
- * `null` when the directory is not inside a repository, which is the ordinary "you are somewhere
- * else" case rather than an error.
+ * `git rev-parse --show-toplevel` rather than a walk for a `.git` directory, so worktrees, submodules
+ * and a `.git` *file* all resolve the way git resolves them.
+ *
+ * `null` when the directory is not inside a repository, which is an ordinary workspace.
  */
 export function checkoutRootOf(directory: string): string | null {
   const result = spawnSync("git", ["rev-parse", "--show-toplevel"], { cwd: directory, encoding: "utf8", shell: false });
@@ -62,32 +78,42 @@ export function checkoutRootOf(directory: string): string | null {
   }
 }
 
-/** The checkout the operator is in, and whether it has ever been registered. */
+/** The workspace the operator is in, and whether it has ever been registered. */
 export function identifyCheckout(cwd: string, manifest = ".brain/project.json"): Checkout {
-  const root = checkoutRootOf(cwd);
-  // A manifest is looked for from where the operator is, upward, so a session started in a
-  // subdirectory still finds the one `init` wrote at the top. What it names is then checked against
-  // the repository the operator is actually in — which is the check that did not exist.
+  // The workspace is where the operator is. Canonicalized, so a symlinked path and its target are
+  // one workspace rather than two; not replaced by anything Git says, because the directory they
+  // chose is the one a native CLI should run in.
+  const root = canonicalDirectory(cwd) ?? resolve(cwd);
+  // A manifest is looked for from here, upward, so a session started in a subdirectory still finds
+  // the one `init` wrote. What it names is then checked against the workspace — which is the check
+  // that did not exist.
   const manifestPath = findManifest(cwd, manifest);
   const found = existsSync(manifestPath) ? manifestPath : null;
-  if (root === null) {
-    // Not in a repository: a manifest above this directory could still name one, and that is a
-    // mismatch rather than a checkout. Reported as the manifest's own directory so the comparison
-    // below can say so rather than crashing on a missing root.
-    return Object.freeze({ root: found === null ? resolve(cwd) : dirname(dirname(found)), manifestPath: found });
-  }
-  return Object.freeze({ root, manifestPath: found });
+  return Object.freeze({ root, gitRoot: checkoutRootOf(cwd), manifestPath: found });
 }
 
 export type AttachRefusal =
-  | "different-checkout"
-  | "registered-checkout-missing"
-  | "registered-path-not-a-repository"
-  | "not-a-repository";
+  | "different-workspace"
+  | "registered-workspace-missing"
+  | "registered-path-not-a-directory";
 
 export type Attachment =
   | {
     readonly kind: "attached";
+    readonly project: RegisteredProject;
+    readonly checkout: Checkout;
+    readonly registeredRoot: string;
+  }
+  | {
+    /**
+     * The operator named a manifest that belongs somewhere else, and is not standing in it.
+     *
+     * This is `braingate status --project /elsewhere/.brain/project.json` from a home directory:
+     * naming a project explicitly to read what it recorded is a legitimate thing to do, and it is
+     * not an attachment. Nothing may execute against `checkout.root` — the workspace is the one the
+     * registration names — and every execution path keeps its own guard for exactly that reason.
+     */
+    readonly kind: "inspecting";
     readonly project: RegisteredProject;
     readonly checkout: Checkout;
     readonly registeredRoot: string;
@@ -114,42 +140,40 @@ function canonical(path: string): string | null {
 }
 
 /**
- * Whether BrainGate may execute against this checkout, and why not when it may not.
+ * Whether BrainGate may execute against this workspace, and why not when it may not.
  *
- * The invariant, in one sentence: **the repository used for execution is the repository the operator
- * attached from.** Everything downstream — snapshots, worktrees, fingerprints, the provider's cwd,
- * task evidence, memory scope — follows from the project handle this returns, so this is the one
- * place the question is asked.
+ * The invariant, in one sentence: **the execution path is the workspace the operator selected.**
+ * Everything downstream — the provider's cwd, snapshots, worktrees, fingerprints, task evidence,
+ * native session binding — follows from the handle this returns, so this is the one place the
+ * question is asked.
  *
- * A disagreement is refused in every direction. Not continued against the registered checkout, which
- * would be executing somewhere the operator is not looking. Not silently rebound to the current one,
- * which would move a project's memory and history onto a different body of work. Not resolved by
- * basename, remote URL or slug, because those say the two clones are *related* and nothing about
- * whether they hold the same uncommitted state.
+ * A disagreement is refused in every direction. Not continued against the registered workspace,
+ * which would run somewhere the operator is not looking. Not silently rebound to the current one,
+ * which would move a project's memory and history onto different work. Not resolved by basename,
+ * remote URL or repository, because those say two directories are *related* and nothing about
+ * whether they hold the same files.
  */
 export function resolveAttachment(input: {
   readonly cwd: string;
   readonly registry: { readonly loadFile: (path: string) => RegisteredProject };
   readonly manifest?: string;
+  /**
+   * Whether the operator named this manifest themselves, as `--project <path>` does.
+   *
+   * The manifest is normally found by walking up from where they are, so the only way the two can
+   * disagree is a directory that carries someone else's registration — a clone copied to a second
+   * volume — and that is refused. An explicitly named manifest is a different act: it says "this
+   * project", from wherever the operator happens to be, and reading what it recorded is what they
+   * asked for. Nothing executes against the current directory in that case either; the workspace
+   * stays the one the registration names, and the execution paths guard the question themselves.
+   */
+  readonly namedByOperator?: boolean;
 }): Attachment {
   const checkout = identifyCheckout(input.cwd, input.manifest ?? ".brain/project.json");
 
   if (checkout.manifestPath === null) {
     return Object.freeze({ kind: "unregistered" as const, checkout });
   }
-  if (checkout.root === null || checkout.root === resolve(input.cwd)) {
-    // Either the directory is not in a repository at all, or the manifest is not inside one. There
-    // is no canonical root to compare, and a registration cannot be honoured without one.
-    return Object.freeze({
-      kind: "refused" as const,
-      reason: "not-a-repository" as const,
-      checkout,
-      registeredRoot: null,
-      projectId: null,
-      message: `${input.cwd} is not inside a git repository, so there is no checkout to attach. Run BrainGate from inside the repository it should work on.`,
-    });
-  }
-
   let project: RegisteredProject;
   try {
     project = input.registry.loadFile(checkout.manifestPath);
@@ -160,7 +184,7 @@ export function resolveAttachment(input: {
     const registered = registeredRootFrom(checkout.manifestPath);
     return Object.freeze({
       kind: "refused" as const,
-      reason: "registered-checkout-missing" as const,
+      reason: "registered-workspace-missing" as const,
       checkout,
       registeredRoot: registered.root,
       projectId: registered.projectId,
@@ -175,7 +199,7 @@ export function resolveAttachment(input: {
         "guess which happened.",
         "",
         "  `braingate init --rebind`               point this project at this checkout",
-        "  `braingate init --project-id <new-id>`  register this checkout as its own project",
+        "  `braingate init --project-id <new-id>`  register this directory as its own project",
       ].join("\n"),
     });
   }
@@ -184,7 +208,7 @@ export function resolveAttachment(input: {
   if (registeredRoot === null) {
     return Object.freeze({
       kind: "refused" as const,
-      reason: "registered-checkout-missing" as const,
+      reason: "registered-workspace-missing" as const,
       checkout,
       registeredRoot: null,
       projectId: project.projectId,
@@ -196,16 +220,31 @@ export function resolveAttachment(input: {
     return Object.freeze({ kind: "attached" as const, project, checkout, registeredRoot });
   }
 
+  // A registration that names a *parent* of this directory is the shape a workspace-in-a-repository
+  // has under the old model, and it is still a legitimate selection: an operator who registered the
+  // repository may work in one of its subdirectories. It is accepted only when the directory is
+  // inside it, and the workspace is still the directory they are in — the provider's cwd is where
+  // they launched, never the parent they happened to register.
+  if (checkout.root.startsWith(`${registeredRoot}/`) && canonicalDirectory(registeredRoot) !== null) {
+    return Object.freeze({ kind: "attached" as const, project, checkout, registeredRoot });
+  }
+
   // The one case this whole module exists for. The registered path is canonicalized (the registry
-  // does that when it loads), and so is the git root, so this comparison is between two real
+  // does that when it loads), and so is the workspace, so this comparison is between two real
   // locations rather than two spellings of one.
-  const registeredExists = existsSync(registeredRoot) && statSync(registeredRoot).isDirectory();
-  const registeredIsRepository = registeredExists && checkoutRootOf(registeredRoot) !== null;
+  // A directory that is gone and a directory that is not a directory are different facts: the first
+  // is an unmounted volume or a move, the second is a path that no longer means a workspace.
+  const registeredExists = existsSync(registeredRoot);
+  const registeredIsDirectory = registeredExists && statSync(registeredRoot).isDirectory();
   const reason: AttachRefusal = !registeredExists
-    ? "registered-checkout-missing"
-    : !registeredIsRepository
-      ? "registered-path-not-a-repository"
-      : "different-checkout";
+    ? "registered-workspace-missing"
+    : !registeredIsDirectory
+      ? "registered-path-not-a-directory"
+      : "different-workspace";
+
+  if (reason === "different-workspace" && input.namedByOperator === true) {
+    return Object.freeze({ kind: "inspecting" as const, project, checkout, registeredRoot });
+  }
 
   return Object.freeze({
     kind: "refused" as const,
@@ -223,24 +262,24 @@ function refusalMessage(input: {
   readonly registeredRoot: string;
   readonly current: string;
 }): string {
-  const head = `Project \`${input.projectId}\` is registered to a different checkout.`;
+  const head = `Project \`${input.projectId}\` is registered to a different workspace.`;
   const body = [
     `  registered:  ${input.registeredRoot}`,
     `  you are in:  ${input.current}`,
   ].join("\n");
   switch (input.reason) {
-    case "different-checkout":
+    case "different-workspace":
       return [
         head,
         body,
         "",
-        "These are two local checkouts, and BrainGate will not choose between them: they can hold",
-        "different uncommitted state, and a provider that edits one has not touched the other.",
+        "These are two local directories, and BrainGate will not choose between them: they can hold",
+        "different files and different uncommitted state, and a worker that edits one has not",
         "",
-        "  `braingate init --project-id <new-id>`  register this checkout as its own project",
+        "  `braingate init --project-id <new-id>`  register this directory as its own project",
         "  `braingate init --rebind`               move this project's registration here instead",
       ].join("\n");
-    case "registered-checkout-missing":
+    case "registered-workspace-missing":
       return [
         `Project \`${input.projectId}\` is registered to a checkout that is not there:`,
         `  registered:  ${input.registeredRoot}`,
@@ -250,11 +289,11 @@ function refusalMessage(input: {
         "guess which happened.",
         "",
         "  `braingate init --rebind`               point this project at this checkout",
-        "  `braingate init --project-id <new-id>`  register this checkout as its own project",
+        "  `braingate init --project-id <new-id>`  register this directory as its own project",
       ].join("\n");
-    case "registered-path-not-a-repository":
+    case "registered-path-not-a-directory":
       return [
-        `Project \`${input.projectId}\` is registered to a directory that is no longer a git checkout:`,
+        `Project \`${input.projectId}\` is registered to a directory that is no longer usable:`,
         `  registered:  ${input.registeredRoot}`,
         `  you are in:  ${input.current}`,
         "",
@@ -262,8 +301,6 @@ function refusalMessage(input: {
         "",
         "  `braingate init --rebind`               point this project at this checkout",
       ].join("\n");
-    case "not-a-repository":
-      return head;
   }
 }
 
@@ -337,8 +374,8 @@ export function manifestPathFor(checkoutRoot: string, manifest = ".brain/project
 
 /** Asserts an attachment is usable, for a caller that has already decided how to report a refusal. */
 export function requireAttached(attachment: Attachment): RegisteredProject {
-  if (attachment.kind !== "attached") {
-    throw new BrainGateInvariantError("PROJECT_CHECKOUT_MISMATCH", attachment.kind === "refused" ? attachment.message : "No BrainGate project is registered for this checkout.");
+  if (attachment.kind !== "attached" && attachment.kind !== "inspecting") {
+    throw new BrainGateInvariantError("PROJECT_CHECKOUT_MISMATCH", attachment.kind === "refused" ? attachment.message : "No BrainGate project is registered for this workspace.");
   }
   assertRegisteredProject(attachment.project);
   return attachment.project;

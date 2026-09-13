@@ -1,4 +1,5 @@
 import { findManifest } from "./manifest-path.js";
+import { projectFromManifest } from "./project-attachment.js";
 import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
@@ -9,7 +10,6 @@ import type { NativeSessionResolver, TaskSnapshotProvider } from "@braingate/sha
 import {
   BrainGateInvariantError,
   ProjectRegistry,
-  checkoutRootOf,
   TaskLedger,
   budgetFor,
   classifyTask,
@@ -223,57 +223,6 @@ function taskWasRecorded(error: unknown): boolean {
  */
 function emit(json: boolean, data: unknown, human: string, stdout: (text: string) => void): void {
   stdout(json ? `${JSON.stringify(data, null, 2)}\n` : `${human}\n`);
-}
-
-function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
-  // Walks upward, because init writes the manifest at the repository root and this may be run
-  // from any directory beneath it.
-  const path = findManifest(cwd, manifest);
-  // A missing manifest is the ordinary "you are not in a registered project" case, especially
-  // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
-  // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about
-  // what to do next. The message names the relative path only, never the resolved one.
-  if (!existsSync(path)) {
-    throw new BrainGateInvariantError(
-      "CLI_PROJECT_NOT_FOUND",
-      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
-    );
-  }
-  const registry = new ProjectRegistry(state.home);
-  const project = registry.loadFile(path);
-  // The registration is honoured only for the checkout the operator is actually in. Everything this
-  // command then does — snapshots, worktrees, fingerprints, the provider's cwd, the evidence it
-  // records — derives from this handle, so this is the one place the question has to be answered.
-  assertCheckoutMatches(project, cwd);
-  return project;
-}
-
-/**
- * Refuses to execute against a checkout other than the one named on the command line.
- *
- * The manifest is found by walking upward from where the operator is, so in every ordinary case these
- * already agree. When they do not, the two clones are different working states and BrainGate will not
- * choose between them: not the one it was told to use, and not the one it happens to be standing in.
- */
-export function assertCheckoutMatches(project: RegisteredProject, cwd: string): void {
-  const checkoutRoot = checkoutRootOf(cwd);
-  if (checkoutRoot === null) return;
-  const registered = project.repositories[0];
-  if (registered === undefined || registered === checkoutRoot) return;
-  throw new BrainGateInvariantError(
-    "PROJECT_CHECKOUT_MISMATCH",
-    [
-      `Project \`${project.projectId}\` is registered to a different checkout.`,
-      `  registered:  ${registered}`,
-      `  you are in:  ${checkoutRoot}`,
-      "",
-      "Nothing was executed. These are two local checkouts and BrainGate will not choose between",
-      "them: they can hold different uncommitted state.",
-      "",
-      "  `braingate init --project-id <new-id>`  register this checkout as its own project",
-      "  `braingate init --rebind`               move this project's registration here instead",
-    ].join("\n"),
-  );
 }
 
 /**
@@ -1008,21 +957,22 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       const ask = deps.ask ?? terminalAsk();
       let createRepository = gitInitFlag;
       if (!createRepository && repositoryReadiness(cwd).repositoryPath === null) {
-        if (json) throw new BrainGateInvariantError("PROJECT_NOT_A_REPOSITORY", "There is no Git repository here. Re-run with --git-init to create one, or run `git init` yourself.");
+        // A repository is offered, never assumed: `git init` writes to their disk. Declining is an
+        // ordinary outcome rather than a dead end. A workspace does not have to be a repository, and
+        // what a missing one costs is the worktree-isolated write modes — which say so themselves,
+        // at the point where they are asked for something they cannot do.
         stdout([
           "",
-          `  ${cwd} is not a Git repository yet.`,
-          "  BrainGate makes every change in a task worktree and fingerprints your checkout",
-          "  before and after each run, so it needs a repository to work in.",
+          `  ${cwd} is not a Git repository. That is a fine workspace, and BrainGate will register it.`,
+          "  A repository is what the worktree-isolated write modes need: every change they propose is",
+          "  made in a task worktree, and your directory is fingerprinted before and after each run.",
           "",
         ].join("\n"));
-        // Without a terminal there is nobody to ask, and creating a repository unasked would
-        // be BrainGate writing to their disk on a guess.
+        // With nobody to ask, no repository is created: registering the directory is the safe
+        // default, and `--git-init` is the explicit way to ask for one.
         const answer = ask === undefined ? null : await ask("  Create one here with `git init`? [Y/n] ");
-        if (answer === null || /^n(o)?$/i.test(answer.trim())) {
-          throw new BrainGateInvariantError("PROJECT_NOT_A_REPOSITORY", "Nothing was created. Run `git init` here when you are ready, then `braingate init` again — or `braingate init --git-init` to do both.");
-        }
-        createRepository = true;
+        createRepository = answer !== null && !/^n(o)?$/i.test(answer.trim());
+        stdout("\n");
       }
       // A rebind keeps the existing project's identity and moves only what the manifest points at, so
       // it does not ask for an id and a name: asking would invite a rename where the operator asked
@@ -1032,6 +982,7 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name, createRepository, rebind });
       const created = (data as { created: boolean }).created;
       const manifestPath = (data as { manifestPath: string }).manifestPath;
+      const hasRepository = (data as { hasRepository: boolean }).hasRepository;
       emit(
         json,
         data,
@@ -1039,6 +990,13 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
           ? `${created ? "Registered" : "Using"} ${identity.projectId}.`
           : [
             `${created ? "Created" : "Using"} local BrainGate project manifest at ${manifestPath}`,
+            ...(hasRepository
+              ? []
+              : [
+                "",
+                "This workspace is not a Git repository. It is registered, and sessions, goals and reading",
+                "run here as they are; the worktree-isolated write modes will say what they need if asked.",
+              ]),
             "",
             "Next:",
             "  braingate dogfood preflight                      check readiness, zero model calls",

@@ -1,4 +1,5 @@
 import { findManifest } from "./manifest-path.js";
+import { projectFromManifest } from "./project-attachment.js";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { conservativeTokenEstimate } from "@braingate/context";
@@ -110,24 +111,6 @@ function safeError(error: unknown): { readonly code: string; readonly message: s
   if (error instanceof BrainGateInvariantError) return Object.freeze({ code: error.code, message: error.message });
   if (error instanceof RangeError) return Object.freeze({ code: "CLI_RANGE_ERROR", message: error.message });
   return Object.freeze({ code: "CLI_UNEXPECTED", message: "Unexpected BrainGate operator failure. Raw error details were suppressed." });
-}
-
-function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
-  // Walks upward, because init writes the manifest at the repository root and this may be run
-  // from any directory beneath it.
-  const path = findManifest(cwd, manifest);
-  // A missing manifest is the ordinary "you are not in a registered project" case, especially
-  // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
-  // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about
-  // what to do next. The message names the relative path only, never the resolved one.
-  if (!existsSync(path)) {
-    throw new BrainGateInvariantError(
-      "CLI_PROJECT_NOT_FOUND",
-      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
-    );
-  }
-  const registry = new ProjectRegistry(state.home);
-  return registry.loadFile(path);
 }
 
 /**
@@ -414,8 +397,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "Start here",
           "  braingate                            the interactive session: one conversation, one goal,",
           "                                       across the CLIs you already pay for",
-          "  braingate init                       register the repository in the current directory",
-          "  braingate init --rebind              move this project's registration to this checkout",
+          "  braingate init                       register the directory you are in as the workspace",
+          "  braingate init --rebind              move this project's registration to this workspace",
           "  braingate dogfood preflight          check readiness, zero model calls",
           '  braingate dogfood ask plan --task "<question>"',
           '  braingate dogfood ask run  --task "<question>" --execute',
@@ -426,7 +409,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "  /worker                              who is selected, the goal, and what would resume",
           "  /goal                                the goal: established findings, disputes, questions",
           "  /new                                 set the current goal aside and start another",
-          "  /project                             which checkout this session is bound to",
+          "  /project                             the project and workspace this session is bound to",
           "  /help                                everything else the session understands",
           "",
           "Everything else",

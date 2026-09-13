@@ -444,7 +444,7 @@ Add one entry per model you want available. `speed` is `fast`, `balanced`, or `d
 the cheap-first lever: `fast` is favoured on simple tasks, `deep` on hard ones. The scores are
 your routing policy — see [`docs/ROUTING_AND_REVIEW.md`](docs/ROUTING_AND_REVIEW.md).
 
-**3. Register a repository.**
+**3. Register a workspace.**
 
 ```bash
 cd /path/to/your/project
@@ -452,36 +452,50 @@ braingate init
 ```
 
 It proposes a project id from the directory name and asks you to confirm. The id is the
-isolation boundary — memory, worktrees, and telemetry are scoped to it — so BrainGate never
+isolation boundary — memory, goals and telemetry are scoped to it — so BrainGate never
 picks one silently. Pass `--project-id <id> --name <name>` to skip the prompt in scripts.
+If the directory is not a Git repository yet, `init` offers to create one and registers the
+directory either way.
 
-### Execution is bound to one checkout
+### Projects and workspaces
 
-A project is **one local checkout**, and BrainGate will not run anywhere else. The manifest is
-found by walking up from where you launched, and the repository it names is compared with the
-repository you are actually in. If they differ, the session stops before planning anything:
+A **project** is your name for a piece of work. A **workspace** is the directory you run BrainGate
+in, and it is where the native CLIs actually run. One project can have more than one workspace.
+
+The workspace is **the directory you launched from**, canonicalized. It is not widened to the
+repository root: if you run BrainGate in `repo/flutter_migration`, that is the `cwd` Claude Code,
+Codex, Antigravity or Grok gets, and their own project files — `CLAUDE.md`, `.cursor/rules`, an
+`AGENTS.md` in that folder — are found exactly where they would be if you ran the CLI yourself.
+
+**Git is optional.** A workspace can be a repository, a subdirectory of one, or a plain directory
+with no repository anywhere above it; `braingate init` registers all three. What a missing repository
+costs is the worktree-isolated write modes, and they say so at the point where they need one rather
+than at the door.
+
+The manifest is found by walking up from where you launched, and the workspace it names is compared
+with the directory you are actually in. If they differ, the session stops before planning anything:
 
 ```text
-Project `flutter-migration` is registered to a different checkout.
+Project `flutter-migration` is registered to a different workspace.
   registered:  /Volumes/Lexar/Tabaq-ai-TabaqAi_31Aug_fixed_issues
   you are in:  /Users/you/Downloads/Tabaq-ai-TabaqAi_31Aug_fixed_issues
 
-These are two local checkouts, and BrainGate will not choose between them: they can hold
-different uncommitted state, and a provider that edits one has not touched the other.
-
-  `braingate init --project-id <new-id>`  register this checkout as its own project
-  `braingate init --rebind`               move this project's registration here instead
+These are two local directories, and BrainGate will not choose between them: they can hold
+different files and different uncommitted state, and a worker that edits one has not touched
+the other.
 ```
 
-Two clones of one repository are two checkouts even when they share a name, a commit or a git
+Two clones of one repository are two workspaces even when they share a name, a commit or a git
 remote, because those say the clones are *related* and nothing about whether they hold the same
-uncommitted state. Nothing is inferred from a basename: the identity is the canonical path.
+uncommitted state. Nothing is inferred from a basename, a remote or a repository: the identity is the
+canonical path. Registering a repository and then working in one of its subdirectories is fine too —
+that attaches, and the workspace is still the directory you are standing in.
 
-- **Two checkouts you use for different things** — register each with its own project id. They
+- **Two directories you use for different things** — register each with its own project id. They
   get separate memory, ledgers, goals and quota history, which is what you want.
 - **You moved the directory, or the drive came back at a different path** — `braingate init
-  --rebind` moves the project to this checkout, keeping its id, name and history.
-- **The registered checkout is unmounted** — BrainGate says so rather than guessing, because an
+  --rebind` moves the project to this workspace, keeping its id, name and history.
+- **The registered workspace is unmounted** — BrainGate says so rather than guessing, because an
   unmounted volume and a moved directory look identical from here.
 
 `/project` in an interactive session prints the binding at any time.
@@ -587,14 +601,14 @@ See:
 ## Current local operator
 
 `braingate` works from any directory. Commands that act on a project read `.brain/project.json`
-from the current directory, so the project is whichever repository you are standing in;
-`--project <manifest>` overrides that. Run it outside a registered project and it says so
-rather than failing obscurely.
+from the current directory, or from the nearest directory above it, so the project is whichever
+workspace you are standing in; `--project <manifest>` overrides that. Run it outside a registered
+project and it says so rather than failing obscurely.
 
 The full command surface:
 
 - `braingate init --project-id <id> --name <name>`
-- `braingate init --rebind` — move this project's registration to the checkout you are in
+- `braingate init --rebind` — move this project's registration to the workspace you are in
 - `braingate discover`
 - `braingate doctor --project <manifest>`
 - `braingate models list|validate|add|remove|import-discovered|profile`
@@ -612,7 +626,7 @@ The full command surface:
 
 `plan` and `run` without `--execute` do not make provider model calls. The explicit `--execute` flag is the model-execution gate.
 
-`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path. The manifest names its own checkout, and that binding is what BrainGate enforces before it executes anything.
+`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path. The manifest names its own workspace by absolute path, and that binding is what BrainGate enforces before it executes anything.
 
 See [`docs/DOGFOOD.md`](docs/DOGFOOD.md) for the real-project trial workflow.
 

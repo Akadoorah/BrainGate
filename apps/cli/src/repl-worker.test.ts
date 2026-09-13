@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -810,17 +810,17 @@ test("M: an ended input releases a waiting prompt instead of hanging the session
   assert.equal(await waiting, null, "the end of input is an answer of `no more input`");
 });
 
-// ---------------------------------------------------------------- checkout attachment
+// ---------------------------------------------------------------- workspace attachment
 
-test("N: a manifest bound to another checkout stops the session before anything is planned or spent", async () => {
-  // The real dogfood failure: the registration names one checkout and the operator is standing in
+test("N: a manifest bound to another workspace stops the session before anything is planned or spent", async () => {
+  // The real dogfood failure: the registration names one directory and the operator is standing in
   // another. Here the binding is written out directly, which is also how it arises in the world —
   // a clone copied to a second volume carries the first one's manifest with it.
   const registered = fixture("attach-registered", undefined, { projectId: "shared-slug" });
   const other = fixture("attach-other", undefined, { projectId: "shared-slug" });
   const cli = new FakeCli();
 
-  // The other clone's manifest now names the first checkout, as a copy of it would.
+  // The other clone's manifest now names the first workspace, as a copy of it would.
   writeFileSync(
     join(other.repo, ".brain", "project.json"),
     JSON.stringify({ project_id: "shared-slug", name: "Sample", repositories: [registered.repo] }),
@@ -830,7 +830,7 @@ test("N: a manifest bound to another checkout stops the session before anything 
   assert.equal(await session.run(), 1, "the session must stop rather than run somewhere else");
   assert.equal(cli.calls.length, 0, "no provider may be reached");
   const text = session.text();
-  assert.match(text, /registered to a different checkout/);
+  assert.match(text, /registered to a different workspace/);
   assert.match(text, /registered: {2}/);
   assert.match(text, /you are in: {2}/);
   assert.match(text, /init --rebind/);
@@ -847,34 +847,49 @@ test("N: two clones that each name themselves both attach, because a clone is se
     const cli = new FakeCli();
     const session = sessionOf(f.repo, f.env, cli, ["/project", "/exit"]);
     assert.equal(await session.run(), 0);
-    assert.match(session.text(), /Execution is bound to that checkout/);
-    assert.match(session.text(), /A different clone is a different checkout/);
+    assert.match(session.text(), /Execution is bound to this workspace/);
+    assert.match(session.text(), /A different directory is a different workspace/);
   }
 });
 
-test("N: /project reports the binding, and a matching checkout is attached rather than refused", async () => {
+test("N: /project reports the binding, and a matching workspace is attached rather than refused", async () => {
   const f = fixture("attach-matching");
   const cli = new FakeCli();
   const session = sessionOf(f.repo, f.env, cli, ["/project", "/exit"]);
   assert.equal(await session.run(), 0);
   const text = session.text();
-  assert.match(text, /Project: {2}attach-matching/);
-  assert.match(text, /Checkout: /);
-  assert.match(text, /Execution is bound to that checkout/);
-  assert.match(text, /A different clone is a different checkout/);
+  assert.match(text, /Project: {3}attach-matching/);
+  assert.match(text, /Workspace: /);
+  assert.match(text, /Git: {7}.+metadata, not the identity/);
+  assert.match(text, /Execution is bound to this workspace/);
+  assert.match(text, /A different directory is a different workspace/);
   assert.equal(cli.calls.length, 0, "looking at the binding spends nothing");
 });
 
-test("N: a session in a subdirectory is bound to the repository, not the subdirectory", async () => {
+test("N: a session in a subdirectory attaches, and the workspace is the subdirectory", async () => {
   const f = fixture("attach-subdir");
   const nested = join(f.repo, "flutter_migration", "tabaq_app_clean");
   mkdirSync(nested, { recursive: true });
   const cli = new FakeCli();
   const session = sessionOf(nested, f.env, cli, ["/project", "/exit"]);
   assert.equal(await session.run(), 0);
-  // The manifest is found upward and the checkout is the repository root, so a session started in a
-  // package of a monorepo attaches to the project rather than reporting none.
-  const reported = /Checkout: (.+)/.exec(session.text())?.[1] ?? "";
-  assert.equal(reported.trim(), checkoutRootOf(nested), "the checkout is the repository root");
-  assert.doesNotMatch(reported, /tabaq_app_clean/);
+  // The manifest is found upward, so a session started in a package of a monorepo still attaches to
+  // the project. The workspace, though, is the directory they launched in: `git rev-parse
+  // --show-toplevel` is not what a native CLI's cwd should be, and widening to it was the defect.
+  const reported = (/Workspace: (.+)/.exec(session.text())?.[1] ?? "").trim();
+  assert.equal(reported, realpathSync.native(nested), "the workspace is the directory the operator selected");
+  assert.notEqual(reported, checkoutRootOf(nested), "and not the repository Git reports above it");
+});
+
+test("N: a workspace with no repository attaches and reports Git as metadata it does not have", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-attach-plain-"));
+  try {
+    mkdirSync(join(root, ".brain"), { recursive: true });
+    writeFileSync(join(root, ".brain", "project.json"), JSON.stringify({ project_id: "plain", name: "Plain", repositories: [root] }));
+    const cli = new FakeCli();
+    const session = sessionOf(root, { BRAINGATE_HOME: join(root, "brain-home") }, cli, ["/project", "/exit"]);
+    assert.equal(await session.run(), 0, session.text());
+    assert.match(session.text(), /Project: {3}plain/);
+    assert.match(session.text(), /Git: {7}none — this workspace is not inside a repository/);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

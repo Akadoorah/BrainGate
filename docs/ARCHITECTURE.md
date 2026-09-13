@@ -63,20 +63,35 @@ a short follow-up can never be budgeted below the goal it belongs to, and one th
 risk still raises it. Routing, budgets, grants, isolation and finalization are unchanged and remain
 where they were.
 
-## Project identity and checkout identity
+## Project identity and workspace identity
 
-A **project** is the operator's name for a body of work, and it owns memory, goals, the task ledger,
-quota history and the audit trail. A **checkout** is the local directory the work happens in, and its
-identity is its canonical path — nothing else.
+A **project** is the operator's name for a body of work, and it owns durable knowledge: memory,
+preferences, goals, the task ledger, quota history and the audit trail. A **workspace** is the local
+directory the work happens in, and its identity is its canonical path — nothing else.
 
-They are bound by the manifest beside the checkout, and BrainGate enforces the binding before it
-executes anything: the repository named by the manifest must be the repository the operator launched
-from, or the session stops. Two clones of one repository are two checkouts even when they share a
-basename, a commit or a remote URL, because those facts say the clones are related and nothing about
-whether they hold the same uncommitted state. Every path downstream — snapshots, worktrees,
-fingerprints, the provider's cwd, task evidence — derives from that one verified binding.
+```text
+Project      — the operator's name for a body of work. Owns durable knowledge.
+  └── Workspace  — a concrete local directory. Owns execution truth.
+        └── Goal ──► Tasks ──► native workers, whose cwd is this directory
+```
 
-Moving a registration to a different checkout is `braingate init --rebind`, and it is never implied.
+They are bound by the manifest in the workspace (`.brain/project.json`), and BrainGate enforces the
+binding before it executes anything: the path named by the manifest must be the directory the
+operator launched from, or the session stops. **Git is metadata a workspace may have**, recorded as
+`gitRoot`, `branch`, `HEAD` and `remote` and used as evidence — never as identity, and never as a
+precondition for registering a directory. A registration naming a *parent* of the selected directory
+is accepted, and the workspace remains the selected directory rather than being widened to the
+parent: the provider's `cwd` is where the operator is.
+
+Two workspaces of one project are two workspaces even when they share a basename, a commit or a
+remote URL, because those facts say the directories are related and nothing about whether they hold
+the same uncommitted state. Execution truth — changed files, tests run, native sessions, snapshots
+and fingerprints — belongs to the directory it happened in, and a workspace id derived from the path
+is what keys it. Every path downstream — snapshots, worktrees, fingerprints, the provider's `cwd`,
+task evidence — derives from that one verified binding.
+
+Moving a registration to a different workspace is `braingate init --rebind`, and it is never implied.
+See `docs/adr/0015-workspace-identity.md`.
 
 ## Execution lifecycle
 

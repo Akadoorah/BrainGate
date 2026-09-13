@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -305,12 +305,15 @@ test("a directory with no repository is offered one before the identity question
 
   assert.equal(result.exitCode, 0);
   assert.match(asked[0] ?? "", /git init/, "the repository question must come first");
-  assert.match(output.out(), /needs a repository to work in/);
+  assert.match(output.out(), /not a Git repository/);
+  assert.match(output.out(), /worktree-isolated write modes/, "and says what a missing repository actually costs");
   assert.equal(existsSync(join(bare, ".git")), true);
   assert.equal(existsSync(join(bare, ".brain", "project.json")), true);
 });
 
-test("declining leaves the directory exactly as it was", async () => {
+// A workspace does not have to be a repository, so saying no is a decision to record rather than a
+// dead end: the directory is registered as `hasRepository: false`, and nothing else is created.
+test("declining the repository registers the plain directory, and creates nothing else", async () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-cli-declined-"));
   const output = io();
   const result = await runDogfoodCli(["init"], {
@@ -318,14 +321,13 @@ test("declining leaves the directory exactly as it was", async () => {
     env: { BRAINGATE_HOME: join(bare, "brain-home") },
     stdout: output.stdout,
     stderr: output.stderr,
-    ask: async () => "n",
+    ask: async (question: string) => (/git init/.test(question) ? "n" : /id/i.test(question) ? "fresh" : "Fresh"),
   });
 
-  assert.equal(result.exitCode, 1);
-  assert.match(output.err(), /PROJECT_NOT_A_REPOSITORY/);
-  // Saying no has to mean nothing happened, including no half-registered project.
-  assert.equal(existsSync(join(bare, ".git")), false);
-  assert.equal(existsSync(join(bare, ".brain")), false);
+  assert.equal(result.exitCode, 0, output.err());
+  assert.equal(existsSync(join(bare, ".git")), false, "saying no to a repository means no repository");
+  const manifest = JSON.parse(readFileSync(join(bare, ".brain", "project.json"), "utf8")) as { repositories: string[] };
+  assert.deepEqual(manifest.repositories, [realpathSync.native(bare)], "and the workspace is the directory itself");
 });
 
 test("with no terminal to ask, nothing is created on a guess", async () => {
@@ -337,8 +339,11 @@ test("with no terminal to ask, nothing is created on a guess", async () => {
     stdout: output.stdout,
     stderr: output.stderr,
   });
-  assert.equal(result.exitCode, 1);
+  // Registering the workspace needs no answer from anyone; creating a repository does, and does not
+  // happen without one.
+  assert.equal(result.exitCode, 0, output.err());
   assert.equal(existsSync(join(bare, ".git")), false);
+  assert.equal(existsSync(join(bare, ".brain", "project.json")), true);
 
   // `--git-init` is how a script says yes, since there is nobody to ask.
   const explicit = await runDogfoodCli(["init", "--git-init", "--project-id", "fresh", "--name", "Fresh"], {
