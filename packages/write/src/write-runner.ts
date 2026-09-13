@@ -20,7 +20,7 @@ import {
 } from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
+import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RoutePin, type RouteResult } from "@braingate/router";
 import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
@@ -162,6 +162,13 @@ export function buildWriteTaskPlan(input: {
   readonly repositoryPath: string;
   readonly baseRef: string;
   readonly review?: boolean;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * The primary only. A write is still reviewed by whoever is independent of it, and pinning the
+   * reviewer would defeat the reason a reviewer exists.
+   */
+  readonly pin?: RoutePin | undefined;
 }): WriteTaskPlan {
   assertM11Scope(input.classification);
   if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("WRITE_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
@@ -184,7 +191,7 @@ export function buildWriteTaskPlan(input: {
       }
     })
     .map((snapshot) => snapshot.providerId);
-  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: primaryExcluded });
+  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: primaryExcluded, ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);
   assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProof);
   const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: "task-worktree" })];
@@ -223,6 +230,7 @@ export class WriteDogfoodRunner {
   readonly #project: RegisteredProject;
   readonly #ledger: TaskLedger;
   readonly #router: CapabilityRouter;
+  readonly #pin: RoutePin | undefined;
   readonly #providers: readonly ProviderSnapshot[];
   readonly #attestations: readonly SubscriptionAttestation[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
@@ -238,6 +246,8 @@ export class WriteDogfoodRunner {
     readonly project: RegisteredProject;
     readonly ledger: TaskLedger;
     readonly router: CapabilityRouter;
+    /** The worker the operator named by hand, applied to every route this runner makes. */
+    readonly pin?: RoutePin | undefined;
     readonly providers: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
     readonly acceptances?: readonly OperatorProviderAcceptance[];
@@ -255,6 +265,7 @@ export class WriteDogfoodRunner {
     this.#project = input.project;
     this.#ledger = input.ledger;
     this.#router = input.router;
+    this.#pin = input.pin;
     this.#providers = input.providers;
     this.#attestations = input.attestations ?? [];
     this.#codexIsolation = input.codexIsolation;
@@ -302,6 +313,7 @@ export class WriteDogfoodRunner {
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
+      ...(this.#pin === undefined ? {} : { pin: this.#pin }),
       repositoryPath: input.repositoryPath,
       baseRef: input.baseRef ?? "HEAD",
       review: input.review ?? true,

@@ -163,6 +163,12 @@ function sessionOf(repo: string, env: NodeJS.ProcessEnv, runtime: FakeRuntime, a
       ask: async () => remaining.shift() ?? null,
       executor: runtime,
       discoverAll: async () => [snapshot("anthropic", "Claude Code", "claude"), snapshot("xai", "Grok Build", "grok")],
+      // This suite is M20.1's subject: the goal handoff. The capability probe answers that this build
+      // cannot name a session, which is the path the handoff exists for — a worker whose session *can*
+      // be resumed is given a delta instead, and that is `repl-worker.test.ts`'s subject. Answering it
+      // here keeps the two suites testing what they are named for rather than each other.
+      probeCapabilities: async () => ({ features: { sessionIdPinning: { supported: false } } }),
+      measureCapabilities: async () => ({}),
     }),
   };
 }
@@ -215,8 +221,10 @@ test("a short follow-up is planned as continuing its goal, not as an isolated lo
   assert.equal(await session.run(), 0);
   const text = session.text();
   assert.match(text, /continues goal/, "the operator must see that this request continues a goal");
-  assert.match(text, /continues goal [0-9a-f]+ · diagnosed · raised to T3 by this goal/, "the plan must route the follow-up at the goal's tier, not the sentence's");
-  assert.match(text, /read-only · T3\/low/, "and the plan line must show the tier the run will use");
+  // T2, not T3: M20.2 refined the floor so a goal with findings is budgeted for the work it is
+  // doing rather than frozen at the highest tier it ever reached.
+  assert.match(text, /continues goal [0-9a-f]+ · diagnosed · raised to T2 by this goal/, "the plan must route the follow-up at the goal's tier, not the sentence's");
+  assert.match(text, /read-only · T2\/low/, "and the plan line must show the tier the run will use");
   // The second plan was declined, so nothing was spent on it: the gate still holds.
   assert.match(text, /Skipped\. Nothing was spent\./);
 });

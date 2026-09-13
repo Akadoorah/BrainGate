@@ -19,6 +19,20 @@ export const CLI_FEATURES = [
   "worktree",
   "toolDenial",
   "sessionResume",
+  /**
+   * The CLI lets the *caller* name the id of a new session.
+   *
+   * Separate from `sessionResume`, and the separation is the whole reason native continuity can be
+   * offered safely today. Resuming a session requires knowing its id; a CLI that only mints ids
+   * tells you one after the fact, in whatever its output format happens to be, and a run that ends
+   * badly may never report one at all. Where the id can be chosen up front, BrainGate knows the
+   * session before the provider starts, so the reference survives a crash and needs no parsing of
+   * a format that may change.
+   *
+   * Measured 2026-09-13: `claude --session-id <uuid>` and `grok --session-id <uuid>` exist; `codex`,
+   * `agy` and `copilot` have resume but no such flag, so native continuity is not offered there.
+   */
+  "sessionIdPinning",
   "nativeReview",
 ] as const;
 export type CliFeature = (typeof CLI_FEATURES)[number];
@@ -88,6 +102,9 @@ const SPECS: Readonly<Record<ProviderId, CliSpec>> = Object.freeze({
       matcher("worktree", /--worktree\b/),
       matcher("toolDenial", /--disallowed-tools\b/, /--tools\b/),
       matcher("sessionResume", /--resume\b/, /--continue\b/),
+      // Measured 2026-09-13 against claude 2.1.269: `--session-id <uuid>` names the id of a new
+      // conversation, which is what lets BrainGate hold the reference before the run starts.
+      matcher("sessionIdPinning", /--session-id\b/),
       matcher("nativeReview"),
     ],
   },
@@ -104,6 +121,10 @@ const SPECS: Readonly<Record<ProviderId, CliSpec>> = Object.freeze({
       matcher("worktree"),
       matcher("toolDenial", /--disable\b/, /--ignore-rules\b/),
       matcher("sessionResume", /\bresume\b/),
+      // Measured 2026-09-13 against codex-cli 0.153.4: `codex exec resume [SESSION_ID]` exists, but
+      // neither `exec` nor `exec resume` accepts an id the caller chooses, and the JSONL event that
+      // would carry one has not been measured. No matcher, so the answer is `false`, not `unknown`.
+      matcher("sessionIdPinning"),
       matcher("nativeReview", /\breview\b/),
     ],
   },
@@ -120,6 +141,9 @@ const SPECS: Readonly<Record<ProviderId, CliSpec>> = Object.freeze({
       matcher("worktree"),
       matcher("toolDenial", /--disable-slash-commands\b/),
       matcher("sessionResume", /--continue\b/, /--conversation\b/),
+      // Measured 2026-09-13 against agy 1.2.2: `--conversation` resumes a conversation by id, but
+      // nothing names the id of a new one.
+      matcher("sessionIdPinning"),
       matcher("nativeReview"),
     ],
   },
@@ -136,6 +160,8 @@ const SPECS: Readonly<Record<ProviderId, CliSpec>> = Object.freeze({
       matcher("worktree", /--worktree\b/),
       matcher("toolDenial", /--disallowed-tools\b/, /--deny\b/),
       matcher("sessionResume", /--resume\b/, /--continue\b/),
+      // Measured 2026-09-13 against grok 1.0.24: `-s, --session-id <UUID>` for a new conversation.
+      matcher("sessionIdPinning", /--session-id\b/),
       matcher("nativeReview"),
     ],
   },
@@ -154,6 +180,9 @@ const SPECS: Readonly<Record<ProviderId, CliSpec>> = Object.freeze({
       matcher("worktree"),
       matcher("toolDenial", /--deny-tool\b/, /--disable-builtin-mcps\b/),
       matcher("sessionResume", /--resume\b/, /--continue\b/),
+      // Measured 2026-09-13 against copilot 0.0.358: `--resume [sessionId]` resumes, and no flag
+      // chooses the id of a new session.
+      matcher("sessionIdPinning"),
       matcher("nativeReview"),
     ],
   },

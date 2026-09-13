@@ -53,6 +53,23 @@ These controls are defense in depth and do not replace a provider/OS sandbox.
 
 Skills are physically scoped under either `global/<skill_id>` or `projects/<project_id>/<skill_id>`. A skill cannot broaden the execution profile. High/critical-risk skills cannot auto-load.
 
-## Next security gate
+## Where the boundary comes from now
 
-Provider write execution in Milestone 6 must supply an isolation backend or a separately verified provider-native permission model before `worktree-write` can actually spawn a provider process.
+Write execution shipped in M11 and widened to more than one provider in M16; the isolation backend
+this section used to wait for is the worktree plus the provider's own proven sandbox. What changed in
+M20.2 is the *default posture*, and it is worth stating precisely because it is easy to misread:
+
+- **Interactive work runs the way the runtime runs.** The provider's own permission prompts remain the
+  approval mechanism, exactly as when the operator starts the CLI themselves. BrainGate does not
+  stand in front of them.
+- **A boundary the operator asks for is applied.** A read-only request is a read-only task; a write
+  goes to a worktree the operator reviews and never lands in their checkout.
+- **Unattended execution is constrained more.** Where nobody is present to approve a runtime action,
+  BrainGate's own policy is what stands in for that approval.
+- **The strict modes remain available** and are chosen, not assumed: project snapshots, isolated
+  worktrees, and the Codex and Grok sandbox attestations proven per run.
+
+The controls in this document — path denial, output redaction, the allowlisted child environment, and
+the API-key stripping — are unaffected and remain in force. They are overlays on a preserved runtime,
+not a replacement harness. ADR [0014](adr/0014-native-runtime-preservation.md) is the principle;
+ADR [0010](adr/0010-tool-grants-are-earned-per-role.md) is still how a capability is earned.

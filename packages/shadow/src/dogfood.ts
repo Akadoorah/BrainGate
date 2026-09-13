@@ -19,11 +19,11 @@ import {
 } from "@braingate/core";
 import { buildTaskBrief, recordTaskBrief, recordWorkflowReceipt } from "@braingate/observability";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type ModelRef, type RouteCandidate, type RouteResult } from "@braingate/router";
+import { CapabilityRouter, type ModelRef, type RouteCandidate, type RoutePin, type RouteResult } from "@braingate/router";
 import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole, type WorkflowOutcome } from "@braingate/workflows";
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import type { GrokIsolationAttestation } from "./grok-isolation.js";
-import { SubscriptionShadowAgentInvoker, type RoleActivity } from "./invoker.js";
+import { SubscriptionShadowAgentInvoker, type NativeSessionResolver, type RoleActivity } from "./invoker.js";
 import type { QuotaReading } from "./quota-readings.js";
 import { planShadowInvocation, shadowProviderRoleStatus, snapshotPrimaryEligibility } from "./profiles.js";
 import type { TaskSnapshotProvider } from "./snapshot-provider.js";
@@ -163,6 +163,8 @@ export class ShadowDogfoodRunner {
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
+  readonly #pin: RoutePin | undefined;
+  readonly #nativeSession: NativeSessionResolver | undefined;
   readonly #snapshotStore: TaskSnapshotProvider | undefined;
   readonly #finalizer: TaskFinalizer;
   readonly #onRoleActivity: ((activity: RoleActivity) => void) | undefined;
@@ -187,6 +189,16 @@ export class ShadowDogfoodRunner {
      */
     readonly grokSnapshotIsolation?: GrokIsolationAttestation;
     readonly executor?: ShadowProcessExecutor;
+    /**
+     * The worker the operator named by hand, when there is one.
+     *
+     * Passed to every route this run makes, and to nothing else. It narrows *which* model is
+     * considered and leaves every eligibility gate in place, so a manual choice can fail but can
+     * never route around a policy.
+     */
+    readonly pin?: RoutePin | undefined;
+    /** Asked per invocation whether this run continues a native provider session. */
+    readonly nativeSession?: NativeSessionResolver | undefined;
     /**
      * Where a read-primary run's project copy comes from.
      *
@@ -222,6 +234,8 @@ export class ShadowDogfoodRunner {
     this.#grokIsolation = input.grokIsolation;
     this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
     this.#executor = input.executor;
+    this.#pin = input.pin;
+    this.#nativeSession = input.nativeSession;
     this.#snapshotStore = input.snapshotStore;
     this.#finalizer = input.finalizer;
     this.#onRoleActivity = input.onRoleActivity;
@@ -297,7 +311,7 @@ export class ShadowDogfoodRunner {
       catch { /* a sweep that cannot run is not a reason to refuse the task */ }
     }
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded });
+    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded, ...(this.#pin === undefined ? {} : { pin: this.#pin }) });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
@@ -331,7 +345,7 @@ export class ShadowDogfoodRunner {
       const independence = input.classification.risk === "high" || input.classification.risk === "critical"
         ? { mode: "required" as const, models: [primaryRef] }
         : { mode: "preferred" as const, models: [primaryRef] };
-      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: reviewerExcluded });
+      const reviewerRoute = this.#router.route({ role: "reviewer", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, independence, excludeProviders: reviewerExcluded, ...(this.#pin === undefined ? {} : { pin: this.#pin }) });
       routes.push(reviewerRoute);
       const reviewerRef = modelRef(reviewerRoute);
       planShadowInvocation({
@@ -461,9 +475,9 @@ export class ShadowDogfoodRunner {
     });
 
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }) });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }), ...(this.#nativeSession === undefined ? {} : { nativeSession: this.#nativeSession }) });
       const sourceBefore = sourceCheckoutFingerprint(cwd);
-      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
+      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, ...(this.#pin === undefined ? {} : { pin: this.#pin }), excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       workflowReceipt = workflow;
       assertSourceCheckoutUnchanged(cwd, sourceBefore);
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });

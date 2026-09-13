@@ -120,6 +120,9 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: input.writeRequired,
       ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
+      // The operator's own choice, carried onto the run. Every gate still applies to it: a pin
+      // narrows which model is considered and excuses it from nothing.
+      ...(input.pin === undefined ? {} : { pin: input.pin }),
       ...failover.routeOptions(),
     }).selected;
     let primary = routePrimary();

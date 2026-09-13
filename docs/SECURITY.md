@@ -40,7 +40,14 @@ Codex fills planning, review and judging from a staged workspace, and may hold t
 
 The resulting isolation attestation is bound to the Codex version, platform, and BrainGate permission-profile hash and expires after a short period. A version/profile/platform change requires a new self-test. Native Windows remains fail-closed in this milestone; WSL follows the Linux sandbox path and must pass the same test.
 
-Codex execution additionally uses ephemeral mode, ignores user exec-policy rules and user config, uses a clean non-repository CWD, pins the routed model, and explicitly disables unnecessary model-visible surfaces such as shell/code execution, web search, apps/plugins, browser/computer use, memory, worktrees, and multi-agent/collaboration features. If required configuration is rejected by the installed CLI, strict configuration causes the run to fail rather than silently broaden permissions.
+Codex execution additionally uses ephemeral mode, ignores user exec-policy rules and user config, uses a clean non-repository CWD, pins the routed model, and disables a declared set of model-visible surfaces — shell and code execution, web search, apps and plugins, browser and computer use, memory, worktrees, and multi-agent collaboration. If required configuration is rejected by the installed CLI, strict configuration causes the run to fail rather than silently broaden permissions.
+
+Read that list for what it is. It describes the Codex **isolation contract** this proof was earned
+under: the denied writes are the evidence, so the denials are part of the proof (class A in ADR
+[0014](adr/0014-native-runtime-preservation.md)). It is not a claim that a Codex worker is inherently
+a text-only reader, and it is not the default posture BrainGate intends for interactive work. Codex
+runs this way because this is the boundary BrainGate can prove for it today; a Codex run in a mode
+whose boundary is proven some other way would carry whatever that proof supports.
 
 ### What a role is allowed to do
 
@@ -55,9 +62,15 @@ by proof of a different kind (ADR 0010):
   because what leaves this machine is the one thing no local check can see. Accepting an
   unscoped provider does **not** grant it.
 
-MCP is refused for every role: BrainGate has no per-invocation way to prove what an MCP server
-reaches. Read profiles pass an empty MCP configuration under strict mode, so the servers are not
-loaded rather than merely denied.
+MCP is refused for every role today: BrainGate has no per-invocation way to prove what an MCP
+server reaches. Read profiles pass an empty MCP configuration under strict mode, so the servers are
+not loaded rather than merely denied.
+
+That refusal is classified as a **legacy** restriction in ADR
+[0014](adr/0014-native-runtime-preservation.md), not as a permanent property of the product. It
+contradicts the principle that a runtime keeps its own harness, and replacing it needs a per-server
+policy — which servers, reaching what — rather than a switch from none to all. Until that policy
+exists the refusal stands, and the plan says so before anything is spent.
 
 A capability probe reads each installed CLI's own help text — no prompt, no model, no cost — and
 can only narrow what a profile declares. A flag this build has dropped is refused with a reason

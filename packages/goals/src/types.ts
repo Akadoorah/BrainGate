@@ -113,8 +113,45 @@ export interface ProviderSessionRef {
   readonly providerId: ProviderId;
   readonly modelId: string | null;
   readonly sessionId: string;
-  readonly resumeMode: SessionResumeMode;
+  /**
+   * Whether this session may be resumed, as of when it was recorded.
+   *
+   * Optional because a goal written by the first M20 build carries no such field, and a goal that
+   * refuses to load is a worse failure than one whose oldest session reference is conservatively
+   * read as unresumable. Absent is read as `unsupported`, never as `available`.
+   */
+  readonly resumeMode?: SessionResumeMode | undefined;
   readonly recordedAt: string;
+}
+
+/**
+ * How a native session ended up being used on one invocation.
+ *
+ * Recorded on the receipt so a reader can tell a continuation from a fresh start without inferring
+ * it. `handoff` is the honest answer when a runtime cannot be resumed: the work continued because
+ * the *goal* continued, and claiming otherwise would be the one lie this whole layer exists to
+ * prevent.
+ */
+export const NATIVE_SESSION_KINDS = ["fresh", "resumed", "handoff", "unsupported", "disabled"] as const;
+export type NativeSessionKind = (typeof NATIVE_SESSION_KINDS)[number];
+
+export function isNativeSessionKind(value: string): value is NativeSessionKind {
+  return (NATIVE_SESSION_KINDS as readonly string[]).includes(value);
+}
+
+/**
+ * Whether a recorded session is still usable.
+ *
+ * `stale` and `incompatible` are kept apart from `unavailable` because they have different causes
+ * and different next steps: a session that has aged out may come back if the runtime retains it, a
+ * session recorded under a different runtime version or workspace may be resumable once the
+ * mismatch is understood, and one the runtime has forgotten is simply gone.
+ */
+export const SESSION_STATUSES = ["active", "stale", "incompatible", "unavailable", "closed"] as const;
+export type SessionStatus = (typeof SESSION_STATUSES)[number];
+
+export function isSessionStatus(value: string): value is SessionStatus {
+  return (SESSION_STATUSES as readonly string[]).includes(value);
 }
 
 /** What has been decided or asked, as of the last recorded turn. */
@@ -211,7 +248,17 @@ export interface ConversationTurn {
   readonly occurredAt: string;
 }
 
-/** One provider/model's native session, kept apart from the goal so it survives the goal that found it. */
+/**
+ * One provider/model's native session.
+ *
+ * Kept apart from the goal so it survives the goal that found it, and keyed by
+ * `(provider, model, sessionId)` so two models on one subscription are two workers with two
+ * sessions — the hierarchy is Provider -> Runtime -> Model -> sessions, never Provider -> one worker.
+ *
+ * A session reference is an execution continuity reference. It is not memory, it is never promoted
+ * to canonical memory, and it holds no credential: the id is a name the runtime chose or was given,
+ * and the runtime's own authentication is what authorizes using it.
+ */
 export interface ProviderSessionRecord {
   readonly projectId: string;
   readonly providerId: ProviderId;
@@ -219,10 +266,53 @@ export interface ProviderSessionRecord {
   readonly sessionId: string;
   readonly quotaPool: string | null;
   readonly resumeMode: SessionResumeMode;
+  readonly status: SessionStatus;
+  /** The CLI build the session was created against, so a mismatch can be seen rather than guessed. */
+  readonly runtimeVersion: string | null;
+  /** Where the session was created, when the runtime scopes sessions by directory. */
+  readonly workspace: string | null;
   readonly goalId: string | null;
   readonly conversationId: string | null;
-  readonly recordedAt: string;
+  /** The BrainGate task that last used this session, so a receipt and a session can be joined. */
+  readonly lastTaskId: string | null;
+  /** The conversation turn that last used it, which is what a returning-worker delta is measured from. */
+  readonly lastTurnSequence: number | null;
+  readonly createdAt: string;
+  readonly lastUsedAt: string;
   readonly updatedAt: string;
+}
+
+/** Why a stored session will not be resumed, in the terms a user is shown. */
+export type SessionUnusableReason =
+  | "provider-does-not-expose-session-ids"
+  | "recorded-unresumable"
+  | "runtime-version-changed"
+  | "workspace-changed"
+  | "goal-mismatch"
+  | "superseded"
+  | "stale-session"
+  | "not-yet-used";
+
+/**
+ * Whether the next invocation may resume, and what happens instead.
+ *
+ * A decision, not a question. Every surface that shows session continuity shows this, so "will this
+ * resume or start fresh" has one answer computed in one place.
+ */
+export interface NativeSessionDecision {
+  /**
+   * Which of the five things happened. Narrowed from `string` so a caller cannot pass, and a
+   * consumer cannot accept, a kind that is not in the list.
+   */
+  readonly kind: NativeSessionKind;
+  /** The session that will be used: resumed, or the id a new one was pinned to. */
+  readonly sessionId: string | null;
+  readonly providerId: ProviderId;
+  readonly modelId: string;
+  readonly resumeMode: SessionResumeMode;
+  readonly reason: SessionUnusableReason | null;
+  /** True when the runtime persists sessions for this run, which is what makes an id usable later. */
+  readonly persistent: boolean;
 }
 
 /**

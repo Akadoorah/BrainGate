@@ -4,6 +4,19 @@
 
 BrainGate is deterministic orchestration software. It is not itself an LLM. Provider models are external workers accessed through supported official CLI processes authenticated by the user.
 
+**BrainGate orchestrates coarsely; the native runtime executes finely.** A work unit is dispatched to
+one CLI, and that CLI uses its own tools, shell, subagents, MCP servers, browser and worktrees to
+carry it out. BrainGate accounts for the dispatch and reads whatever usage the runtime reports; it
+does not micromanage what happens inside. Where a boundary is needed it is applied as an explicit
+policy overlay — requested by the operator, or required because nobody is present to approve a
+runtime action — and every overlay is visible in the plan before anything is spent. ADR
+[0014](adr/0014-native-runtime-preservation.md) states this, and classifies every restriction that
+exists today.
+
+Session continuity follows the same division: a provider owns its own session storage, and BrainGate
+stores only the reference that connects a goal to it. Cross-provider continuity is carried by the
+goal's shared state and never depends on any runtime's ability to resume.
+
 ```text
 User
   |
@@ -52,8 +65,8 @@ where they were.
 
 ## Execution lifecycle
 
-1. Resolve an explicit project identity.
-2. Create a task ledger record.
+1. Resolve an explicit project identity, and the conversation and goal this request continues.
+2. Create a task ledger record, linked to that goal.
 3. Classify task intent, complexity, risk, read/write needs, and confidence.
 4. If confidence is low, run a bounded cheap scout and reclassify.
 5. Build a minimal context pack from project-scoped sources.
@@ -68,6 +81,11 @@ where they were.
 14. Finalize: write the result, record the observation, write the marker, then the terminal state —
     in that order, each step idempotent, so a crash at any point is finished by `reconcile`.
 15. Report the recorded outcome, which is the only thing any surface may present as what happened.
+16. Fold the turn into the goal's state, and record where each provider session got to.
+
+Steps 2 and 16 are what make a follow-up a continuation: the task is a work unit *of* a goal, and the
+goal's state — accepted findings, disputed claims, files changed, tests run — is what the next worker
+is handed, whichever runtime it belongs to.
 
 ## Finalization and reconciliation
 

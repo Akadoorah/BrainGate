@@ -289,3 +289,12 @@ Use one project at a time:
 4. Tabaq AI — read-only first; keep payments/subscriptions/auth flows out of M12 writes.
 
 For the first 20-30 tasks, label complexity/outcome consistently. Treat every isolation, routing, quota, memory, or classification failure as a regression before widening the write boundary.
+
+## Continuity between runs
+
+A dogfood run is a work unit of a goal. The interactive session keeps a short thread so a follow-up
+resolves; the goal keeps what was *established* — accepted findings, disputed claims, files changed,
+tests run, open questions — and that is what a later worker is handed, whether it is hours later on
+the same model or immediately on a different one. A worker whose own native session can be resumed is
+given only what changed while it was away. None of this reaches canonical memory: an answer is a
+worker's claim until the operator or the evidence makes it a finding, exactly as before.

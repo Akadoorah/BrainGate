@@ -24,6 +24,26 @@ same as changing the subject — but it is not memory and never becomes memory:
 - nothing in it can reach canonical memory except by the operator writing it down through
   `/remember`, which starts at the same proposal gate as everything else.
 
+## The goal, beside the thread
+
+The thread is what was said. A **goal** is what was established, and it is the layer a worker is
+actually handed:
+
+- **Local history** — every turn, in `goals.sqlite`, redacted before it is written. This is the
+  record, and it does not expire the way the eight-hour thread does.
+- **Goal state** — accepted findings, findings established but not the active cause, contrary claims
+  that have *not* displaced them, files changed, tests run, open questions, the next action. Compact
+  by construction: bounded lists with bounded entries, because a handoff carrying two hundred
+  findings fails the same way as one carrying none.
+- **Evidence references** — where the detail lives (task ids, artifacts), never a copy of it.
+- **Native session references** — `goal ↔ this runtime's session id`. The runtime owns the session;
+  BrainGate owns the reference, and stores no credentials and no session database.
+
+A worker with no session for the goal is handed the **handoff**. A worker whose own session is being
+resumed is handed a **delta** — only what changed since that session last participated — because it
+already remembers its own turns, and re-sending them invites it to re-derive what it concluded. Both
+are bounded; neither is the raw transcript.
+
 ## Single-writer memory flow
 
 ```text

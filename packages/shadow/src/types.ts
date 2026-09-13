@@ -132,9 +132,85 @@ export interface ShadowInvocationPlan {
   readonly grant: ToolGrant;
   /** The stream shape this invocation produces, for the providers whose shape was measured. */
   readonly streamDialect: StreamDialect | null;
+  /**
+   * How this invocation relates to a native provider session.
+   *
+   * On the plan rather than only in the invoker, because three separate readers need it and they
+   * must not each infer it: the argument builder writes the flags, the receipt reports the kind, and
+   * the session registry stores the id. A plan that carried the flags but not the decision would
+   * leave the record unable to say whether a continuation happened.
+   *
+   * Optional so a plan built by a caller that has no goal — the write path's own planner, the
+   * visual profile, a hand-built plan in a test — keeps compiling and is read as "no session",
+   * rather than having to write out a decision it does not have.
+   */
+  readonly nativeSession?: PlannedNativeSession;
   readonly guarantees: ShadowGuarantees;
   readonly minimumVersion: string | null;
 }
+
+/**
+ * The session decision as it reaches the executor.
+ *
+ * Structurally the goals layer's `NativeSessionDecision`, restated here because the execution layer
+ * must not depend on the goals package — the decision is made above it and passed down as data. Every
+ * field is carried, `reason` included, so a surface that reports *why* a session was not continued
+ * reads it from the decision rather than reconstructing it.
+ */
+/** The kinds of session outcome, restated so this layer needs no dependency on the goals package. */
+export const PLANNED_SESSION_KINDS = ["fresh", "resumed", "handoff", "unsupported", "disabled"] as const;
+export type PlannedSessionKind = (typeof PLANNED_SESSION_KINDS)[number];
+
+/** How a session may be resumed, restated here for the same reason the kinds are. */
+export const PLANNED_SESSION_RESUME_MODES = ["unsupported", "unsafe", "available"] as const;
+export type PlannedSessionResumeMode = (typeof PLANNED_SESSION_RESUME_MODES)[number];
+
+/**
+ * Why a session was not continued, restated here for the same reason the kinds are.
+ *
+ * Exported as one runtime list so a guard and its type cannot drift, and so a surface that explains
+ * a refusal cannot invent a reason the layer above does not produce.
+ */
+export const PLANNED_SESSION_REASONS = [
+  "provider-does-not-expose-session-ids",
+  "recorded-unresumable",
+  "runtime-version-changed",
+  "workspace-changed",
+  "goal-mismatch",
+  "superseded",
+  "stale-session",
+  "not-yet-used",
+] as const;
+export type PlannedSessionReason = (typeof PLANNED_SESSION_REASONS)[number];
+
+export interface PlannedNativeSession {
+  readonly kind: PlannedSessionKind;
+  readonly sessionId: string | null;
+  /** The provider's own id, which this package already knows how to name. */
+  readonly providerId: ProviderId;
+  readonly modelId: string;
+  readonly resumeMode: PlannedSessionResumeMode;
+  /** Why the session could not be continued, when it could not be. `null` when it was. */
+  readonly reason: PlannedSessionReason | null;
+  /** True when this run leaves a session the next turn could resume. */
+  readonly persistent: boolean;
+}
+
+/**
+ * The decision a plan carries when nothing asked for session continuity.
+ *
+ * `providerId` and `modelId` are filled in by the planner from the snapshot and the model it is
+ * actually going to run, so this placeholder names no provider rather than claiming one.
+ */
+export const NO_NATIVE_SESSION: Omit<PlannedNativeSession, "providerId" | "modelId"> & { readonly providerId: ProviderId | null; readonly modelId: string | null } = Object.freeze({
+  kind: "disabled",
+  sessionId: null,
+  providerId: null,
+  modelId: null,
+  resumeMode: "unsupported",
+  reason: null,
+  persistent: false,
+});
 
 export interface ShadowInvocationPreview {
   readonly providerId: ProviderId;

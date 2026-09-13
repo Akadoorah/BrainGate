@@ -1,7 +1,8 @@
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ExecutionBudget, RegisteredProject, TaskClassification } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
+import {
+  type RoutePin, CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
 import {
   assertShadowProjectCwd,
   planShadowInvocation,
@@ -142,6 +143,14 @@ export function buildShadowTaskPlan(input: {
   readonly budget: ExecutionBudget;
   readonly requiredContextTokens: number;
   readonly optionalReview?: boolean;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * Applied to the primary route only. The planner and the reviewer are chosen for their
+   * independence from the primary, and pinning them would defeat the reason they exist; the operator
+   * chooses who does the work, not who checks it.
+   */
+  readonly pin?: RoutePin | undefined;
 }): ShadowTaskPlan {
   const cwd = assertShadowProjectCwd(input.project, input.cwd);
   const attestations = input.attestations ?? [];
@@ -157,6 +166,7 @@ export function buildShadowTaskPlan(input: {
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
     excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof }),
+    ...(input.pin === undefined ? {} : { pin: input.pin }),
   });
   const primaryModel = modelRef(primaryRoute);
   const primarySnapshot = snapshotFor(input.providers, primaryModel.providerId);

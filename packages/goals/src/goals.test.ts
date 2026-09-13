@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { BrainGateInvariantError, ProjectRegistry, type RegisteredProject, type TaskClassification, type TaskComplexity, type TaskRisk } from "@braingate/core";
-import { effectiveClassification, inheritedComplexityFloor } from "./inheritance.js";
+import { effectiveClassification, inheritedComplexityFloor, riskFloor } from "./inheritance.js";
 import { buildGoalContext, buildHandoffPackage, renderHandoff, MAX_CONTEXT_TURNS } from "./handoff.js";
 import { MAX_HANDOFF_CHARS, applyGoalStateUpdate, sameSubject } from "./goal-state.js";
 import { GOALS_SCHEMA_VERSION, GoalStore } from "./store.js";
@@ -265,9 +265,9 @@ test("a short follow-up inherits the complexity of the goal it continues", () =>
   const prompt = classification("T1", "low", ["small-question-cue"]);
   const effective = effectiveClassification({ prompt, state });
   assert.equal(effective.prompt.complexity, "T1");
-  assert.equal(effective.effective.complexity, "T3");
+  assert.equal(effective.effective.complexity, "T2");
   assert.equal(effective.applied, true);
-  assert.ok(effective.effective.reasons.includes("goal-inherited-complexity:T3"));
+  assert.ok(effective.effective.reasons.includes("goal-inherited-complexity:T2"));
   // The prompt's own reasons survive: the receipt can show both numbers and why they differ.
   assert.ok(effective.effective.reasons.includes("small-question-cue"));
 });
@@ -287,11 +287,37 @@ test("a follow-up can raise the floor but never lower it", () => {
   assert.equal(open.effective.complexity, "T1");
 });
 
-test("a diagnosed goal raises the risk floor, because the work it continues is not a lookup", () => {
-  const state = diagnosedState();
-  assert.equal(inheritedComplexityFloor(state), "T3");
-  const lowRisk = effectiveClassification({ prompt: classification("T1", "low"), state });
-  assert.equal(lowRisk.effective.risk, "low", "risk is only raised by the goal's own state, not by its tier");
+test("the goal's floor is a floor, and not a history of the highest tier it ever reached", () => {
+  // A goal with findings is T2 whether it is diagnosed or being implemented. Holding it at T3
+  // because it was once a fresh diagnosis is the inflation this rule exists to prevent: ten turns
+  // into an implementation would still be buying a planner for running the tests.
+  assert.equal(inheritedComplexityFloor({ ...diagnosedState(), status: "diagnosed" }), "T2");
+  // A diagnosis with no formally accepted finding is still a diagnosis: the stage alone is enough,
+  // because it means a turn concluded something the next worker must not re-derive from nothing.
+  assert.equal(inheritedComplexityFloor({ ...diagnosedState(), status: "diagnosed", acceptedFindings: Object.freeze([]) }), "T2");
+  assert.equal(inheritedComplexityFloor({ ...diagnosedState(), status: "implementing" }), "T3");
+  assert.equal(inheritedComplexityFloor({ ...diagnosedState(), status: "blocked" }), "T3");
+  // Nothing established and nothing in progress is no floor at all.
+  assert.equal(inheritedComplexityFloor({ ...diagnosedState(), status: "open", acceptedFindings: Object.freeze([]), approvedScope: Object.freeze([]), nextAction: null }), "T0");
+  // A goal with nothing but a dispute still cannot be routed as a lookup.
+  assert.equal(inheritedComplexityFloor({ ...diagnosedState(), status: "open", acceptedFindings: Object.freeze([]), disputedFindings: diagnosedState().acceptedFindings }), "T2");
+
+  // It never exceeds T3 on its own account, so the tiers above it stay reserved for a message that
+  // actually earns them.
+  for (const status of ["open", "diagnosed", "implementing", "blocked", "done", "abandoned"] as const) {
+    const floor = inheritedComplexityFloor({ ...diagnosedState(), status });
+    assert.ok(["T0", "T2", "T3"].includes(floor), `${status} produced ${floor}`);
+  }
+});
+
+test("a goal's own state raises risk only when it is actually stuck", () => {
+  assert.equal(riskFloor({ ...diagnosedState(), status: "diagnosed" }), "low");
+  assert.equal(riskFloor({ ...diagnosedState(), status: "blocked" }), "medium");
+  const lowRisk = effectiveClassification({ prompt: classification("T1", "low"), state: diagnosedState() });
+  assert.equal(lowRisk.effective.risk, "low", "risk is raised by the goal being blocked, not by its tier");
+  const blocked = effectiveClassification({ prompt: classification("T1", "low"), state: { ...diagnosedState(), status: "blocked" } });
+  assert.equal(blocked.effective.risk, "medium");
+  assert.equal(blocked.effective.complexity, "T3");
 });
 
 // ---------------------------------------------------------------------------- handoff
@@ -380,11 +406,11 @@ test("a native session is recorded with an explicit resume mode, never an assume
     const conversation = store.openConversation();
     const goal = store.createGoal({ conversationId: conversation.conversationId, objective: "g" });
     store.recordProviderSession({ providerId: "anthropic", modelId: "claude-sonnet", sessionId: "sess-sonnet", resumeMode: "unsupported", goalId: goal.goalId, quotaPool: "claude-subscription" });
-    const latest = store.latestProviderSession("anthropic", "claude-sonnet");
+    const latest = store.latestSessionFor("anthropic", "claude-sonnet");
     assert.equal(latest?.sessionId, "sess-sonnet");
     // `unsupported` is what makes the next slice honest: nothing may resume this yet.
     assert.equal(latest?.resumeMode, "unsupported");
-    assert.equal(store.latestProviderSession("xai"), null);
+    assert.equal(store.latestSessionFor("xai", null), null);
     // The reference rides on the goal, so a handoff carries it without a second lookup.
     assert.equal(store.requireGoal(goal.goalId).state.providerSessions.length, 1);
   } finally { store.close(); }
@@ -398,7 +424,7 @@ test("re-recording the same provider session updates it rather than duplicating 
     store.recordProviderSession({ providerId: "openai", modelId: "gpt-5", sessionId: "s1", resumeMode: "unsupported", goalId: goal.goalId });
     store.recordProviderSession({ providerId: "openai", modelId: "gpt-5", sessionId: "s1", resumeMode: "available", goalId: goal.goalId });
     assert.equal(store.requireGoal(goal.goalId).state.providerSessions.length, 1);
-    assert.equal(store.latestProviderSession("openai", "gpt-5")?.resumeMode, "available");
+    assert.equal(store.latestSessionFor("openai", "gpt-5")?.resumeMode, "available");
   } finally { store.close(); }
 });
 
@@ -442,7 +468,7 @@ test("turn 2 to a second provider knows the accepted root cause, and turn 3 back
     const prompt = classification("T1", "low", ["small-question-cue"]);
     const turnTwo = effectiveClassification({ prompt, state: continued.state });
     assert.equal(prompt.complexity, "T1");
-    assert.equal(turnTwo.effective.complexity, "T3", "the follow-up must not be routed as an isolated lookup");
+    assert.equal(turnTwo.effective.complexity, "T2", "the follow-up must not be routed as an isolated lookup");
 
     const handoff = buildHandoffPackage({ goal: continued, workUnit: "How would you implement the proposed fix?", addressedTo: "anthropic/claude-haiku" });
     const text = renderHandoff(handoff);

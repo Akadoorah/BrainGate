@@ -13,23 +13,35 @@ function maxRisk(a: TaskRisk, b: TaskRisk): TaskRisk {
 }
 
 /**
- * The class the goal's recorded state was classified under, read back off the findings.
+ * The tier a goal's recorded state has earned, which is a *floor* for the next turn and nothing more.
  *
- * A goal does not carry a tier of its own, and inventing one would be a second classification to
- * keep in step with the first. What it carries is what its state *means*, and the reading is
- * deliberately coarse because its only job is to stop a follow-up falling through the floor.
+ * The rule changed in M20.2, and the reason is that the M20.1 version ratcheted. It read a goal as
+ * T3 from the moment it was `diagnosed`, and nothing ever lowered it: a goal stays diagnosed for as
+ * long as it takes to finish, so ten follow-ups into an implementation the work was still being
+ * budgeted as a fresh diagnosis — a planner and a second opinion for a turn that merely ran the
+ * tests. Continuity without inflation means the floor reflects where the goal is *now*.
  *
- * - **diagnosed** is T3. Something has been concluded and the next thing is to act on it; that is
- *   the shape of work the tier table gives a separate planning pass and a second opinion, and it is
- *   exactly the turn that used to be routed to a cheaper model and answered differently.
- * - Anything established or contested at all is T2: a follow-up to a goal with findings is not a
- *   lookup, whatever the sentence looks like, but it is not necessarily a change either.
- * - Nothing established is T0 — no floor. A follow-up to a question that was never answered
- *   inherits nothing, and pretending otherwise would buy a planner for a second question.
+ * So there are two ceilings, and both are deliberately below the tiers the classifier can reach on
+ * a message's own evidence:
+ *
+ * - Findings or disputes put the floor at **T2**, never higher. A follow-up to a goal with findings
+ *   is not a lookup — that is the failure this layer exists to fix — but having findings is not by
+ *   itself a reason to buy a planner and an independent reviewer forever.
+ * - Work in progress or blocked puts the floor at **T3**, never higher. Those two states mean the
+ *   goal is mid-change or stuck, which is where a second opinion is genuinely owed.
+ *
+ * `T0` means "no floor at all", which is the honest reading of a goal whose first turn established
+ * nothing: a follow-up to a question that was never answered inherits nothing.
  */
 export function inheritedComplexityFloor(state: GoalState): TaskComplexity {
-  if (state.status === "diagnosed" || state.status === "implementing") return "T3";
-  if (state.acceptedFindings.length > 0 || state.disputedFindings.length > 0) return "T2";
+  // Stage first, because it is a statement about the goal that survives having no formally accepted
+  // findings. A goal is `diagnosed` because a turn finished and concluded something; whether that
+  // conclusion was recorded as a finding is a separate question, and a follow-up to a diagnosis is
+  // not a lookup even when nobody has written the diagnosis down as a belief yet.
+  if (state.status === "implementing" || state.status === "blocked") return "T3";
+  if (state.status === "diagnosed") return "T2";
+  const established = state.acceptedFindings.length > 0 || state.disputedFindings.length > 0;
+  if (established) return "T2";
   return "T0";
 }
 

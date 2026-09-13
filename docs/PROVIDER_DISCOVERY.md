@@ -100,6 +100,22 @@ Two properties matter more than the list itself:
 Each report carries the version it measured and the moment it was read, so a claim built on it
 can be checked against the build it came from.
 
+## What discovery says about sessions
+
+The capability probe reads each installed CLI's own help text — no prompt, no model, no cost — and one
+of the features it records is whether that build lets the caller **name the id of a new session**
+(`sessionIdPinning`), as distinct from merely being able to resume one.
+
+The distinction matters because resuming needs a name. A build that mints ids internally reveals one
+only in its output, and a run that dies before its final envelope never reveals one at all — so the
+reference is unknown until the work is over, which is when it is too late to have recorded it
+reliably. Where the id can be chosen up front, BrainGate knows the session before the provider starts.
+
+Measured 2026-09-13 from each build's `--help`: `claude` 2.1.269 and `grok` 1.0.24 expose
+`--session-id`; `codex-cli` 0.153.4, `agy` 1.2.2 and `copilot` 0.0.358 expose resume without it. Those
+are readings with a date, not standing facts — these CLIs ship weekly, and a probe that finds the flag
+is what actually enables continuity for a given build.
+
 ## Why auth and usage can be `unknown`
 
 A truthful `unknown` is safer than spending quota, scraping provider credentials, or depending on an undocumented private endpoint. Future provider adapters may upgrade a field to `native` only when the installed official CLI exposes a stable, machine-readable, zero-prompt surface.

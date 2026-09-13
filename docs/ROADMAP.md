@@ -95,6 +95,29 @@ field to stream.
 
 Full plan, measured provider evidence, and sequencing: [`MULTI_MODEL_PLAN.md`](MULTI_MODEL_PLAN.md).
 
+## Milestones 19-20 — Truth, and a goal above the task
+
+Two milestones that exist because dogfooding found them, not because a plan predicted them.
+
+- **M19 — Run integrity and truth.** ✅ Three vocabularies that had been one (ledger state, operator
+  outcome, review status) were separated and derived from exported runtime lists; a run's record is
+  written as a fixed sequence of idempotent steps that `tasks reconcile` completes from any prefix;
+  usage values are labelled `native`, `measured`, `estimated` or `unknown`, and only a provider's own
+  statement may set a quota state (ADR [0012](adr/0012-quota-state-is-native-only.md)).
+- **M20 — Native CLI control plane and shared goal context.** ✅ in two slices.
+  - **M20.1 — Conversation and Goal above Task.** A conversation and a goal became first-class
+    persistent entities in the project's own `goals.sqlite`; a task became a work unit of a goal;
+    goal state carries accepted, secondary and *disputed* findings, and a worker's contrary claim is
+    recorded beside an accepted one rather than replacing it. A follow-up inherits the complexity of
+    the goal it continues, and every worker is handed a bounded handoff built from that state.
+  - **M20.2 — Native session continuity and manual switching.** A provider-session registry records
+    `Goal ↔ runtime session` references with a resume mode that must be stated; a capability probe
+    decides per build whether a session may be named at all; a returning worker is given only what
+    changed while it was away; `/use`, `/auto`, `/worker` and `--fresh` switch workers without
+    losing the goal. ADR [0014](adr/0014-native-runtime-preservation.md) states the principle behind
+    all of it: the native runtime is the default execution mechanism, and BrainGate coordinates it
+    rather than replacing it.
+
 ## Immediate technical hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.

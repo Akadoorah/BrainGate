@@ -10,6 +10,8 @@ import {
   CONVERSATION_STATUSES,
   GOAL_STATUSES,
   SESSION_RESUME_MODES,
+  SESSION_STATUSES,
+  isSessionStatus,
   type ConversationRecord,
   type ConversationTurn,
   type Finding,
@@ -19,6 +21,7 @@ import {
   type ProviderSessionRecord,
   type ProviderSessionRef,
   type SessionResumeMode,
+  type SessionStatus,
 } from "./types.js";
 
 /** How much of a turn is kept. Bounds the store, not the fidelity of the state derived from it. */
@@ -89,10 +92,63 @@ interface SessionRow {
   session_id: string;
   quota_pool: string | null;
   resume_mode: string;
+  status: SessionStatus;
+  runtime_version: string | null;
+  workspace: string | null;
   goal_id: string | null;
   conversation_id: string | null;
+  last_task_id: string | null;
+  last_turn_sequence: number | null;
+  created_at: string | null;
+  last_used_at: string | null;
+  state_snapshot_json: string | null;
   recorded_at: string;
   updated_at: string;
+}
+
+/**
+ * The columns M20.2 added to `provider_sessions`.
+ *
+ * The same idiom M20.1 used for `tasks.goal_id`, and for the same reason: the table exists on disk
+ * with real session rows in it, `CREATE TABLE IF NOT EXISTS` cannot widen it, and rebuilding it
+ * would be the one change that could lose a reference. `PRAGMA table_info` decides, so the migration
+ * is idempotent against a file written before this change and a file written after it.
+ */
+const SESSION_ADDED_COLUMNS: readonly { readonly name: string; readonly ddl: string }[] = Object.freeze([
+  { name: "status", ddl: "status TEXT NOT NULL DEFAULT 'active'" },
+  { name: "runtime_version", ddl: "runtime_version TEXT" },
+  { name: "workspace", ddl: "workspace TEXT" },
+  { name: "last_task_id", ddl: "last_task_id TEXT" },
+  { name: "last_turn_sequence", ddl: "last_turn_sequence INTEGER" },
+  { name: "created_at", ddl: "created_at TEXT" },
+  { name: "last_used_at", ddl: "last_used_at TEXT" },
+  // The goal state as it stood when this session was last used. It is what makes a returning
+  // worker's delta a *diff* rather than a second full handoff, and it is stored per session because
+  // two workers on one goal have two different "last seen" states.
+  { name: "state_snapshot_json", ddl: "state_snapshot_json TEXT" },
+]);
+
+function mapSession(row: SessionRow): ProviderSessionRecord {
+  return Object.freeze({
+    projectId: row.project_id,
+    providerId: row.provider_id as ProviderId,
+    modelId: row.model_id,
+    sessionId: row.session_id,
+    quotaPool: row.quota_pool,
+    resumeMode: row.resume_mode as SessionResumeMode,
+    status: isSessionStatus(row.status) ? row.status : "active",
+    runtimeVersion: row.runtime_version,
+    workspace: row.workspace,
+    goalId: row.goal_id,
+    conversationId: row.conversation_id,
+    lastTaskId: row.last_task_id,
+    lastTurnSequence: row.last_turn_sequence,
+    // A row written before these columns existed has no creation time; its own recorded_at is the
+    // closest true statement, rather than null or "now".
+    createdAt: row.created_at ?? row.recorded_at,
+    lastUsedAt: row.last_used_at ?? row.updated_at,
+    updatedAt: row.updated_at,
+  });
 }
 
 function nowIso(): string {
@@ -442,27 +498,51 @@ export class GoalStore {
     readonly sessionId: string;
     readonly quotaPool?: string | null;
     readonly resumeMode: SessionResumeMode;
+    readonly status?: SessionStatus | undefined;
+    readonly runtimeVersion?: string | null;
+    readonly workspace?: string | null;
     readonly goalId?: string | null;
     readonly conversationId?: string | null;
+    readonly lastTaskId?: string | null;
+    readonly lastTurnSequence?: number | null;
   }): ProviderSessionRecord {
     if (!SESSION_RESUME_MODES.includes(input.resumeMode)) {
       throw new BrainGateInvariantError("GOAL_SESSION_RESUME_MODE_INVALID", `Unsupported session resume mode: ${String(input.resumeMode)}`);
+    }
+    const status = input.status ?? "active";
+    if (!isSessionStatus(status)) {
+      throw new BrainGateInvariantError("GOAL_SESSION_STATUS_INVALID", `Unsupported session status: ${String(status)}`);
     }
     const sessionId = input.sessionId.trim();
     if (sessionId.length === 0) {
       throw new BrainGateInvariantError("GOAL_SESSION_ID_INVALID", "A provider session needs a non-empty id.");
     }
     const goal = input.goalId == null ? null : this.requireGoal(input.goalId);
+    const turn = input.lastTurnSequence ?? null;
+    if (turn !== null && (!Number.isInteger(turn) || turn < 0)) {
+      throw new BrainGateInvariantError("GOAL_SESSION_TURN_INVALID", "lastTurnSequence must be a non-negative integer.");
+    }
     const timestamp = this.#now();
+    // One statement, because a session is used again every time it is resumed: the first write
+    // creates it and every later one moves `lastUsedAt` forward. Only `created_at` is preserved,
+    // and it is preserved by never being in the update list.
     this.#db.prepare(`
       INSERT INTO provider_sessions (
-        project_id, provider_id, model_id, session_id, quota_pool, resume_mode, goal_id, conversation_id, recorded_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        project_id, provider_id, model_id, session_id, quota_pool, resume_mode, status,
+        runtime_version, workspace, goal_id, conversation_id, last_task_id, last_turn_sequence,
+        created_at, last_used_at, recorded_at, updated_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       ON CONFLICT (project_id, provider_id, model_id, session_id) DO UPDATE SET
         quota_pool = excluded.quota_pool,
         resume_mode = excluded.resume_mode,
+        status = excluded.status,
+        runtime_version = excluded.runtime_version,
+        workspace = excluded.workspace,
         goal_id = excluded.goal_id,
         conversation_id = excluded.conversation_id,
+        last_task_id = excluded.last_task_id,
+        last_turn_sequence = excluded.last_turn_sequence,
+        last_used_at = excluded.last_used_at,
         updated_at = excluded.updated_at
     `).run(
       this.#project.projectId,
@@ -471,54 +551,131 @@ export class GoalStore {
       bounded(sessionId).slice(0, 200),
       input.quotaPool ?? null,
       input.resumeMode,
+      status,
+      input.runtimeVersion ?? null,
+      input.workspace ?? null,
       goal?.goalId ?? null,
       input.conversationId ?? goal?.conversationId ?? null,
+      input.lastTaskId ?? null,
+      turn,
+      timestamp,
+      timestamp,
       timestamp,
       timestamp,
     );
     if (goal !== null) this.#attachSessionRef(goal.goalId, input.providerId, input.modelId ?? null, sessionId, input.resumeMode, timestamp);
-    return Object.freeze({
-      projectId: this.#project.projectId,
-      providerId: input.providerId,
-      modelId: input.modelId ?? null,
-      sessionId,
-      quotaPool: input.quotaPool ?? null,
-      resumeMode: input.resumeMode,
-      goalId: goal?.goalId ?? null,
-      conversationId: input.conversationId ?? goal?.conversationId ?? null,
-      recordedAt: timestamp,
-      updatedAt: timestamp,
-    });
+    return this.requireProviderSession(input.providerId, input.modelId ?? null, sessionId);
   }
 
-  /** The newest session on record for one provider, or `null` when none was ever observed. */
-  latestProviderSession(providerId: ProviderId, modelId?: string | null): ProviderSessionRecord | null {
-    const row = modelId === undefined || modelId === null
-      ? this.#db.prepare(
-        "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? ORDER BY updated_at DESC, session_id DESC LIMIT 1",
-      ).get(this.#project.projectId, providerId) as SessionRow | undefined
-      : this.#db.prepare(
-        "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id = ? ORDER BY updated_at DESC, session_id DESC LIMIT 1",
-      ).get(this.#project.projectId, providerId, modelId) as SessionRow | undefined;
-    return row === undefined ? null : Object.freeze({
-      projectId: row.project_id,
-      providerId: row.provider_id as ProviderId,
-      modelId: row.model_id,
-      sessionId: row.session_id,
-      quotaPool: row.quota_pool,
-      resumeMode: row.resume_mode as SessionResumeMode,
-      goalId: row.goal_id,
-      conversationId: row.conversation_id,
-      recordedAt: row.recorded_at,
-      updatedAt: row.updated_at,
-    });
+  /** One session by its own key, so a caller sees what was stored rather than what it sent. */
+  requireProviderSession(providerId: ProviderId, modelId: string | null, sessionId: string): ProviderSessionRecord {
+    const row = this.#db.prepare(
+      "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id IS ? AND session_id = ?",
+    ).get(this.#project.projectId, providerId, modelId, sessionId) as SessionRow | undefined;
+    if (row === undefined) {
+      throw new BrainGateInvariantError("GOAL_SESSION_NOT_FOUND", `No session ${sessionId} for ${providerId}/${modelId ?? "-"} in project ${this.#project.projectId}.`);
+    }
+    return mapSession(row);
+  }
+
+  /**
+   * The newest session for one provider and model, or `null`.
+   *
+   * Scoped to the *model* rather than the provider, which is the difference the hierarchy exists
+   * for: Sonnet and Haiku on one subscription are two workers, and resuming Sonnet's session while
+   * a Haiku run is pinned would hand Haiku a conversation it never had.
+   */
+  latestSessionFor(providerId: ProviderId, modelId: string | null): ProviderSessionRecord | null {
+    const row = this.#db.prepare(
+      "SELECT * FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id IS ? ORDER BY last_used_at DESC, session_id DESC LIMIT 1",
+    ).get(this.#project.projectId, providerId, modelId) as SessionRow | undefined;
+    return row === undefined ? null : mapSession(row);
+  }
+
+  /**
+   * Records that a session was just used, and what the goal looked like when it was.
+   *
+   * Two writes in one statement: the session's last-used position, and the snapshot of goal state
+   * that the next delta is computed against. They go together because a delta measured against a
+   * snapshot from a different turn is worse than no delta — it would report changes the worker
+   * already saw, or miss ones it did not.
+   */
+  markSessionUsed(input: {
+    readonly providerId: ProviderId;
+    readonly modelId: string | null;
+    readonly sessionId: string;
+    readonly taskId?: string | null;
+    readonly turnSequence?: number | null;
+    readonly status?: SessionStatus | undefined;
+    /** The goal state as of this use. Omitted, the previous snapshot is left alone. */
+    readonly stateSnapshot?: GoalState | undefined;
+  }): ProviderSessionRecord {
+    const timestamp = this.#now();
+    const status = input.status ?? "active";
+    if (!isSessionStatus(status)) {
+      throw new BrainGateInvariantError("GOAL_SESSION_STATUS_INVALID", `Unsupported session status: ${String(status)}`);
+    }
+    const snapshot = input.stateSnapshot === undefined ? null : JSON.stringify(input.stateSnapshot);
+    const result = this.#db.prepare(`
+      UPDATE provider_sessions
+         SET last_used_at = ?, updated_at = ?, status = ?,
+             last_task_id = COALESCE(?, last_task_id),
+             last_turn_sequence = COALESCE(?, last_turn_sequence),
+             state_snapshot_json = COALESCE(?, state_snapshot_json)
+       WHERE project_id = ? AND provider_id = ? AND model_id IS ? AND session_id = ?
+    `).run(
+      timestamp,
+      timestamp,
+      status,
+      input.taskId ?? null,
+      input.turnSequence ?? null,
+      snapshot,
+      this.#project.projectId,
+      input.providerId,
+      input.modelId,
+      input.sessionId,
+    );
+    if (result.changes !== 1) {
+      throw new BrainGateInvariantError("GOAL_SESSION_NOT_FOUND", `No session ${input.sessionId} for ${input.providerId}/${input.modelId ?? "-"} to mark used.`);
+    }
+    return this.requireProviderSession(input.providerId, input.modelId, input.sessionId);
+  }
+
+  /**
+   * The goal state a session last saw, or `null` when none was recorded.
+   *
+   * `null` is meaningful and load-bearing: it means the delta has no baseline, so a returning worker
+   * is given the ordinary handoff instead of a delta that would have to guess.
+   */
+  sessionStateSnapshot(providerId: ProviderId, modelId: string | null, sessionId: string): GoalState | null {
+    const row = this.#db.prepare(
+      "SELECT state_snapshot_json FROM provider_sessions WHERE project_id = ? AND provider_id = ? AND model_id IS ? AND session_id = ?",
+    ).get(this.#project.projectId, providerId, modelId, sessionId) as { readonly state_snapshot_json: string | null } | undefined;
+    if (row === undefined || row.state_snapshot_json === null) return null;
+    return parseState(row.state_snapshot_json);
+  }
+
+  /** Every session this project knows about, newest use first. For `/worker` and for reconciliation. */
+  listProviderSessions(limit = 50): readonly ProviderSessionRecord[] {
+    const boundedLimit = Math.max(1, Math.min(200, Math.floor(limit)));
+    const rows = this.#db.prepare(
+      "SELECT * FROM provider_sessions WHERE project_id = ? ORDER BY last_used_at DESC, session_id DESC LIMIT ?",
+    ).all(this.#project.projectId, boundedLimit) as SessionRow[];
+    return Object.freeze(rows.map(mapSession));
   }
 
   // ---------------------------------------------------------------- internals
 
+  /**
+   * Records the goal's pointer at a session.
+   *
+   * Keyed by `(provider, model)` so a goal can remember Sonnet's session *and* Haiku's at once —
+   * keying by provider alone kept whichever was written last, which is exactly the collapse the
+   * provider/runtime/model hierarchy forbids.
+   */
   #attachSessionRef(goalId: string, providerId: ProviderId, modelId: string | null, sessionId: string, resumeMode: SessionResumeMode, timestamp: string): void {
     const goal = this.requireGoal(goalId);
-    const refs = goal.state.providerSessions.filter((ref) => ref.providerId !== providerId);
+    const refs = goal.state.providerSessions.filter((ref) => !(ref.providerId === providerId && ref.modelId === modelId));
     refs.push(Object.freeze({ providerId, modelId, sessionId, resumeMode, recordedAt: timestamp }));
     const next: GoalState = Object.freeze({ ...goal.state, providerSessions: Object.freeze(refs.slice(-8)) });
     this.#db.prepare("UPDATE goals SET state_json = ?, updated_at = ? WHERE goal_id = ? AND project_id = ?")
@@ -599,8 +756,16 @@ export class GoalStore {
         session_id TEXT NOT NULL,
         quota_pool TEXT,
         resume_mode TEXT NOT NULL CHECK (resume_mode IN (${SESSION_RESUME_MODES.map((value) => `'${value}'`).join(", ")})),
+        status TEXT NOT NULL DEFAULT 'active',
+        runtime_version TEXT,
+        workspace TEXT,
         goal_id TEXT,
         conversation_id TEXT,
+        last_task_id TEXT,
+        last_turn_sequence INTEGER,
+        created_at TEXT,
+        last_used_at TEXT,
+        state_snapshot_json TEXT,
         recorded_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
         PRIMARY KEY (project_id, provider_id, model_id, session_id)
@@ -632,6 +797,27 @@ export class GoalStore {
       CREATE INDEX IF NOT EXISTS idx_turns_conversation_sequence ON conversation_turns(project_id, conversation_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_sessions_project_provider ON provider_sessions(project_id, provider_id, updated_at);
     `);
+    this.#addSessionColumns();
     if (version < GOALS_SCHEMA_VERSION) this.#db.pragma(`user_version = ${String(GOALS_SCHEMA_VERSION)}`);
+  }
+
+  /**
+   * Widens `provider_sessions` for a file written before M20.2.
+   *
+   * The check, the ALTER and the reads all come from `SESSION_ADDED_COLUMNS`, so a column cannot be
+   * added to one and forgotten in another. Every column is nullable or defaulted, which is what
+   * makes this additive: an existing session row keeps its id, its model and its resume mode and
+   * reads back with `status: "active"` and its own `recorded_at` as its creation time — the closest
+   * true statement available, rather than `null` or "now".
+   */
+  #addSessionColumns(): void {
+    const existing = new Set(
+      (this.#db.pragma("table_info(provider_sessions)") as readonly { readonly name: string }[]).map((column) => column.name),
+    );
+    for (const column of SESSION_ADDED_COLUMNS) {
+      if (existing.has(column.name)) continue;
+      this.#db.exec(`ALTER TABLE provider_sessions ADD COLUMN ${column.ddl}`);
+    }
+    this.#db.exec("CREATE INDEX IF NOT EXISTS idx_sessions_project_model ON provider_sessions(project_id, provider_id, model_id, last_used_at)");
   }
 }

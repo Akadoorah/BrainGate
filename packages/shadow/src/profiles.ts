@@ -14,7 +14,7 @@ import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
 import { subagentsArgument } from "./subagents.js";
 import { grants, guaranteesFor, measuredSurface, resolveToolGrant, type MeasuredCapabilities, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
 import type { SnapshotPrimaryIneligibleReason } from "./snapshot-provider.js";
-import { STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
+import { NO_NATIVE_SESSION, STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type PlannedNativeSession, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
 // The release where a custom sandbox profile that cannot be applied refuses to start rather
@@ -35,6 +35,25 @@ const SCHEMA_PROMPT = [
   "Answer with real values you produce; the response shape is enforced for you.",
   "If you cannot complete the request, still answer in that shape and put the reason in the text field.",
 ].join(" ");
+
+/**
+ * The flags that name or continue a native session, from the decision that was made.
+ *
+ * It reads the decision rather than the runtime, so one place decides and one place acts: a decision
+ * of `handoff` produces no flags at all, and a runtime whose continuity is not offered cannot
+ * acquire it here through a later edit going unnoticed.
+ *
+ * Measured 2026-09-13 against claude 2.1.269: `--session-id <uuid>` names the id of a *new*
+ * conversation and `--resume <uuid>` continues one, both in print mode. Exactly one of them is
+ * passed, never both — the help text does not document the two together, and an undocumented
+ * combination is not something to build continuity on.
+ */
+function sessionFlags(session: PlannedNativeSession): readonly string[] {
+  if (session.sessionId === null) return [];
+  if (session.kind === "resumed") return ["--resume", session.sessionId];
+  if (session.kind === "fresh") return ["--session-id", session.sessionId];
+  return [];
+}
 
 /** Where a staged response schema is written for a CLI that takes it as a path. */
 export const STAGED_SCHEMA_FILE = "braingate-response-schema.json";
@@ -288,6 +307,14 @@ export function planShadowInvocation(input: {
    * the provider.
    */
   readonly measured?: MeasuredCapabilities;
+  /**
+   * How this invocation relates to a native provider session.
+   *
+   * Supplied by the invoker, which is the only layer that knows the model *and* the goal. Absent,
+   * nothing about sessions changes: no id is pinned, no session is resumed, and the run is told not
+   * to persist one — which is what every caller before M20.2 gets.
+   */
+  readonly nativeSession?: PlannedNativeSession;
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
@@ -300,6 +327,15 @@ export function planShadowInvocation(input: {
   }
   const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now, { snapshotPrimary });
   const body = serializedPayload(input.payload);
+  // The session decision, filled in with the real provider and model so the plan is
+  // self-describing. Resolved once here rather than read from three places later.
+  // Always named after the model this plan is actually for: a session decision that reached the
+  // executor without a provider and model would be unusable by every reader downstream.
+  const session: PlannedNativeSession = Object.freeze({
+    ...(input.nativeSession ?? NO_NATIVE_SESSION),
+    providerId: input.snapshot.providerId,
+    modelId: input.model.modelId,
+  });
   // The shape the provider must answer in, as a constraint it applies rather than a paragraph
   // it may ignore. Every CLI here except Copilot accepts one; Copilot keeps the long prompt.
   const schema = jsonSchemaArgument(input.payload.responseContract);
@@ -337,7 +373,15 @@ export function planShadowInvocation(input: {
       "--output-format", "stream-json",
       "--verbose",
       "--include-partial-messages",
-      "--no-session-persistence",
+      // Session persistence is a per-invocation decision, not a property of the profile.
+      //
+      // M20.1 removed this flag unconditionally, which is not what native continuity needs either:
+      // a run that is not continuing a goal should leave nothing behind, and a run that is should
+      // leave exactly one session under an id BrainGate already knows. Measured 2026-09-13 against
+      // claude 2.1.269: `--session-id <uuid>` names a new session and `--resume <uuid>` continues
+      // one, both in print mode. The capability probe has to agree before either is used.
+      ...(session.persistent ? [] : ["--no-session-persistence"]),
+      ...sessionFlags(session),
       "--no-chrome",
       "--disable-slash-commands",
       // Exactly what the grant allows, and nothing standing by in case. The Agent tool appears
@@ -378,8 +422,9 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
       grant,
+      nativeSession: session,
       streamDialect: "anthropic",
-      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
+      guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: !session.persistent, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -436,6 +481,7 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze(["CODEX_HOME"]),
       envOverrides: Object.freeze({}),
       grant,
+      nativeSession: session,
       streamDialect: null,
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
@@ -517,6 +563,7 @@ export function planShadowInvocation(input: {
       // permitted". Network blocking is real on Linux and a documented no-op on macOS, so
       // noNetworkTools claims only the tools BrainGate actually disabled.
       grant,
+      nativeSession: session,
       streamDialect: "xai",
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: false, noNetworkTools: true, noMcp: true, noSessionPersistence: false, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,
@@ -609,6 +656,7 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze(["COPILOT_HOME"]),
       envOverrides: Object.freeze({}),
       grant,
+      nativeSession: session,
       streamDialect: null,
       guarantees: guaranteesFor(grant, Object.freeze({ projectOnlyRead: true, noProjectWrites: true, noShell: true, noNetworkTools: true, noMcp: true, noSessionPersistence: true, isolatedUserConfig: true })),
       minimumVersion: profile.minimumVersion,

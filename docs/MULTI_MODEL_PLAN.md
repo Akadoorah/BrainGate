@@ -174,8 +174,17 @@ call.*
 - Re-measure Antigravity's isolation against 1.1.28 under the M14 probe. If HOME scoping is
   still impossible, it stays behind the ADR 0008 acceptance — but with stdin, `--add-dir`,
   `--sandbox` and a schema, so accepting it buys a real worker rather than a crippled one.
-- Terminal experience: streaming output, per-project resumable sessions (all four CLIs support
-  resume), a visible tool-call timeline, and the plan-then-confirm gate the REPL already has.
+- Terminal experience: streaming output, a visible tool-call timeline, the plan-then-confirm gate
+  the REPL already has, and — added in M20 — a *goal* that survives a provider switch.
+
+  **Correction (2026-09-13).** This line used to claim that per-project resumable sessions were
+  already working because "all four CLIs support resume". They do support resume, and BrainGate
+  passed no resume flag anywhere: every invocation was stateless by construction, and Claude even
+  ran `--no-session-persistence`. What was measured afterwards, from each installed build's own
+  `--help` (claude 2.1.269, codex-cli 0.153.4, agy 1.2.2, grok 1.0.24, copilot 0.0.358), is that
+  naming the id of a *new* session is available in Claude and Grok and not in the other three — and
+  that is what native continuity needs, because without a name there is nothing truthful to resume.
+  See ADR [0014](adr/0014-native-runtime-preservation.md).
   Parity with Claude Code is the floor here; the surplus is the receipt — which provider did
   which step, on which quota, and why the router chose it.
 

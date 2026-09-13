@@ -109,6 +109,17 @@ export function renderHandoff(handoff: HandoffPackage): string {
 
   lines.push("Changes so far:", ...bullets(handoff.filesChanged, "no files have been changed"), "");
   lines.push("Tests so far:", ...bullets(handoff.testsRun, "no tests have been run"), "");
+  // A fresh worker told only "nothing has been established" would reasonably start from scratch.
+  // Saying what the goal *is* costs one line and prevents a second diagnosis of a bug that is
+  // already understood further than the accepted findings show.
+  if (handoff.status === "diagnosed" || handoff.status === "implementing" || handoff.status === "blocked") {
+    lines.push(
+      `This goal is already ${handoff.status}. A previous worker concluded something about it; the`,
+      "findings above are what was formally established, and the timeline holds what was said.",
+      "Build on that rather than re-deriving it from nothing.",
+      "",
+    );
+  }
   lines.push("Approved scope:", ...bullets(handoff.approvedScope, "not yet scoped"), "");
   if (handoff.openQuestions.length > 0) lines.push("Open questions:", ...bullets(handoff.openQuestions, ""), "");
   if (handoff.nextAction !== null) lines.push(`Next action on record: ${handoff.nextAction}`, "");

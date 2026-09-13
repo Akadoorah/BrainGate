@@ -1,0 +1,363 @@
+import type { ProviderId } from "@braingate/providers";
+import { randomUUID } from "node:crypto";
+import { isNativeSessionKind, type NativeSessionDecision, type NativeSessionKind, type ProviderSessionRecord, type SessionUnusableReason } from "./types.js";
+
+/**
+ * What one runtime can actually do about native sessions, as measured.
+ *
+ * These are readings with a date and a version, not standing facts. Each CLI here ships weekly, so
+ * a limitation recorded today is a measurement that expires — re-measure before building anything
+ * on a `false`, and before telling an operator their subscription cannot do something it now can.
+ *
+ * Measured 2026-09-13 against: claude 2.1.269, codex-cli 0.153.4, agy 1.2.2, grok 1.0.24,
+ * copilot 0.0.358. Read from each CLI's own `--help`; no model call was made to obtain any of it.
+ */
+export interface RuntimeSessionPolicy {
+  /**
+   * Whether the caller may name the id of a session it is about to create.
+   *
+   * This is the capability native continuity actually needs. A CLI that only mints ids reveals one
+   * after the fact, in whatever its output format happens to be, and a run that dies before its
+   * final envelope never reveals one at all — so the reference is not known until the work is over,
+   * which is exactly when it is too late to have recorded it reliably.
+   */
+  readonly idPinning: boolean;
+  /**
+   * Whether invoking this runtime writes a session that can be resumed later.
+   *
+   * Separate from `idPinning` because a runtime can pin an id *and* be told not to persist, and
+   * because persistence has consequences of its own: it is state the provider keeps.
+   */
+  readonly persistsSessions: boolean;
+  /** The flag that names a new session, as `[flag, value]` pairs. Empty when `idPinning` is false. */
+  readonly newSessionArgs: (sessionId: string) => readonly string[];
+  /** The flag that resumes an existing session. */
+  readonly resumeArgs: (sessionId: string) => readonly string[];
+  /** The flag that suppresses persistence entirely, when the run may not leave a session behind. */
+  readonly noPersistenceArgs: readonly string[];
+  /**
+   * Whether resuming is offered at all, and if not, why not.
+   *
+   * A runtime can have the flags and still not be offered: `grok` supports both pinning and
+   * resuming, and its sessions are recorded per working directory *outside* the sandbox that the
+   * rest of Grok's isolation is earned on — so persisting one would leave a record of the run in
+   * the operator's own home, which is a change to the security posture rather than a feature. The
+   * policy says no and the reason says which kind of no it is.
+   */
+  readonly resumeOffered: boolean;
+  readonly notOfferedBecause: SessionUnusableReason | null;
+  /**
+   * The capability-probe feature whose reading must agree before continuity is offered.
+   *
+   * The policy is a claim about a CLI; the probe is a reading of the build that is installed. Where
+   * they disagree the reading wins, and it can only ever take the capability away — a build that
+   * dropped `--session-id` refuses continuity rather than failing at the provider with a flag error.
+   */
+  readonly probeFeature: "sessionIdPinning";
+}
+
+const ANTHROPIC_SESSION: RuntimeSessionPolicy = Object.freeze({
+  idPinning: true,
+  persistsSessions: true,
+  newSessionArgs: (sessionId: string) => Object.freeze(["--session-id", sessionId]),
+  resumeArgs: (sessionId: string) => Object.freeze(["--resume", sessionId]),
+  noPersistenceArgs: Object.freeze(["--no-session-persistence"]),
+  resumeOffered: true,
+  notOfferedBecause: null,
+  probeFeature: "sessionIdPinning" as const,
+});
+
+export const RUNTIME_SESSION_POLICIES: Readonly<Record<ProviderId, RuntimeSessionPolicy>> = Object.freeze({
+  anthropic: ANTHROPIC_SESSION,
+  openai: Object.freeze({
+    idPinning: false,
+    persistsSessions: true,
+    newSessionArgs: () => Object.freeze([]),
+    resumeArgs: (sessionId: string) => Object.freeze(["exec", "resume", sessionId]),
+    noPersistenceArgs: Object.freeze(["--ephemeral"]),
+    resumeOffered: false,
+    notOfferedBecause: "provider-does-not-expose-session-ids" as const,
+    probeFeature: "sessionIdPinning" as const,
+  }),
+  google: Object.freeze({
+    idPinning: false,
+    persistsSessions: true,
+    newSessionArgs: () => Object.freeze([]),
+    resumeArgs: (sessionId: string) => Object.freeze(["--conversation", sessionId]),
+    noPersistenceArgs: Object.freeze([]),
+    resumeOffered: false,
+    notOfferedBecause: "provider-does-not-expose-session-ids" as const,
+    probeFeature: "sessionIdPinning" as const,
+  }),
+  xai: Object.freeze({
+    idPinning: true,
+    persistsSessions: true,
+    newSessionArgs: (sessionId: string) => Object.freeze(["--session-id", sessionId]),
+    resumeArgs: (sessionId: string) => Object.freeze(["--resume", sessionId]),
+    noPersistenceArgs: Object.freeze([]),
+    // Grok has no flag that suppresses persistence, and it does not need one: its sessions are its
+    // own, in its own home, exactly as they are when the operator runs `grok` directly. BrainGate
+    // holding a reference to one is not a claim to own it, and where a runtime keeps its files was
+    // never a reason to refuse continuity.
+    //
+    // Offered on the same evidence as Claude and after the same measurement (grok 1.0.24,
+    // 2026-09-13): `-s, --session-id <UUID>` names a new conversation and `-r, --resume <id>`
+    // continues it. Whether a *particular* session can be continued is decided per run by the
+    // workspace check, which is a fact about where the session was written rather than a policy
+    // about where the runtime may keep it.
+    resumeOffered: true,
+    notOfferedBecause: null,
+    probeFeature: "sessionIdPinning" as const,
+  }),
+  "github-copilot": Object.freeze({
+    idPinning: false,
+    persistsSessions: true,
+    newSessionArgs: () => Object.freeze([]),
+    resumeArgs: (sessionId: string) => Object.freeze(["--resume", sessionId]),
+    noPersistenceArgs: Object.freeze([]),
+    resumeOffered: false,
+    notOfferedBecause: "provider-does-not-expose-session-ids" as const,
+    probeFeature: "sessionIdPinning" as const,
+  }),
+});
+
+/**
+ * Which roles may hold a native session.
+ *
+ * The primary only, and this is a design decision rather than an omission. A planner is asked for
+ * an approach and a reviewer is asked for an independent verdict; resuming either one would hand
+ * it its own earlier opinion and quietly turn a second opinion into a first. Independence is the
+ * whole value of those roles, so their sessions are not persisted across turns.
+ */
+export const SESSION_CONTINUITY_ROLES: readonly string[] = Object.freeze(["primary"]);
+
+/**
+ * What kind of reason a restriction has, per ADR 0014.
+ *
+ * `legacy` is the one that matters: a restriction with no current justification, which the default
+ * interactive experience should not keep without a concrete reason. Naming the classes in code keeps
+ * the ADR's table and the product's defaults from drifting, and gives the next slice a list to work
+ * through rather than a paragraph to re-read.
+ */
+export const RESTRICTION_CLASSES = ["native-runtime", "operator-policy", "unattended-safety", "legacy", "strict-mode"] as const;
+export type RestrictionClass = (typeof RESTRICTION_CLASSES)[number];
+
+export interface RestrictionClassification {
+  readonly id: string;
+  readonly classification: RestrictionClass;
+  readonly note: string;
+}
+
+/**
+ * The restrictions ADR 0014 classifies, as data.
+ *
+ * Kept next to the session policy because the two are read together — whether continuity is offered
+ * depends on what the runtime permits, and whether a *capability* is offered depends on which class
+ * its restriction falls in.
+ */
+export const RESTRICTION_CLASSIFICATIONS: readonly RestrictionClassification[] = Object.freeze([
+  Object.freeze({ id: "codex-ephemeral", classification: "native-runtime", note: "Part of the isolation contract the Codex snapshot proof was earned under." }),
+  Object.freeze({ id: "grok-sandbox-profile", classification: "native-runtime", note: "The CLI's own enforcement, proven per run by self-test." }),
+  Object.freeze({ id: "codex-sandbox-profile", classification: "native-runtime", note: "The CLI's own enforcement, proven per run by self-test." }),
+  Object.freeze({ id: "grok-not-read-primary", classification: "native-runtime", note: "Its sandbox writes to its own working directory; snapshot-read is the mode that removes the reason." }),
+  Object.freeze({ id: "project-scoped-data", classification: "operator-policy", note: "ADR 0002. Unrelated to tool breadth." }),
+  Object.freeze({ id: "budget-and-concurrency-ceilings", classification: "operator-policy", note: "The operator's spend and runaway bounds." }),
+  Object.freeze({ id: "read-primary-without-shell", classification: "legacy", note: "No current justification for denying a read-only run the shell its runtime would give it. Lifting it needs a read-only-repository overlay, not a blanket denial." }),
+  Object.freeze({ id: "universal-mcp-refusal", classification: "legacy", note: "Contradicts preservation. Replacing it needs a per-server policy rather than none-or-all." }),
+  Object.freeze({ id: "braingate-declared-subagents", classification: "legacy", note: "Should be an option, not the only way helpers exist." }),
+  Object.freeze({ id: "snapshot-worktree-isolation", classification: "strict-mode", note: "Kept and selectable." }),
+]);
+
+/** The restrictions a future slice should work through first. */
+export function legacyRestrictions(): readonly RestrictionClassification[] {
+  return Object.freeze(RESTRICTION_CLASSIFICATIONS.filter((item) => item.classification === "legacy"));
+}
+
+export interface SessionResolutionRequest {
+  readonly providerId: ProviderId;
+  readonly modelId: string;
+  readonly role: string;
+  /** Whether the caller asked for a fresh native session on purpose. */
+  readonly freshRequested: boolean;
+  /** The capability probe's reading for this build, when one was taken. */
+  readonly probedPinning: boolean | "unknown" | null;
+  readonly runtimeVersion: string | null;
+  readonly workspace: string | null;
+  readonly goalId: string | null;
+}
+
+/**
+ * Whether the next invocation for this provider and model may continue a native session.
+ *
+ * One function, so "will this resume or start fresh" has exactly one answer and every surface that
+ * shows it shows the same one. It is deliberately total: every path returns a decision, including
+ * the ones that refuse, because a caller that has to handle "no decision" will invent one.
+ */
+export function resolveSessionDecision(input: SessionResolutionRequest & { readonly stored: ProviderSessionRecord | null }): NativeSessionDecision {
+  const policy = RUNTIME_SESSION_POLICIES[input.providerId];
+  const base = { providerId: input.providerId, modelId: input.modelId, resumeMode: "unsupported" as const };
+
+  // A role that must stay independent never holds a session. Reported as `handoff` rather than
+  // `unsupported`, because the goal handoff still reaches it — the continuity is of the *work*.
+  if (!SESSION_CONTINUITY_ROLES.includes(input.role)) {
+    return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: "provider-does-not-expose-session-ids" as const, persistent: false });
+  }
+
+  if (!policy.resumeOffered) {
+    return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: policy.notOfferedBecause, persistent: false });
+  }
+
+  // The probe can only take the capability away. A build that no longer publishes the flag, or one
+  // nobody could read, is not a build to pin ids against.
+  if (input.probedPinning === false) {
+    return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: "provider-does-not-expose-session-ids" as const, persistent: false });
+  }
+
+  if (!policy.idPinning) {
+    return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: "provider-does-not-expose-session-ids" as const, persistent: false });
+  }
+
+  if (input.freshRequested) {
+    return Object.freeze({
+      ...base,
+      kind: "fresh" as const,
+      sessionId: randomUUID(),
+      resumeMode: "available" as const,
+      reason: null,
+      persistent: policy.persistsSessions,
+    });
+  }
+
+  const stored = input.stored;
+  if (stored === null) {
+    // Nothing to resume, so a new session is created *with a known id* — that is the whole point of
+    // pinning, and it is why the next turn can resume even if this one dies.
+    return Object.freeze({
+      ...base,
+      kind: "fresh" as const,
+      sessionId: randomUUID(),
+      resumeMode: "available" as const,
+      reason: "not-yet-used" as const,
+      persistent: policy.persistsSessions,
+    });
+  }
+
+  const unusable = sessionUnusableReason({ stored, goalId: input.goalId, runtimeVersion: input.runtimeVersion, workspace: input.workspace });
+  if (unusable !== null) {
+    return Object.freeze({
+      ...base,
+      kind: "fresh" as const,
+      sessionId: randomUUID(),
+      resumeMode: "available" as const,
+      reason: unusable,
+      persistent: policy.persistsSessions,
+    });
+  }
+
+  return Object.freeze({
+    ...base,
+    kind: "resumed" as const,
+    sessionId: stored.sessionId,
+    resumeMode: "available" as const,
+    reason: null,
+    persistent: policy.persistsSessions,
+  });
+}
+
+/**
+ * Why a stored session will not be resumed, or `null` when it will be.
+ *
+ * Each reason is a fact about the session, not a guess about the runtime: a version that changed
+ * mid-goal may resume perfectly well, and BrainGate does not know, so it declines to promise
+ * continuity rather than promising it and losing the session on the way.
+ */
+export function sessionUnusableReason(input: {
+  readonly stored: ProviderSessionRecord;
+  readonly goalId: string | null;
+  readonly runtimeVersion: string | null;
+  readonly workspace: string | null;
+}): SessionUnusableReason | null {
+  const { stored } = input;
+  if (stored.status === "closed") return "superseded";
+  if (stored.status === "stale") return "stale-session";
+  if (stored.status === "unavailable" || stored.status === "incompatible") return "recorded-unresumable";
+  if (stored.resumeMode !== "available") return "recorded-unresumable";
+  if (input.goalId !== null && stored.goalId !== null && stored.goalId !== input.goalId) return "goal-mismatch";
+  // A session created against a different build may not be readable by this one. Recorded, not
+  // assumed either way.
+  if (stored.runtimeVersion !== null && input.runtimeVersion !== null && stored.runtimeVersion !== input.runtimeVersion) return "runtime-version-changed";
+  if (stored.workspace !== null && input.workspace !== null && stored.workspace !== input.workspace) return "workspace-changed";
+  return null;
+}
+
+/** The arguments a plan needs for a decision: the session flag, or the flag that suppresses one. */
+export function sessionArgs(policy: RuntimeSessionPolicy, decision: NativeSessionDecision): readonly string[] {
+  if (!policy.idPinning || decision.sessionId === null) return Object.freeze([]);
+  if (decision.kind === "resumed") return policy.resumeArgs(decision.sessionId);
+  if (decision.kind === "fresh") return policy.newSessionArgs(decision.sessionId);
+  return Object.freeze([]);
+}
+
+/**
+ * The session id a fresh invocation will have, when the runtime lets one be chosen.
+ *
+ * Used by the recorder to know what to store before the run starts, which is the property that
+ * makes an interrupted run recoverable: the reference exists even if the process never returns.
+ */
+export function pinnedSessionId(decision: NativeSessionDecision): string | null {
+  if (decision.kind === "fresh" && decision.sessionId !== null) return decision.sessionId;
+  return null;
+}
+
+export function sessionKindIs(value: string): value is NativeSessionKind {
+  return isNativeSessionKind(value);
+}
+
+/**
+ * The decision an unrecognised provider gets: no continuity, honestly labelled.
+ *
+ * Total on purpose. A provider added to the catalogue before a policy is measured for it must not
+ * be able to acquire session continuity by omission.
+ */
+export function unsupportedSessionDecision(input: { readonly providerId: ProviderId; readonly modelId: string; readonly reason?: SessionUnusableReason | null }): NativeSessionDecision {
+  return Object.freeze({
+    providerId: input.providerId,
+    modelId: input.modelId,
+    kind: "handoff" as const,
+    sessionId: null,
+    resumeMode: "unsupported" as const,
+    reason: input.reason ?? "provider-does-not-expose-session-ids",
+    persistent: false,
+  });
+}
+
+/** Where a session's continuity stands, for `/worker` and for a receipt line. */
+export function describeSessionDecision(decision: NativeSessionDecision): string {
+  switch (decision.kind) {
+    case "resumed": return `resuming native session ${shortId(decision.sessionId)}`;
+    case "fresh": return decision.reason === "not-yet-used"
+      ? `new native session ${shortId(decision.sessionId)}`
+      : `new native session ${shortId(decision.sessionId)} (${describeReason(decision.reason)})`;
+    case "unsupported": return `no native session (${describeReason(decision.reason)})`;
+    case "disabled": return "native sessions disabled for this run";
+    case "handoff": return `fresh invocation with a goal handoff (${describeReason(decision.reason)})`;
+  }
+}
+
+export function describeReason(reason: SessionUnusableReason | null): string {
+  switch (reason) {
+    case null: return "nothing to report";
+    case "provider-does-not-expose-session-ids": return "this runtime does not let BrainGate choose a session id";
+    case "recorded-unresumable": return "the recorded session cannot be resumed";
+    case "runtime-version-changed": return "the installed runtime version changed since that session";
+    case "workspace-changed": return "that session belongs to a different workspace";
+    case "goal-mismatch": return "that session belongs to a different goal";
+    case "superseded": return "that session is closed";
+    case "stale-session": return "that session has gone stale";
+    case "not-yet-used": return "nothing has been run yet";
+  }
+}
+
+function shortId(value: string | null): string {
+  return value === null ? "none" : value.slice(0, 8);
+}

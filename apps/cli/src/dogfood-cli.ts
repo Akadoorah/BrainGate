@@ -5,7 +5,7 @@ import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
 import { CODEX_PROBE_VERSION } from "@braingate/shadow";
 import { ProjectSnapshotProvider } from "@braingate/execution";
-import type { TaskSnapshotProvider } from "@braingate/shadow";
+import type { NativeSessionResolver, TaskSnapshotProvider } from "@braingate/shadow";
 import {
   BrainGateInvariantError,
   ProjectRegistry,
@@ -112,6 +112,21 @@ export interface DogfoodCliDependencies {
   /** The goal and conversation the task this run creates is a work unit of. */
   readonly goalId?: string | null;
   readonly conversationId?: string | null;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * A pin narrows which model is *considered* and nothing else — every eligibility gate still
+   * applies, and an ineligible pin is refused rather than routed around. Supplied only by the
+   * interactive session, which is the only surface where a person is choosing.
+   */
+  readonly pin?: { readonly providerId: string; readonly modelId: string } | undefined;
+  /**
+   * Asked per invocation whether this run continues a native provider session.
+   *
+   * Supplied by the session, which is the only layer that knows the goal a session belongs to. Absent,
+   * nothing is pinned, nothing is resumed, and no session is persisted.
+   */
+  readonly nativeSession?: NativeSessionResolver | undefined;
   /**
    * The complexity floor of the goal this request continues.
    *
@@ -735,7 +750,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
-    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
+    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
     // terminal prints; `complexity`, `risk`, `promptComplexity` and `roleLines` are the same facts as
@@ -788,7 +803,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
           if (!servedBy.includes(attribution)) servedBy.push(attribution);
         }
         deps.onRoleActivity?.(activity);
-      }, ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
+      }, ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); }, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }) });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_RECEIPT_MISSING", "Executed dogfood ask did not produce a task receipt.");
       deps.onTurnAttribution?.(Object.freeze([...servedBy]));
@@ -856,7 +871,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const grokWrite = await grokProof(state, snapshots, deps, env, project, GROK_WRITE_SANDBOX);
     const grokWriteIsolation = grokWrite.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The same structural fields the read plan carries, so a caller that continues a goal reads one
     // shape whichever mode the request took. `summary` is what the terminal prints; the tiers are
@@ -893,7 +908,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const ledger = new TaskLedger(project);
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       // Read back what the runner recorded, so the screen and the ledger cannot disagree.

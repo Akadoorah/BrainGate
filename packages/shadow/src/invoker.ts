@@ -9,7 +9,7 @@ import type { TaskSnapshotEvidence, TaskSnapshotProvider } from "./snapshot-prov
 import { providerQuotaRefusal, quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
 import { grants } from "./tool-grants.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
-import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
+import type { OperatorProviderAcceptance, PlannedSessionKind, PlannedSessionReason, PlannedSessionResumeMode, ShadowInvocationPlan, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 /** What a role is doing, as it happens. */
 export interface RoleActivity {
@@ -355,6 +355,39 @@ function failureAdvice(reason: string | null): string {
   return "";
 }
 
+/**
+ * How one invocation relates to a native provider session, decided by the caller.
+ *
+ * The invoker knows the model and the role but not the goal, and the goal is what a session belongs
+ * to; so the decision is asked for rather than made here. What comes back may also replace the
+ * request's own `task` and `context`, which is how a returning worker is given a *delta* instead of
+ * the whole handoff it already remembers living through.
+ */
+export interface NativeSessionResolution {
+  readonly decision: {
+    readonly kind: PlannedSessionKind;
+    readonly sessionId: string | null;
+    readonly providerId: ProviderId;
+    readonly modelId: string;
+    readonly resumeMode: PlannedSessionResumeMode;
+    readonly reason: PlannedSessionReason | null;
+    readonly persistent: boolean;
+  };
+  /** The request's own text, when the caller narrowed it — a delta plus the work unit. */
+  readonly task?: string | undefined;
+  readonly context?: unknown;
+  /** Extra context for the receipt, describing what the caller decided and why. */
+  readonly note?: string | undefined;
+}
+
+export type NativeSessionResolver = (input: {
+  readonly role: string;
+  readonly phase: string;
+  readonly model: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string };
+  readonly task: string;
+  readonly context: unknown;
+}) => Promise<NativeSessionResolution | null>;
+
 export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #project: RegisteredProject;
   readonly #cwd: string;
@@ -380,6 +413,15 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
   readonly #timeoutMs: number | undefined;
   readonly #snapshotStore: TaskSnapshotProvider | undefined;
+  readonly #nativeSession: NativeSessionResolver | undefined;
+  /**
+   * The last plan this invoker built, so a caller can read back what actually ran.
+   *
+   * The plan is where the session decision and the arguments both live, and reconstructing either
+   * from the response would be a second derivation of the same fact. Read, not decided, here.
+   */
+  #lastPlan: ShadowInvocationPlan | null = null;
+  #lastSessionNote: string | null = null;
 
   constructor(input: {
     readonly project: RegisteredProject;
@@ -403,6 +445,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
      * rather than falling back to the checkout, which is the whole point of the mode.
      */
     readonly snapshotStore?: TaskSnapshotProvider;
+    /**
+     * Asked, per invocation, whether this run continues a native provider session.
+     *
+     * Injected rather than reached for: the goals live in a package the execution layer must not
+     * depend on, and the decision is a property of the *goal* rather than of the run. Absent, no
+     * session is pinned, none is resumed, and nothing is persisted — the pre-M20.2 behaviour.
+     */
+    readonly nativeSession?: NativeSessionResolver;
     /** Tool-use turns a read-only inspection may spend; from the task's execution budget. */
     readonly maxTurns?: number;
     /** Wall-clock allowance for one invocation; from the task's execution budget. */
@@ -465,23 +515,31 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#onQuotaReading = input.onQuotaReading;
     this.#timeoutMs = input.timeoutMs;
     this.#snapshotStore = input.snapshotStore;
+    this.#nativeSession = input.nativeSession;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
 
   async invoke(request: AgentRequest): Promise<AgentResponse> {
     const snapshot = this.#snapshots.get(request.model.providerId);
     if (snapshot === undefined) throw new BrainGateInvariantError("SHADOW_SNAPSHOT_MISSING", `No provider discovery snapshot for ${request.model.providerId}.`);
+
+    // Asked before the payload is built, because what it answers decides the payload's own `task`
+    // and `context`: a worker resuming its own session is handed the delta since its last turn
+    // rather than the handoff it already remembers, and asking afterwards would mean building the
+    // wrong prompt first and replacing it second.
+    const resolution = await this.#resolveNativeSession(request);
+    const session = resolution?.decision ?? null;
     const payload: ShadowRolePayload = Object.freeze({
       schemaVersion: 1,
       role: request.role,
       phase: request.phase,
-      task: request.task,
+      task: resolution?.task ?? request.task,
       findings: Object.freeze([...request.findings]),
       candidateOutput: request.candidateOutput == null ? null : boundedText(request.candidateOutput),
       // Without this the executor receives a plan in the same field a reviewer receives a draft,
       // and treats the approach it was given as something to critique rather than to follow.
       candidateOutputRole: request.candidateOutput == null ? null : (request.role === "primary" ? "approach-to-follow" : "prior-result-under-review"),
-      context: this.#context,
+      context: resolution === null || resolution.context === undefined ? this.#context : resolution.context,
       responseContract: responseContract(request.role),
     });
     const attestation = this.#attestations.get(request.model.providerId);
@@ -522,6 +580,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
+      ...(session === null ? {} : { nativeSession: session }),
       cwd: this.#cwd,
       ...(snapshotEvidence === null ? {} : { snapshotPrimary: true, workspaceRoot: snapshotEvidence.root }),
       ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),
@@ -546,6 +605,21 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       // travels with the attempt instead of being inferred later from what was planned.
       workspaceMode: plan.workspaceMode,
     });
+    this.#lastPlan = plan;
+    this.#lastSessionNote = resolution?.note ?? null;
+    // Recorded before the call, so a run that never returns still says which session it was for.
+    // The id is the one BrainGate pinned, not a value read back from the provider, so it exists
+    // whether or not the run ever reported anything.
+    if (session !== null && session.kind !== "disabled") {
+      this.#event("session.invocation", {
+        ...safeMeta,
+        kind: session.kind,
+        sessionId: session.sessionId,
+        resumeMode: session.resumeMode,
+        persistent: session.persistent,
+        ...(this.#lastSessionNote === null ? {} : { note: this.#lastSessionNote }),
+      });
+    }
     this.#event("shadow.provider.started", safeMeta);
     this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
     try {
@@ -670,6 +744,40 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
 
   #event(kind: string, payload: unknown): void {
     if (this.#ledger !== null && this.#taskId !== null) this.#ledger.appendEvent(this.#taskId, kind, payload);
+  }
+
+  /**
+   * Asks the caller how this invocation relates to a native session.
+   *
+   * A resolver that throws, or that answers with an id this provider's policy does not support, is
+   * refused rather than allowed to describe a continuation that did not happen. Nothing else in the
+   * invoker interprets the answer: it is put on the plan, and the recorder reads it from there.
+   */
+  async #resolveNativeSession(request: AgentRequest): Promise<NativeSessionResolution | null> {
+    if (this.#nativeSession === undefined) return null;
+    const resolved = await this.#nativeSession({
+      role: request.role,
+      phase: request.phase,
+      model: request.model,
+      task: request.task,
+      context: this.#context,
+    });
+    if (resolved === null) return null;
+    const { decision } = resolved;
+    if (decision.sessionId !== null && (decision.kind === "resumed" || decision.kind === "fresh") && decision.sessionId.trim().length === 0) {
+      throw new BrainGateInvariantError("SHADOW_SESSION_INVALID", "A native session decision named a session with an empty id.");
+    }
+    return resolved;
+  }
+
+  /**
+   * What the last invocation actually did about sessions, for the run's record.
+   *
+   * `null` when nothing has run yet. Read from the plan rather than re-derived, so the receipt and
+   * the arguments cannot disagree about whether a session was continued.
+   */
+  lastInvocation(): { readonly plan: ShadowInvocationPlan; readonly note: string | null } | null {
+    return this.#lastPlan === null ? null : Object.freeze({ plan: this.#lastPlan, note: this.#lastSessionNote });
   }
 
   #usage(

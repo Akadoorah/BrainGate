@@ -404,7 +404,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       // init and dogfood are dispatched before this handler is reached, so they were absent
       // from the only listing a new user sees — which left the two commands they actually
       // need undiscoverable. The listing describes every command the binary accepts.
-      data = { commands: ["init", "dogfood", "doctor", "discover", "providers", "models", "memory", "shadow", "write", "status", "dashboard"] };
+      data = { commands: ["repl", "init", "dogfood", "doctor", "discover", "providers", "models", "memory", "shadow", "write", "status", "dashboard"] };
       emit(
         json,
         data,
@@ -412,10 +412,20 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "BrainGate — one local control plane for the AI coding subscriptions you already use.",
           "",
           "Start here",
+          "  braingate                            the interactive session: one conversation, one goal,",
+          "                                       across the CLIs you already pay for",
           "  braingate init                       register the repository in the current directory",
           "  braingate dogfood preflight          check readiness, zero model calls",
           '  braingate dogfood ask plan --task "<question>"',
           '  braingate dogfood ask run  --task "<question>" --execute',
+          "",
+          "In the interactive session",
+          "  /use <provider>/<model> [--fresh]    send the next work to this worker, keeping the goal",
+          "  /auto                                let BrainGate choose the worker again",
+          "  /worker                              who is selected, the goal, and what would resume",
+          "  /goal                                the goal: established findings, disputes, questions",
+          "  /new                                 set the current goal aside and start another",
+          "  /help                                everything else the session understands",
           "",
           "Everything else",
           "  discover     which provider CLIs are installed and how they are authenticated",

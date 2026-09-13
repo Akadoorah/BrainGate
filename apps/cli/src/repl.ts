@@ -8,9 +8,18 @@ import { runMemoryCli } from "./memory-cli.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
 import { ProjectRegistry, TaskLedger } from "@braingate/core";
-import { GoalStore, buildGoalContext, inheritedComplexityFloor, renderHandoff, type GoalRecord } from "@braingate/goals";
+import {
+  GoalStore,
+  buildGoalContext,
+  describeGoalDelta,
+  describeSessionDecision,
+  inheritedComplexityFloor,
+  renderHandoff,
+  type GoalRecord,
+  type NativeSessionDecision,
+} from "@braingate/goals";
 import { resolveOperatorState } from "@braingate/operator";
-import type { ProviderSnapshot } from "@braingate/providers";
+import { NodeProbeRunner, probeCliCapabilities, type ProviderId, type ProviderSnapshot } from "@braingate/providers";
 import type {
   CodexIsolationAttestation,
   GrokIsolationAttestation,
@@ -19,6 +28,16 @@ import type {
   TaskSnapshotProvider,
 } from "@braingate/shadow";
 import type { WriteProviderExecutor } from "@braingate/write";
+import {
+  AUTO_WORKER,
+  createNativeSessionResolver,
+  describeWorker,
+  pinFor,
+  recordSessionUse,
+  resolveManualWorker,
+  type RunSessionSummary,
+  type WorkerSelection,
+} from "./worker-commands.js";
 import { COLOURED, PLAIN, renderBanner } from "./banner.js";
 import { COLOURED_PROGRESS, PLAIN_PROGRESS, startProgress } from "./progress.js";
 
@@ -57,6 +76,14 @@ interface ReplDeps {
   readonly verifyGrokIsolation?: (snapshot: ProviderSnapshot) => Promise<GrokIsolationAttestation>;
   readonly measureCapabilities?: () => Promise<Readonly<Record<string, MeasuredCapabilities>>>;
   readonly snapshotStore?: TaskSnapshotProvider;
+  /**
+   * The capability probe, for asking whether an installed build offers a session flag.
+   *
+   * Injected so a test can answer without spawning anything, and because the probe is the only
+   * thing that may grant native session continuity: a build that no longer publishes `--session-id`
+   * must be refused rather than fail at the provider with a flag error.
+   */
+  readonly probeCapabilities?: (providerId: string) => Promise<{ readonly features: Readonly<Record<string, { readonly supported: boolean | "unknown" }>> } | null>;
   /** False on a terminal that should not be redrawn, or when the operator asked for quiet. */
   readonly animate?: boolean;
   /** False under NO_COLOR or a dumb terminal. */
@@ -169,6 +196,59 @@ function safeGoalFile(): string | null {
   }
 }
 
+/**
+ * What the installed build accepts, asked once per provider and remembered.
+ *
+ * A `--help` read costs nothing and happens at most once per provider per session, which is why it
+ * is asked lazily: a session that never switches workers never probes anything. The reading is a
+ * gate rather than a hint — `sessionIdPinning` false or unknown refuses native continuity.
+ */
+class SessionCapabilityProbe {
+  readonly #readings = new Map<string, boolean | "unknown">();
+  readonly #pending = new Map<string, Promise<boolean | "unknown">>();
+  constructor(private readonly probe: ReplDeps["probeCapabilities"], private readonly version?: (providerId: string) => string | null) {}
+
+  /**
+   * The reading, awaited.
+   *
+   * Asynchronous on purpose. The first version answered `unknown` while it read the help text in the
+   * background, which meant the *first* turn of every session refused native continuity and only a
+   * later one could use it — a session that started and finished in one turn would never resume,
+   * which is the common case. Waiting one `--help` read is cheaper than being wrong about it.
+   */
+  async pinning(providerId: string): Promise<boolean | "unknown" | null> {
+    if (this.probe === undefined) return null;
+    const known = this.#readings.get(providerId);
+    if (known !== undefined) return known;
+    const inFlight = this.#pending.get(providerId);
+    if (inFlight !== undefined) return await inFlight;
+    const promise = this.#read(providerId);
+    this.#pending.set(providerId, promise);
+    const value = await promise;
+    this.#pending.delete(providerId);
+    return value;
+  }
+
+  async #read(providerId: string): Promise<boolean | "unknown"> {
+    try {
+      const report = await this.probe?.(providerId);
+      const supported = report?.features.sessionIdPinning?.supported ?? "unknown";
+      this.#readings.set(providerId, supported);
+      return supported;
+    } catch {
+      // A probe that could not run answers `unknown`, and an unknown refuses continuity. Silence
+      // must never be able to grant a capability.
+      this.#readings.set(providerId, "unknown");
+      return "unknown";
+    }
+  }
+
+  /** The installed build's version, as discovery read it. `null` when nothing has been discovered. */
+  runtimeVersion(providerId: string): string | null {
+    return this.version?.(providerId) ?? null;
+  }
+}
+
 /** The plan as structure, or `null` when the surface produced something else. */
 export interface ReadPlan {
   readonly summary: string;
@@ -240,6 +320,23 @@ function recordGoalProgress(store: GoalStore, goal: GoalRecord, input: string): 
 }
 
 /**
+ * Reads an installed build's `--help` to find out what it accepts.
+ *
+ * A local, zero-cost, zero-model-call probe. It is the only thing that may grant native session
+ * continuity, so it is deliberately the real thing rather than an assumption: a build whose help
+ * could not be read answers `unknown`, and an unknown refuses continuity rather than attempting a
+ * flag that may not exist.
+ */
+async function probeCapabilitiesFor(providerId: string): Promise<{ readonly features: Readonly<Record<string, { readonly supported: boolean | "unknown" }>> } | null> {
+  try {
+    const report = await probeCliCapabilities({ providerId: providerId as ProviderId, runner: new NodeProbeRunner() });
+    return Object.freeze({ features: report.features });
+  } catch {
+    return null;
+  }
+}
+
+/**
  * The provider-facing dependencies, when the caller supplied them.
  *
  * Spread into every `runDogfoodCli` call rather than looked up per call site, so a session that was
@@ -259,14 +356,28 @@ function runtimeDeps(deps: ReplDeps): Record<string, unknown> {
   };
 }
 
-async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null): Promise<void> {
+interface WorkerLoopState {
+  selection: WorkerSelection;
+  /** Mutated by `/use --fresh`: consumed by exactly one run. */
+  freshRequested: boolean;
+  /** What the last run did about a native session, for `/worker`. */
+  lastRun: RunSessionSummary | null;
+  readonly probe: SessionCapabilityProbe;
+  /** The installed build per provider, filled by discovery as it runs. */
+  readonly versions: Map<string, string | null>;
+}
+
+async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const captured: string[] = [];
   const capture = (text: string): void => { captured.push(text); };
   const sessionTurns = (budget: number) => session.recent(budget);
   // One probe for the whole request. Beyond the seconds it saves, it is what makes the plan the
   // operator approved and the run that follows describe the same machine.
-  const discoverAll = providers.lease();
+  // The versions discovery reads are captured here, once per request, because they decide whether a
+  // native session recorded earlier is still resumable: a build that changed under a goal is a
+  // mismatch to report, not a session to resume into and hope.
+  const discoverAll = providers.lease({ onDiscovered: (snapshots) => { for (const snapshot of snapshots) worker.versions.set(snapshot.providerId, snapshot.version.value); } });
 
   // The goal layer, if this session has one. It is attached to the *plan* as well as the run: the
   // plan is what the operator approves, and a plan that routed a follow-up as a standalone T1 while
@@ -276,11 +387,30 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // the honest reading of a goal with nothing established and the value that leaves the classifier
   // exactly as it was before M20.
   const floor = goal === null ? "T0" : inheritedComplexityFloor(goal.state);
-  const goalDeps = goal === null || goalLayers === null ? {} : {
-    goalContext: goalLayers.context,
-    goalId: goal.goalId,
-    conversationId: goal.conversationId,
-    inheritedComplexity: floor,
+  const pin = pinFor(worker.selection);
+  // The session resolver, built per run so it closes over *this* run's goal. A resolver closed over
+  // a stale goal would resume a session against state that has since moved on, which is the one
+  // thing a delta must not do.
+  const nativeSession = goal === null || goals === null ? undefined : createNativeSessionResolver({
+    goals,
+    goal: () => goal,
+    conversationId: () => goal.conversationId,
+    freshRequested: () => worker.freshRequested,
+    consumeFresh: () => { worker.freshRequested = false; },
+    probedPinning: (providerId) => worker.probe.pinning(providerId),
+    runtimeVersion: (providerId) => worker.probe.runtimeVersion(providerId),
+    workspace: () => deps.cwd,
+    onResolved: (summary) => { worker.lastRun = summary; },
+  });
+  const goalDeps = {
+    ...(goal === null || goalLayers === null ? {} : {
+      goalContext: goalLayers.context,
+      goalId: goal.goalId,
+      conversationId: goal.conversationId,
+      inheritedComplexity: floor,
+    }),
+    ...(pin === undefined ? {} : { pin }),
+    ...(nativeSession === undefined ? {} : { nativeSession }),
   };
 
   const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });
@@ -359,6 +489,12 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // The goal's own record of the turn, on the same terms: a clean result, and nothing at all when
   // the run failed. What this buys is that the *next* turn — tomorrow, on another provider, after
   // this process is gone — is a continuation rather than a new question.
+  if (result.exitCode === 0 && goal !== null && worker.lastRun?.session != null) {
+    const decision = worker.lastRun.session;
+    if (decision.kind !== "disabled") {
+      deps.stdout(`  session: ${describeSessionDecision(decision)}${worker.lastRun.delta === null ? "" : ` · delta: ${describeGoalDelta(worker.lastRun.delta)}`}\n`);
+    }
+  }
   if (goal !== null && goals !== null) {
     const taskId = taskIdOf(result.data);
     // The answer of record, preferred over anything re-assembled from the terminal. A provider that
@@ -373,7 +509,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
       catch { /* an already-linked task is the expected case, not a failure */ }
     }
     if (result.exitCode === 0 && answer.length > 0) {
-      goals.recordTurn({
+      const turn = goals.recordTurn({
         conversationId: goal.conversationId,
         goalId: goal.goalId,
         taskId,
@@ -381,6 +517,10 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
         answer,
         attributedTo: attributed,
       });
+      // Where the session's next delta starts from. Written after the turn so it covers everything
+      // up to and including this one, and against the state the turn produced rather than the state
+      // it started in — a snapshot taken before would report this turn's own work as news.
+      recordSessionUse({ goals, summary: worker.lastRun, goal, taskId, turnSequence: turn.sequence });
       // The goal as the store has it *now*, not as it was when this turn started. The record read
       // before the run is a snapshot from before the run, and folding progress into a snapshot is
       // how a goal stays `open` after it has been answered.
@@ -407,7 +547,7 @@ export function answerOf(data: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
-async function runSlash(line: string, deps: ReplDeps, session: SessionContext, goals: GoalStore | null, ledger: TaskLedger | null): Promise<"continue" | "exit"> {
+async function runSlash(line: string, deps: ReplDeps, session: SessionContext, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<"continue" | "exit"> {
   const [command, ...rest] = line.slice(1).trim().split(/\s+/);
   const io = { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr };
 
@@ -428,6 +568,14 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
         "  /remember <text>  record something about this project, for later sessions",
         "  /goal       the current goal, its established findings and its open questions",
         "  /new        set the current goal aside and start a different one",
+        "",
+        "  Which worker does the work. A switch keeps the goal: the next worker is handed the",
+        "  established findings, and a worker whose own session can be resumed is given only what",
+        "  changed while it was away.",
+        "",
+        "  /use <provider>/<model> [--fresh]   send the next work to this worker",
+        "  /auto       let BrainGate choose again",
+        "  /worker     who is selected, what the goal is, and what the next run would resume",
         "  /memory     what is remembered, and what is waiting for your evidence",
         "  /status     recent tasks in this project",
         "  /models     configured models and reviewer independence",
@@ -469,6 +617,40 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       // own copy. Two stores, one question, and the ledger is the one that holds the task records.
       const tasks = ledger === null ? [] : ledger.listTasksForGoal(goal.goalId);
       if (tasks.length > 0) deps.stdout(`\nTasks under this goal: ${tasks.length} · newest ${tasks[tasks.length - 1]!.taskId}\n`);
+      return "continue";
+    }
+    case "use": {
+      // Only the first token is the target: `/use anthropic/claude-sonnet --fresh` must pass the
+      // flag as a flag rather than folding it into the model id, where it would be reported as a
+      // model nobody configured.
+      const result = resolveManualWorker({ target: rest[0] ?? "", ...(deps.env === undefined ? {} : { env: deps.env }) });
+      if (!result.ok) { deps.stderr(`  ${result.message}\n`); return "continue"; }
+      worker.selection = result.selection;
+      // `--fresh` is consumed by the next run, so it is armed here and cleared when that run
+      // resolves its session. Arming it permanently would make every later turn a new session,
+      // which is not what "start fresh" means.
+      worker.freshRequested = result.selection.mode === "manual" && (result.selection.fresh || rest.slice(1).includes("--fresh"));
+      if (worker.selection.mode === "manual") {
+        // Read the build's capability now, so the first run after the switch has a real answer
+        // rather than an in-flight one. A failure here is harmless: unknown refuses continuity.
+        const pinning = await worker.probe.pinning(worker.selection.providerId);
+        if (pinning === true) deps.stdout("  Native session continuity: supported by the installed build.\n");
+        else if (pinning === false) deps.stdout("  Native session continuity: this build does not publish a session-id flag, so each turn will be a fresh invocation with a goal handoff.\n");
+        else deps.stdout("  Native session continuity: not confirmed for this build, so each turn will be a fresh invocation with a goal handoff.\n");
+      }
+      deps.stdout(`  ${result.message}\n`);
+      return "continue";
+    }
+    case "auto": {
+      worker.selection = AUTO_WORKER;
+      worker.freshRequested = false;
+      deps.stdout("  Automatic selection restored. BrainGate routes each turn again — availability, quota, capability and isolation decide.\n");
+      return "continue";
+    }
+    case "worker": {
+      const goal = goals === null ? null : goals.activeGoal();
+      const known = goals === null ? [] : goals.listProviderSessions(8);
+      for (const line of describeWorker({ selection: worker.selection, goal, lastRun: worker.lastRun, knownSessions: known })) deps.stdout(`${line}\n`);
       return "continue";
     }
     case "new": {
@@ -578,6 +760,12 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
       deps.stdout(`  ${resumed.state.status}${resumed.state.acceptedFindings.length === 0 ? "" : ` · ${String(resumed.state.acceptedFindings.length)} established finding(s)`} · /goal for detail, /new to start a different one.\n\n`);
     }
   }
+  // The installed build per provider, as discovery reads it. A session recorded against a different
+  // version is not resumed on a guess: the mismatch is reported and a new session is started, which
+  // is cheap, instead of resuming into a format this build may no longer read.
+  const versions = new Map<string, string | null>();
+  const probe = new SessionCapabilityProbe(deps.probeCapabilities, (providerId) => versions.get(providerId) ?? null);
+  const worker: WorkerLoopState = { selection: AUTO_WORKER, freshRequested: false, lastRun: null, probe, versions };
   try {
     for (;;) {
       const line = await deps.ask("> ");
@@ -585,7 +773,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
       const input = line.trim();
       if (input.length === 0) continue;
       if (input.startsWith("/")) {
-        if (await runSlash(input, deps, session, goals, ledger) === "exit") return 0;
+        if (await runSlash(input, deps, session, goals, ledger, worker) === "exit") return 0;
         // `/new` abandons the current goal, so the cached record must follow it rather than
         // describing a goal this session no longer continues.
         if (goals !== null && activeGoalId !== null && goals.getGoal(activeGoalId)?.state.status === "abandoned") {
@@ -602,7 +790,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
         request: input,
         goalId: current?.goalId ?? null,
       });
-      await runPlanned(input, deps, session, providers, goal, goals, ledger);
+      await runPlanned(input, deps, session, providers, goal, goals, ledger, worker);
       // The goal the next request will continue. Re-read after the turn, because the turn changed
       // it: the next plan must be built from the state the last answer produced, not from the state
       // it started in.
@@ -664,6 +852,7 @@ export async function runReplOnTerminal(cwd: string): Promise<number> {
         try { return await rl.question(question); }
         catch { return null; }
       },
+      probeCapabilities: probeCapabilitiesFor,
     });
   } finally {
     rl.close();

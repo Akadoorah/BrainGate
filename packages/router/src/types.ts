@@ -67,8 +67,26 @@ export interface IndependenceConstraint {
   readonly level?: IndependenceLevel;
 }
 
+/**
+ * A worker the operator named by hand.
+ *
+ * A pin constrains *which* model is considered; it does not excuse that model from anything. Every
+ * eligibility gate still applies — availability, quota state, capability floor, context capacity,
+ * write support, independence and isolation — because those are the reasons BrainGate exists rather
+ * than a shell script that runs `claude`. What a pin bypasses is the *ranking*: the cost-and-speed
+ * preference that picks among models that are all eligible. Choosing to spend a stronger model on
+ * cheap work is the operator's call; choosing a model their subscription cannot currently run is
+ * not a call anybody can make.
+ */
+export interface RoutePin {
+  readonly providerId: string;
+  readonly modelId: string;
+}
+
 export interface RouteRequest {
   readonly role: ModelRole;
+  /** When set, only this model is considered, and its rejection is reported as a refusal. */
+  readonly pin?: RoutePin | undefined;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
   readonly requiredContextTokens: number;
