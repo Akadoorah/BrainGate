@@ -4,13 +4,38 @@ import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject, InMemoryObservationWriter, ResultStore, createFinalizer, type TaskClassification, type TaskFinalizer } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  TaskLedger,
+  budgetFor,
+  classifyTask,
+  parseProjectConfig,
+  type RegisteredProject,
+  InMemoryObservationWriter,
+  ResultStore,
+  createFinalizer,
+  type TaskClassification,
+  type TaskFinalizer,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
 import { codexIsolationProfileHash, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
 import { WriteDogfoodRunner, buildWriteTaskPlan } from "./write-runner.js";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "./types.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 const PNG = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(300_000, 7)]);
 
@@ -70,7 +95,7 @@ function fixture() {
   writeFileSync(join(repo, "README.md"), "hello\n");
   git(repo, ["add", "."]); git(repo, ["commit", "-m", "initial"]);
   const registry = new ProjectRegistry(join(root, "state"));
-  const project = registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] })));
   return { root, repo, project };
 }
 

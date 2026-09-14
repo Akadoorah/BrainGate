@@ -1,16 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, type RegisteredProject } from "@braingate/core";
+import {
+  ProjectRegistry,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { DogfoodStore, initializeDogfoodProject } from "@braingate/dogfood";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
 import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "@braingate/write";
 import { runDogfoodCli, suggestedProjectId, roleLine } from "./dogfood-cli.js";
+
+
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -94,9 +101,15 @@ function io() {
   return { stdout: (value: string) => { stdout += value; }, stderr: (value: string) => { stderr += value; }, out: () => stdout, err: () => stderr };
 }
 
-function projectFor(f: ReturnType<typeof fixture>): RegisteredProject {
+/**
+ * The workspace execution handle for a fixture, resolved the way a command resolves it.
+ *
+ * A store that describes local execution takes this, not the project handle: the ledger, the corpus
+ * and the results belong to the fixture's directory.
+ */
+function projectFor(f: ReturnType<typeof fixture>): ExecutionProject {
   const registry = new ProjectRegistry(f.home);
-  return registry.loadFile(f.manifest);
+  return executionScopeFor(registry.loadFile(f.manifest), f.repo).project;
 }
 
 test("braingate init is idempotent and keeps the source checkout clean", async () => {
@@ -234,10 +247,12 @@ test("dogfood ask execute records sanitized observation then feedback/report", a
   assert.doesNotMatch(JSON.stringify(report.data), /safe dogfood answer|Where is the theme config/);
 });
 
-test("dogfood write execute mutates only worktree and records a run", async () => {
+// The strict mode is now chosen rather than assumed: DIRECT is the default (ADR 0017), so this
+// test names the policy it is about instead of relying on it being the only one.
+test("dogfood write execute under the worktree policy mutates only the worktree", async () => {
   const f = fixture(); const writer = new FakeWriteExecutor(); const out = io();
-  const result = await runDogfoodCli(["dogfood", "write", "run", "--task", "change the button label", "--no-review", "--execute", "--json"], { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: out.stdout, stderr: out.stderr });
-  assert.equal(result.exitCode, 0); assert.equal(writer.calls.length, 1);
+  const result = await runDogfoodCli(["dogfood", "write", "run", "--policy", "worktree", "--task", "change the button label", "--no-review", "--execute", "--json"], { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], writeExecutor: writer, stdout: out.stdout, stderr: out.stderr });
+  assert.equal(result.exitCode, 0, out.err()); assert.equal(writer.calls.length, 1);
   assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), "before\n"); assert.equal(git(f.repo, ["status", "--porcelain"]), "");
   assert.equal((result.data as { readyForApproval: boolean; mergePerformed: boolean }).readyForApproval, true); assert.equal((result.data as { mergePerformed: boolean }).mergePerformed, false);
   const store = new DogfoodStore(projectFor(f)); try { assert.equal(store.report().runs, 1); } finally { store.close(); }
@@ -305,12 +320,15 @@ test("a directory with no repository is offered one before the identity question
 
   assert.equal(result.exitCode, 0);
   assert.match(asked[0] ?? "", /git init/, "the repository question must come first");
-  assert.match(output.out(), /needs a repository to work in/);
+  assert.match(output.out(), /not a Git repository/);
+  assert.match(output.out(), /worktree-isolated write modes/, "and says what a missing repository actually costs");
   assert.equal(existsSync(join(bare, ".git")), true);
   assert.equal(existsSync(join(bare, ".brain", "project.json")), true);
 });
 
-test("declining leaves the directory exactly as it was", async () => {
+// A workspace does not have to be a repository, so saying no is a decision to record rather than a
+// dead end: the directory is registered as `hasRepository: false`, and nothing else is created.
+test("declining the repository registers the plain directory, and creates nothing else", async () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-cli-declined-"));
   const output = io();
   const result = await runDogfoodCli(["init"], {
@@ -318,14 +336,13 @@ test("declining leaves the directory exactly as it was", async () => {
     env: { BRAINGATE_HOME: join(bare, "brain-home") },
     stdout: output.stdout,
     stderr: output.stderr,
-    ask: async () => "n",
+    ask: async (question: string) => (/git init/.test(question) ? "n" : /id/i.test(question) ? "fresh" : "Fresh"),
   });
 
-  assert.equal(result.exitCode, 1);
-  assert.match(output.err(), /PROJECT_NOT_A_REPOSITORY/);
-  // Saying no has to mean nothing happened, including no half-registered project.
-  assert.equal(existsSync(join(bare, ".git")), false);
-  assert.equal(existsSync(join(bare, ".brain")), false);
+  assert.equal(result.exitCode, 0, output.err());
+  assert.equal(existsSync(join(bare, ".git")), false, "saying no to a repository means no repository");
+  const manifest = JSON.parse(readFileSync(join(bare, ".brain", "project.json"), "utf8")) as { repositories: string[] };
+  assert.deepEqual(manifest.repositories, [realpathSync.native(bare)], "and the workspace is the directory itself");
 });
 
 test("with no terminal to ask, nothing is created on a guess", async () => {
@@ -337,8 +354,11 @@ test("with no terminal to ask, nothing is created on a guess", async () => {
     stdout: output.stdout,
     stderr: output.stderr,
   });
-  assert.equal(result.exitCode, 1);
+  // Registering the workspace needs no answer from anyone; creating a repository does, and does not
+  // happen without one.
+  assert.equal(result.exitCode, 0, output.err());
   assert.equal(existsSync(join(bare, ".git")), false);
+  assert.equal(existsSync(join(bare, ".brain", "project.json")), true);
 
   // `--git-init` is how a script says yes, since there is nobody to ask.
   const explicit = await runDogfoodCli(["init", "--git-init", "--project-id", "fresh", "--name", "Fresh"], {
@@ -448,4 +468,25 @@ test("failures that are not quota refusals never create a backoff", async () => 
       assert.equal(store.refusalBackoffHistory().length, 0);
     } finally { store.close(); }
   }
+});
+
+test("a quota store that cannot be opened is named with its path, not turned into CLI_UNEXPECTED", async () => {
+  // Operator state is not always writable, and when it is not, the run used to fail as
+  // CLI_UNEXPECTED with the details suppressed: the operator saw a bug where there was a directory
+  // they could fix. The failure is the same failure; it now says which file and what to do.
+  const f = fixture("quota-blocked");
+  const globalDir = resolveOperatorState(f.env, f.repo).globalDir;
+  // A file where the database goes is the one thing that can fail here: the state directory is
+  // writable and the catalogue is present, so routing has everything it needs but its history.
+  mkdirSync(join(globalDir, "quota.sqlite"), { recursive: true });
+  const out = io();
+  const result = await runDogfoodCli(
+    ["dogfood", "ask", "plan", "--task", "Where is the theme config?"],
+    { cwd: f.repo, env: f.env, discoverAll: async () => [snapshot()], stdout: out.stdout, stderr: out.stderr },
+  );
+  assert.equal(result.exitCode, 1);
+  assert.match(out.err(), /QUOTA_STORE_UNAVAILABLE/, "the failure must have a name");
+  assert.match(out.err(), /quota\.sqlite/, "and name the file");
+  assert.match(out.err(), /BRAINGATE_HOME/, "and the way out");
+  assert.doesNotMatch(out.err(), /CLI_UNEXPECTED/, "a suppressed failure would say nothing");
 });

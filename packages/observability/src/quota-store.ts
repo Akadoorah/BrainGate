@@ -411,3 +411,25 @@ export class GlobalQuotaStore {
     `);
   }
 }
+
+/**
+ * Opens the quota store, or says which file could not be opened and why.
+ *
+ * `~/.braingate` is the operator's own state and is not always writable: a home on a read-only
+ * volume, another process holding the database, a sandbox that denies the path. What must not
+ * happen is that a run dies as `CLI_UNEXPECTED` with the details suppressed, because that tells the
+ * operator neither what failed nor what to change — and it reads as a bug in the run rather than a
+ * problem with a directory. The store is the same store; only the failure is given a name.
+ */
+export function openQuotaStore(globalStateDir: string): GlobalQuotaStore {
+  try {
+    return new GlobalQuotaStore(globalStateDir);
+  } catch (error) {
+    const path = join(globalStateDir, "quota.sqlite");
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new BrainGateInvariantError(
+      "QUOTA_STORE_UNAVAILABLE",
+      `Quota history at ${path} could not be opened: ${reason}. Make that path writable, or point BRAINGATE_HOME at a writable directory, then retry.`,
+    );
+  }
+}

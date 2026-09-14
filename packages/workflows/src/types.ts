@@ -79,4 +79,13 @@ export interface WorkflowInput {
   readonly writeRequired: boolean;
   readonly optionalReview: boolean;
   readonly excludeProviders?: Readonly<Partial<Record<WorkflowRole, readonly string[]>>>;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * Carried on the run rather than only on the plan, because the engine routes for itself: a plan
+   * that named one model and a run that then chose another would be describing work nobody agreed
+   * to. It constrains the primary only — the planner and reviewer are chosen for their independence
+   * from it, and pinning them would defeat what they are for.
+   */
+  readonly pin?: { readonly providerId: string; readonly modelId: string } | undefined;
 }

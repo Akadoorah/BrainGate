@@ -2,9 +2,9 @@ import { existsSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import {
   BrainGateInvariantError,
-  ProjectRegistry,
   ResultStore,
   TaskLedger,
+  legacyExecutionState,
   finalizedSnapshotOf,
   inspectReconciliation,
   reconcile,
@@ -15,6 +15,7 @@ import {
   type RegisteredProject,
   type TaskReceipt,
   type TaskRecord,
+  type ExecutionScope,
 } from "@braingate/core";
 import { DogfoodStore } from "@braingate/dogfood";
 import { MAX_PROVIDER_CALL_MS } from "@braingate/shadow";
@@ -25,6 +26,7 @@ import { quotaRefusalFromEvents } from "@braingate/observability";
 import { redactSecrets } from "@braingate/security";
 import { resolveOperatorState } from "@braingate/operator";
 import { DEFAULT_MANIFEST, findManifest } from "./manifest-path.js";
+import { attachFromManifest } from "./project-attachment.js";
 import { reviewerVerdictOf } from "./finalization.js";
 
 /**
@@ -83,17 +85,6 @@ function emit(json: boolean, data: unknown, human: string, stdout: (text: string
   stdout(json ? `${JSON.stringify(data, null, 2)}\n` : `${human}\n`);
 }
 
-function projectFromManifest(state: { readonly home: string }, manifest: string, cwd: string): RegisteredProject {
-  const path = findManifest(cwd, manifest);
-  if (!existsSync(path)) {
-    throw new BrainGateInvariantError(
-      "CLI_PROJECT_NOT_FOUND",
-      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
-    );
-  }
-  return new ProjectRegistry(state.home).loadFile(path);
-}
-
 /**
  * The corpus writer, for the tasks this command repairs.
  *
@@ -120,10 +111,10 @@ class ReconcileObservationWriter implements ObservationWriter {
   }
 }
 
-function depsFor(project: RegisteredProject, ledger: TaskLedger, store: DogfoodStore, now: () => Date) {
+function depsFor(scope: ExecutionScope, ledger: TaskLedger, store: DogfoodStore, now: () => Date) {
   return Object.freeze({
     ledger,
-    results: new ResultStore(project.storageDir, { redact: redactSecrets }),
+    results: ResultStore.fromScope(scope, { redact: redactSecrets }),
     observations: new ReconcileObservationWriter(store, ledger),
     // Derived, never authored: no provider call can outlive the ceiling the executors enforce, so
     // nothing that has been silent for three of them can still be working.
@@ -298,8 +289,8 @@ async function runList(args: string[], deps: TasksCliDependencies, cwd: string, 
   const limit = limitRaw === undefined ? DEFAULT_LIMIT : Number(limitRaw);
   if (!Number.isInteger(limit) || limit < 1 || limit > 1000) throw new BrainGateInvariantError("CLI_ARGUMENT_INVALID", "--limit must be an integer between 1 and 1000.");
   const operatorState = resolveOperatorState(deps.env ?? process.env);
-  const project = projectFromManifest(operatorState, manifest, cwd);
-  const ledger = new TaskLedger(project);
+  const { project, scope } = attachFromManifest(operatorState, manifest, cwd);
+  const ledger = new TaskLedger(scope.project);
   try {
     // Newest first: the operator is looking for the task they just ran, not the first one ever.
     const all = [...ledger.listTasks()].reverse();
@@ -309,6 +300,8 @@ async function runList(args: string[], deps: TasksCliDependencies, cwd: string, 
     const page = filtered.slice(0, limit);
     const data = Object.freeze({
       projectId: project.projectId,
+      workspaceId: scope.workspaceId,
+      workspacePath: scope.workspacePath,
       matched: filtered.length,
       shown: page.length,
       tasks: Object.freeze(page.map((entry) => Object.freeze({
@@ -328,6 +321,15 @@ async function runList(args: string[], deps: TasksCliDependencies, cwd: string, 
     });
     const header = `task      state       outcome                      tier   title`;
     const lines = page.length === 0 ? ["No tasks matched."] : [header, ...page.map((entry) => taskLine(entry.task, entry.snapshot))];
+    // An empty workspace ledger next to state from before workspaces existed is the one case where
+    // "no tasks" needs an explanation: the history is still there, and it belongs to no directory
+    // BrainGate can name, so it is preserved rather than shown as if it were this workspace's.
+    if (all.length === 0) {
+      const legacy = legacyExecutionState(scope.projectStorageDir);
+      if (legacy.length > 0) {
+        lines.push("", `Execution state from before workspaces is present at ${scope.projectStorageDir} (${legacy.join(", ")}).`, "It is preserved, is not used here, and is not carried into this workspace.");
+      }
+    }
     if (filtered.length > page.length) lines.push(`… ${filtered.length - page.length} more (--limit ${filtered.length} to see them).`);
     emit(json, data, lines.join("\n"), stdout);
     return Object.freeze({ exitCode: 0, data });
@@ -341,15 +343,15 @@ async function runShow(args: string[], deps: TasksCliDependencies, cwd: string, 
   noExtraArgs(args);
   if (taskId === undefined) throw new BrainGateInvariantError("CLI_ARGUMENT_INVALID", "tasks show requires a task id.");
   const operatorState = resolveOperatorState(deps.env ?? process.env);
-  const project = projectFromManifest(operatorState, manifest, cwd);
-  const ledger = new TaskLedger(project);
+  const { project, scope } = attachFromManifest(operatorState, manifest, cwd);
+  const ledger = new TaskLedger(scope.project);
   try {
     const receipt: TaskReceipt = ledger.receipt(resolveTaskId(ledger, taskId));
     const snapshot = finalizedSnapshotOf(receipt.events);
     // Read from the run's own provider events: what was dispatched, not what was planned.
     const execution = recordedExecutionAttribution(receipt.events) ?? executionAttribution({ events: receipt.events });
     const refusal = quotaRefusalFromEvents(receipt.events);
-    const results = new ResultStore(project.storageDir, { redact: redactSecrets });
+    const results = ResultStore.fromScope(scope, { redact: redactSecrets });
     let resultEvent: Record<string, unknown> | null = null;
     for (let index = receipt.events.length - 1; index >= 0; index -= 1) {
       const event = receipt.events[index]!;
@@ -492,18 +494,18 @@ async function runReconcile(args: string[], deps: TasksCliDependencies, cwd: str
   const manifest = takeOption(args, "--project") ?? DEFAULT_MANIFEST;
   noExtraArgs(args);
   const operatorState = resolveOperatorState(deps.env ?? process.env);
-  const project = projectFromManifest(operatorState, manifest, cwd);
-  const ledger = new TaskLedger(project);
-  const store = new DogfoodStore(project);
+  const { project, scope } = attachFromManifest(operatorState, manifest, cwd);
+  const ledger = new TaskLedger(scope.project);
+  const store = new DogfoodStore(scope.project);
   const unregister = registerActiveRun(() => { /* a signal during reconciliation stops here; the next run finishes it */ });
   try {
     const now = deps.now ?? (() => new Date());
-    const report = reconcile(project, depsFor(project, ledger, store, now), now());
+    const report = reconcile(scope.project, depsFor(scope, ledger, store, now), now());
     // Reconciliation is where a task's remains are already being tidied, so it is where a project copy
     // left by a killed process is tidied too. A separate concern from the record: the sweep removes
     // only BrainGate-owned snapshot directories whose owning process is gone, and reports what it
     // will not touch rather than guessing at it.
-    const sweep = (deps.snapshotStore ?? new ProjectSnapshotProvider(project)).sweep({
+    const sweep = (deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project)).sweep({
       isTaskFinished: (taskId) => {
         try { return isTerminalTaskState(ledger.receipt(taskId).task.state); }
         catch { return undefined; }
@@ -549,24 +551,24 @@ async function runReconcile(args: string[], deps: TasksCliDependencies, cwd: str
  * the command that creates a database, and a corpus that does not exist has no observations to
  * report. Opening an existing one is a read.
  */
-export function reconciliationNotice(project: RegisteredProject, ledger: TaskLedger, now = new Date()): string | null {
+export function reconciliationNotice(scope: ExecutionScope, ledger: TaskLedger, now = new Date()): string | null {
   const required = (observations: ObservationWriter): number => inspectReconciliation({
     ledger,
-    results: new ResultStore(project.storageDir, { redact: redactSecrets }),
+    results: ResultStore.fromScope(scope, { redact: redactSecrets }),
     observations,
     staleAfterMs: STALE_CALL_MULTIPLIER * MAX_PROVIDER_CALL_MS,
     now: () => now,
   }, now).required;
 
   let count: number;
-  if (!existsSync(join(project.storageDir, "dogfood.sqlite"))) {
+  if (!existsSync(join(scope.storageDir, "dogfood.sqlite"))) {
     const absent: ObservationWriter = {
       find: () => null,
       record: () => { throw new BrainGateInvariantError("DOGFOOD_READ_ONLY", "A read-only command does not write observations."); },
     };
     count = required(absent);
   } else {
-    const store = new DogfoodStore(project);
+    const store = new DogfoodStore(scope.project);
     try { count = required(new ReconcileObservationWriter(store, ledger)); } finally { store.close(); }
   }
   return count === 0 ? null : `Reconciliation required: ${String(count)} task(s). Run \`braingate tasks reconcile\`.`;

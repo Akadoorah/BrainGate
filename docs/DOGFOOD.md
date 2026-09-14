@@ -289,3 +289,55 @@ Use one project at a time:
 4. Tabaq AI — read-only first; keep payments/subscriptions/auth flows out of M12 writes.
 
 For the first 20-30 tasks, label complexity/outcome consistently. Treat every isolation, routing, quota, memory, or classification failure as a regression before widening the write boundary.
+
+## Continuity between runs
+
+A dogfood run is a work unit of a goal. The interactive session keeps a short thread so a follow-up
+resolves; the goal keeps what was *established* — accepted findings, disputed claims, files changed,
+tests run, open questions — and that is what a later worker is handed, whether it is hours later on
+the same model or immediately on a different one. A worker whose own native session can be resumed is
+given only what changed while it was away. None of this reaches canonical memory: an answer is a
+worker's claim until the operator or the evidence makes it a finding, exactly as before.
+
+## Trying DIRECT execution on a disposable copy
+
+The ordinary loop is: run BrainGate in a directory, ask for something, and see it in your files. Use a
+throwaway clone for the first run, and expect uncommitted changes rather than a worktree:
+
+```bash
+git clone <repo> /tmp/braingate-direct && cd /tmp/braingate-direct
+braingate init --project-id direct-trial --name "Direct trial"
+braingate                      # the session; DIRECT is the default policy
+```
+
+Inside the session:
+
+```text
+/policy                                            the boundary the next run happens inside
+/use anthropic/claude-sonnet-5
+what does the auth flow do when the session expires?      a read, in your workspace
+/use google/<configured-model>
+review that answer against the code                        a second opinion, same files
+/use anthropic/claude-sonnet-5
+implement the smallest fix you proposed                    a write, in your workspace
+/policy worktree
+the same change again, proposed instead of applied          the strict mode, on request
+```
+
+Afterwards, `git status --short` in the clone is the record: BrainGate made no commit, and nothing
+was merged. `braingate tasks list` shows the tasks, and their receipts name the policy, the provider
+`cwd` and the files each run changed.
+
+### Reading a session listing
+
+`/worker` lists the sessions on record with the envelope each was created under:
+
+```text
+  Sessions on record:
+    anthropic/claude-sonnet-5 · 8a7862ad · read/direct · told not to modify files · available · last used …
+    anthropic/claude-sonnet-5 · abc12345 · write/direct · available · last used …
+  A read session is never resumed for a write: the instruction it was created with lasts as long as it does.
+```
+
+A read request resumes the read session; a write request gets the write session, or a fresh one plus
+the goal handoff if there is none yet. Both belong to the same goal, and the operator repeats nothing.

@@ -18,6 +18,23 @@ const WRITE_SCHEMA = Object.freeze({
   additionalProperties: false,
 });
 
+/**
+ * The deny entries that are policy rather than harness.
+ *
+ * Secrets and version-control internals are out of bounds under every policy — that is the
+ * invariant, not a strict mode. The rest of `SETTINGS.permissions.deny` (a shell, a browser, the
+ * runtime's own subagents, its MCP servers) is the harness BrainGate substituted for the CLI's, and
+ * the DIRECT policy leaves that to the runtime.
+ */
+const SECRET_AND_VCS_DENY: readonly string[] = Object.freeze([
+  "Read(.env)", "Read(.env.*)", "Read(**/.env)", "Read(**/.env.*)",
+  "Read(credentials*)", "Read(**/credentials*)", "Read(**/*.pem)", "Read(**/*.key)",
+  "Edit(.env)", "Edit(.env.*)", "Edit(**/.env)", "Edit(**/.env.*)",
+  "Edit(credentials*)", "Edit(**/credentials*)", "Edit(**/*.pem)", "Edit(**/*.key)",
+  "Edit(.git/**)", "Edit(.claude/**)", "Edit(.brain/**)", "Edit(.github/workflows/**)",
+  "Edit(CLAUDE.md)", "Edit(AGENTS.md)", "Edit(AI_ENGINEERING_GUIDE.md)",
+]);
+
 const SETTINGS = Object.freeze({
   permissions: Object.freeze({
     disableBypassPermissionsMode: "disable",
@@ -57,42 +74,91 @@ export function assertClaudeWriteEligible(snapshot: ProviderSnapshot, model: Mod
   if (snapshot.models.value !== null && snapshot.models.value.length > 0 && !snapshot.models.value.includes(model.modelId)) throw new BrainGateInvariantError("WRITE_MODEL_UNAVAILABLE", `Routed model ${model.modelId} is not in Claude's discovered model list.`);
 }
 
-export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSnapshot; readonly model: ModelRef; readonly cwd: string; readonly task: string; readonly context: unknown; readonly findings?: readonly string[]; readonly candidateOutput?: string | null; readonly maxTurns?: number }): WriteProviderPlan {
+export function planClaudeWriteInvocation(input: {
+  readonly snapshot: ProviderSnapshot;
+  readonly model: ModelRef;
+  readonly cwd: string;
+  readonly task: string;
+  readonly context: unknown;
+  readonly findings?: readonly string[];
+  readonly candidateOutput?: string | null;
+  readonly maxTurns?: number;
+  /**
+   * Whether this write runs in the workspace itself under the DIRECT policy.
+   *
+   * The difference is the boundary, and it is the operator's choice rather than a capability: the
+   * worktree profile *withholds* a shell because it cannot grant one inside a worktree, and under
+   * DIRECT there is no such claim to make. What is passed instead is the runtime's own permission
+   * mode, with BrainGate's tool allowlist, MCP denial and declared subagents left out — the three
+   * restrictions ADR 0014 classifies as legacy (ADR 0017).
+   */
+  readonly nativeHarness?: boolean;
+  /** The native session this write runs in, when one was resolved. */
+  readonly session?: { readonly kind: string; readonly sessionId: string | null; readonly persistent: boolean } | null;
+}): WriteProviderPlan {
   assertClaudeWriteEligible(input.snapshot, input.model);
+  const nativeHarness = input.nativeHarness === true;
+  const session = input.session ?? null;
+  // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns.
+  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
   const body = JSON.stringify(Object.freeze({
     schemaVersion: 1,
     task: input.task,
     context: input.context,
     findings: Object.freeze([...(input.findings ?? [])]),
     candidateOutput: input.candidateOutput ?? null,
-    constraints: Object.freeze({ smallChangeOnly: true, worktreeOnly: true, noShell: true, noNetwork: true, noSecrets: true, noAgentConfigChanges: true }),
+    constraints: Object.freeze({
+      smallChangeOnly: true,
+      worktreeOnly: !nativeHarness,
+      noShell: !nativeHarness,
+      noNetwork: !nativeHarness,
+      noSecrets: true,
+      noAgentConfigChanges: true,
+      // Recorded in the brief as well as the argv, so a worker that is resuming knows it is.
+      resumedNativeSession: session !== null && session.kind === "resumed",
+    }),
     responseContract: WRITE_SCHEMA,
   }));
   if (body.length === 0 || body.length > 2_000_000) throw new BrainGateInvariantError("WRITE_PAYLOAD_INVALID", "Write payload must be between 1 and 2,000,000 characters.");
   // A ceiling on pathology, not a budget: see ExecutionBudget.maxInspectionTurns. Clamping
   // lower than the budget asks for would silently reimpose the limit this stopped being.
-  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
+
   const args = Object.freeze([
     "--restricted",
     "--safe-mode",
     "-p", GENERIC_WRITE_PROMPT,
     "--output-format", "json",
     "--json-schema", JSON.stringify(WRITE_SCHEMA),
-    "--no-session-persistence",
+    // A write that is continuing a goal keeps its session, and a write that is not leaves none
+    // behind. Both halves were hard-coded before: the flag was always here, so a DIRECT write could
+    // never be resumed by the next compatible write — which is the continuity the M20 architecture
+    // promises and the reason S2 did not exist in dogfood.
+    ...(session !== null && session.kind === "resumed" && session.sessionId !== null ? ["--resume", session.sessionId] : []),
+    ...(session !== null && session.kind === "fresh" && session.sessionId !== null ? ["--session-id", session.sessionId] : []),
+    ...(session !== null && session.persistent ? [] : ["--no-session-persistence"]),
     "--no-chrome",
     "--disable-slash-commands",
     "--permission-mode", "acceptEdits",
-    "--tools", "Read,Glob,Grep,Edit,Write",
-    // CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, which this profile sets, makes Claude Code force
-    // permission mode back to default, so --permission-mode alone leaves every Edit awaiting
-    // an approval that never comes in a headless run and the task ends with no changes. The
-    // CLI's own guidance is to declare the allowlist explicitly, which is narrower than a
-    // permission mode: exactly these five tools, still under the deny list in --settings.
-    "--allowedTools", "Read,Glob,Grep,Edit,Write",
-    "--disallowedTools", "Bash,WebFetch,WebSearch,Agent,NotebookEdit,mcp__*",
-    "--strict-mcp-config",
-    "--mcp-config", "{\"mcpServers\":{}}",
-    "--settings", JSON.stringify(SETTINGS),
+    // In the workspace the runtime keeps its own harness: `--permission-mode acceptEdits` is the
+    // CLI's own setting for "apply edits, ask for everything else", and the settings file keeps the
+    // secret and version-control guards that are policy rather than harness. What is not passed is
+    // the tool allowlist, the `mcp__*` denial and the MCP config BrainGate used to substitute for
+    // the CLI's own — nor the shell denial, which existed because a worktree could not bound one.
+    ...(nativeHarness
+      ? ["--settings", JSON.stringify({ permissions: { ...SETTINGS.permissions, deny: SECRET_AND_VCS_DENY } })]
+      : [
+        // CLAUDE_CODE_SUBPROCESS_ENV_SCRUB, which this profile sets, makes Claude Code force
+        // permission mode back to default, so --permission-mode alone leaves every Edit awaiting
+        // an approval that never comes in a headless run and the task ends with no changes. The
+        // CLI's own guidance is to declare the allowlist explicitly, which is narrower than a
+        // permission mode: exactly these five tools, still under the deny list in --settings.
+        "--tools", "Read,Glob,Grep,Edit,Write",
+        "--allowedTools", "Read,Glob,Grep,Edit,Write",
+        "--disallowedTools", "Bash,WebFetch,WebSearch,Agent,NotebookEdit,mcp__*",
+        "--strict-mcp-config",
+        "--mcp-config", "{\"mcpServers\":{}}",
+        "--settings", JSON.stringify(SETTINGS),
+      ]),
     "--max-turns", String(maxTurns),
     "--model", input.model.modelId,
   ]);
@@ -100,10 +166,14 @@ export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSn
   return Object.freeze({
     providerId: "anthropic",
     grant: resolveToolGrant({
-      role: "primary", providerId: "anthropic", workspaceMode: "task-worktree", writeMode: true,
+      role: "primary", providerId: "anthropic",
+      // The mode is what this invocation actually is: a worktree write, or a write in the workspace
+      // the operator selected. Reported rather than assumed, because the grant is what the plan and
+      // the receipt both read.
+      workspaceMode: nativeHarness ? "project" : "task-worktree", writeMode: true,
       // Claude's boundary here is its settings file and its tool allowlist, not the kernel —
       // which is enough to withhold a shell and not enough to grant one.
-      surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false },
+      surface: { isolatedPerInvocation: true, toolDenial: !nativeHarness, declaredSubagents: !nativeHarness, enforcedSandbox: false },
       attested: true, operatorAccepted: false,
     }),
     executable: input.snapshot.binary,
@@ -112,8 +182,25 @@ export function planClaudeWriteInvocation(input: { readonly snapshot: ProviderSn
     modelId: input.model.modelId,
     quotaPool: input.model.quotaPool,
     stdin: body,
-    allowedEnvKeys: Object.freeze(["CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_SKIP_PROMPT_HISTORY", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]),
-    envOverrides: Object.freeze({ CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" }),
+    // `CLAUDE_CODE_SUBPROCESS_ENV_SCRUB` is a BrainGate-invented hardening, and in the workspace it
+    // is self-defeating: the CLI reacts to it by forcing the permission mode back to `default`, so
+    // `--permission-mode acceptEdits` stops taking effect and every Edit waits for an approval that
+    // a headless run can never give. Real dogfood showed it, in the CLI's own words:
+    //
+    //   ⚠ Permission mode forced to default — CLAUDE_CODE_SUBPROCESS_ENV_SCRUB is set
+    //     (allowed_non_write_users hardening). Declare allowedTools explicitly, or set
+    //     CLAUDE_CODE_SUBPROCESS_ENV_SCRUB=0 to opt out.
+    //
+    // The worktree profile compensates with an explicit tool allowlist; the DIRECT profile
+    // deliberately has none, because there the runtime keeps its own harness. So the scrub stays
+    // where it was earned — the isolated worktree — and is not set in the operator's workspace,
+    // where the operator has already approved the change at BrainGate's own prompt.
+    allowedEnvKeys: Object.freeze(nativeHarness
+      ? ["CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_SKIP_PROMPT_HISTORY"]
+      : ["CLAUDE_CODE_DISABLE_AUTO_MEMORY", "CLAUDE_CODE_SKIP_PROMPT_HISTORY", "CLAUDE_CODE_SUBPROCESS_ENV_SCRUB"]),
+    envOverrides: Object.freeze(nativeHarness
+      ? { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1" }
+      : { CLAUDE_CODE_DISABLE_AUTO_MEMORY: "1", CLAUDE_CODE_SKIP_PROMPT_HISTORY: "1", CLAUDE_CODE_SUBPROCESS_ENV_SCRUB: "1" }),
   });
 }
 

@@ -1,12 +1,23 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import Database from "better-sqlite3";
-import { BrainGateInvariantError, ProjectRegistry, TaskLedger, type RegisteredProject, type TaskClassification, type TaskComplexity, type TaskRisk } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  TaskLedger,
+  executionScopeFor,
+  type ExecutionProject,
+  type TaskClassification,
+  type TaskComplexity,
+  type TaskRisk,
+} from "@braingate/core";
 import { applyDogfoodPrior, DogfoodStore, emptyDogfoodPrior, initializeDogfoodProject, inspectGitRepository, repositoryReadiness } from "./index.js";
+
+
 
 function git(cwd: string, args: readonly string[]): string {
   const result = spawnSync("git", [...args], { cwd, encoding: "utf8", shell: false });
@@ -26,18 +37,18 @@ function repoFixture(label: string): { root: string; repo: string } {
   return { root, repo };
 }
 
-function registered(label: string): { root: string; repo: string; project: RegisteredProject } {
+function registered(label: string): { root: string; repo: string; project: ExecutionProject } {
   const f = repoFixture(label);
   const registry = new ProjectRegistry(join(f.root, "brain-home"));
   const project = registry.register({ projectId: `${label}` as never, name: label, repositories: [f.repo] });
-  return { ...f, project };
+  return { ...f, project: executionScopeFor(project, f.repo).project };
 }
 
 function classification(complexity: TaskComplexity, risk: TaskRisk): TaskClassification {
   return Object.freeze({ complexity, risk, confidence: 0.8, requiresScout: complexity !== "T0", reasons: Object.freeze(["test"]), sensitiveDomains: Object.freeze([]), ruleVersion: "test-rule" });
 }
 
-function receipt(project: RegisteredProject, complexity: TaskComplexity, risk: TaskRisk) {
+function receipt(project: ExecutionProject, complexity: TaskComplexity, risk: TaskRisk) {
   const ledger = new TaskLedger(project);
   const task = ledger.createTask({ title: `Dogfood ${complexity}`, complexity, risk });
   ledger.transition(task.taskId, "running");
@@ -48,7 +59,7 @@ function receipt(project: RegisteredProject, complexity: TaskComplexity, risk: T
   return result;
 }
 
-function record(store: DogfoodStore, project: RegisteredProject, complexity: TaskComplexity = "T1", risk: TaskRisk = "low") {
+function record(store: DogfoodStore, project: ExecutionProject, complexity: TaskComplexity = "T1", risk: TaskRisk = "low") {
   const predicted = classification(complexity, risk);
   const taskReceipt = receipt(project, complexity, risk);
   return store.recordObservation({
@@ -73,47 +84,73 @@ test("project init is local-only, idempotent, and refuses identity conflicts", (
   assert.equal(git(repo, ["status", "--porcelain"]), "");
   const manifest = JSON.parse(readFileSync(first.manifestPath, "utf8")) as { project_id: string; repositories: string[] };
   assert.equal(manifest.project_id, "waslo");
-  assert.deepEqual(manifest.repositories, [".."]);
+  assert.deepEqual(manifest.repositories, [realpathSync.native(repo)]);
   const second = initializeDogfoodProject({ cwd: repo, projectId: "waslo", name: "Waslo" });
   assert.equal(second.created, false);
   assert.throws(() => initializeDogfoodProject({ cwd: repo, projectId: "other", name: "Other" }), /will not be overwritten/);
   assert.equal(git(repo, ["status", "--porcelain"]), "");
 });
 
-// A brand-new directory is where people start, and it was the one place BrainGate turned them
-// away — with git's own error, after it had already asked for a project id and a display name.
-test("a directory with no repository is told what it needs, not handed a git error", () => {
+// A directory with no repository is a workspace. Git is a capability one may have, not a
+// precondition for being registered, and this used to be the one place BrainGate turned people away
+// — with git's own error, after it had already asked for a project id and a display name.
+test("a directory with no repository is registered as a workspace, not turned away", () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-no-repo-"));
-  assert.equal(repositoryReadiness(bare).repositoryPath, null);
-  assert.throws(
-    () => initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh" }),
-    (error: unknown) => error instanceof BrainGateInvariantError
-      && error.code === "PROJECT_NOT_A_REPOSITORY"
-      && /worktree/.test(error.message)
-      && /git init/.test(error.message),
-  );
-  assert.equal(existsSync(join(bare, ".git")), false, "refusing must not leave a repository behind");
+  try {
+    assert.equal(repositoryReadiness(bare).repositoryPath, null);
+    const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh" });
+    assert.equal(result.created, true);
+    assert.equal(result.hasRepository, false);
+    assert.equal(result.repositoryPath, realpathSync.native(bare), "the workspace is the directory they are in");
+    assert.deepEqual(JSON.parse(readFileSync(result.manifestPath, "utf8")).repositories, [realpathSync.native(bare)]);
+    assert.equal(existsSync(join(bare, ".git")), false, "registering must not create a repository");
+    // Registration is what the manifest says; nothing above it is consulted.
+    const registry = new ProjectRegistry(join(bare, "..", "fresh-home"));
+    assert.equal(registry.loadFile(result.manifestPath).repositories[0], realpathSync.native(bare));
+    assert.equal(initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh" }).created, false);
+  } finally { rmSync(bare, { recursive: true, force: true }); }
+});
+
+test("a subdirectory of a repository is registered as itself, not widened to the repository root", () => {
+  const f = repoFixture("subdir-init");
+  try {
+    const workspace = join(f.repo, "flutter_migration");
+    mkdirSync(workspace);
+    writeFileSync(join(workspace, "main.dart"), "void main() {}\n");
+    const result = initializeDogfoodProject({ cwd: workspace, projectId: "flutter-migration", name: "Flutter Migration" });
+    assert.equal(result.hasRepository, true, "a repository is still metadata it has");
+    assert.equal(result.repositoryPath, realpathSync.native(workspace), "and the workspace is the selected directory");
+    assert.deepEqual(JSON.parse(readFileSync(result.manifestPath, "utf8")).repositories, [realpathSync.native(workspace)]);
+    // The manifest still stays out of Git: the ignore is written to the repository's own exclude,
+    // which is found from the subdirectory. The untracked source file is the operator's, not ours.
+    assert.doesNotMatch(git(f.repo, ["status", "--porcelain", "--untracked-files=all"]), /\.brain\//);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
 test("creating the repository is something BrainGate is asked to do, never something it assumes", () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-git-init-"));
-  const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
-  assert.equal(result.created, true);
-  assert.equal(existsSync(join(bare, ".git")), true);
-  // The manifest is registered against the repository that was just made, and stays out of it.
-  assert.equal(git(result.repositoryPath, ["status", "--porcelain"]), "");
-  assert.equal(repositoryReadiness(bare).repositoryPath, result.repositoryPath);
+  try {
+    const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
+    assert.equal(result.created, true);
+    assert.equal(result.hasRepository, true);
+    assert.equal(existsSync(join(bare, ".git")), true);
+    // The manifest is registered against the repository that was just made, and stays out of it.
+    assert.equal(git(result.repositoryPath, ["status", "--porcelain"]), "");
+    assert.equal(repositoryReadiness(bare).repositoryPath, result.repositoryPath);
+  } finally { rmSync(bare, { recursive: true, force: true }); }
 });
 
 test("a repository with no commit yet is a state to report, not a crash", () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-unborn-"));
-  const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
-  // `git rev-parse HEAD` fails on an unborn branch, which is exactly where someone who just ran
-  // `git init` is standing. Questions work there; worktree writes need a commit to branch from.
-  const state = inspectGitRepository(result.repositoryPath);
-  assert.equal(state.head, null);
-  assert.equal(state.clean, true);
-  assert.notEqual(state.branch, null);
+  try {
+    const result = initializeDogfoodProject({ cwd: bare, projectId: "fresh", name: "Fresh", createRepository: true });
+    // `git rev-parse HEAD` fails on an unborn branch, which is exactly where someone who just ran
+    // `git init` is standing. Questions work there; worktree writes need a commit to branch from.
+    const state = inspectGitRepository(result.repositoryPath);
+    assert.equal(state.head, null);
+    assert.equal(state.clean, true);
+    assert.notEqual(state.branch, null);
+  } finally { rmSync(bare, { recursive: true, force: true }); }
 });
 
 test("dogfood telemetry is physically project scoped and append-only", () => {
@@ -230,4 +267,41 @@ test("every workflow role can be recorded, so none fails a task after it succeed
     const stored = store.listRuns().at(-1)!;
     assert.deepEqual(stored.roles.map((entry) => entry.role), ["planner", "primary", "reviewer", "judge"]);
   } finally { store.close(); }
+});
+
+test("a rebind moves a registration to this checkout, and only when it is asked for", () => {
+  const f = repoFixture("rebind");
+  try {
+    // Registered against a checkout that is not this one, which is what a copied clone looks like.
+    const other = join(f.root, "other-repo");
+    mkdirSync(other);
+    git(other, ["init", "-q", "-b", "main"]);
+    git(other, ["config", "user.email", "test@example.invalid"]);
+    git(other, ["config", "user.name", "BrainGate Test"]);
+
+    mkdirSync(join(f.repo, ".brain"), { recursive: true });
+    const manifest = join(f.repo, ".brain", "project.json");
+    writeFileSync(manifest, JSON.stringify({ project_id: "moved", name: "Moved", repositories: [other] }));
+
+    // Without the flag, the manifest is left exactly as it was: a conflict, not an overwrite.
+    assert.throws(
+      () => initializeDogfoodProject({ cwd: f.repo, projectId: "moved", name: "Moved" }),
+      (error: unknown) => error instanceof BrainGateInvariantError && error.code === "PROJECT_INIT_CONFLICT" && /--rebind/.test(error.message),
+      "the refusal must name the flag that would do it deliberately",
+    );
+    assert.equal(JSON.parse(readFileSync(manifest, "utf8")).repositories[0], other, "and nothing was rewritten");
+
+    // With it, the project keeps its identity and follows the operator to this checkout.
+    const rebound = initializeDogfoodProject({ cwd: f.repo, projectId: "moved", name: "Moved", rebind: true });
+    assert.equal(rebound.created, false);
+    assert.equal(rebound.projectId, "moved");
+    const document = JSON.parse(readFileSync(manifest, "utf8"));
+    // Absolute, so it names the directory the operator was in rather than inferring the repository
+    // from where the file sits. A workspace can be a subdirectory, and `..` could not say so.
+    assert.deepEqual(document.repositories, [realpathSync.native(f.repo)], "the manifest names this workspace");
+    const registry = new ProjectRegistry(join(f.root, "rebind-home"));
+    assert.equal(registry.loadFile(manifest).repositories[0], realpathSync.native(f.repo));
+    // And the move is not visible to git, which is the property the local ignore exists for.
+    assert.equal(git(f.repo, ["status", "--porcelain"]), "");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

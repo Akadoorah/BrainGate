@@ -1,8 +1,8 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
-import { BrainGateInvariantError, type RegisteredProject } from "@braingate/core";
+import { BrainGateInvariantError, type ExecutionProject } from "@braingate/core";
 import { SecretGuard, redactSecrets } from "@braingate/security";
 import { GROK_SNAPSHOT_READ_SANDBOX, createIsolatedGrokHome, grokSandboxProfileToml, resolveGrokHome } from "./grok-isolation.js";
 import { trackChild } from "./child-registry.js";
@@ -29,7 +29,7 @@ function inside(root: string, candidate: string): boolean {
   return rel === "" || (!rel.startsWith(`..${sep}`) && rel !== ".." && !isAbsolute(rel));
 }
 
-export function assertShadowProjectCwd(project: RegisteredProject, cwdInput: string): string {
+export function assertShadowProjectCwd(project: ExecutionProject, cwdInput: string): string {
   let cwd: string;
   try { cwd = realpathSync.native(resolve(cwdInput)); }
   catch { throw new BrainGateInvariantError("SHADOW_CWD_INVALID", "Shadow working directory does not exist or cannot be resolved."); }
@@ -56,7 +56,7 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
   readonly #secretGuard = new SecretGuard();
 
   async run(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly plan: ShadowInvocationPlan;
     readonly env?: NodeJS.ProcessEnv;
     readonly timeoutMs?: number;
@@ -78,6 +78,18 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     const internalAllowedEnv = new Set(input.plan.allowedEnvKeys);
 
     try {
+      // Written for either mode before anything else: these are absolute paths outside the workspace
+      // — a response schema a CLI takes as a file — and a DIRECT run needs them precisely because it
+      // has no staged directory to put one in. Placed inside the staged branch first, which is why a
+      // real Codex read reported "Failed to read output schema file: No such file or directory".
+      for (const [externalPath, externalContent] of Object.entries(input.plan.externalFiles ?? {})) {
+        if (!isAbsolute(externalPath) || externalPath.includes("..")) {
+          throw new BrainGateInvariantError("SHADOW_EXTERNAL_FILE_INVALID", "An external file needs an absolute path outside the workspace.");
+        }
+        mkdirSync(dirname(externalPath), { recursive: true, mode: 0o700 });
+        writeFileSync(externalPath, externalContent, { encoding: "utf8", mode: 0o600, flag: "w" });
+      }
+
       if (input.plan.workspaceMode === "staged-clean" || input.plan.workspaceMode === "staged-read-snapshot") {
         // Both modes need an isolated home; only the staged one needs a workspace built here. The
         // snapshot is prepared before the call and handed in, so it is verified (and reused across a

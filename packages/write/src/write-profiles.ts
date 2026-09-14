@@ -40,6 +40,20 @@ export const GROK_WRITE_PROFILE = GROK_WRITE_SANDBOX.name;
 
 const GROK_MINIMUM = "1.0.13";
 
+/**
+ * The providers whose DIRECT write invocation was measured after Claude's (2026-09-14).
+ *
+ * Claude is not in this list because it is the reference implementation and has had one since
+ * ADR 0017: this is the set of providers that gained a DIRECT write in the multi-provider
+ * milestone, and `directWriteCapable` is the question callers should ask instead of membership.
+ */
+export const DIRECT_WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["xai", "openai"]);
+
+/** Whether this provider may write the workspace itself under the DIRECT policy. */
+export function directWriteCapable(providerId: ProviderId): boolean {
+  return providerId === "anthropic" || DIRECT_WRITE_PROVIDERS.includes(providerId);
+}
+
 const WRITE_SCHEMA = Object.freeze({ kind: "work", summary: "string" });
 
 const WRITE_INSTRUCTION = [
@@ -79,7 +93,30 @@ function assertCommonEligibility(snapshot: ProviderSnapshot, model: ModelRef): v
 export interface WriteEligibilityProof {
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
+  /**
+   * Whether this write runs in the workspace itself under the DIRECT policy (ADR 0017).
+   *
+   * Only Claude has an invocation that can honour it: the Codex and Grok write argv are built
+   * around a task worktree and a sandbox profile earned against one, so they refuse rather than
+   * silently running with a boundary they were not proven under.
+   */
+  readonly nativeHarness?: boolean;
+  /**
+   * The native session this write runs in, when one was resolved.
+   *
+   * Structural rather than imported: the decision is made above this layer and passed down as data,
+   * exactly as the read path does it. Absent, the write profile behaves as it always did — no id
+   * pinned, no session resumed, and the run told not to persist one.
+   */
+  readonly session?: WriteNativeSession | null;
   readonly now?: Date;
+}
+
+/** The subset of the session decision a write profile needs to write its flags. */
+export interface WriteNativeSession {
+  readonly kind: "fresh" | "resumed" | "handoff" | "unsupported" | "disabled";
+  readonly sessionId: string | null;
+  readonly persistent: boolean;
 }
 
 /**
@@ -93,6 +130,17 @@ export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef,
   if (snapshot.providerId === "anthropic") { assertClaudeWriteEligible(snapshot, model); return; }
   assertCommonEligibility(snapshot, model);
   const now = proof.now ?? new Date();
+  if (proof.nativeHarness === true) {
+    // DIRECT. The boundary is the workspace the operator selected and the run they approved, and
+    // the permission posture is the CLI's own: Codex's kernel sandbox at `workspace-write`, Grok's
+    // `acceptEdits`, Antigravity's `--mode accept-edits`. There is no BrainGate-written sandbox
+    // profile here, so there is no self-test about one to demand — asking for it would refuse the
+    // very invocation this path exists to make, for a boundary it does not use.
+    if (!DIRECT_WRITE_PROVIDERS.includes(snapshot.providerId)) {
+      throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${snapshot.displayName} has no measured DIRECT write invocation.`);
+    }
+    return;
+  }
   if (snapshot.providerId === "xai") {
     if (!versionAtLeast(snapshot.version.value, GROK_MINIMUM)) {
       throw new BrainGateInvariantError("WRITE_VERSION_TOO_OLD", `Grok must be at least ${GROK_MINIMUM}: below it a sandbox profile that cannot be applied warns and continues.`);
@@ -103,6 +151,14 @@ export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef,
       throw new BrainGateInvariantError("WRITE_GROK_ISOLATION_REQUIRED", "A Grok write requires a current sandbox self-test attestation for this version/platform, earned under the write profile.");
     }
     return;
+  }
+  if (snapshot.providerId !== "openai") {
+    // Antigravity has a DIRECT write and no worktree profile. Saying so here rather than falling
+    // through to Codex's rule keeps the reason the operator sees the true one.
+    throw new BrainGateInvariantError(
+      "WRITE_NATIVE_HARNESS_UNSUPPORTED",
+      `${snapshot.displayName} has a DIRECT write profile only. Choose the direct policy for it, or a provider with a worktree write profile.`,
+    );
   }
   if (!validCodexIsolationAttestation(proof.codexIsolation, snapshot, { now })) {
     throw new BrainGateInvariantError("WRITE_CODEX_ISOLATION_REQUIRED", "A Codex write requires a current sandbox self-test attestation for this version/platform/profile.");
@@ -117,11 +173,13 @@ export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef,
  * without a current proof — is enforced by the code that reads the proof instead of by a
  * constant that happens to match it today.
  */
-function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
+function writeGrant(providerId: ProviderId, attested: boolean, nativeHarness = false): ToolGrant {
   return resolveToolGrant({
     role: "primary",
     providerId,
-    workspaceMode: "task-worktree",
+    // The mode this invocation actually uses, so the plan and the receipt report the boundary the
+    // run had rather than the one the strict modes have.
+    workspaceMode: nativeHarness ? "project" : "task-worktree",
     writeMode: true,
     surface: {
       isolatedPerInvocation: true,
@@ -142,8 +200,16 @@ function writeGrant(providerId: ProviderId, attested: boolean): ToolGrant {
 export interface WriteInvocationInput {
   readonly snapshot: ProviderSnapshot;
   readonly model: ModelRef;
-  /** The task worktree. Never the registered checkout. */
+  /**
+   * Where the worker runs: a task worktree under the worktree policy, the selected workspace under
+   * DIRECT. Which one it is decides the boundary, so the caller states it rather than leaving it to
+   * be inferred from the path.
+   */
   readonly cwd: string;
+  /** Whether the runtime keeps its own harness here, which only DIRECT asks for. */
+  readonly nativeHarness?: boolean;
+  /** The native session this write runs in, when one was resolved. */
+  readonly session?: WriteNativeSession | null;
   readonly task: string;
   readonly context: unknown;
   readonly findings?: readonly string[];
@@ -162,11 +228,124 @@ function brief(input: WriteInvocationInput): string {
     context: input.context,
     findings: Object.freeze([...(input.findings ?? [])]),
     candidateOutput: input.candidateOutput ?? null,
-    constraints: Object.freeze({ smallChangeOnly: true, worktreeOnly: true, noSecrets: true, noAgentConfigChanges: true }),
+    // `worktreeOnly` was hard-coded true, so a DIRECT worker was told its change had to stay inside a
+    // task worktree while its cwd was the operator's workspace — a contradiction in the brief, and
+    // the kind a careful worker resolves by changing nothing.
+    constraints: Object.freeze({ smallChangeOnly: true, worktreeOnly: input.nativeHarness !== true, noSecrets: true, noAgentConfigChanges: true }),
     responseContract: WRITE_SCHEMA,
   }));
   if (body.length === 0 || body.length > 2_000_000) throw new BrainGateInvariantError("WRITE_PAYLOAD_INVALID", "Write payload must be between 1 and 2,000,000 characters.");
   return body;
+}
+
+/**
+ * A DIRECT write, for the providers whose native write posture BrainGate has measured.
+ *
+ * Measured 2026-09-14 on this machine. Each of the three has a way to be told "make this edit
+ * without asking me" that is narrower than a blanket bypass, and that is what an approved DIRECT
+ * write uses:
+ *
+ *   codex-cli 0.153.4  `-s workspace-write`: the kernel sandbox allows writes inside the working
+ *                      root and nowhere else, which is the workspace. No approval prompt exists in
+ *                      `exec`, so nothing waits for an answer BrainGate could not give.
+ *   grok 1.0.24        `--permission-mode acceptEdits`: edits are approved, everything else still
+ *                      needs an approval a headless run cannot give.
+ *   agy 1.2.2          `--mode accept-edits`: the same posture in Antigravity's own vocabulary.
+ *
+ * What is deliberately absent is every flag BrainGate used to substitute for the CLI's harness: no
+ * isolated home, no `--ignore-user-config`, no tool allowlist, no sandbox profile BrainGate wrote,
+ * no `--worktree`. The workspace is the boundary, the operator approved the run, and the diff
+ * guard observes what actually changed afterwards.
+ */
+function planDirectWrite(input: WriteInvocationInput): WriteProviderPlan {
+  const now = input.now ?? new Date();
+  const body = brief({ ...input, context: input.context });
+  const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
+  const schema = jsonSchemaFor(WRITE_SCHEMA);
+  const session = input.session ?? null;
+  const resumedId = session?.kind === "resumed" && session.sessionId !== null ? session.sessionId : null;
+  const persistent = session?.persistent === true;
+  const grant = writeGrant(input.snapshot.providerId, false, true);
+
+  if (input.snapshot.providerId === "openai") {
+    const schemaPath = input.schemaPath;
+    if (schemaPath === undefined) throw new BrainGateInvariantError("WRITE_SCHEMA_PATH_REQUIRED", "A Codex write needs a schema path outside the workspace, so the schema cannot join the diff.");
+    const args = Object.freeze(resumedId === null
+      ? [
+        "exec",
+        "--json",
+        "-C", input.cwd,
+        "--sandbox", "workspace-write",
+        "--model", input.model.modelId,
+        ...(persistent ? [] : ["--ephemeral"]),
+        "--output-schema", schemaPath,
+        "-",
+      ]
+      : [
+        "exec", "resume",
+        "--json",
+        "--model", input.model.modelId,
+        "-c", 'sandbox_mode="workspace-write"',
+        ...(persistent ? [] : ["--ephemeral"]),
+        "--output-schema", schemaPath,
+        resumedId,
+        "-",
+      ]);
+    if (args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--add-dir") || args.includes("--ignore-user-config")) {
+      throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe or workspace-widening Codex flags are forbidden for a write.");
+    }
+    return Object.freeze({
+      providerId: "openai",
+      executable: input.snapshot.binary,
+      args,
+      cwd: input.cwd,
+      modelId: input.model.modelId,
+      quotaPool: input.model.quotaPool,
+      stdin: `${WRITE_INSTRUCTION}\n\n${body}`,
+      allowedEnvKeys: Object.freeze([]),
+      envOverrides: Object.freeze({}),
+      grant,
+      externalFiles: Object.freeze({ [schemaPath]: JSON.stringify(schema, null, 2) }),
+    });
+  }
+
+  if (input.snapshot.providerId === "xai") {
+    const args = Object.freeze([
+      "-p", `${WRITE_INSTRUCTION}\n\n${body}`,
+      "--cwd", input.cwd,
+      "--output-format", "json",
+      "--json-schema", JSON.stringify(schema),
+      "--model", input.model.modelId,
+      "--max-turns", String(maxTurns),
+      "--verbatim",
+      // Edits approved; nothing else is. Never `--always-approve`, which approves every tool.
+      "--permission-mode", "acceptEdits",
+      "--no-alt-screen",
+      ...(resumedId === null
+        ? (session?.kind === "fresh" && session.sessionId !== null ? ["--session-id", session.sessionId] : [])
+        : ["--resume", resumedId]),
+    ]);
+    if (args.some((argument) => argument === "--always-approve" || argument === "bypassPermissions" || argument === "--dangerously-skip-permissions" || argument === "--worktree" || argument === "--sandbox")) {
+      throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe, sandboxed or worktree-creating Grok flags are forbidden for a DIRECT write.");
+    }
+    return Object.freeze({
+      providerId: "xai",
+      executable: input.snapshot.binary,
+      args,
+      cwd: input.cwd,
+      modelId: input.model.modelId,
+      quotaPool: input.model.quotaPool,
+      stdin: "",
+      allowedEnvKeys: Object.freeze(["GROK_HOME"]),
+      envOverrides: Object.freeze({}),
+      grant,
+    });
+  }
+
+  if (input.snapshot.providerId !== "google") {
+    throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${input.snapshot.displayName} has no measured DIRECT write invocation.`);
+  }
+  throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${input.snapshot.displayName} auto-denies every tool it would need in headless mode, so BrainGate has no DIRECT write for it. Its DIRECT read is blocked for the same reason.`);
 }
 
 /**
@@ -181,16 +360,19 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
   assertWriteEligible(input.snapshot, input.model, {
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
     ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+    ...(input.nativeHarness === true ? { nativeHarness: true } : {}),
     now,
   });
 
-  // Claude's write boundary is its settings file and tool allowlist, not a kernel sandbox, so
-  // there is no sandbox attestation to hold and none is claimed: the grant withholds `shell` on
-  // exactly that ground.
   if (input.snapshot.providerId === "anthropic") {
+    // Claude's write boundary is its settings file and tool allowlist, not a kernel sandbox, so
+    // there is no sandbox attestation to hold and none is claimed: the grant withholds `shell` on
+    // exactly that ground.
     const plan = planClaudeWriteInvocation(input);
-    return Object.freeze({ ...plan, grant: writeGrant("anthropic", false) });
+    return Object.freeze({ ...plan, grant: writeGrant("anthropic", false, input.nativeHarness === true) });
   }
+
+  if (input.nativeHarness === true) return planDirectWrite(input);
 
   const body = brief(input);
   const maxTurns = Math.max(1, Math.min(60, Math.floor(input.maxTurns ?? 20)));
@@ -236,6 +418,14 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
     });
   }
 
+  if (input.snapshot.providerId !== "openai") {
+    // Antigravity has a measured DIRECT write and no worktree profile: the only sandbox BrainGate
+    // could point it at is one it wrote and proved, and it has proved none for this CLI.
+    throw new BrainGateInvariantError(
+      "WRITE_NATIVE_HARNESS_UNSUPPORTED",
+      `${input.snapshot.displayName} has a DIRECT write profile only. Choose the direct policy for it, or a provider with a worktree write profile.`,
+    );
+  }
   const schemaPath = input.schemaPath;
   if (schemaPath === undefined) throw new BrainGateInvariantError("WRITE_SCHEMA_PATH_REQUIRED", "A Codex write needs a schema path outside the worktree, so the schema cannot join the diff.");
   const args = Object.freeze([

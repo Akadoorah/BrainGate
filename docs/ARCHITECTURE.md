@@ -4,6 +4,19 @@
 
 BrainGate is deterministic orchestration software. It is not itself an LLM. Provider models are external workers accessed through supported official CLI processes authenticated by the user.
 
+**BrainGate orchestrates coarsely; the native runtime executes finely.** A work unit is dispatched to
+one CLI, and that CLI uses its own tools, shell, subagents, MCP servers, browser and worktrees to
+carry it out. BrainGate accounts for the dispatch and reads whatever usage the runtime reports; it
+does not micromanage what happens inside. Where a boundary is needed it is applied as an explicit
+policy overlay — requested by the operator, or required because nobody is present to approve a
+runtime action — and every overlay is visible in the plan before anything is spent. ADR
+[0014](adr/0014-native-runtime-preservation.md) states this, and classifies every restriction that
+exists today.
+
+Session continuity follows the same division: a provider owns its own session storage, and BrainGate
+stores only the reference that connects a goal to it. Cross-provider continuity is carried by the
+goal's shared state and never depends on any runtime's ability to resume.
+
 ```text
 User
   |
@@ -26,10 +39,119 @@ BrainGate
        `-- Grok Build
 ```
 
+## Conversation, Goal and Task
+
+M20 put a level above the task. A **Conversation** is the session a person is having; a **Goal** is
+what they are trying to achieve in it; a **Task** is one work unit of that goal. The three are
+project-scoped and persisted in the project's own `storage_dir` (`goals.sqlite`), never shared
+across projects.
+
+The distinction that matters is between a **worker claim** and an **accepted finding**. A goal's
+state holds findings BrainGate treats as established, findings established but *not* the active
+cause, and contrary claims that have not displaced either. A worker that asserts a different root
+cause is recorded as `conflicting` beside the established one; it does not overwrite it. Replacing
+an accepted finding is reconciliation, which is a later milestone and deliberately absent here.
+
+Continuity across providers is carried by a **handoff package** derived from that state — findings
+with their evidence, what changed, what ran, what is unresolved — and by a registry of native
+provider sessions. A handoff carries engineering state and never hidden reasoning. Where a
+provider's own session can be resumed, that is recorded as a fact about the session; nothing
+resumes one yet, and the registry says so rather than implying otherwise.
+
+A follow-up also inherits the complexity of the goal it continues. `max(prompt, goal)` is the rule:
+a short follow-up can never be budgeted below the goal it belongs to, and one that introduces new
+risk still raises it. Routing, budgets, grants, isolation and finalization are unchanged and remain
+where they were.
+
+## Project identity and workspace identity
+
+A **project** is the operator's name for a body of work, and it owns durable knowledge: memory,
+preferences, the project identity, quota history. A **workspace** is the local directory the work
+happens in, and its identity is its canonical path — nothing else.
+
+```text
+Project      — the operator's name for a body of work. Owns durable knowledge.
+  └── Workspace  — a concrete local directory. Owns execution truth.
+        └── Conversation ──► Goal ──► Tasks ──► native workers, whose cwd is the directory
+                                             the operator launched from
+```
+
+They are bound by the manifest in the workspace (`.brain/project.json`), and BrainGate enforces the
+binding before it executes anything: the path named by the manifest must contain the directory the
+operator launched from, or the session stops. **Git is metadata a workspace may have**, recorded as
+`gitRoot`, `branch`, `HEAD` and `remote` and used as evidence — never as identity, and never as a
+precondition for registering a directory.
+
+The workspace is the directory the *manifest* names, not the one the shell happens to be in. Launching
+from `repo/src` reads and writes `repo`'s state, so a project has the workspaces it was registered
+with and no others; a directory registered on its own — `braingate init` inside
+`repo/flutter_migration` — is its own workspace. The provider's `cwd` is always the directory the
+operator launched from, and is never widened to the workspace or to a repository root.
+
+Two workspaces of one project are two workspaces even when they share a basename, a commit or a
+remote URL, because those facts say the directories are related and nothing about whether they hold
+the same uncommitted state. Execution truth — the ledger, goals and conversations, native sessions,
+the dogfood corpus, results and evidence, snapshots, worktrees and fingerprints — belongs to the
+workspace it happened in, keyed by an id derived from the path, and is stored under
+`<home>/projects/<projectId>/workspaces/<workspaceId>/`. A goal records the workspace it belongs to,
+and a provider session is bound to project, workspace, goal, provider and model: continuing the same
+logical work in another workspace is a fresh native session plus a goal handoff, never a native
+resume. State written before workspaces existed belongs to no identifiable workspace; it is preserved
+untouched, never read, and never migrated on a guess.
+
+Moving a registration to a different workspace is `braingate init --rebind`, and it is never implied.
+See `docs/adr/0015-workspace-identity.md` and `docs/adr/0016-workspace-scoped-execution-state.md`.
+
+## Role, execution policy and harness
+
+Three things that were once one setting:
+
+```text
+ROLE             = purpose     (plan, execute, review, judge)
+EXECUTION POLICY = boundary    (direct, read-only, worktree, snapshot, unattended)
+NATIVE CLI       = harness     (its tools, shell, subagents, MCP servers, permissions)
+```
+
+The **policy** is chosen, not inferred, and it is the only thing that decides where a worker runs.
+`direct` — the ordinary interactive boundary — runs the native CLI in the selected workspace, with
+the workspace as its `cwd`, no worktree, no snapshot and no commit. `read-only` runs there and is
+verified afterwards to have changed nothing. `worktree` and `snapshot` are the strict modes and are
+unchanged in what they guarantee; they are selected explicitly. `unattended` runs in the workspace
+with BrainGate's own bounds standing in for the runtime's approvals.
+
+The **intent** of a request decides what is wanted — a read or a change — and can only ever narrow
+the policy, never widen it. A request that says "do not modify anything" is read-only whatever is
+selected.
+
+The **harness** belongs to the runtime. Under `direct` the invocation stops substituting BrainGate's
+tool allowlist, MCP refusal and declared subagents for the CLI's own, and passes the CLI's own
+permission mode instead; the guarantees published on the plan are updated to describe what the argv
+actually earns. Where a provider's invocation cannot yet honour that — Grok, Codex and Antigravity
+are built around a staged copy and a sandbox proof earned against it — the plan refuses rather than
+running with an unmeasured boundary. See `docs/adr/0017-direct-execution.md`.
+
+## Native session continuity and its envelope
+
+A native session is a conversation the provider's CLI remembers, and the instruction it was created
+with lasts as long as it does. BrainGate's read profile tells the CLI not to modify files; a session
+created under it is therefore a *read* session, and resuming it for a write asks the model to
+contradict itself. Real dogfood showed the refusal that produces, twice.
+
+So continuity is decided per **execution envelope** — the requested effect, the execution policy,
+the role, whether the invocation told the runtime not to modify anything, and the native permission
+mode — and the newest *compatible* session is the one resumed. One worker can hold several sessions
+for one goal (`read/direct` and `write/direct`), and none of them is deleted when another is created.
+When nothing is compatible the run gets a fresh session and the goal handoff, which is what keeps
+**goal continuity broader than native-session continuity**: the session is an optimisation, the goal
+is the continuity. See `docs/adr/0018-session-execution-envelopes.md`.
+
+Intent is decided by the requested effect and nothing else (`apps/cli/src/request-intent.ts`). A
+constraint like "do not commit" bounds *how* a change is made; it does not turn a write into a read.
+
 ## Execution lifecycle
 
-1. Resolve an explicit project identity.
-2. Create a task ledger record.
+1. Resolve an explicit project identity, and the conversation and goal this request continues.
+2. Create a task ledger record, linked to that goal.
 3. Classify task intent, complexity, risk, read/write needs, and confidence.
 4. If confidence is low, run a bounded cheap scout and reclassify.
 5. Build a minimal context pack from project-scoped sources.
@@ -44,6 +166,11 @@ BrainGate
 14. Finalize: write the result, record the observation, write the marker, then the terminal state —
     in that order, each step idempotent, so a crash at any point is finished by `reconcile`.
 15. Report the recorded outcome, which is the only thing any surface may present as what happened.
+16. Fold the turn into the goal's state, and record where each provider session got to.
+
+Steps 2 and 16 are what make a follow-up a continuation: the task is a work unit *of* a goal, and the
+goal's state — accepted findings, disputed claims, files changed, tests run — is what the next worker
+is handed, whichever runtime it belongs to.
 
 ## Finalization and reconciliation
 

@@ -40,7 +40,14 @@ Codex fills planning, review and judging from a staged workspace, and may hold t
 
 The resulting isolation attestation is bound to the Codex version, platform, and BrainGate permission-profile hash and expires after a short period. A version/profile/platform change requires a new self-test. Native Windows remains fail-closed in this milestone; WSL follows the Linux sandbox path and must pass the same test.
 
-Codex execution additionally uses ephemeral mode, ignores user exec-policy rules and user config, uses a clean non-repository CWD, pins the routed model, and explicitly disables unnecessary model-visible surfaces such as shell/code execution, web search, apps/plugins, browser/computer use, memory, worktrees, and multi-agent/collaboration features. If required configuration is rejected by the installed CLI, strict configuration causes the run to fail rather than silently broaden permissions.
+Codex execution additionally uses ephemeral mode, ignores user exec-policy rules and user config, uses a clean non-repository CWD, pins the routed model, and disables a declared set of model-visible surfaces — shell and code execution, web search, apps and plugins, browser and computer use, memory, worktrees, and multi-agent collaboration. If required configuration is rejected by the installed CLI, strict configuration causes the run to fail rather than silently broaden permissions.
+
+Read that list for what it is. It describes the Codex **isolation contract** this proof was earned
+under: the denied writes are the evidence, so the denials are part of the proof (class A in ADR
+[0014](adr/0014-native-runtime-preservation.md)). It is not a claim that a Codex worker is inherently
+a text-only reader, and it is not the default posture BrainGate intends for interactive work. Codex
+runs this way because this is the boundary BrainGate can prove for it today; a Codex run in a mode
+whose boundary is proven some other way would carry whatever that proof supports.
 
 ### What a role is allowed to do
 
@@ -55,9 +62,15 @@ by proof of a different kind (ADR 0010):
   because what leaves this machine is the one thing no local check can see. Accepting an
   unscoped provider does **not** grant it.
 
-MCP is refused for every role: BrainGate has no per-invocation way to prove what an MCP server
-reaches. Read profiles pass an empty MCP configuration under strict mode, so the servers are not
-loaded rather than merely denied.
+MCP is refused for every role today: BrainGate has no per-invocation way to prove what an MCP
+server reaches. Read profiles pass an empty MCP configuration under strict mode, so the servers are
+not loaded rather than merely denied.
+
+That refusal is classified as a **legacy** restriction in ADR
+[0014](adr/0014-native-runtime-preservation.md), not as a permanent property of the product. It
+contradicts the principle that a runtime keeps its own harness, and replacing it needs a per-server
+policy — which servers, reaching what — rather than a switch from none to all. Until that policy
+exists the refusal stands, and the plan says so before anything is spent.
 
 A capability probe reads each installed CLI's own help text — no prompt, no model, no cost — and
 can only narrow what a profile declares. A flag this build has dropped is refused with a reason
@@ -151,3 +164,58 @@ Task ledgers record classification, routing, provider/model role, permission gra
 - Provider CLI behavior changing unexpectedly.
 - Compromised or malicious third-party skills.
 - Unsafe adaptation caused by a small or noisy dogfood sample.
+
+## Write risk follows the artifact, not the vocabulary
+
+The M11 write-scope guard refuses T3+, high and critical risk. What it is given comes from the
+classifier, and the classifier used to decide risk by matching words anywhere in the request — as
+substrings. Real dogfood showed what that costs: a request to append one inert comment line to
+
+```text
+flutter_migration/…/LaunchImage.imageset/README.md
+```
+
+was refused as high-risk migration work, because `flutter_migration` contains `migration`. The same
+request also read as payment work, because `do not use git checkout` contains `checkout`. Neither
+word said anything about the change.
+
+Risk is now decided by the requested effect and by the **artifact** the request names
+(`packages/core/src/artifact.ts`):
+
+- a documentation artifact — `.md`, `.mdx`, `.txt`, `.rst`, or a `README`/`LICENSE`/`CHANGELOG`
+  basename — contributes **no** domain and never raises the architecture tier, whatever directory it
+  sits in;
+- a `.sql` file, or any file under a `migrations/`, `schema/`, `alembic/`, `flyway/`, `ddl/` or
+  `seeds/` directory, is a schema migration and stays architecture-level and high risk;
+- everything else is judged by the file and directory names it actually lives under, so
+  `auth/login.ts` is authentication work and `payments/processor.ts` is payment work;
+- negative constraints are removed before the wording is read, because "do not commit" bounds *how*
+  a change is made rather than describing it;
+- domain cues match at word starts, so `flutter_migration` is not `migration` and `subscription` is
+  not `auth`.
+
+The gate itself is unchanged, and the tests run through it: real migration, auth and payment writes
+are refused with `WRITE_SCOPE_BLOCKED`, and an inert documentation edit is admitted at T2/low.
+
+## DIRECT execution and the security model
+
+The default interactive policy runs the native CLI in the workspace the operator selected (ADR
+[0017](adr/0017-direct-execution.md)). That is a deliberate change to where the boundary sits, and it
+is worth stating exactly what it does and does not claim.
+
+- **It is the operator's own runtime, in the operator's own directory, on purpose.** The runtime's
+  permission model is the one they accepted when they installed and signed into it, and under DIRECT
+  BrainGate stops substituting its own tool allowlist, MCP refusal and declared subagents for it.
+- **Nothing is granted that the runtime would have asked about.** In a headless run there is nobody to
+  answer a prompt, so a tool the CLI would prompt for is refused by the CLI. BrainGate reports that as
+  the runtime's decision rather than presenting it as a BrainGate guarantee.
+- **What is still enforced by BrainGate**: the secret and version-control deny list in the Claude
+  settings file (`.env`, credentials, keys, `.git` internals, agent/control-plane configuration); no
+  commit, no merge, no branch switch, no reset, no clean; and the read-only intent check, which
+  fingerprints the workspace before and after and refuses a read that changed it.
+- **The strict modes still exist and still mean what they meant.** A worktree write never touches the
+  workspace; a snapshot read cannot. Both are selected explicitly, and an unattended workflow uses
+  them or the `unattended` policy rather than inheriting the interactive default.
+- **A DIRECT write leaves uncommitted changes in the workspace.** That is the point of the policy, and
+  it is reported: which files changed, by which worker, under which policy, and that nothing was
+  committed.

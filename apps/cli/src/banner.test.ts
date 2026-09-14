@@ -13,12 +13,15 @@ test("every frame is a complete picture, never a half-drawn one", () => {
   }
 });
 
-test("the wordmark reveals and the routing line sweeps once", () => {
+test("the wordmark reveals, the track sweeps once, and the tagline settles the picture", () => {
   const frames = bannerFrames(PLAIN);
   assert.match(frames[0]!, /^ {2}▌ {2}B$/, "the first frame should show one letter");
   const still = bannerStill(PLAIN);
   assert.match(still, /B R A I N G A T E/);
-  assert.match(still, /route each task to the cheapest worker/);
+  assert.match(still, /one goal, many native CLIs/);
+  // The banner must not claim what is not built: council orchestration is a later milestone, and a
+  // tagline promising it would be the first thing a new user found to be untrue.
+  assert.doesNotMatch(still, /council|every provider|all providers/i);
 
   // The travelling mark occupies a different cell in each sweep frame, and the gate is always
   // drawn, so the picture reads as one request passing through it.

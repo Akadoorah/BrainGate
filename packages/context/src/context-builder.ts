@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import {
   BrainGateInvariantError,
   assertRegisteredProject,
+  isExecutionProject,
   type RegisteredProject,
 } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
@@ -100,6 +101,11 @@ export class ContextBuilder {
 
   constructor(project: RegisteredProject, memory: ProjectMemory) {
     assertRegisteredProject(project);
+    // A context pack is built from durable project knowledge, so it takes the project handle. Given
+    // a workspace execution handle it would read whichever memory file sat beside the workspace.
+    if (isExecutionProject(project)) {
+      throw new BrainGateInvariantError("CONTEXT_SCOPE_INVALID", "A context pack is project-scoped; a workspace execution handle cannot own one.");
+    }
     if (memory.projectId !== project.projectId) {
       throw new BrainGateInvariantError("CONTEXT_MEMORY_PROJECT_MISMATCH", "ContextBuilder memory must belong to the same registered project.");
     }

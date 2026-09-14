@@ -120,7 +120,7 @@ test("a budget that allows one agent at a time gets no helpers, and is told why"
 test("a build that dropped a flag loses the capability, whatever the profile declares", () => {
   const declared: ProviderGrantSurface = PROVEN;
   // What the probe read from this build's own help text.
-  const narrowed = measuredSurface(declared, { toolDenial: true, declaredSubagents: false, sandbox: true });
+  const narrowed = measuredSurface(declared, { toolDenial: true, declaredSubagents: false, sandbox: true, sessionIdPinning: "unknown" });
   assert.equal(narrowed.declaredSubagents, false, "the reading wins over the declaration");
   assert.equal(narrowed.toolDenial, true);
   assert.equal(grants(grant({ role: "reviewer", surface: narrowed }), "subagents"), false);
@@ -129,13 +129,13 @@ test("a build that dropped a flag loses the capability, whatever the profile dec
 test("a probe that could not read the help leaves the declaration standing", () => {
   // Unknown is not a finding. Refusing on it would make an unreadable terminal look like a
   // missing feature, which is the mistake the probe exists to avoid.
-  const narrowed = measuredSurface(PROVEN, { toolDenial: "unknown", declaredSubagents: "unknown", sandbox: "unknown" });
+  const narrowed = measuredSurface(PROVEN, { toolDenial: "unknown", declaredSubagents: "unknown", sandbox: "unknown", sessionIdPinning: "unknown" });
   assert.deepEqual(narrowed, PROVEN);
   assert.deepEqual(measuredSurface(PROVEN, null), PROVEN);
 });
 
 test("a measurement can never grant what the profile withheld", () => {
-  const narrowed = measuredSurface(BARE, { toolDenial: true, declaredSubagents: true, sandbox: true });
+  const narrowed = measuredSurface(BARE, { toolDenial: true, declaredSubagents: true, sandbox: true, sessionIdPinning: "unknown" });
   assert.equal(narrowed.declaredSubagents, false);
   assert.equal(narrowed.enforcedSandbox, false);
   assert.equal(narrowed.toolDenial, false);
@@ -147,10 +147,13 @@ test("the report speaks the grant's vocabulary without the grant learning the re
       toolDenial: { supported: true },
       declaredSubagents: { supported: false },
       sandbox: { supported: "unknown" },
+      sessionIdPinning: { supported: true },
       structuredSchema: { supported: true },
     },
   });
-  assert.deepEqual(measured, { toolDenial: true, declaredSubagents: false, sandbox: "unknown" });
-  // A feature the report never mentions is unknown, not absent.
+  assert.deepEqual(measured, { toolDenial: true, declaredSubagents: false, sandbox: "unknown", sessionIdPinning: true });
+  // A feature the report never mentions is unknown, not absent. That includes the session reading,
+  // which is what keeps a build nobody probed from being offered native session continuity.
   assert.equal(measuredFrom({ features: {} }).toolDenial, "unknown");
+  assert.equal(measuredFrom({ features: {} }).sessionIdPinning, "unknown");
 });

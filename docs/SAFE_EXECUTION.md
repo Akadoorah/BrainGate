@@ -1,4 +1,26 @@
-# Safe execution boundaries
+# Safe execution
+
+## Execution policy
+
+Where a worker runs is chosen, and it is separate from what the request is about: the classifier
+decides whether the operator wants a read or a change, the policy decides where that may happen.
+Intent can only narrow the boundary, never widen it.
+
+| Policy | Where the worker runs | Writes | Git |
+|---|---|---|---|
+| `direct` (default) | the selected workspace itself | allowed | observed only |
+| `read-only` | the selected workspace | refused, and verified afterwards | observed only |
+| `worktree` | an isolated task worktree | proposed, never applied | required |
+| `snapshot` | an immutable copy taken for the run | refused | required |
+| `unattended` | the selected workspace, nobody present | allowed, under BrainGate's own bounds | observed only |
+
+DIRECT is what ordinary interactive work means: the native CLI runs in the workspace you selected,
+its changes are there when it finishes, and the next worker reads the same files. Nothing is
+committed, merged, reset or cleaned, and uncommitted changes are a normal outcome rather than a
+failure. The strict modes are one `/policy` away and are never chosen for you. See ADR
+[0017](adr/0017-direct-execution.md).
+
+## Boundaries
 
 BrainGate distinguishes **change isolation** from **process isolation**.
 
@@ -53,6 +75,27 @@ These controls are defense in depth and do not replace a provider/OS sandbox.
 
 Skills are physically scoped under either `global/<skill_id>` or `projects/<project_id>/<skill_id>`. A skill cannot broaden the execution profile. High/critical-risk skills cannot auto-load.
 
-## Next security gate
+## Where the boundary comes from now
 
-Provider write execution in Milestone 6 must supply an isolation backend or a separately verified provider-native permission model before `worktree-write` can actually spawn a provider process.
+Write execution shipped in M11 and widened to more than one provider in M16; the isolation backend
+this section used to wait for is the worktree plus the provider's own proven sandbox. What changed in
+M20.2 is the *default posture*, and it is worth stating precisely because it is easy to misread:
+
+- **Interactive work runs the way the runtime runs.** The provider's own permission prompts remain the
+  approval mechanism, exactly as when the operator starts the CLI themselves. BrainGate does not
+  stand in front of them.
+- **A boundary the operator asks for is applied.** A read-only request is a read-only task. A write
+  runs under the selected execution policy — `direct` in the workspace, `worktree` in an isolated
+  worktree the operator reviews — and BrainGate neither commits nor merges on its own (ADR 0017).
+- **Effort follows the budget, not a blanket rule.** A T0–T2 write is one worker unless the operator
+  asks for a reviewer or the budget requires one; a write that changes nothing is reported as a
+  no-change result rather than sent to a reviewer.
+- **Unattended execution is constrained more.** Where nobody is present to approve a runtime action,
+  BrainGate's own policy is what stands in for that approval.
+- **The strict modes remain available** and are chosen, not assumed: project snapshots, isolated
+  worktrees, and the Codex and Grok sandbox attestations proven per run.
+
+The controls in this document — path denial, output redaction, the allowlisted child environment, and
+the API-key stripping — are unaffected and remain in force. They are overlays on a preserved runtime,
+not a replacement harness. ADR [0014](adr/0014-native-runtime-preservation.md) is the principle;
+ADR [0010](adr/0010-tool-grants-are-earned-per-role.md) is still how a capability is earned.

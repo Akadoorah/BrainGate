@@ -1,4 +1,5 @@
-import { BrainGateInvariantError, ProviderQuotaRefusalError, failureKindFromCode, type RegisteredProject, type TaskLedger } from "@braingate/core";
+import { join } from "node:path";
+import { BrainGateInvariantError, ProviderQuotaRefusalError, failureKindFromCode, type ExecutionProject, type TaskLedger } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
 import type { AgentInvoker, AgentRequest, AgentResponse } from "@braingate/workflows";
@@ -9,7 +10,7 @@ import type { TaskSnapshotEvidence, TaskSnapshotProvider } from "./snapshot-prov
 import { providerQuotaRefusal, quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
 import { grants } from "./tool-grants.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
-import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
+import type { OperatorProviderAcceptance, PlannedSessionKind, PlannedSessionReason, PlannedSessionResumeMode, ShadowInvocationPlan, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
 /** What a role is doing, as it happens. */
 export interface RoleActivity {
@@ -59,6 +60,40 @@ export function extractCodexAgentMessage(stdout: string): string {
   return finalMessage;
 }
 
+
+/**
+ * The session id a runtime reported for the run it just finished, when it reports one.
+ *
+ * Measured 2026-09-14: Codex opens its JSONL stream with
+ * `{"type":"thread.started","thread_id":"…"}` before any model work, and Antigravity's print-mode
+ * envelope carries `conversation_id`. Both are read here rather than guessed at, and a run that
+ * never reported one returns `null` — which is a fact about that run, not a failure.
+ *
+ * Deliberately not "the last session this CLI used": that would attach this goal's work to
+ * whatever the operator happened to run in their own terminal.
+ */
+export function reportedSessionIdOf(providerId: string, stdout: string): string | null {
+  if (providerId !== "openai" && providerId !== "google") return null;
+  let found: string | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    if (providerId === "openai") {
+      if (event.type === "thread.started" && typeof event.thread_id === "string") found = event.thread_id;
+      continue;
+    }
+    // Antigravity: the id sits on the envelope itself, and on the inner `result` of a streamed run.
+    if (typeof event.conversation_id === "string") found = event.conversation_id;
+    const result = event.result;
+    if (typeof result === "object" && result !== null && typeof (result as Record<string, unknown>).conversation_id === "string") {
+      found = (result as Record<string, unknown>).conversation_id as string;
+    }
+  }
+  return found;
+}
 
 /**
  * The answer from an Antigravity stream-json run.
@@ -128,6 +163,21 @@ export function lastJsonLine(stdout: string, pick: (event: Record<string, unknow
     if (picked !== null) latest = picked;
   }
   return latest;
+}
+
+/**
+ * The answer a run produced, in whichever dialect its CLI speaks, or `null` when it produced none.
+ *
+ * Exported because the write path needs the same reading: a builder that understood only Claude's
+ * envelope reported "no report was returned by the worker" for a Codex, Grok or Antigravity run that
+ * had answered perfectly well, and an unparseable answer had no words attached to diagnose it.
+ */
+export function providerAnswerText(providerId: string, stdout: string): string | null {
+  try {
+    return unwrapProviderOutput(providerId as ProviderId, stdout);
+  } catch {
+    return null;
+  }
 }
 
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
@@ -355,8 +405,55 @@ function failureAdvice(reason: string | null): string {
   return "";
 }
 
+/**
+ * How one invocation relates to a native provider session, decided by the caller.
+ *
+ * The invoker knows the model and the role but not the goal, and the goal is what a session belongs
+ * to; so the decision is asked for rather than made here. What comes back may also replace the
+ * request's own `task` and `context`, which is how a returning worker is given a *delta* instead of
+ * the whole handoff it already remembers living through.
+ */
+export interface NativeSessionResolution {
+  readonly decision: {
+    readonly kind: PlannedSessionKind;
+    readonly sessionId: string | null;
+    readonly providerId: ProviderId;
+    readonly modelId: string;
+    readonly resumeMode: PlannedSessionResumeMode;
+    readonly reason: PlannedSessionReason | null;
+    readonly persistent: boolean;
+  };
+  /** The request's own text, when the caller narrowed it — a delta plus the work unit. */
+  readonly task?: string | undefined;
+  readonly context?: unknown;
+  /** Extra context for the receipt, describing what the caller decided and why. */
+  readonly note?: string | undefined;
+}
+
+export type NativeSessionResolver = ((input: {
+  readonly role: string;
+  readonly phase: string;
+  readonly model: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string };
+  readonly task: string;
+  readonly context: unknown;
+}) => Promise<NativeSessionResolution | null>) & {
+  /**
+   * What a run reported about its own session, when the runtime mints the id itself.
+   *
+   * A resolver that pins ids has nothing to report: the id was chosen before the call. This exists
+   * for the runtimes that publish theirs in their output, where the reference can only be recorded
+   * once the run has started saying what it is. Optional, because a caller that does not keep
+   * sessions has nothing to record — and a resolver that cannot record must not stop the run.
+   */
+  readonly reportReported?: (input: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly sessionId: string;
+  }) => void;
+};
+
 export class SubscriptionShadowAgentInvoker implements AgentInvoker {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #cwd: string;
   readonly #snapshots: ReadonlyMap<string, ProviderSnapshot>;
   readonly #attestations: ReadonlyMap<string, SubscriptionAttestation>;
@@ -380,9 +477,19 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #onQuotaReading: ((reading: QuotaReading & { readonly quotaPool: string }) => void) | undefined;
   readonly #timeoutMs: number | undefined;
   readonly #snapshotStore: TaskSnapshotProvider | undefined;
+  readonly #nativeHarness: boolean;
+  readonly #nativeSession: NativeSessionResolver | undefined;
+  /**
+   * The last plan this invoker built, so a caller can read back what actually ran.
+   *
+   * The plan is where the session decision and the arguments both live, and reconstructing either
+   * from the response would be a second derivation of the same fact. Read, not decided, here.
+   */
+  #lastPlan: ShadowInvocationPlan | null = null;
+  #lastSessionNote: string | null = null;
 
   constructor(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly cwd: string;
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
@@ -403,6 +510,19 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
      * rather than falling back to the checkout, which is the whole point of the mode.
      */
     readonly snapshotStore?: TaskSnapshotProvider;
+    /**
+     * Asked, per invocation, whether this run continues a native provider session.
+     *
+     * Injected rather than reached for: the goals live in a package the execution layer must not
+     * depend on, and the decision is a property of the *goal* rather than of the run. Absent, no
+     * session is pinned, none is resumed, and nothing is persisted — the pre-M20.2 behaviour.
+     */
+    readonly nativeSession?: NativeSessionResolver;
+    /**
+     * Whether this run keeps the runtime's own harness (the DIRECT policy, ADR 0017). One flag for
+     * one decision: the plan builder is the only place that turns it into argv.
+     */
+    readonly nativeHarness?: boolean;
     /** Tool-use turns a read-only inspection may spend; from the task's execution budget. */
     readonly maxTurns?: number;
     /** Wall-clock allowance for one invocation; from the task's execution budget. */
@@ -465,23 +585,32 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#onQuotaReading = input.onQuotaReading;
     this.#timeoutMs = input.timeoutMs;
     this.#snapshotStore = input.snapshotStore;
+    this.#nativeHarness = input.nativeHarness === true;
+    this.#nativeSession = input.nativeSession;
     if ((this.#ledger === null) !== (this.#taskId === null)) throw new BrainGateInvariantError("SHADOW_LEDGER_INVALID", "ledger and taskId must be supplied together.");
   }
 
   async invoke(request: AgentRequest): Promise<AgentResponse> {
     const snapshot = this.#snapshots.get(request.model.providerId);
     if (snapshot === undefined) throw new BrainGateInvariantError("SHADOW_SNAPSHOT_MISSING", `No provider discovery snapshot for ${request.model.providerId}.`);
+
+    // Asked before the payload is built, because what it answers decides the payload's own `task`
+    // and `context`: a worker resuming its own session is handed the delta since its last turn
+    // rather than the handoff it already remembers, and asking afterwards would mean building the
+    // wrong prompt first and replacing it second.
+    const resolution = await this.#resolveNativeSession(request);
+    const session = resolution?.decision ?? null;
     const payload: ShadowRolePayload = Object.freeze({
       schemaVersion: 1,
       role: request.role,
       phase: request.phase,
-      task: request.task,
+      task: resolution?.task ?? request.task,
       findings: Object.freeze([...request.findings]),
       candidateOutput: request.candidateOutput == null ? null : boundedText(request.candidateOutput),
       // Without this the executor receives a plan in the same field a reviewer receives a draft,
       // and treats the approach it was given as something to critique rather than to follow.
       candidateOutputRole: request.candidateOutput == null ? null : (request.role === "primary" ? "approach-to-follow" : "prior-result-under-review"),
-      context: this.#context,
+      context: resolution === null || resolution.context === undefined ? this.#context : resolution.context,
       responseContract: responseContract(request.role),
     });
     const attestation = this.#attestations.get(request.model.providerId);
@@ -493,7 +622,10 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     // Read-primary only, and only for a provider whose sandbox BrainGate can currently attest. A
     // reviewer on the same provider keeps its staged workspace: the role decides the mode, not the
     // provider, so an attestation for one role never silently changes how another one executes.
-    const snapshotPrimary = request.role === "primary" && snapshotPrimaryEligibility({
+    // A DIRECT run reads the workspace the operator selected. Substituting a copy for it would
+    // make the plan say `project` and the run read something else, which is the one thing the
+    // DIRECT contract forbids outright.
+    const snapshotPrimary = this.#nativeHarness !== true && request.role === "primary" && snapshotPrimaryEligibility({
       providerId: snapshot.providerId,
       snapshot,
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
@@ -519,9 +651,18 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         model: request.model.modelId,
       });
     }
+    // A schema for the runs whose CLI enforces one from a path: Codex, on the DIRECT path only, since
+    // a staged run puts it in the staged workspace. Written under this project's storage, never in
+    // the workspace the run is reading.
+    const schemaPath = this.#nativeHarness && request.model.providerId === "openai" && this.#taskId !== null
+      ? join(this.#project.storageDir, "shadow-schemas", `${this.#taskId}.json`)
+      : undefined;
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
+      ...(session === null ? {} : { nativeSession: session }),
+      ...(schemaPath === undefined ? {} : { schemaPath }),
+      ...(this.#nativeHarness ? { nativeHarness: true } : {}),
       cwd: this.#cwd,
       ...(snapshotEvidence === null ? {} : { snapshotPrimary: true, workspaceRoot: snapshotEvidence.root }),
       ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }),
@@ -546,8 +687,27 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       // travels with the attempt instead of being inferred later from what was planned.
       workspaceMode: plan.workspaceMode,
     });
+    this.#lastPlan = plan;
+    this.#lastSessionNote = resolution?.note ?? null;
+    // Recorded before the call, so a run that never returns still says which session it was for.
+    // The id is the one BrainGate pinned, not a value read back from the provider, so it exists
+    // whether or not the run ever reported anything.
+    if (session !== null && session.kind !== "disabled") {
+      this.#event("session.invocation", {
+        ...safeMeta,
+        kind: session.kind,
+        sessionId: session.sessionId,
+        resumeMode: session.resumeMode,
+        persistent: session.persistent,
+        ...(this.#lastSessionNote === null ? {} : { note: this.#lastSessionNote }),
+      });
+    }
     this.#event("shadow.provider.started", safeMeta);
     this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
+    // What the run said, kept for the failure path. A message like "the provider did not return
+    // parseable JSON" is a diagnosis with no evidence in it, and the evidence is the answer that
+    // failed to parse — which the process-level failure branch already keeps and this one did not.
+    let observedStdout: string | null = null;
     try {
       const result = await this.#executor.run({
         project: this.#project,
@@ -556,6 +716,13 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         ...(this.#onText === undefined ? {} : { onText: this.#onText }),
         ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }),
       });
+      // What the runtime said about its own session, recorded while the run is still in hand. The
+      // resolver owns the goal this belongs to; this layer only knows what came back, and only a run
+      // that succeeded is worth recording a session for.
+      if (result.exitCode === 0 && session !== null && session.sessionId === null) {
+        const reported = reportedSessionIdOf(request.model.providerId, result.stdout);
+        if (reported !== null) this.#nativeSession?.reportReported?.({ providerId: request.model.providerId, modelId: request.model.modelId, sessionId: reported });
+      }
       // The copy the provider was given must still match its manifest, byte for byte, before anything
       // it said is believed. A run that wrote into it is a boundary violation whether or not it also
       // produced an answer — and an answer from a workspace that changed underneath it is not one
@@ -566,6 +733,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           throw new BrainGateInvariantError("SHADOW_SNAPSHOT_MUTATED", "The provider's read-only project snapshot changed during the run, so its output is discarded.");
         }
       }
+      observedStdout = result.stdoutTail ?? result.stdout;
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         const failureKind = result.timedOut ? "timeout" : "provider-failed";
         // Recognised before the event is written, so the refusal is in the failure record itself and
@@ -656,6 +824,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           failureKind: error instanceof BrainGateInvariantError ? failureKindFromCode(error.code) : "unknown",
           code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN",
           error: redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 500),
+          ...(observedStdout === null ? {} : { stdoutTail: redactSecrets(observedStdout).slice(-2_000) }),
         });
       }
       throw error;
@@ -670,6 +839,40 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
 
   #event(kind: string, payload: unknown): void {
     if (this.#ledger !== null && this.#taskId !== null) this.#ledger.appendEvent(this.#taskId, kind, payload);
+  }
+
+  /**
+   * Asks the caller how this invocation relates to a native session.
+   *
+   * A resolver that throws, or that answers with an id this provider's policy does not support, is
+   * refused rather than allowed to describe a continuation that did not happen. Nothing else in the
+   * invoker interprets the answer: it is put on the plan, and the recorder reads it from there.
+   */
+  async #resolveNativeSession(request: AgentRequest): Promise<NativeSessionResolution | null> {
+    if (this.#nativeSession === undefined) return null;
+    const resolved = await this.#nativeSession({
+      role: request.role,
+      phase: request.phase,
+      model: request.model,
+      task: request.task,
+      context: this.#context,
+    });
+    if (resolved === null) return null;
+    const { decision } = resolved;
+    if (decision.sessionId !== null && (decision.kind === "resumed" || decision.kind === "fresh") && decision.sessionId.trim().length === 0) {
+      throw new BrainGateInvariantError("SHADOW_SESSION_INVALID", "A native session decision named a session with an empty id.");
+    }
+    return resolved;
+  }
+
+  /**
+   * What the last invocation actually did about sessions, for the run's record.
+   *
+   * `null` when nothing has run yet. Read from the plan rather than re-derived, so the receipt and
+   * the arguments cannot disagree about whether a session was continued.
+   */
+  lastInvocation(): { readonly plan: ShadowInvocationPlan; readonly note: string | null } | null {
+    return this.#lastPlan === null ? null : Object.freeze({ plan: this.#lastPlan, note: this.#lastSessionNote });
   }
 
   #usage(

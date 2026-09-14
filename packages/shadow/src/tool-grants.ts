@@ -117,6 +117,17 @@ export interface MeasuredCapabilities {
   readonly toolDenial: boolean | "unknown";
   readonly declaredSubagents: boolean | "unknown";
   readonly sandbox: boolean | "unknown";
+  /**
+   * Whether this build lets the caller name the id of a new session.
+   *
+   * A fourth field on a record that already answers "what may a role ask this build to do". It is
+   * not a grant — it does not appear in `ProviderGrantSurface`, because it shapes how a provider is
+   * *driven* rather than what it is *allowed* — but it is the same kind of fact: a reading of the
+   * installed build, taken once, that decides whether a capability may be offered at all. Native
+   * session continuity is gated on it, so a build that dropped `--session-id` refuses continuity
+   * instead of failing at the provider with a flag error.
+   */
+  readonly sessionIdPinning: boolean | "unknown";
 }
 
 /**
@@ -134,6 +145,7 @@ export function measuredFrom(report: {
     toolDenial: read("toolDenial"),
     declaredSubagents: read("declaredSubagents"),
     sandbox: read("sandbox"),
+    sessionIdPinning: read("sessionIdPinning"),
   });
 }
 

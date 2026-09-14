@@ -2,6 +2,12 @@
 
 BrainGate is a local AI engineering control plane for developers who already subscribe to one or more AI coding products.
 
+It is one workspace, one conversation and one goal across the CLIs you already pay for — Claude Code,
+Codex, Antigravity, Grok and their exposed models — while each of those CLIs keeps its own tools,
+shell, subagents, MCP servers, browser and sessions. BrainGate selects, launches, resumes, switches,
+hands off, constrains when a boundary is asked for, observes and accounts. It does not reimplement
+the agent harness underneath. ADR [0014](adr/0014-native-runtime-preservation.md).
+
 The user asks BrainGate a question or requests a change. BrainGate identifies the active project, classifies complexity and risk, retrieves only relevant context, allocates a bounded execution budget, selects an available model role, and records the result.
 
 The long-term product thesis is:

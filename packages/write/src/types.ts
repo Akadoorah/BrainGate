@@ -1,4 +1,4 @@
-import type { ExecutionBudget, TaskClassification, TaskReceipt } from "@braingate/core";
+import type { ExecutionBudget, ExecutionPolicyId, TaskClassification, TaskReceipt } from "@braingate/core";
 import type { ProviderId } from "@braingate/providers";
 import type { ModelRef, RouteResult } from "@braingate/router";
 import type { ToolGrant } from "@braingate/shadow";
@@ -48,7 +48,7 @@ export interface PlannedWriteRole {
   readonly role: "primary" | "reviewer";
   readonly model: ModelRef;
   readonly route: RouteResult;
-  readonly workspace: "task-worktree" | "staged-review" | "project-read-only";
+  readonly workspace: "task-worktree" | "staged-review" | "project-read-only" | "workspace";
 }
 
 export interface WriteTaskPlan {
@@ -57,6 +57,8 @@ export interface WriteTaskPlan {
   readonly requiredContextTokens: number;
   readonly repositoryPath: string;
   readonly baseRef: string;
+  /** The boundary this plan runs inside: the workspace itself, or an isolated worktree (ADR 0017). */
+  readonly policy: ExecutionPolicyId;
   readonly roles: readonly PlannedWriteRole[];
   readonly providerCallsOnPlan: 0;
   readonly createsWorktree: false;
@@ -73,14 +75,37 @@ export interface WriteVerificationResult {
 export interface WriteRunResult {
   readonly dryRun: boolean;
   readonly taskId: string | null;
-  readonly worktree: Readonly<{ path: string; branch: string; baseRef: string }> | null;
+  /** `null` under the DIRECT policy: the run happened in the workspace, so there is no second directory. */
+  readonly worktree: Readonly<{ path: string; branch: string | null; baseRef: string }> | null;
+  readonly executionPolicy?: ExecutionPolicyId;
+  /** The directory the worker ran in, recorded so the cwd a run actually used can be audited. */
+  readonly providerCwd?: string;
+  /**
+   * What the worker said it did, when it said anything.
+   *
+   * A write's result is its diff, so a run that changed nothing used to leave no trace of the
+   * worker's own words at all — and "the worker reported success and changed nothing" was
+   * indistinguishable from "the worker was never asked". Recorded, bounded and redacted.
+   */
+  readonly report?: string | null;
+  /** True when the run finished and the workspace did not change: a truthful no-change result. */
+  readonly noChange?: boolean;
+  /**
+   * True when the session the run resumed turned out not to exist, and a fresh one carried it.
+   *
+   * The decision to resume was still the right one at the time it was made; this says what the
+   * runtime then did. Without it a surface prints "resuming session X" for a run that in fact
+   * started a new conversation, which is the ledger and the terminal telling different stories.
+   */
+  readonly sessionRecovered?: boolean;
   readonly changedFiles: readonly string[];
   readonly diff: string;
   readonly verification: readonly WriteVerificationResult[];
   readonly review: Readonly<{ providerId: string; modelId: string; verdict: string; findings: readonly string[] }> | null;
   /** True only when verification passed and the configured reviewer approved (or review was explicitly disabled). */
   readonly readyForApproval: boolean;
-  readonly approvalRequired: true;
+  /** False under DIRECT: the change is already in the workspace, so there is nothing to approve. */
+  readonly approvalRequired: boolean;
   readonly mergePerformed: false;
   readonly taskReceipt: TaskReceipt | null;
 }

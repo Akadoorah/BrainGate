@@ -11,7 +11,7 @@ import {
   type FailureKind,
   type FinalizationPlan,
   type ObservationRole,
-  type RegisteredProject,
+  type ExecutionProject,
   type TaskClassification,
   type TaskFinalizer,
   type TaskLedger,
@@ -20,13 +20,16 @@ import {
 } from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteResult } from "@braingate/router";
+import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RoutePin, type RouteResult } from "@braingate/router";
 import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
-import { assertWriteEligible, planWriteInvocation } from "./write-profiles.js";
+import { WRITE_PROVIDERS, assertWriteEligible, directWriteCapable, planWriteInvocation } from "./write-profiles.js";
+import { changedPaths, providerAnswerText, reportedSessionIdOf, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
+import type { ExecutionPolicyId } from "@braingate/core";
+import { redactSecrets } from "@braingate/security";
 import { collectGuardedDiff } from "./diff-guard.js";
 import { collectArtifacts, parseArtifactDeclarations, type CollectedArtifact } from "./artifact-collector.js";
 import type { PlannedWriteRole, VisualRequest, WriteProviderExecutor, WriteRunResult, WriteTaskPlan, WriteVerificationResult } from "./types.js";
@@ -88,6 +91,77 @@ function assertM11Scope(classification: TaskClassification): void {
   if (classification.risk === "high" || classification.risk === "critical" || classification.complexity === "T3" || classification.complexity === "T4") {
     throw new BrainGateInvariantError("WRITE_SCOPE_BLOCKED", "M11 permits only T0-T2 low/medium-risk code changes. Auth, payment, security, migration and other high-risk writes remain blocked.");
   }
+}
+
+/**
+ * What the write worker said, from the CLI's own envelope.
+ *
+ * The write profile asks for `{ summary: string }`, and Claude returns it inside its JSON result.
+ * Anything unreadable is reported as unreadable rather than invented, and the text is bounded and
+ * redacted before it reaches the ledger.
+ */
+/** The last complete JSON object in a text, which is how a narrating worker still answers. */
+function lastBalancedObjectIn(text: string): Record<string, unknown> | null {
+  const end = text.lastIndexOf("}");
+  if (end < 0) return null;
+  for (let start = text.indexOf("{"); start >= 0 && start < end; start = text.indexOf("{", start + 1)) {
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1)) as unknown;
+      if (typeof parsed === "object" && parsed !== null) return parsed as Record<string, unknown>;
+    } catch { /* not this one */ }
+  }
+  return null;
+}
+
+function workerReportOf(stdout: string, providerId?: string): string {
+  const envelope = ((): Record<string, unknown> | null => {
+    try {
+      const parsed = JSON.parse(stdout.trim()) as unknown;
+      if (typeof parsed !== "object" || parsed === null) return null;
+      const record = parsed as Record<string, unknown>;
+      // Claude's envelope nests the answer in `result` as a JSON string; a bare object is also read.
+      if (typeof record.result === "string") {
+        try {
+          const inner = JSON.parse(record.result) as unknown;
+          if (typeof inner === "object" && inner !== null) return inner as Record<string, unknown>;
+        } catch { return null; }
+      }
+      return record;
+    } catch { return null; }
+  })();
+  const summary = envelope?.summary;
+  if (typeof summary === "string" && summary.trim().length > 0) return redactSecrets(summary.trim()).slice(0, 2_000);
+  // Claude's is not the only envelope. A Codex run answers in JSONL, Grok and Antigravity in their
+  // own single objects, and all three were reported as "no report" while having reported clearly.
+  if (providerId !== undefined) {
+    const answer = providerAnswerText(providerId, stdout);
+    if (answer !== null) {
+      const inner = ((): Record<string, unknown> | null => {
+        try {
+          const parsed = JSON.parse(answer) as unknown;
+          if (typeof parsed !== "object" || parsed === null) return null;
+          return parsed as Record<string, unknown>;
+        } catch { return lastBalancedObjectIn(answer); }
+      })();
+      const nested = inner?.summary;
+      const text = typeof nested === "string" && nested.trim().length > 0 ? nested : answer;
+      if (text.trim().length > 0) return redactSecrets(text.trim()).slice(0, 2_000);
+    }
+  }
+  return "no report was returned by the worker";
+}
+
+/**
+ * Whether the CLI said the session we resumed does not exist.
+ *
+ * Measured against Claude Code 2.1.270: a `--resume <id>` for a session it has never heard of ends
+ * with `No conversation found with session ID: <id>` and a non-zero exit. Sessions are the runtime's
+ * own state — an operator can clear them, and a run that dies before the CLI persists one leaves a
+ * reference to nothing — so this is an ordinary condition to recover from rather than a task
+ * failure. The recorded reference is kept: it is evidence of what was attempted.
+ */
+export function sessionMissingFrom(output: string): boolean {
+  return /no conversation found with session id|session (?:id )?not found|unknown session/i.test(output);
 }
 
 function isNoEligibleModel(error: unknown): boolean {
@@ -161,16 +235,35 @@ export function buildWriteTaskPlan(input: {
   readonly requiredContextTokens: number;
   readonly repositoryPath: string;
   readonly baseRef: string;
+  /**
+   * The execution boundary this write runs inside (ADR 0017).
+   *
+   * `worktree` is the strict mode: an isolated worktree the operator merges. `direct` edits the
+   * workspace itself, which is what ordinary interactive work means — and it is why
+   * `createsWorktree` is false and no merge is ever offered for it.
+   */
+  readonly policy?: ExecutionPolicyId;
   readonly review?: boolean;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * The primary only. A write is still reviewed by whoever is independent of it, and pinning the
+   * reviewer would defeat the reason a reviewer exists.
+   */
+  readonly pin?: RoutePin | undefined;
 }): WriteTaskPlan {
   assertM11Scope(input.classification);
   if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("WRITE_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
   // Every provider that cannot prove a bounded place to work is excluded here, rather than one
   // provider being named as the only one allowed to. The router then picks on capability among
   // whoever is left, which is what makes the executing role something more than one subscription.
+  const direct = input.policy === "direct" || input.policy === "unattended";
   const writeProof = {
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
     ...(input.grokWriteIsolation === undefined ? {} : { grokIsolation: input.grokWriteIsolation }),
+    // The policy decides which proof a write owes: a worktree write owes the sandbox self-test,
+    // and a DIRECT write owes the operator's approval of the workspace it edits.
+    ...(direct ? { nativeHarness: true } : {}),
   };
   const primaryExcluded = input.providers
     .filter((snapshot) => {
@@ -184,10 +277,21 @@ export function buildWriteTaskPlan(input: {
       }
     })
     .map((snapshot) => snapshot.providerId);
-  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: primaryExcluded });
+  if (direct) {
+    // Only the providers whose invocation can honestly run in the workspace. The rest are not
+    // refused here but excluded from routing, so the answer to "which model" is decided by the
+    // router among the ones that can, and the operator sees that in the plan.
+    primaryExcluded.push(...WRITE_PROVIDERS.filter((providerId) => !directWriteCapable(providerId)));
+    // And the automatic route keeps the shape it was accepted with: DIRECT work goes to the
+    // reference provider unless the operator named another worker. Making a selected worker run
+    // natively is this milestone; re-routing every write to another subscription is a different
+    // decision, and the operator makes it by naming the worker.
+    if (input.pin === undefined) primaryExcluded.push("openai", "google", "xai");
+  }
+  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);
   assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProof);
-  const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: "task-worktree" })];
+  const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: direct ? "workspace" : "task-worktree" })];
 
   const wantsReview = input.review ?? true;
   if (wantsReview) {
@@ -212,32 +316,39 @@ export function buildWriteTaskPlan(input: {
     requiredContextTokens: input.requiredContextTokens,
     repositoryPath: input.repositoryPath,
     baseRef: input.baseRef,
+    policy: direct ? "direct" : "worktree",
     roles: Object.freeze(roles),
     providerCallsOnPlan: 0,
     createsWorktree: false,
+    // A change made in the workspace is already where the operator works. There is nothing to
+    // merge, and offering a merge would imply the edit had been held somewhere.
     mergeAvailable: false,
   });
 }
 
 export class WriteDogfoodRunner {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #ledger: TaskLedger;
   readonly #router: CapabilityRouter;
+  readonly #pin: RoutePin | undefined;
   readonly #providers: readonly ProviderSnapshot[];
   readonly #attestations: readonly SubscriptionAttestation[];
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #grokWriteIsolation: GrokIsolationAttestation | undefined;
   readonly #acceptances: readonly OperatorProviderAcceptance[];
+  readonly #nativeSession: NativeSessionResolver | undefined;
   readonly #finalizer: TaskFinalizer;
   readonly #writer: WriteProviderExecutor;
   readonly #reviewExecutor: ShadowProcessExecutor | undefined;
   readonly #visualExecutor: ShadowProcessExecutor | undefined;
 
   constructor(input: {
-    readonly project: RegisteredProject;
+    readonly project: ExecutionProject;
     readonly ledger: TaskLedger;
     readonly router: CapabilityRouter;
+    /** The worker the operator named by hand, applied to every route this runner makes. */
+    readonly pin?: RoutePin | undefined;
     readonly providers: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
     readonly acceptances?: readonly OperatorProviderAcceptance[];
@@ -251,10 +362,20 @@ export class WriteDogfoodRunner {
     readonly visualExecutor?: ShadowProcessExecutor;
     /** Where this run's permanent record is written. Required; see `ShadowDogfoodRunner`. */
     readonly finalizer: TaskFinalizer;
+    /**
+     * The session resolver, for the write intent.
+     *
+     * The write path had none, so a DIRECT write could neither create the write-compatible session
+     * the M20 architecture promises nor record one: dogfood produced a task with no session at all,
+     * and the next write had nothing to resume. Same resolver, same envelope rules — only the intent
+     * differs, which is exactly what makes READ→WRITE land on a fresh write session.
+     */
+    readonly nativeSession?: NativeSessionResolver;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
     this.#router = input.router;
+    this.#pin = input.pin;
     this.#providers = input.providers;
     this.#attestations = input.attestations ?? [];
     this.#codexIsolation = input.codexIsolation;
@@ -264,6 +385,7 @@ export class WriteDogfoodRunner {
     this.#writer = input.writer ?? new NodeClaudeWriteExecutor();
     this.#reviewExecutor = input.reviewExecutor;
     this.#visualExecutor = input.visualExecutor;
+    this.#nativeSession = input.nativeSession;
     this.#finalizer = input.finalizer;
   }
 
@@ -271,6 +393,8 @@ export class WriteDogfoodRunner {
     readonly task: string;
     readonly repositoryPath: string;
     readonly baseRef?: string;
+    /** Defaults to `worktree`: the strict mode, and the one this path shipped with. */
+    readonly policy?: ExecutionPolicyId;
     readonly classification: TaskClassification;
     readonly budget: ExecutionBudget;
     readonly requiredContextTokens: number;
@@ -286,7 +410,23 @@ export class WriteDogfoodRunner {
       readonly effective: TaskClassification;
       readonly prior: unknown;
     };
-    readonly review?: boolean;
+    /**
+     * The goal this write continues, so a write is a work unit of the goal like a read is.
+     *
+     * Without it the task was created with no goal and no conversation, which is why the write never
+     * appeared in the goal's history and the next request could not continue from it.
+     */
+    readonly goalId?: string | null;
+    readonly conversationId?: string | null;
+    /**
+     * Whether to run a reviewer.
+     *
+     * `undefined` follows the budget: `required` reviews, anything else does not. A T0–T2 DIRECT
+     * write is one worker unless the operator asks otherwise — the old default of `true` bought a
+     * second subscription for a documentation edit and, on an empty change, produced a recorded
+     * refusal instead of the truth.
+     */
+    readonly review?: boolean | undefined;
     readonly dryRun?: boolean;
     readonly env?: NodeJS.ProcessEnv;
   }): Promise<WriteRunResult> {
@@ -302,14 +442,33 @@ export class WriteDogfoodRunner {
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
+      ...(this.#pin === undefined ? {} : { pin: this.#pin }),
       repositoryPath: input.repositoryPath,
       baseRef: input.baseRef ?? "HEAD",
-      review: input.review ?? true,
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
+      review: input.review ?? input.budget.reviewerPolicy === "required",
     });
+    // The DIRECT policy: the worker runs in the workspace itself. No worktree is prepared, nothing
+    // is merged, and what it changed is reported by comparing the workspace before and after.
+    const direct = plan.policy === "direct";
     if (input.dryRun ?? false) return Object.freeze({ dryRun: true, taskId: null, worktree: null, changedFiles: Object.freeze([]), diff: "", verification: Object.freeze([]), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: null });
 
-    const task = this.#ledger.createTask({ title: taskTitleFor(input.task), complexity: input.classification.complexity, risk: input.classification.risk });
-    this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: true, mergeAvailable: false });
+    const task = this.#ledger.createTask({
+      title: taskTitleFor(input.task),
+      complexity: input.classification.complexity,
+      risk: input.classification.risk,
+      ...(input.goalId === undefined || input.goalId === null ? {} : { goalId: input.goalId }),
+      ...(input.conversationId === undefined || input.conversationId === null ? {} : { conversationId: input.conversationId }),
+      // The routed roles, recorded where every reader already looks for a route. The write path used
+      // to keep them only in `task.execution`, so `/status` said "no route recorded" about a task
+      // whose own receipt named primary and reviewer.
+      route: Object.freeze({
+        policy: plan.policy,
+        roles: Object.freeze(plan.roles.map((role) => ({ role: role.role, providerId: role.model.providerId, modelId: role.model.modelId }))),
+      }),
+    });
+    // `worktreeOnly` was hard-coded true here, so a DIRECT plan described itself as a worktree write.
+    this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: !direct, mergeAvailable: false, executionPolicy: plan.policy });
 
     /**
      * The one place this run's outcome is composed.
@@ -362,10 +521,27 @@ export class WriteDogfoodRunner {
       finalized = true;
       this.#finalizer.finalize(finalization);
     };
+    /**
+     * Who did the work, written before the receipt that has to carry it.
+     *
+     * This used to be appended only in the `finally`, which runs *after* the return expression has
+     * been evaluated — so the receipt handed back to the caller was a snapshot from before its own
+     * execution record existed. The read path's receipt has always carried it; the write path's did
+     * not, which is why a write turn reached the goal delta with no attribution at all and the
+     * operator was told "another worker" about a change whose author the ledger knew.
+     */
+    let executionRecorded = false;
+    const recordExecution = (): void => {
+      if (executionRecorded) return;
+      executionRecorded = true;
+      try { this.#ledger.appendEvent(task.taskId, "task.execution", executionRecord(executionAttribution({ events: this.#ledger.receipt(task.taskId).events, planned: observationRolesFor(plan.roles) }))); }
+      catch { /* evidence, not the run's own error: never replace it */ }
+    };
     // The receipt is read after finalization, not while building the return value: a return
     // expression is evaluated before the surrounding `finally` runs, so reading it there would
     // report the state from before the outcome was recorded.
     const finish = (): TaskReceipt => {
+      recordExecution();
       complete();
       return this.#ledger.receipt(task.taskId);
     };
@@ -383,16 +559,25 @@ export class WriteDogfoodRunner {
     });
 
     const worktrees = new WorktreeGuard(this.#project);
-    let handle;
+    let handle: { readonly repositoryPath: string; readonly worktreePath: string; readonly branch: string | null; readonly baseRef: string; readonly worktree?: import("@braingate/execution").WorktreeHandle };
     try {
-      handle = worktrees.prepare({ taskId: task.taskId, repositoryPath: input.repositoryPath, baseRef: plan.baseRef });
+      handle = direct
+        // The workspace itself. `worktreePath` is the same directory, because in this policy there
+        // is no second place for the work to happen — and every reader below that says "the
+        // worktree" is reading the operator's own files, which is the point of the policy.
+        ? { repositoryPath: input.repositoryPath, worktreePath: input.repositoryPath, branch: null, baseRef: plan.baseRef }
+        : (() => { const prepared = worktrees.prepare({ taskId: task.taskId, repositoryPath: input.repositoryPath, baseRef: plan.baseRef }); return { repositoryPath: prepared.repositoryPath, worktreePath: prepared.worktreePath, branch: prepared.branch, baseRef: prepared.baseRef, worktree: prepared }; })();
       // The state of the source checkout before anything ran, as a hash of everything a provider
       // could touch: HEAD, the index, tracked changes, and the *content* of untracked and
       // ignored files — which is where a `.env` lives, and where `git status` alone sees nothing.
       // Every check below compares against this rather than merely asking whether the tree is
       // clean, because a run that rewrote an ignored file would leave it clean and changed.
-      const sourceBefore = sourceCheckoutFingerprint(handle.repositoryPath);
-      this.#ledger.transition(task.taskId, "running", { write: true, branch: handle.branch, workspace: "task-worktree" });
+      // The state the workspace was in before the worker touched it. In DIRECT that is what the
+      // change report is computed from; in the worktree mode it is what proves the source checkout
+      // was never the thing being edited.
+      const workspaceBefore: WorkspaceSnapshot = snapshotWorkspace(direct ? handle.worktreePath : handle.repositoryPath);
+      const sourceBefore = direct ? null : sourceCheckoutFingerprint(handle.repositoryPath);
+      this.#ledger.transition(task.taskId, "running", { write: true, branch: handle.branch, workspace: direct ? "workspace" : "task-worktree", executionPolicy: plan.policy, providerCwd: handle.worktreePath });
       const primary = plan.roles[0]!;
       const primarySnapshot = snapshotFor(this.#providers, primary.model.providerId);
       // Turns and wall clock come from the task's own budget rather than a fixed ceiling, for
@@ -401,9 +586,27 @@ export class WriteDogfoodRunner {
       // A schema path outside the worktree, for a CLI that reads its schema from a file: inside
       // it, the schema would arrive in the diff as part of the change.
       const schemaPath = join(this.#project.storageDir, "write-schemas", `${task.taskId}.json`);
+      // Resolved before the call, so the id exists even if the process dies during it — the same
+      // property the read path relies on. A read-only session is refused here rather than reused:
+      // its standing instruction lasts as long as it does (ADR 0018).
+      const session = this.#nativeSession === undefined
+        ? null
+        : await this.#nativeSession({ role: "primary", phase: "write", model: primary.model, task: input.task, context: input.context });
+      if (session !== null && session.decision.kind !== "disabled") {
+        this.#ledger.appendEvent(task.taskId, "session.invocation", {
+          role: "primary", phase: "write",
+          kind: session.decision.kind,
+          sessionId: session.decision.sessionId,
+          resumeMode: session.decision.resumeMode,
+          persistent: session.decision.persistent,
+          ...(session.note === undefined ? {} : { note: session.note }),
+        });
+      }
       const invocation = planWriteInvocation({
         snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath,
-        task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
+        ...(direct ? { nativeHarness: true } : {}),
+        ...(session === null ? {} : { session: session.decision }),
+        task: input.task, context: session?.context ?? input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
         ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
         // The write profile's proof, not the reviewer's: they are different policies.
         ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
@@ -412,7 +615,38 @@ export class WriteDogfoodRunner {
       // came back empty left nothing saying a call had happened. These are the same event kinds
       // the read path emits, so one reader understands both.
       this.#ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool });
-      const result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
+      let result = await this.#writer.run({ plan: invocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
+      // A session the runtime no longer has is not a reason to fail the task: the goal handoff is
+      // what the next worker needs, so the run is retried once without the session reference. The
+      // alternative is what real dogfood produced — a write that cannot proceed because a reference
+      // to a session that never came into existence is resumed forever.
+      let recoveredFromMissingSession = false;
+      // A runtime that mints its own session id reports it in the output; the resolver records it
+      // against this goal so the next compatible write can continue it.
+      if (session !== null && session.decision.sessionId === null && result.exitCode === 0) {
+        const reported = reportedSessionIdOf(primary.model.providerId, result.stdout);
+        if (reported !== null) this.#nativeSession?.reportReported?.({ providerId: primary.model.providerId, modelId: primary.model.modelId, sessionId: reported });
+      }
+      if (!result.spawned || result.timedOut || result.exitCode !== 0) {
+        const missing = sessionMissingFrom(`${result.stdout}\n${result.stderr}`);
+        if (missing && session !== null && session.decision.kind === "resumed") {
+          recoveredFromMissingSession = true;
+          this.#ledger.appendEvent(task.taskId, "session.unavailable", {
+            role: "primary", phase: "write",
+            kind: session.decision.kind, sessionId: session.decision.sessionId,
+            note: "the runtime no longer has this session; retried with a fresh one and the goal handoff",
+          });
+          const freshInvocation = planWriteInvocation({
+            snapshot: primarySnapshot, model: primary.model, cwd: handle.worktreePath,
+            ...(direct ? { nativeHarness: true } : {}),
+            session: Object.freeze({ kind: "fresh" as const, sessionId: session.decision.sessionId, persistent: session.decision.persistent }),
+            task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
+            ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
+            ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
+          });
+          result = await this.#writer.run({ plan: freshInvocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
+        }
+      }
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         // Recognised and recorded even though this path will not act on it: a write that was refused
         // is a fact the operator needs, whether or not a failover is safe here (it is not — the
@@ -436,10 +670,15 @@ export class WriteDogfoodRunner {
         });
         throw new BrainGateInvariantError("WRITE_PROVIDER_FAILED", `${primary.model.providerId} write provider failed with exit ${result.exitCode ?? "none"}${result.timedOut ? " (timeout/output cap)" : ""}.`);
       }
-      this.#ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool, durationMs: result.durationMs });
+      this.#ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: primary.model.providerId, model: primary.model.modelId, quotaPool: primary.model.quotaPool, durationMs: result.durationMs, ...(recoveredFromMissingSession ? { recoveredFromMissingSession: true } : {}) });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "provider_call", value: 1, unit: "call" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "measured", metric: "duration_ms", value: result.durationMs, unit: "ms" });
       this.#ledger.recordUsage({ taskId: task.taskId, provider: primary.model.providerId, model: primary.model.modelId, evidence: "unknown", metric: "provider_tokens", value: null, unit: "tokens" });
+      // What the worker said it did. The write profile answers with a `summary`, and nothing read
+      // it: a worker that replied "I could not edit the file" left no trace at all, which is how a
+      // real dogfood task ended with `result = none · 0 bytes` and no explanation.
+      const report = workerReportOf(result.stdout, primary.model.providerId);
+      this.#ledger.appendEvent(task.taskId, "write.primary.reported", { role: "primary", provider: primary.model.providerId, model: primary.model.modelId, report });
 
       // A visual task runs a second, artifact-producing invocation in the same worktree. It is
       // the same task, guarded the same way: the artifacts join the diff rather than bypassing
@@ -449,19 +688,80 @@ export class WriteDogfoodRunner {
         artifacts = await this.#runVisual({ input, task, handle, visual: input.visual });
       }
 
-      const guarded = collectGuardedDiff(handle.worktreePath, artifacts);
-      assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
-      this.#ledger.appendEvent(task.taskId, "write.changes_collected", { changedFiles: guarded.changedFiles, changedFileCount: guarded.changedFiles.length, diffBytes: Buffer.byteLength(guarded.diff, "utf8") });
+      // What changed, observed rather than taken on the worker's word. In DIRECT this is the whole
+      // report: there is no diff against a base to take, because the workspace may already have
+      // carried the operator's own uncommitted work before the run started.
+      const observed = workspaceChangesSince(workspaceBefore, snapshotWorkspace(handle.worktreePath));
+      const observedFiles = observed === null ? Object.freeze([]) : changedPaths(observed);
+      const guarded = direct
+        ? Object.freeze({ changedFiles: observedFiles, diff: "" })
+        : collectGuardedDiff(handle.worktreePath, artifacts);
+      if (sourceBefore !== null) assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
+      if (direct && guarded.changedFiles.length === 0) {
+        // The worker finished and the workspace is untouched. That is a result, not a review
+        // problem: the truthful answer is "no change", the worker's own words are the explanation,
+        // and a reviewer has nothing to read — calling one produced a recorded CHANGES_REQUESTED
+        // for an empty diff and made the reviewer look like the cause.
+        this.#ledger.appendEvent(task.taskId, "write.no_changes", { executionPolicy: plan.policy, report, observedInPlace: true });
+        finalization = planFor({
+          writeCompleted: true,
+          writeReviewRan: false,
+          writeVerdict: null,
+          failureKind: "verification-failed",
+          result: Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }),
+        });
+        return Object.freeze({
+          dryRun: false,
+          taskId: task.taskId,
+          worktree: null,
+          executionPolicy: plan.policy,
+          providerCwd: handle.worktreePath,
+          changedFiles: Object.freeze([]),
+          diff: "",
+          verification: Object.freeze([]),
+          review: null,
+          readyForApproval: false,
+          approvalRequired: false,
+          mergePerformed: false,
+          report,
+          noChange: true,
+          sessionRecovered: recoveredFromMissingSession,
+          taskReceipt: finish(),
+        });
+      }
+      this.#ledger.appendEvent(task.taskId, "write.changes_collected", {
+        changedFiles: guarded.changedFiles,
+        changedFileCount: guarded.changedFiles.length,
+        diffBytes: Buffer.byteLength(guarded.diff, "utf8"),
+        executionPolicy: plan.policy,
+        ...(direct ? { observedInPlace: true } : {}),
+        ...(direct && observed !== null && observed.changedTotal > observedFiles.length ? { changedFilesTruncatedFrom: observed.changedTotal } : {}),
+      });
       if (artifacts.length > 0) {
         // Path, media type, size and hash: what a reviewer needs to judge a file they cannot read.
         this.#ledger.appendEvent(task.taskId, "write.artifacts_collected", { artifacts: artifacts.map((artifact) => ({ path: artifact.path, mediaType: artifact.mediaType, bytes: artifact.bytes, sha256: artifact.sha256 })) });
       }
 
+      // In DIRECT the workspace is not a diff against a base, so `git diff --check` would be
+      // checking the operator's own uncommitted work as much as this run's. Nothing is claimed:
+      // an empty verification list is the honest answer, and the changed-file list is the evidence.
+      // `git diff --check` over the task's own worktree, once. The real handle is passed rather
+      // than a rebuilt one: the runner validates it against the project, and a hand-made object
+      // would be refused by that check rather than by anything being wrong.
       const verifier = new SafeCommandRunner([{ executable: "git", args: ["diff", "--check"] }]);
-      const verifyResult = await verifier.run({ project: this.#project, profile: "verify", worktree: handle, command: { executable: "git", args: ["diff", "--check"], cwd: handle.worktreePath }, ...(input.env === undefined ? {} : { env: input.env }), timeoutMs: 30_000, maxOutputBytes: 256 * 1024 });
-      const verification: WriteVerificationResult[] = [Object.freeze({ command: "git diff --check", passed: !verifyResult.timedOut && verifyResult.exitCode === 0, exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut })];
-      if (!verification[0]!.passed) {
-        this.#ledger.appendEvent(task.taskId, "write.verification_failed", { command: "git diff --check", exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut });
+      const verifyResult = direct ? null : await verifier.run({
+        project: this.#project, profile: "verify",
+        ...(handle.worktree === undefined ? {} : { worktree: handle.worktree }),
+        command: { executable: "git", args: ["diff", "--check"], cwd: handle.worktreePath },
+        ...(input.env === undefined ? {} : { env: input.env }),
+        timeoutMs: 30_000, maxOutputBytes: 256 * 1024,
+      });
+      const whitespace = verifyResult === null ? null : { exitCode: verifyResult.exitCode, timedOut: verifyResult.timedOut };
+      const verification: readonly WriteVerificationResult[] = whitespace === null
+        ? Object.freeze([])
+        : Object.freeze([Object.freeze({ command: "git diff --check", passed: !whitespace.timedOut && whitespace.exitCode === 0, exitCode: whitespace.exitCode, timedOut: whitespace.timedOut })]);
+      if (verification.length > 0 && !verification[0]!.passed) {
+        this.#ledger.appendEvent(task.taskId, "write.verification_failed", { command: "git diff --check", exitCode: verification[0]!.exitCode, timedOut: verification[0]!.timedOut });
         finalization = planFor({ writeCompleted: false, writeReviewRan: false, writeVerdict: null, failureKind: "verification-failed", result: Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }) });
         return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review: null, readyForApproval: false, approvalRequired: true, mergePerformed: false, taskReceipt: finish() });
       }
@@ -478,18 +778,24 @@ export class WriteDogfoodRunner {
           acceptances: this.#acceptances,
           ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
           ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
-          context: { changedFiles: guarded.changedFiles, mode: "worktree-diff-review" },
+          context: {
+            changedFiles: guarded.changedFiles,
+            mode: direct ? "workspace-change-review" : "worktree-diff-review",
+            ...(direct ? { note: "The worker edited the workspace in place; read the files listed here for the current content." } : {}),
+          },
           ...(this.#reviewExecutor === undefined ? {} : { executor: this.#reviewExecutor }),
           ledger: this.#ledger,
           taskId: task.taskId,
         });
-        const response = await invoker.invoke({ role: "reviewer", model: reviewerRole.model, phase: "write-review", task: input.task, findings: Object.freeze([]), candidateOutput: guarded.diff });
+        const response = await invoker.invoke({ role: "reviewer", model: reviewerRole.model, phase: "write-review", task: input.task, findings: Object.freeze([]), candidateOutput: direct ? null : guarded.diff });
         if (response.kind !== "review") throw new BrainGateInvariantError("WRITE_REVIEW_INVALID", "Write reviewer did not return a review verdict.");
         review = Object.freeze({ providerId: reviewerRole.model.providerId, modelId: reviewerRole.model.modelId, verdict: response.verdict, findings: response.findings });
         this.#ledger.appendEvent(task.taskId, `write.review.${response.verdict}`, { provider: reviewerRole.model.providerId, model: reviewerRole.model.modelId, findingCount: response.findings.length });
       }
 
-      assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
+      // Only the worktree mode asserts the source checkout is untouched. In DIRECT the source
+      // *is* what changed, which is why the observation above is the record rather than a failure.
+      if (sourceBefore !== null) assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
       const readyForApproval = review === null || review.verdict === "approve";
       finalization = planFor({
         writeCompleted: true,
@@ -502,7 +808,28 @@ export class WriteDogfoodRunner {
           ? Object.freeze({ kind: "diff" as const, text: guarded.diff, evidence: "redacted" as const })
           : Object.freeze({ kind: "none" as const, text: null, evidence: "unavailable" as const }),
       });
-      return Object.freeze({ dryRun: false, taskId: task.taskId, worktree: Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }), changedFiles: guarded.changedFiles, diff: guarded.diff, verification: Object.freeze(verification), review, readyForApproval, approvalRequired: true, mergePerformed: false, taskReceipt: finish() });
+      return Object.freeze({
+        dryRun: false,
+        taskId: task.taskId,
+        // The plan and the receipt both name the boundary: `worktree` is null for a DIRECT run,
+        // because there is no second directory and pretending there is one would be the lie.
+        worktree: direct ? null : Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }),
+        executionPolicy: plan.policy,
+        providerCwd: handle.worktreePath,
+        changedFiles: guarded.changedFiles,
+        diff: guarded.diff,
+        verification: Object.freeze(verification),
+        review,
+        report,
+        noChange: false,
+        sessionRecovered: recoveredFromMissingSession,
+        // Nothing to approve and nothing to merge: the operator reviews their own working tree, and
+        // no commit was made — a DIRECT run leaves the workspace exactly as the worker left it.
+        readyForApproval: direct ? false : readyForApproval,
+        approvalRequired: !direct,
+        mergePerformed: false,
+        taskReceipt: finish(),
+      });
     } catch (error) {
       // No transition here: the finalizer owns the terminal state, and it derives it from the same
       // evidence a reconciler would find — so a run that dies right now is repaired to the state
@@ -521,9 +848,9 @@ export class WriteDogfoodRunner {
       // if the release throws: an unremovable worktree must not also lose the task's outcome.
       try { worktrees.close(); }
       finally {
-        // The attribution is durable before the observation that reads it.
-        try { this.#ledger.appendEvent(task.taskId, "task.execution", executionRecord(executionAttribution({ events: this.#ledger.receipt(task.taskId).events, planned: observationRolesFor(plan.roles) }))); }
-        catch { /* evidence, not the run's own error: never replace it */ }
+        // The attribution is durable before the observation that reads it, and this is the crash
+        // path's only chance to write it: a run that never reached `finish` still records who ran.
+        recordExecution();
         try { complete(); } catch { /* an incomplete record is reconciled later, not hidden */ }
       }
     }

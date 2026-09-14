@@ -18,9 +18,209 @@ BrainGate is a private pre-alpha project for coordinating official AI coding CLI
 [हिन्दी](docs/i18n/README.hi.md)
 
 English is the source of truth. Translations cover installation and first use; the rest of
-this document and everything under `docs/` is English only.
+this document and everything under `docs/` is English only. They predate the current product
+position and are being brought up to date one at a time.
 
 ---
+
+## What BrainGate is
+
+One workspace, one conversation and one goal, across the AI CLIs you already pay for.
+
+You talk to BrainGate. BrainGate decides which of your installed runtimes should do the work, hands
+it the goal and the context, and records what happened. A follow-up continues the same goal. If you
+switch workers — Claude to Grok to Codex — the new worker is handed what the previous one
+established rather than starting from nothing. If you switch back, BrainGate continues that worker's
+own session where its runtime supports it, and tells it only what changed while it was away.
+
+**Work happens in your workspace, where you can see it.** BrainGate runs the native CLI in the
+directory you selected: a change it makes is in your files when it finishes, the next worker reads
+those same files, and nothing is committed, merged, reset or cleaned behind your back. Worktrees and
+snapshots are still there — as *policies you choose* (`/policy worktree`, `/policy snapshot`) when
+you want a change proposed rather than applied, or a read that cannot touch what it reads.
+
+**Each runtime stays itself.** BrainGate launches `claude`, `codex`, `agy` or `grok` and lets them
+work the way they normally work: their tools, their shell, their subagents, their MCP servers, their
+browser, their worktrees, their own permission prompts. When Claude Code decides to spawn three
+subagents and run your test suite, BrainGate accounts for that as one dispatch and does not
+micromanage the inside. That division is the whole design: **BrainGate orchestrates coarsely; the
+native runtime executes finely.**
+
+## What BrainGate is not
+
+- **Not a foundation model, and not a new agent harness.** There is no BrainGate model and no
+  BrainGate agent loop. It is software that runs other people's CLIs.
+- **Not a replacement for Claude Code, Codex, Antigravity or Grok.** If BrainGate did less than the
+  CLI does on its own, it would have no reason to exist. It removes no capability merely because it
+  is the one launching the process.
+- **Not a credential broker.** It never asks for an API key, never reads or copies your provider
+  tokens, and never proxies your traffic through a BrainGate service. It drives the CLIs you are
+  already signed into, and strips known API-key and base-URL variables from the subprocesses it
+  starts so a stray `ANTHROPIC_API_KEY` cannot silently move you onto per-token billing.
+- **Not "ask every AI about everything."** One worker is the default. A second opinion is asked for
+  when the risk or the disagreement warrants one, not on every message.
+- **Not free, and not a way around a subscription.** It spends the subscriptions you have, through
+  the CLIs you have installed, under their own terms.
+
+## The shape of it
+
+```text
+Conversation
+  └── Goal
+        ├── accepted / disputed findings, artifacts, evidence
+        ├── provider sessions (one per runtime that worked on it)
+        └── Tasks  ──►  Router  ──►  native CLI worker  ──►  results
+```
+
+A **Conversation** is what you are doing with BrainGate. A **Goal** is what you are trying to
+achieve in it, and it is authoritative: a worker's claim is recorded as a claim, and only evidence
+or you make it an accepted finding. A **Task** is one work unit of a goal. The **Router** picks a
+worker for each work unit from what your machine actually has installed and what your subscriptions
+can currently run — every availability, quota, capability and isolation check still applies, so a
+manual choice can fail but can never route around a policy.
+
+## Native workers
+
+BrainGate models three levels, because your machine has three:
+
+```text
+Provider            Runtime / CLI          Models
+────────            ─────────────          ──────
+Anthropic           claude                 whatever your subscription exposes
+OpenAI              codex                  whatever your account exposes
+Google              agy (Antigravity)      whatever your account exposes
+xAI                 grok                   whatever your account exposes
+GitHub Copilot      copilot                whatever your account exposes
+```
+
+Two models from one provider are two workers. `/use anthropic/claude-haiku` after
+`anthropic/claude-sonnet` is a switch to a different worker with its own session and its own place in
+the goal's history. Run `braingate discover` and `braingate models add` to see and configure what
+yours exposes; BrainGate routes over your catalogue, never over a list baked into the code.
+
+## Shared context
+
+BrainGate keeps four things, and they do different jobs:
+
+| | What it is | Who owns it |
+|---|---|---|
+| **Local history** | Every turn, locally, redacted, in the project's own storage | BrainGate |
+| **Goal state** | Accepted findings, disputed claims, files changed, tests run, open questions | BrainGate, and authoritative |
+| **Native session references** | `Goal ↔ this runtime's session id` | The runtime owns the session; BrainGate owns the reference |
+| **Handoffs and deltas** | Bounded context sent to a worker: the goal for a new worker, only what changed for a returning one | BrainGate |
+
+Provider-native session files are never copied into BrainGate and never need to be: Claude keeps its
+sessions where Claude keeps them, Grok where Grok does. BrainGate records a reference. Your goal
+continues whether or not a session can be resumed — a runtime with no way to name a session still
+gets the goal.
+
+## Using it
+
+```text
+$ braingate
+
+  ▌ B R A I N G A T E
+  ▌ one goal, many native CLIs — the worker is swappable
+
+  Dogfood preflight demo: ask=ready · write=ready · configured=4 · model calls=0
+  Type a request, or /help. Nothing is spent until you confirm.
+
+> Investigate why the mobile app logs the user out when it is idle
+
+  read-only · T2/medium · primary=anthropic/claude-sonnet
+  continues goal 4f2a91c3 · diagnosed
+  primary: read, subagents
+  Run it? [y/N] y
+  … Claude Code reads the repository with its own tools and answers …
+  session: new native session 9c1d4e77
+
+> /use xai/grok-fast
+  Next work will go to xai/grok-fast. Every availability, quota, capability and
+  isolation check still applies; /auto returns to automatic selection.
+
+> Do you agree with that diagnosis?
+
+  read-only · T2/medium · primary=xai/grok-fast
+  continues goal 4f2a91c3 · diagnosed · raised to T2 by this goal (the words alone were T1)
+
+> /use anthropic/claude-sonnet
+
+> Now apply the fix you proposed
+
+  write · isolated worktree · T2/medium · primary=anthropic/claude-sonnet
+  continues goal 4f2a91c3 · diagnosed
+  session: resuming native session 9c1d4e77 · delta: 2 turn(s) by another worker
+
+> /worker
+  Worker: manual — anthropic/claude-sonnet
+  Goal: 4f2a91c3 · why the app logs the user out when idle
+  Last run: anthropic/claude-sonnet
+  Native session: resuming native session 9c1d4e77
+  Sessions on record:
+    anthropic/claude-sonnet · 9c1d4e77 · available · last used 2026-09-13T…
+    xai/grok-fast · 3b7e0a12 · available · last used 2026-09-13T…
+
+> /auto
+  Automatic selection restored. BrainGate routes each turn again.
+```
+
+| Command | What it does |
+|---|---|
+| `/use <provider>/<model>` | Send the next work to this worker. The goal is unchanged. |
+| `/use <provider>/<model> --fresh` | Same worker, new native session, same goal. |
+| `/auto` | Return to automatic selection. |
+| `/worker` | Who is selected, what the goal is, what the next run would resume. |
+| `/goal` | The current goal: established findings, disputed claims, open questions. |
+| `/new` | Set the current goal aside and start a different one. |
+| `/remember`, `/memory` | Record something for later sessions; see what is remembered. |
+
+**Nothing is spent until you confirm.** Every request is planned first — which costs nothing — and
+the plan is shown with its classification, the worker that would run, and what that worker may do,
+before any provider is called.
+
+## Safety
+
+Preserving a runtime's capabilities is not the same as having no boundaries, and the two are
+separate decisions:
+
+- **Ordinary interactive work runs the way the runtime normally runs.** Its own permission prompts
+  are the approval mechanism, exactly as when you start it yourself.
+- **A boundary you ask for is applied.** "Review this and do not modify files" is a read-only task.
+  A write happens under the execution policy you selected: `direct` edits your workspace in place and
+  leaves the change uncommitted for you to keep, amend or discard; `worktree` stages it in an
+  isolated worktree you review and never merges for you.
+- **Autonomous and unattended execution is constrained more, not less.** When nobody is there to
+  approve a runtime action, BrainGate's own policy is what stands in for that approval.
+- **Strict modes remain available**: project snapshots, isolated worktrees, and the Codex and Grok
+  sandbox attestations, which are proven per run rather than assumed.
+
+ADR [0014](docs/adr/0014-native-runtime-preservation.md) states the principle and classifies every
+restriction that exists today, including the ones BrainGate intends to lift and why.
+
+## Cost
+
+BrainGate spends the subscriptions you already pay for, through the CLIs you installed and signed
+into. It does not resell access, does not require an API key, and does not claim any provider's
+pricing model on your behalf. `braingate status` and `/worker` show what is on your machine and what
+has been spent; quota readings are recorded only when a provider states them, marked as such
+(ADR [0012](docs/adr/0012-quota-state-is-native-only.md)).
+
+## Status
+
+| | |
+|---|---|
+| **Working now** | Conversation and goal continuity; cross-provider handoff; returning-worker delta; manual switching (`/use`, `/auto`, `/worker`, `--fresh`); routing with eligibility, quota, budget and isolation gates; DIRECT and worktree writes with native session continuity and a reviewer only when policy or the operator asks; task ledger, receipts and reconciliation; memory with a single validated write path; per-project isolation |
+| **Native session resume** | Claude and Grok, where the installed build publishes a session-id flag (verified by a zero-cost capability probe) and the session belongs to the same workspace and build. Codex, Antigravity and Copilot have resume but no way to name a *new* session, so each turn is a fresh invocation with the goal handoff — recorded as such, never faked |
+| **Planned** | Automated review and council execution beyond the current T4 disagreement path; a web dashboard; the broader native-capability overlays ADR 0014 classifies |
+
+Known limitations a new user should expect: a worker whose runtime cannot be resumed starts from the
+goal handoff rather than its own memory; a resumed session is given a delta, so if nothing changed it
+is told exactly that; a T0–T2 DIRECT write uses one worker unless you ask for a reviewer (`--review`)
+or the budget requires one; and a run that changes nothing says so, in the worker's own words, rather
+than reporting a review of a diff that never existed.
+
+---
+
 
 ## Requirements
 
@@ -253,7 +453,7 @@ Add one entry per model you want available. `speed` is `fast`, `balanced`, or `d
 the cheap-first lever: `fast` is favoured on simple tasks, `deep` on hard ones. The scores are
 your routing policy — see [`docs/ROUTING_AND_REVIEW.md`](docs/ROUTING_AND_REVIEW.md).
 
-**3. Register a repository.**
+**3. Register a workspace.**
 
 ```bash
 cd /path/to/your/project
@@ -261,8 +461,85 @@ braingate init
 ```
 
 It proposes a project id from the directory name and asks you to confirm. The id is the
-isolation boundary — memory, worktrees, and telemetry are scoped to it — so BrainGate never
+isolation boundary — memory, goals and telemetry are scoped to it — so BrainGate never
 picks one silently. Pass `--project-id <id> --name <name>` to skip the prompt in scripts.
+If the directory is not a Git repository yet, `init` offers to create one and registers the
+directory either way.
+
+### Projects and workspaces
+
+A **project** is your name for a piece of work: it owns durable memory and preferences, and it can
+span more than one directory. A **workspace** is one of those directories — the one you register —
+and it owns everything that describes work *done* there: the conversation, the goals, the task
+ledger, the evidence, the native sessions, the snapshots and the worktrees.
+
+The workspace is the directory your manifest names, canonicalized. It is never widened to the
+repository root: if you `braingate init` inside `repo/flutter_migration`, then that is the workspace,
+with its own ledger and its own goals, separate from `repo`. And you can launch from deeper inside
+it — a package, a subdirectory — without changing which state you are reading or minting a new
+workspace: workers still run in the directory you launched from, so their `cwd` is never moved and
+their own project files — `CLAUDE.md`, `.cursor/rules`, an `AGENTS.md` in that folder — are found
+exactly where they would be if you ran the CLI yourself.
+
+**Two workspaces of one project do not share unfinished work.** A goal belongs to the workspace whose
+files it is about, a task receipt is filed under the directory it ran in, and a native session is
+bound to the workspace as well as to the provider and model. Moving the same logical work to another
+workspace gives the next worker a goal handoff and a fresh native session, never a resume of a
+conversation that happened somewhere else. What they *do* share is durable project memory.
+
+**Git is optional.** A workspace can be a repository, a subdirectory of one, or a plain directory
+with no repository anywhere above it; `braingate init` registers all three. What a missing repository
+costs is the worktree-isolated write modes, and they say so at the point where they need one rather
+than at the door.
+
+The manifest is found by walking up from where you launched, and the workspace it names is compared
+with the directory you are actually in. If you are not inside it, the session stops before planning
+anything:
+
+```text
+Project `flutter-migration` is registered to a different workspace.
+  registered:  /Volumes/Lexar/Tabaq-ai-TabaqAi_31Aug_fixed_issues
+  you are in:  /Users/you/Downloads/Tabaq-ai-TabaqAi_31Aug_fixed_issues
+
+These are two local directories, and BrainGate will not choose between them: they can hold
+different files and different uncommitted state, and a worker that edits one has not touched
+the other.
+```
+
+Two clones of one repository are two workspaces even when they share a name, a commit or a git
+remote, because those say the clones are *related* and nothing about whether they hold the same
+uncommitted state. Nothing is inferred from a basename, a remote or a repository: the identity is the
+canonical path.
+
+State written before workspaces were part of the identity — an older `tasks.sqlite`, `goals.sqlite`
+or corpus directly under `<home>/projects/<id>` — belongs to no directory that can be identified, so
+it is preserved exactly where it is and never used. The session says so once at startup if it finds
+any, and new work starts a clean workspace.
+
+- **Two directories you use for different things** — register each with its own project id. They
+  get separate memory, ledgers, goals and quota history, which is what you want.
+- **One project, several directories** — register each as its own workspace (its own `braingate
+  init`), and they share memory while keeping their own execution state.
+- **You moved the directory, or the drive came back at a different path** — `braingate init
+  --rebind` moves the project to this workspace, keeping its id, name and history.
+- **The registered workspace is unmounted** — BrainGate says so rather than guessing, because an
+  unmounted volume and a moved directory look identical from here.
+
+`/project` in an interactive session prints the project, the workspace, its id, the directory workers
+run in, and where the state lives — so you can verify where BrainGate is operating at any time.
+`/policy` shows and changes the execution boundary, and changing it spends nothing:
+
+```text
+/policy                       the current boundary
+/policy direct                run in this workspace (the default)
+/policy read-only             read it, change nothing, and verify that
+/policy worktree              propose a write in an isolated Git worktree
+/policy snapshot              read an immutable copy of the workspace
+```
+
+**A worker may leave uncommitted changes, and that is normal.** In the default policy the CLI edits
+your files directly. BrainGate tells you which files changed, by whom, and under which policy, and
+makes no commit. Committing stays your decision, in your own shell.
 
 **4. Check readiness. This spends nothing.**
 
@@ -365,13 +642,14 @@ See:
 ## Current local operator
 
 `braingate` works from any directory. Commands that act on a project read `.brain/project.json`
-from the current directory, so the project is whichever repository you are standing in;
-`--project <manifest>` overrides that. Run it outside a registered project and it says so
-rather than failing obscurely.
+from the current directory, or from the nearest directory above it, so the project is whichever
+workspace you are standing in; `--project <manifest>` overrides that. Run it outside a registered
+project and it says so rather than failing obscurely.
 
 The full command surface:
 
 - `braingate init --project-id <id> --name <name>`
+- `braingate init --rebind` — move this project's registration to the workspace you are in
 - `braingate discover`
 - `braingate doctor --project <manifest>`
 - `braingate models list|validate|add|remove|import-discovered|profile`
@@ -389,7 +667,7 @@ The full command surface:
 
 `plan` and `run` without `--execute` do not make provider model calls. The explicit `--execute` flag is the model-execution gate.
 
-`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path.
+`braingate init` creates a local ignored `.brain/project.json`, so dogfood and memory commands can use the current project without repeatedly passing a manifest path. The manifest names its own workspace by absolute path, and that binding is what BrainGate enforces before it executes anything.
 
 See [`docs/DOGFOOD.md`](docs/DOGFOOD.md) for the real-project trial workflow.
 
@@ -525,7 +803,7 @@ Codex review runs from a fresh staged workspace rather than the real repository.
 
 Current writes are intentionally narrow:
 
-- Claude is the only write-capable primary provider in the current dogfood path;
+- Claude Code is the reference write provider: it is the one whose write profile is proven end to end, and `braingate doctor` reports whether it is currently eligible on this machine. Grok and Codex also route writes once you score them for the role and their sandbox self-test is current.;
 - writes occur only inside task-specific BrainGate worktrees;
 - source checkout mutation is treated as an invariant failure;
 - sensitive paths and BrainGate/agent control files are rejected;
@@ -545,6 +823,6 @@ Current writes are intentionally narrow:
 
 ## Status
 
-Milestones 0–12 establish the deterministic core, project/task isolation, canonical memory, routing, observability, hardened subscription execution, independent Codex review, guarded worktree-only writes, and real-project dogfood telemetry. Milestone 13 adds safe memory bootstrap and graded single-provider routing so the first real project trial can start with useful historical context and still work well with only one AI subscription provider.
+Milestones 0–12 established the deterministic core, project and task isolation, canonical memory, routing, observability, hardened subscription execution, independent Codex review, guarded worktree-only writes and real-project dogfood telemetry; 13 added memory bootstrap and graded single-provider routing; 14–18 opened the provider surface underneath the router (capability probes, per-role tool grants, more than one provider able to write, subagents as a routing primitive, Antigravity readmitted); 19 hardened truth and budget reporting; and 20 made the conversation and the goal first-class above the task, with cross-provider handoffs, returning-worker deltas and manual worker switching. See docs/ROADMAP.md for where the milestones stand.
 
 See `docs/ARCHITECTURE.md`, `docs/SECURITY.md`, `docs/ROADMAP.md`, `docs/DOGFOOD.md`, and `docs/PRETRIAL.md`.

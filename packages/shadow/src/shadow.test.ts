@@ -18,6 +18,8 @@ import {
   type RegisteredProject,
   type TaskClassification,
   type TaskFinalizer,
+  type ExecutionProject,
+  executionScopeFor,
 } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import { executionAttribution, finalizedSnapshotOf } from "@braingate/core";
@@ -26,6 +28,7 @@ import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry, type ModelRef } from "@braingate/router";
 import type { AgentRequest } from "@braingate/workflows";
 import {
+
   CODEX_REVIEW_DISABLED_FEATURES,
   STAGE_PATH_TOKEN,
   CodexIsolationVerifier,
@@ -80,6 +83,15 @@ import {
 } from "./index.js";
 
 /**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
+/**
  * The finalization seam the runner requires.
  *
  * A runner cannot be constructed without one, which is the point: an execution package that could
@@ -113,7 +125,7 @@ function setupProject() {
   git(repo, ["add", "."]);
   git(repo, ["-c", "user.name=BrainGate Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init"]);
   const registry = new ProjectRegistry(join(root, "registry"));
-  const project = registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] })));
   return { root, repo, project };
 }
 
@@ -551,7 +563,9 @@ test("a read-only run that mutates the source checkout fails closed and the task
       title: "Inspect readme", task: taskText, cwd: repo, classification, budget: budgetFor(classification, { writeRequested: false }), requiredContextTokens: 500,
       context: {}, observation: observationFor(classification), contextSummary: { memoryRecords: 0, explicitCandidates: 0, includedItems: 0, estimatedTokens: 500, truncatedItems: 0 }, dryRun: false,
     }),
-    /SHADOW_SOURCE_MUTATED|checkout changed while a read-only task was running/,
+    // The guard now covers a workspace without a repository as well as a checkout with one, so the
+    // code is the workspace-level one; the fact it reports is the same.
+    /SHADOW_SOURCE_MUTATED|WORKSPACE_MUTATED|changed the workspace it was only supposed to read/,
   );
   assert.equal(existsSync(join(repo, "provider-escaped.txt")), true, "the fixture must actually have written, or the guard proves nothing");
 });

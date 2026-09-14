@@ -71,11 +71,23 @@ export function bannerFrames(style: BannerStyle = PLAIN): readonly string[] {
   frames.push([
     `  ${style.accent}${RAIL}${style.reset}  ${style.bright}${full}${style.reset}`,
     `  ${style.accent}${RAIL}${style.reset}  ${style.dim}${trackAt(-1)}${style.reset}`,
-    `  ${style.accent}${RAIL}${style.reset}  ${style.dim}route each task to the cheapest worker that can do it${style.reset}`,
+    `  ${style.accent}${RAIL}${style.reset}  ${style.dim}${TAGLINE}${style.reset}`,
   ].join("\n"));
 
   return Object.freeze(frames);
 }
+
+/**
+ * What the banner claims about the product, in one line.
+ *
+ * It described routing for a long time — "route each task to the cheapest worker that can do it" —
+ * and routing alone stopped being the point at M20. What the operator now gets is one conversation
+ * and one goal across several native CLIs, with the workers swappable and the context carried
+ * between them. Cheapest-capable routing is still there; it is a means, not the claim.
+ *
+ * Kept to what is implemented: no council, no automatic second opinions, nothing about the dashboard.
+ */
+export const TAGLINE = "one goal, many native CLIs — the worker is swappable";
 
 /** The finished picture, for terminals that should not or cannot animate. */
 export function bannerStill(style: BannerStyle = PLAIN): string {

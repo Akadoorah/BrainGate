@@ -50,7 +50,8 @@ export interface DashboardTaskCard {
     readonly role: string;
     readonly providerId: string;
     readonly modelId: string;
-    readonly quotaPool: string;
+    /** Null for a role known only from what ran: an executed event carries no pool of its own. */
+    readonly quotaPool: string | null;
   }[];
   readonly budget: {
     readonly providerCalls: number;
@@ -154,6 +155,7 @@ export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTas
   // Read from the marker rather than re-derived: the writer already decided, and two derivations
   // of the same evidence are two answers waiting to disagree.
   const finalized = finalizedSnapshotOf(receipt.events);
+  const executed = recordedExecutionAttribution(receipt.events) ?? executionAttribution({ events: receipt.events });
   return Object.freeze({
     taskId: receipt.task.taskId,
     projectId: project.projectId,
@@ -163,11 +165,18 @@ export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTas
     complexity: receipt.task.complexity,
     risk: receipt.task.risk,
     updatedAt: receipt.task.updatedAt,
-    route: Object.freeze((workflow?.roles ?? brief?.route ?? []).map((role) => Object.freeze({
+    // The planned route when the run recorded one, and otherwise the roles its own provider events
+    // show actually answering. A write task has no brief and no workflow receipt, so the first two
+    // sources are empty for it — which is why `/status` said "no route recorded" about a task whose
+    // receipt named primary and reviewer (M20.7). The executed roles are the same evidence the
+    // `execution` field below is built from, so the two cannot disagree.
+    route: Object.freeze((workflow?.roles ?? brief?.route ?? executed).map((role) => Object.freeze({
       role: role.role,
       providerId: role.providerId,
       modelId: role.modelId,
-      quotaPool: role.quotaPool,
+      // An executed role carries no quota pool of its own; the plan does. Absent rather than
+      // invented, and the model's own pool is already reported by the token card.
+      quotaPool: "quotaPool" in role && typeof role.quotaPool === "string" ? role.quotaPool : null,
     }))),
     budget: workflow === null ? null : Object.freeze({
       providerCalls: workflow.budget.providerCalls,
@@ -182,7 +191,7 @@ export function buildTaskCard(project: RegisteredProject, receipt: NormalizedTas
     failureKind: finalized?.failureKind ?? null,
     reconciled: finalized?.reconciled ?? false,
     usageProvenance: uniqueSorted(receipt.usage.map((usage) => usage.evidence)),
-    execution: recordedExecutionAttribution(receipt.events) ?? executionAttribution({ events: receipt.events }),
+    execution: executed,
     quotaRefusal: quotaRefusalFromEvents(receipt.events),
     tokensByModel: tokensByModel(receipt),
   });

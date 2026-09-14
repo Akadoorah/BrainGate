@@ -75,6 +75,9 @@ export class CapabilityRouter {
     const excludedPools = new Set(request.excludeQuotaPools ?? []);
     const accepted: RouteCandidate[] = [];
     const rejected: RouteRejection[] = [];
+    // A worker the operator named by hand, if any. It constrains *which* model is considered and
+    // nothing else: every gate below still applies to it.
+    const pin = request.pin ?? null;
     const independenceLevel = request.independence?.level ?? "cross-provider";
 
     for (const model of this.#registry.list()) {
@@ -99,6 +102,10 @@ export class CapabilityRouter {
       if (request.independence?.mode === "required" && request.independence.models.some((other) => violatesIndependence(modelRef, other, independenceLevel))) {
         reasons.push(`independence-required:${independenceLevel}`);
       }
+
+      // A pin that does not name this model takes it out of consideration before anything is asked
+      // of it. A comparison of identities rather than a gate, so it contributes no reason.
+      if (pin !== null && (definition.providerId !== pin.providerId || definition.modelId !== pin.modelId)) continue;
 
       if (reasons.length > 0) {
         rejected.push(Object.freeze({ model: modelRef, reasons: Object.freeze(reasons) }));
@@ -132,6 +139,22 @@ export class CapabilityRouter {
     rejected.sort((a, b) => a.model.providerId.localeCompare(b.model.providerId) || a.model.modelId.localeCompare(b.model.modelId));
 
     const selected = accepted[0];
+    // A pinned model that did not survive the gates is a refusal the operator asked for by name, and
+    // it must be told apart from "nothing was eligible". Routing the work elsewhere instead would
+    // spend a subscription they did not choose, on work they asked a different worker to do.
+    //
+    // Only when nothing was selected: a pin that *did* survive has already been chosen, and refusing
+    // it here would make every manual choice fail.
+    if (pin !== null && selected === undefined) {
+      const pinned = rejected.find((rejection) => rejection.model.providerId === pin.providerId && rejection.model.modelId === pin.modelId);
+      const because = pinned !== undefined
+        ? pinned.reasons.join(", ")
+        : `it is not registered for role ${request.role}${request.writeRequired ? " with write support" : ""}`;
+      throw new BrainGateInvariantError(
+        "ROUTE_MANUAL_INELIGIBLE",
+        `${pin.providerId}/${pin.modelId} cannot run this work: ${because}. Nothing was routed elsewhere. Use /auto to return to automatic selection.`,
+      );
+    }
     if (selected === undefined) {
       // Why nothing was eligible, in the words the rejections used. Without this the operator sees
       // "no eligible model" and cannot tell a policy wait from a capability floor from a provider

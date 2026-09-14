@@ -41,12 +41,21 @@ export class ProviderSnapshotCache {
   /**
    * A resolver for one request. It probes at most once, however many times it is called, and
    * every caller holding it sees the same answer.
+   *
+   * `onDiscovered` is told the snapshots once, for a caller that needs a fact discovery read — the
+   * installed build's version, which decides whether a native session recorded earlier is still
+   * resumable. Told rather than returned so this stays a plain resolver at every call site, and
+   * called once because the probe itself happens once.
    */
-  lease(): () => Promise<readonly ProviderSnapshot[]> {
+  lease(options: { readonly onDiscovered?: (snapshots: readonly ProviderSnapshot[]) => void } = {}): () => Promise<readonly ProviderSnapshot[]> {
     let held: Promise<readonly ProviderSnapshot[]> | null = null;
+    const onDiscovered = options.onDiscovered;
     return async () => {
       held ??= this.#current();
-      return await held;
+      const snapshots = await held;
+      // Guarded so a caller's bookkeeping cannot turn a successful probe into a failed request.
+      if (onDiscovered !== undefined) { try { onDiscovered(snapshots); } catch { /* not this layer's problem */ } }
+      return snapshots;
     };
   }
 

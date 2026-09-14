@@ -1,4 +1,4 @@
-import type { RegisteredProject } from "./project-registry.js";
+import type { ExecutionProject } from "./project-registry.js";
 import { executionAttribution, recordedExecutionAttribution } from "./role-attribution.js";
 import { finalizeTask, finalizedSnapshotOf, type FinalizationDeps, type FinalizationPlan, type ObservationRole, type ObservationRoleName } from "./finalization.js";
 import {
@@ -181,7 +181,7 @@ function failureKindFor(input: {
   return null;
 }
 
-function planFor(project: RegisteredProject, candidate: Candidate): FinalizationPlan {
+function planFor(project: ExecutionProject, candidate: Candidate): FinalizationPlan {
   const { task, receipt } = candidate;
   const events = receipt.events;
   const brief = lastPayload(events, "task.brief");
@@ -339,7 +339,7 @@ export function inspectReconciliation(deps: ReconciliationDeps, now = new Date()
   });
 }
 
-export function reconcile(project: RegisteredProject, deps: ReconciliationDeps, now = new Date()): ReconciliationReport {
+export function reconcile(project: ExecutionProject, deps: ReconciliationDeps, now = new Date()): ReconciliationReport {
   const candidates = classify(deps, now);
   const reconciled: string[] = [];
   const interrupted: string[] = [];

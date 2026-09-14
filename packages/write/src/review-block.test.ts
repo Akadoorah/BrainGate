@@ -4,12 +4,36 @@ import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { ProjectRegistry, TaskLedger, budgetFor, classifyTask, parseProjectConfig, type RegisteredProject, InMemoryObservationWriter, ResultStore, createFinalizer, type TaskClassification, type TaskFinalizer } from "@braingate/core";
+import {
+  ProjectRegistry,
+  TaskLedger,
+  budgetFor,
+  classifyTask,
+  parseProjectConfig,
+  type RegisteredProject,
+  InMemoryObservationWriter,
+  ResultStore,
+  createFinalizer,
+  type TaskClassification,
+  type TaskFinalizer,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, ModelRegistry } from "@braingate/router";
 import { codexIsolationProfileHash, type CodexIsolationAttestation, type ShadowInvocationPlan, type ShadowProcessExecutor, type ShadowProcessResult } from "@braingate/shadow";
 import { WriteDogfoodRunner, type WriteProviderExecutor, type WriteProviderPlan, type WriteProviderResult } from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 /**
  * The finalization seam the runner requires: a ledger, a result directory, and an observation
@@ -68,7 +92,7 @@ test("review request_changes leaves worktree inspectable but marks task blocked"
   git(repo, ["init", "-b", "main"]); git(repo, ["config", "user.email", "test@example.invalid"]); git(repo, ["config", "user.name", "BrainGate Test"]);
   writeFileSync(join(repo, "app.txt"), "before\n"); git(repo, ["add", "app.txt"]); git(repo, ["commit", "-m", "initial"]);
   const registry = new ProjectRegistry(join(root, "brain"));
-  const project = registry.register(parseProjectConfig({ project_id: "review-block", name: "Review Block", repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "review-block", name: "Review Block", repositories: [repo] })));
   const models = new ModelRegistry();
   models.register({ providerId: "anthropic", modelId: "claude", quotaPool: "claude", capabilities: { coder: 95, reviewer: 80, judge: 80 }, speed: "balanced", contextCapacity: 200_000, writeCapable: true, reasoning: 90, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: new Date().toISOString() });
   models.register({ providerId: "openai", modelId: "codex", quotaPool: "chatgpt", capabilities: { coder: 100, reviewer: 100, judge: 100 }, speed: "balanced", contextCapacity: 200_000, writeCapable: false, reasoning: 100, underlyingFamily: null }, { available: true, quotaState: "healthy", quotaHint: 0.1, refusalBackoffUntil: null, quotaObservedAt: null, observedAt: new Date().toISOString() });

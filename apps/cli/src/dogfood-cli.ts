@@ -1,22 +1,30 @@
 import { findManifest } from "./manifest-path.js";
-import { existsSync, mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { attachFromManifest } from "./project-attachment.js";
+import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
 import { CODEX_PROBE_VERSION } from "@braingate/shadow";
 import { ProjectSnapshotProvider } from "@braingate/execution";
-import type { TaskSnapshotProvider } from "@braingate/shadow";
+import type { NativeSessionResolver, TaskSnapshotProvider } from "@braingate/shadow";
 import {
   BrainGateInvariantError,
   ProjectRegistry,
   TaskLedger,
   budgetFor,
   classifyTask,
+  isTaskComplexity,
   quotaRefusalOf,
   type ProviderQuotaRefusal,
   type RegisteredProject,
+  type TaskComplexity,
   type TaskReceipt,
   type TaskClassification,
+  DEFAULT_EXECUTION_POLICY,
+  executionPolicySpec,
+  type ExecutionPolicyId,
+  recordedExecutionAttribution,
+  type TaskEvent,
 } from "@braingate/core";
 import {
   DogfoodStore,
@@ -25,7 +33,7 @@ import {
   inspectGitRepository,
   repositoryReadiness,
 } from "@braingate/dogfood";
-import { GlobalQuotaStore, WINDOW_UTILIZATION_METRIC, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
+import { WINDOW_UTILIZATION_METRIC, openQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
 import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
@@ -47,7 +55,8 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
-import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
 export interface DogfoodCliDependencies {
@@ -96,6 +105,52 @@ export interface DogfoodCliDependencies {
    * persisted or promoted to memory.
    */
   readonly sessionTurns?: (contextTokenBudget: number) => readonly { readonly request: string; readonly answer: string }[];
+  /**
+   * The goal this request continues, as the layers a provider reads.
+   *
+   * M20. Supplied by the interactive session and absent for the flag interface — a one-shot command
+   * continues nothing, and inventing a goal for it would make every scripted invocation a
+   * conversation. It reaches the provider inside the payload's `context` field, beside project
+   * memory and the session turns, and it is what makes a provider switch a continuation rather
+   * than a fresh start.
+   */
+  readonly goalContext?: unknown;
+  /** The goal and conversation the task this run creates is a work unit of. */
+  readonly goalId?: string | null;
+  readonly conversationId?: string | null;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * A pin narrows which model is *considered* and nothing else — every eligibility gate still
+   * applies, and an ineligible pin is refused rather than routed around. Supplied only by the
+   * interactive session, which is the only surface where a person is choosing.
+   */
+  readonly pin?: { readonly providerId: string; readonly modelId: string } | undefined;
+  /**
+   * Asked per invocation whether this run continues a native provider session.
+   *
+   * Supplied by the session, which is the only layer that knows the goal a session belongs to. Absent,
+   * nothing is pinned, nothing is resumed, and no session is persisted.
+   */
+  readonly nativeSession?: NativeSessionResolver | undefined;
+  /**
+   * The complexity floor of the goal this request continues.
+   *
+   * Supplied by the session that owns the goal rather than read from the goals store here: a task
+   * surface takes a tier, not a second copy of the goal model. Absent, the request is classified
+   * exactly as it was before M20, which is what the flag interface and every scripted call get.
+   *
+   * It is applied to the plan as well as the run, on purpose. A plan that routed a follow-up as a
+   * standalone T1 while the run then inherited T3 would be describing a task nobody approved.
+   */
+  readonly inheritedComplexity?: TaskComplexity | null;
+  /**
+   * Told which `provider/model` actually served the run, once it has.
+   *
+   * Read from the same role-activity events the terminal already watches rather than derived a
+   * second time, so what a turn is attributed to and what the operator saw happen cannot disagree.
+   */
+  readonly onTurnAttribution?: (attributedTo: readonly string[]) => void;
   /** Set by the interactive session, which has already introduced itself and shows its own prompt. */
   readonly quiet?: boolean;
 }
@@ -110,6 +165,31 @@ interface CodexIsolationStatus {
   readonly eligible: boolean;
   readonly attestation: CodexIsolationAttestation | null;
   readonly reason: string | null;
+}
+
+/**
+ * Who actually did the work, read from the task's own execution record.
+ *
+ * The plan says who *would* run; `task.execution` is written by the runner that watched the
+ * invocations and says who did. Attribution derived anywhere else — from streamed activity, from the
+ * prose of an answer, from a marker left in a file — is a second derivation of one fact, and the two
+ * disagree the moment either is wrong. A real smoke showed exactly that: read turns recorded
+ * `["anthropic/claude-sonnet-5"]` and `["xai/grok-4.6"]` while both WRITE turns recorded `[]`, so the
+ * goal delta said "another worker" about work whose author was on the ledger the whole time.
+ *
+ * Only roles that completed are named: a role that was routed and then failed did not produce the
+ * turn, and naming it would attribute the work to a worker that never finished it.
+ */
+function executedBy(receipt: { readonly events: readonly TaskEvent[] } | null): readonly string[] {
+  const roles = receipt === null ? null : recordedExecutionAttribution(receipt.events);
+  if (roles === null) return Object.freeze([]);
+  const names: string[] = [];
+  for (const role of roles) {
+    if (role.status !== "completed") continue;
+    const name = `${role.providerId}/${role.modelId}`;
+    if (!names.includes(name)) names.push(name);
+  }
+  return Object.freeze(names);
 }
 
 function removeFlag(args: string[], name: string): boolean {
@@ -162,26 +242,29 @@ function taskWasRecorded(error: unknown): boolean {
   return typeof error === "object" && error !== null && (error as Record<symbol, unknown>)[RECORDED_TASK] === true;
 }
 
-function emit(json: boolean, data: unknown, human: string, stdout: (text: string) => void): void {
-  stdout(json ? `${JSON.stringify(data, null, 2)}\n` : `${human}\n`);
+/**
+ * Prints a result, and returns it.
+ *
+ * Returning is the point. Whether a caller asked for JSON decides how a result is *rendered*, not
+ * what the result *is*: the interactive session reads a plan's classification and a run's task id
+ * back out of `data`, and the earlier version handed it nothing whenever `--json` was absent, so the
+ * session could not tell "the run recorded no task" from "the run's task id was never returned".
+ * The two are different answers and the difference decides what the operator does next.
+ */
+/**
+ * The execution policy this command runs under, from `--policy` or the DIRECT default.
+ *
+ * Parsed in one place so every command that runs a worker accepts the same word, and validated
+ * against the exported list rather than a copy of it: `--policy direct` and `--policy snapshot` mean
+ * the same thing wherever they are typed, and an unknown word is refused with the list.
+ */
+function policyOption(args: string[]): ExecutionPolicyId {
+  const requested = takeOption(args, "--policy") ?? DEFAULT_EXECUTION_POLICY;
+  return executionPolicySpec(requested).id;
 }
 
-function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
-  // Walks upward, because init writes the manifest at the repository root and this may be run
-  // from any directory beneath it.
-  const path = findManifest(cwd, manifest);
-  // A missing manifest is the ordinary "you are not in a registered project" case, especially
-  // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
-  // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about
-  // what to do next. The message names the relative path only, never the resolved one.
-  if (!existsSync(path)) {
-    throw new BrainGateInvariantError(
-      "CLI_PROJECT_NOT_FOUND",
-      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
-    );
-  }
-  const registry = new ProjectRegistry(state.home);
-  return registry.loadFile(path);
+function emit(json: boolean, data: unknown, human: string, stdout: (text: string) => void): void {
+  stdout(json ? `${JSON.stringify(data, null, 2)}\n` : `${human}\n`);
 }
 
 /**
@@ -266,6 +349,26 @@ async function resolveProjectIdentity(input: {
 }
 
 function manifestOption(args: string[]): string { return takeOption(args, "--project") ?? ".brain/project.json"; }
+
+/**
+ * The project a `--rebind` is moving, read straight from the manifest.
+ *
+ * Not through the registry, deliberately: the registry resolves the manifest's repository, and a
+ * rebind is precisely the case where that resolution fails — an unmounted drive, a moved directory.
+ * The id and name are readable regardless, and they are what has to survive the move.
+ */
+function existingManifestIdentity(cwd: string, manifest: string): { readonly projectId: string; readonly name: string } | null {
+  const path = findManifest(cwd, manifest);
+  if (!existsSync(path)) throw new BrainGateInvariantError("PROJECT_REBIND_NO_MANIFEST", `--rebind moves an existing registration, and there is no manifest at ${manifest} here. Run \`braingate init --project-id <id>\` to register this checkout as a new project.`);
+  let parsed: unknown;
+  try { parsed = JSON.parse(readFileSync(path, "utf8")) as unknown; }
+  catch { throw new BrainGateInvariantError("PROJECT_REBIND_INVALID", "The existing .brain/project.json cannot be read, so there is no registration to move."); }
+  const record = parsed as { readonly project_id?: unknown; readonly name?: unknown };
+  if (typeof record.project_id !== "string" || typeof record.name !== "string") {
+    throw new BrainGateInvariantError("PROJECT_REBIND_INVALID", "The existing .brain/project.json does not name a project, so there is no registration to move.");
+  }
+  return Object.freeze({ projectId: record.project_id, name: record.name });
+}
 function contextTokens(task: string): number { return Math.max(128, conservativeTokenEstimate(task) + 64); }
 
 function attestations(copilotOauth: boolean, state: OperatorStatePaths): readonly SubscriptionAttestation[] {
@@ -364,7 +467,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
     spend.set(key, current);
   }
   if (spend.size === 0) return;
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     recordPoolSpend(store, [...spend.values()]);
     recordPoolLoad(store);
@@ -374,7 +477,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
 function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnapshot[]): { readonly router: CapabilityRouter; readonly runtimes: readonly unknown[] } {
   const entries = new ModelCatalog(state.modelCatalogPath).load();
   if (!entries.some((entry) => entry.configured)) throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Import/discover then add scored model definitions before dogfood execution.");
-  const quota = new GlobalQuotaStore(state.globalDir);
+  const quota = openQuotaStore(state.globalDir);
   try {
     // The refusal backoff is applied here, where a task is about to be routed: a pool a provider
     // refused minutes ago is avoided before the call rather than after it. It does not touch
@@ -462,7 +565,7 @@ function recordRefusalBackoffs(state: OperatorStatePaths, receipt: TaskReceipt, 
   const refusals = refusalsIn(receipt.events);
   const served = providerCalls.filter((call) => call.completed);
   if (refusals.length === 0 && served.length === 0) return;
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     for (const refusal of refusals) {
       store.recordRefusalBackoff({
@@ -522,7 +625,7 @@ function recordQuotaReading(state: OperatorStatePaths, readings: readonly (Quota
   // Every window is kept, because a receipt should be able to say what the provider reported.
   // Which of them decides a routing hint is the reader's question, and the reader takes the fullest:
   // a five-hour window at 0.9 matters whatever the weekly figure says.
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     for (const reading of readings) {
       store.record({
@@ -573,7 +676,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const state = resolveOperatorState(env);
   const manifest = manifestOption(args);
   noExtraArgs(args);
-  const project = projectFromManifest(state, manifest, cwd);
+  const { project, scope } = attachFromManifest(state, manifest, cwd);
   const repositories = project.repositories.map(inspectGitRepository);
   const snapshots = await discovery(deps, state);
   const catalog = new ModelCatalog(state.modelCatalogPath).load();
@@ -581,26 +684,32 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"), state, CODEX_PROBE_VERSION);
   const grok = await grokProof(state, snapshots, deps, env, project);
   const acceptances = loadAcceptances(state);
-  const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer") => {
+  // DIRECT is the default policy, so readiness is asked under it: a provider whose only invocation
+  // BrainGate has measured is its native one in the workspace is ready for exactly that, and asking
+  // the staged question instead printed `ask=blocked` beside a run that then worked.
+  const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer", direct: boolean) => {
     const acceptance = acceptances.find((item) => item.providerId === providerId);
-    return shadowProviderRoleStatus(providerId, role, acceptance === undefined ? {} : { acceptance });
+    return shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), direct });
   };
   const providerById = new Map<string, ProviderSnapshot>(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
 
   const askCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && roleStatus(snapshot.providerId, "primary").enabled;
+    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && roleStatus(snapshot.providerId, "primary", true).enabled;
   });
-  let writeCandidate = false;
-  for (const entry of configured) {
-    if (entry.providerId !== "anthropic" || !entry.configured || !entry.definition.writeCapable) continue;
-    const snapshot = providerById.get("anthropic");
-    if (snapshot === undefined) continue;
+  // A DIRECT write is ready when some configured, write-capable model's provider has a measured
+  // DIRECT write invocation. Claude is no longer the only answer to that, and the check is the same
+  // one the write path runs rather than a second opinion about it.
+  const directWriteCandidates = configured.filter((entry) => {
+    if (!entry.configured || !entry.definition.writeCapable) return false;
+    const snapshot = providerById.get(entry.providerId);
+    if (snapshot === undefined || snapshot.available.value !== true) return false;
     try {
-      assertClaudeWriteEligible(snapshot, { providerId: snapshot.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool });
-      writeCandidate = true;
-    } catch { /* reported as unavailable below */ }
-  }
+      assertWriteEligible(snapshot, { providerId: entry.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool }, { nativeHarness: true });
+      return true;
+    } catch { return false; }
+  });
+  const writeCandidate = directWriteCandidates.length > 0;
   const cleanForWrite = repositories.every((repo) => repo.clean);
   // A repository created a moment ago has a branch and no commit. Worktree writes branch from
   // a commit, so they cannot start yet — and saying that plainly beats letting the write path
@@ -608,17 +717,20 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const uncommitted = repositories.filter((repo) => repo.head === null);
   const reviewerCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    if (snapshot === undefined || !roleStatus(snapshot.providerId, "reviewer").enabled) return false;
+    if (snapshot === undefined || !roleStatus(snapshot.providerId, "reviewer", false).enabled) return false;
     if (snapshot.providerId === "openai") return isolation.eligible;
     if (snapshot.providerId === "xai") return grok.eligible;
     return snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription";
   });
   const blockers: string[] = [];
+  const notes: string[] = [];
   if (configured.length === 0) blockers.push("No scored models are configured in the model catalog.");
   if (askCandidates.length === 0) blockers.push("No authenticated configured model is eligible as a read-only primary.");
-  if (!writeCandidate) blockers.push("No authenticated configured Claude model is eligible for M11 restricted writes.");
-  if (!cleanForWrite) blockers.push("At least one registered repository is dirty; worktree writes require a clean source checkout.");
-  if (uncommitted.length > 0) blockers.push("No commit yet in this repository; make a first commit before asking for a change, since worktree writes branch from one. Questions work now.");
+  if (!writeCandidate) blockers.push("No authenticated configured model is eligible for a DIRECT write.");
+  // Not blockers for the default policy: they are what the worktree policy needs, and a DIRECT write
+  // is unaffected by either. Kept visible so an operator choosing `worktree` knows what it requires.
+  if (!cleanForWrite) notes.push("At least one registered repository has uncommitted or untracked files; worktree writes require a clean source checkout, DIRECT writes do not.");
+  if (uncommitted.length > 0) notes.push("No commit yet in this repository; worktree writes branch from one. DIRECT writes and questions work now.");
 
   const data = Object.freeze({
     project: { projectId: project.projectId, name: project.name, manifest: resolve(cwd, manifest) },
@@ -626,11 +738,26 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     catalog: { entries: catalog.length, configured: configured.length, unscored: catalog.length - configured.length },
     providers: snapshots.map((snapshot) => ({ providerId: snapshot.providerId, available: snapshot.available.value, version: snapshot.version.value, authState: snapshot.authState.value, authMode: snapshot.authMode.value })),
     ask: { ready: askCandidates.length > 0, candidates: askCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
-    write: { ready: writeCandidate && cleanForWrite && uncommitted.length === 0, primaryReady: writeCandidate, sourceClean: cleanForWrite, reviewerReady: reviewerCandidates.length > 0, reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
+    write: {
+      directCandidates: directWriteCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`),
+      // DIRECT is the ordinary interactive policy, and it does not need a clean checkout: it edits
+      // the workspace the operator is working in, alongside whatever they already had uncommitted.
+      // The cleanliness requirement belongs to the worktree policy, so it is reported separately
+      // rather than gating a DIRECT write — which is how preflight came to print `write=blocked`
+      // beside a write that then ran (M20.7).
+      ready: writeCandidate,
+      primaryReady: writeCandidate,
+      direct: true,
+      sourceClean: cleanForWrite,
+      worktreeReady: cleanForWrite && uncommitted.length === 0,
+      reviewerReady: reviewerCandidates.length > 0,
+      reviewerCandidates: reviewerCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`),
+    },
     codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason },
     grokIsolation: { attempted: grok.attempted, eligible: grok.eligible, reason: grok.reason },
     acceptedProviders: acceptances.map((item) => item.providerId),
     blockers,
+    notes,
     providerModelCalls: 0,
   });
   emit(json, data, `Dogfood preflight ${project.projectId}: ask=${data.ask.ready ? "ready" : "blocked"} · write=${data.write.ready ? "ready" : "blocked"} · configured=${configured.length} · model calls=0${blockers.length > 0 ? `\n${blockers.map((item) => `- ${item}`).join("\n")}` : ""}`, stdout);
@@ -641,6 +768,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
   const action = args.shift();
   if (action !== "plan" && action !== "run") throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "dogfood ask requires plan or run.");
   const manifest = manifestOption(args);
+  const policy = policyOption(args);
   const task = takeOption(args, "--task", true)!;
   const execute = removeFlag(args, "--execute");
   const optionalReview = removeFlag(args, "--review");
@@ -650,15 +778,18 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
 
   const state = resolveOperatorState(env);
   const oauth = attestations(copilotOauth, state);
-  const project = projectFromManifest(state, manifest, cwd);
+  const { project, scope } = attachFromManifest(state, manifest, cwd);
   const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
-  const store = new DogfoodStore(project);
+  const store = new DogfoodStore(scope.project);
   try {
     const predicted = classifyTask({ text: task, mode: "ask" });
     const prior = store.derivePrior("ask");
     const adaptive = applyDogfoodPrior(predicted, prior);
-    const effective = adaptive.effective;
+    // The goal this request continues, applied after the project prior so both the plan and the run
+    // are priced for the work rather than for the sentence. M20.
+    const floor = deps.inheritedComplexity ?? null;
+    const effective = floor === null ? adaptive.effective : applyInheritedFloor(adaptive.effective, floor);
     const budget = budgetFor(effective, { writeRequested: false });
     const requiredContextTokens = contextTokens(task);
     const memory = collectTaskMemory(project, task, budget.maxContextTokens);
@@ -672,6 +803,9 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       // The session's earlier turns: kept with the project for a few hours, redacted, and never
       // promoted to memory.
       session: deps.sessionTurns?.(budget.maxContextTokens) ?? [],
+      // M20 layer 2 and 3: the goal this request continues, and where its detail lives. Absent for
+      // the flag interface, which continues nothing.
+      ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }),
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
     // A review needs Codex's proof, and so does a read primary on a project copy: one self-test
@@ -686,22 +820,36 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
-    const plan = buildShadowTaskPlan({ project, cwd, router: runtime.router, providers: snapshots, measured, attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
+    const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
-    const planData = Object.freeze({ classification: view, budget, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })), providerCallsOnPlan: 0 });
+    // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
+    // terminal prints; `complexity`, `risk`, `promptComplexity` and `roleLines` are the same facts as
+    // structure, so a caller that reads the plan back — the interactive session does — gets the
+    // classification and the grants the plan actually used rather than a re-parse of its prose.
+    const planData = Object.freeze({
+      classification: view,
+      complexity: effective.complexity,
+      risk: effective.risk,
+      promptComplexity: predicted.complexity,
+      summary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+      grantLines: Object.freeze(plan.roles.map((role, index) => {
+        const grant = role.invocation.grant;
+        const refused = grant.refused.map((item) => item.capability).join(", ");
+        const name = roleLine(plan.roles).split(" · ")[index]?.split("=")[0] ?? role.role;
+        return Object.freeze(`${name}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`);
+      })),
+      budget,
+      roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })),
+      providerCallsOnPlan: 0,
+    });
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason } };
       emit(json, data, [
-        `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+        planData.summary,
         // What each role may do, and what it asked for and did not get. Read before the run,
         // where "the planner wanted the network and nobody accepted it" is still actionable.
-        ...plan.roles.map((role, index) => {
-          const grant = role.invocation.grant;
-          const refused = grant.refused.map((item) => item.capability).join(", ");
-          const name = roleLine(plan.roles).split(" · ")[index]?.split("=")[0] ?? role.role;
-          return `  ${name}: ${grant.granted.join(", ")}${refused.length === 0 ? "" : ` · refused ${refused}`}`;
-        }),
+        ...planData.grantLines.map((line) => `  ${line}`),
         "Zero provider model calls executed.",
       ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -710,14 +858,25 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // Collected during the run and written once it ends: a provider reports every window on
     // every call, and only the fullest of them should decide where the next task goes.
     const pendingQuotaReadings: (QuotaReading & { readonly quotaPool: string })[] = [];
-    const ledger = new TaskLedger(project);
+    const ledger = new TaskLedger(scope.project);
     // Whatever was newest before this invocation, so the task this run created can be identified on
     // the failure path — a refusal ends the run, and its backoff must be applied anyway.
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
+    // Which provider and model actually served this run. Collected from the role-activity stream the
+    // terminal already receives, so the turn's attribution is a reading rather than a second guess,
+    // and deduplicated because a task may spend several phases on the same model.
+    const servedBy: string[] = [];
     try {
-      const runner = new ShadowDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), ...(deps.onRoleActivity === undefined ? {} : { onRoleActivity: deps.onRoleActivity }), ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); } });
-      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
+      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, nativeHarness: policy === "direct", policy, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
+        if (activity.stage === "started") {
+          const attribution = `${activity.provider}/${activity.model}`;
+          if (!servedBy.includes(attribution)) servedBy.push(attribution);
+        }
+        deps.onRoleActivity?.(activity);
+      }, ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); }, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }) });
+      const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_RECEIPT_MISSING", "Executed dogfood ask did not produce a task receipt.");
+      deps.onTurnAttribution?.(executedBy(result.taskReceipt));
       // The runner recorded the outcome, the result and the observation; this reads them back
       // rather than deciding again. A second derivation here is how the screen and the ledger end
       // up disagreeing about the same task.
@@ -752,24 +911,40 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
   const requestedRepo = takeOption(args, "--repo");
   const baseRef = takeOption(args, "--base") ?? "HEAD";
   const execute = removeFlag(args, "--execute");
-  const review = !removeFlag(args, "--no-review");
+  // Tri-state: unset follows the budget's reviewer policy, and the flags are how the operator
+  // overrides it. `true` by default meant every write bought a second subscription, which for a
+  // T0-T2 DIRECT documentation edit is one worker too many (M20.7).
+  const wantsReview = removeFlag(args, "--review");
+  const declinesReview = removeFlag(args, "--no-review");
+  const reviewPreference: boolean | null = wantsReview ? true : declinesReview ? false : null;
   const copilotOauth = removeFlag(args, "--attest-copilot-oauth");
+  // Read before the leftover-argument check: a flag the command accepts is not an extra argument.
+  const policy = policyOption(args);
   noExtraArgs(args);
   if (action === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with dogfood write run.");
 
   const state = resolveOperatorState(env);
   const oauth = attestations(copilotOauth, state);
-  const project = projectFromManifest(state, manifest, cwd);
-  const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
+  const { project, scope } = attachFromManifest(state, manifest, cwd);
+  // Under DIRECT the write happens in the workspace itself, so the path it runs in is the workspace
+  // the operator selected rather than a registered repository picked for a worktree of it.
+  const repositoryPath = policy === "direct" || policy === "unattended"
+    ? scope.workspacePath
+    : resolveWriteRepository(project, cwd, requestedRepo);
   const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
-  const store = new DogfoodStore(project);
+  const store = new DogfoodStore(scope.project);
   try {
     const predicted = classifyTask({ text: task, mode: "write" });
     const prior = store.derivePrior("write");
     const adaptive = applyDogfoodPrior(predicted, prior);
-    const effective = adaptive.effective;
+    // A write that continues a goal inherits the goal's floor on the same terms as a question. M20.
+    const floor = deps.inheritedComplexity ?? null;
+    const effective = floor === null ? adaptive.effective : applyInheritedFloor(adaptive.effective, floor);
     const budget = budgetFor(effective, { writeRequested: true });
+    // The decision, after the budget: required reviews always run, and a reviewer the budget only
+    // permits runs when the operator asked for one.
+    const review = reviewPreference ?? budget.reviewerPolicy === "required";
     const requiredContextTokens = contextTokens(task);
     const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state, CODEX_PROBE_VERSION);
     const codexIsolation = isolation.attestation ?? undefined;
@@ -780,30 +955,94 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const grokWrite = await grokProof(state, snapshots, deps, env, project, GROK_WRITE_SANDBOX);
     const grokWriteIsolation = grokWrite.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildWriteTaskPlan({ router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const plan = buildWriteTaskPlan({ policy, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
-    const planData = Object.freeze({ classification: view, budget, repositoryPath, baseRef, roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })), providerCallsOnPlan: 0, createsWorktree: false, mergeAvailable: false });
+    // The same structural fields the read plan carries, so a caller that continues a goal reads one
+    // shape whichever mode the request took. `summary` is what the terminal prints; the tiers are
+    // what the plan *used*, which is what the session's goal line has to agree with.
+    const planData = Object.freeze({
+      classification: view,
+      complexity: effective.complexity,
+      risk: effective.risk,
+      promptComplexity: predicted.complexity,
+      summary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+      // No grants here: a write role carries a workspace rather than a tool grant, and inventing an
+      // empty list would let a reader conclude the roles were granted nothing.
+      budget,
+      repositoryPath,
+      baseRef,
+      roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })),
+      providerCallsOnPlan: 0,
+      createsWorktree: false,
+      mergeAvailable: false,
+    });
 
     if (action === "plan" || !execute) {
       const data = { ...planData, codexIsolation: { attempted: isolation.attempted, eligible: isolation.eligible, reason: isolation.reason }, approvalRequired: true };
-      emit(json, data, `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}\nZero provider model calls. Zero worktrees. Merge unavailable.`, stdout);
+      emit(json, data, [
+        planData.summary,
+        // Which workspace each write role runs in, which is this mode's equivalent of a grant: it
+        // says where a change would land, and that the operator's checkout is not on the list.
+        ...plan.roles.map((role) => `  ${role.role}: ${role.workspace} · ${role.model.providerId}/${role.model.modelId}`),
+        "Zero provider model calls. Zero worktrees. Merge unavailable.",
+      ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
     }
 
-    const ledger = new TaskLedger(project);
+    const ledger = new TaskLedger(scope.project);
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
-      const runner = new WriteDogfoodRunner({ project, ledger, finalizer: projectFinalizer({ project, ledger, store }), router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
-      const result = await runner.run({ task, repositoryPath, baseRef, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [] }), review, dryRun: false, env });
+      const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const result = await runner.run({ task, repositoryPath, baseRef, policy, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
+      // A write turn is a turn like any other, and the goal history has to name the worker that made
+      // the change: a later worker reading the delta must be able to tell who wrote what.
+      deps.onTurnAttribution?.(executedBy(result.taskReceipt));
       // Read back what the runner recorded, so the screen and the ledger cannot disagree.
       const recorded = recordedOutcomeOf(result.taskReceipt);
       const observationSequence = store.find(result.taskId)?.sequence ?? null;
       recordSpendFromReceipt(state, result.taskReceipt.usage, new ModelCatalog(state.modelCatalogPath).configured());
       recordRefusalBackoffs(state, result.taskReceipt, servedPools(result.taskReceipt.events));
-      const data = Object.freeze({ plan: planData, taskId: result.taskId, observationSequence, outcome: recorded?.outcome ?? null, reviewStatus: recorded?.reviewStatus ?? null, failureKind: recorded?.failureKind ?? null, worktree: result.worktree, changedFiles: result.changedFiles, diff: result.diff, verification: result.verification, review: result.review, readyForApproval: result.readyForApproval, approvalRequired: true, mergePerformed: false, usage: result.taskReceipt.usage });
-      emit(json, data, `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · branch=${result.worktree?.branch ?? "unknown"}\nChanged: ${result.changedFiles.join(", ")}\nReady for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`, stdout);
-      return Object.freeze({ exitCode: recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1, data });
+      const noChange = result.noChange === true;
+      const data = Object.freeze({
+        plan: planData,
+        taskId: result.taskId,
+        observationSequence,
+        outcome: recorded?.outcome ?? null,
+        reviewStatus: recorded?.reviewStatus ?? null,
+        failureKind: recorded?.failureKind ?? null,
+        worktree: result.worktree,
+        executionPolicy: result.executionPolicy ?? policy,
+        providerCwd: result.providerCwd ?? repositoryPath,
+        changedFiles: result.changedFiles,
+        diff: result.diff,
+        verification: result.verification,
+        review: result.review,
+        // What the worker said it did, so a run that changed nothing still has an explanation and a
+        // conversation turn worth continuing from.
+        answer: result.report ?? null,
+        noChange,
+        sessionRecovered: result.sessionRecovered === true,
+        readyForApproval: result.readyForApproval,
+        approvalRequired: result.approvalRequired,
+        mergePerformed: false,
+        usage: result.taskReceipt.usage,
+      });
+      const boundary = result.worktree === null ? `workspace=${result.providerCwd ?? repositoryPath}` : `branch=${result.worktree.branch}`;
+      emit(json, data, [
+        `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · ${boundary}`,
+        noChange
+          // The worker finished and the workspace did not change. Said plainly, with its own words,
+          // rather than as a review outcome about a diff that never existed.
+          ? `No change was made. The worker reported: ${result.report ?? "nothing"}`
+          : `Changed: ${result.changedFiles.join(", ")}`,
+        ...(noChange ? [] : [`Ready for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`]),
+      ].join("\n"), stdout);
+      // A no-change run is a completed observation, not a command failure: the record is written,
+      // the operator is told the truth, and the follow-up ("try again, or say what blocked you")
+      // needs the turn to exist. Every other unusable outcome still exits non-zero.
+      const exitCode = noChange ? 0 : recorded !== null && isUsableOutcome(recorded.outcome) ? 0 : 1;
+      return Object.freeze({ exitCode, data });
     } catch (error) {
       // The task exists and the runner has already recorded what became of it, so this is an
       // execution failure rather than a preflight one. Marked so the operator is never told that
@@ -827,6 +1066,10 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       const flagProjectId = takeOption(args, "--project-id") ?? null;
       const flagName = takeOption(args, "--name") ?? null;
       const gitInitFlag = removeFlag(args, "--git-init");
+      // The one explicit way a project's registration moves to a different checkout. Never implied:
+      // without it, a manifest that names another checkout is a conflict rather than something to
+      // overwrite, because overwriting would silently point a project's memory at other work.
+      const rebind = removeFlag(args, "--rebind");
       noExtraArgs(args);
       // Asked first, because it decides whether the identity questions are worth asking at all.
       // A new directory is where people start, and finding out it cannot be registered only
@@ -835,26 +1078,32 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       const ask = deps.ask ?? terminalAsk();
       let createRepository = gitInitFlag;
       if (!createRepository && repositoryReadiness(cwd).repositoryPath === null) {
-        if (json) throw new BrainGateInvariantError("PROJECT_NOT_A_REPOSITORY", "There is no Git repository here. Re-run with --git-init to create one, or run `git init` yourself.");
+        // A repository is offered, never assumed: `git init` writes to their disk. Declining is an
+        // ordinary outcome rather than a dead end. A workspace does not have to be a repository, and
+        // what a missing one costs is the worktree-isolated write modes — which say so themselves,
+        // at the point where they are asked for something they cannot do.
         stdout([
           "",
-          `  ${cwd} is not a Git repository yet.`,
-          "  BrainGate makes every change in a task worktree and fingerprints your checkout",
-          "  before and after each run, so it needs a repository to work in.",
+          `  ${cwd} is not a Git repository. That is a fine workspace, and BrainGate will register it.`,
+          "  A repository is what the worktree-isolated write modes need: every change they propose is",
+          "  made in a task worktree, and your directory is fingerprinted before and after each run.",
           "",
         ].join("\n"));
-        // Without a terminal there is nobody to ask, and creating a repository unasked would
-        // be BrainGate writing to their disk on a guess.
+        // With nobody to ask, no repository is created: registering the directory is the safe
+        // default, and `--git-init` is the explicit way to ask for one.
         const answer = ask === undefined ? null : await ask("  Create one here with `git init`? [Y/n] ");
-        if (answer === null || /^n(o)?$/i.test(answer.trim())) {
-          throw new BrainGateInvariantError("PROJECT_NOT_A_REPOSITORY", "Nothing was created. Run `git init` here when you are ready, then `braingate init` again — or `braingate init --git-init` to do both.");
-        }
-        createRepository = true;
+        createRepository = answer !== null && !/^n(o)?$/i.test(answer.trim());
+        stdout("\n");
       }
-      const identity = await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask, stdout, quiet: deps.quiet === true });
-      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name, createRepository });
+      // A rebind keeps the existing project's identity and moves only what the manifest points at, so
+      // it does not ask for an id and a name: asking would invite a rename where the operator asked
+      // for a relocation.
+      const rebindTarget = rebind ? existingManifestIdentity(cwd, manifestOption(args)) : null;
+      const identity = rebindTarget ?? await resolveProjectIdentity({ cwd, projectId: flagProjectId, name: flagName, ask, stdout, quiet: deps.quiet === true });
+      data = initializeDogfoodProject({ cwd, projectId: identity.projectId, name: identity.name, createRepository, rebind });
       const created = (data as { created: boolean }).created;
       const manifestPath = (data as { manifestPath: string }).manifestPath;
+      const hasRepository = (data as { hasRepository: boolean }).hasRepository;
       emit(
         json,
         data,
@@ -862,6 +1111,13 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
           ? `${created ? "Registered" : "Using"} ${identity.projectId}.`
           : [
             `${created ? "Created" : "Using"} local BrainGate project manifest at ${manifestPath}`,
+            ...(hasRepository
+              ? []
+              : [
+                "",
+                "This workspace is not a Git repository. It is registered, and sessions, goals and reading",
+                "run here as they are; the worktree-isolated write modes will say what they need if asked.",
+              ]),
             "",
             "Next:",
             "  braingate dogfood preflight                      check readiness, zero model calls",
@@ -885,8 +1141,8 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
 
     const state = resolveOperatorState(env);
     const manifest = manifestOption(args);
-    const project = projectFromManifest(state, manifest, cwd);
-    const store = new DogfoodStore(project);
+    const { project, scope } = attachFromManifest(state, manifest, cwd);
+    const store = new DogfoodStore(scope.project);
     try {
       if (subcommand === "feedback") {
         const taskId = takeOption(args, "--task-id", true)!;
@@ -920,7 +1176,17 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "dogfood requires preflight, ask, write, feedback, report, or export.");
     } finally { store.close(); }
   } catch (error) {
-    const safe = safeError(error);
+    let safe = safeError(error);
+    // A pinned worker that the gates refuse says "provider-excluded", which names the fact and not
+    // the reason. Where the provider has a recorded measurement, the operator gets it here — the one
+    // place every command's failure passes through — so "why can't I use the worker I chose" has an
+    // answer and a next step instead of a shrug.
+    const advice = safe.code === "ROUTE_MANUAL_INELIGIBLE" && deps.pin !== undefined
+      ? shadowProviderRoleStatus(deps.pin.providerId as ProviderSnapshot["providerId"], "primary", { direct: true })
+      : null;
+    if (advice !== null && !advice.enabled && advice.reason !== null) {
+      safe = Object.freeze({ code: safe.code, message: `${safe.message}\n  ${deps.pin?.providerId} is blocked for this policy: ${advice.reason}` });
+    }
     // Whether anything was recorded for this attempt is the one thing the operator cannot infer
     // from the error itself, and it decides what they do next: fix a flag, or read a task.
     const recorded = taskWasRecorded(error);

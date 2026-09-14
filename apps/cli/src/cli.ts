@@ -1,4 +1,5 @@
 import { findManifest } from "./manifest-path.js";
+import { attachFromManifest } from "./project-attachment.js";
 import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { resolve } from "node:path";
 import { conservativeTokenEstimate } from "@braingate/context";
@@ -8,10 +9,11 @@ import {
   TaskLedger,
   budgetFor,
   classifyTask,
+  type ExecutionScope,
   type RegisteredProject,
 } from "@braingate/core";
 import { startDashboardServer } from "@braingate/dashboard";
-import { GlobalQuotaStore, buildDashboardSnapshot, recordPoolLoad, recordPoolSpend, type DashboardSnapshot, type RefusalBackoff } from "@braingate/observability";
+import { buildDashboardSnapshot, openQuotaStore, recordPoolLoad, recordPoolSpend, type DashboardSnapshot, type GlobalQuotaStore, type RefusalBackoff } from "@braingate/observability";
 import {
   ModelCatalog,
   NETWORK_ACCESS_RISK,
@@ -24,7 +26,8 @@ import {
 } from "@braingate/operator";
 import { CLI_FEATURES, ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, isProviderId, probeCliCapabilities, type CliCapabilityReport, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition, type ModelRef } from "@braingate/router";
-import { CODEX_PROBE_VERSION } from "@braingate/shadow";
+import { CODEX_PROBE_VERSION, nativeDirectCapable } from "@braingate/shadow";
+import { RUNTIME_SESSION_POLICIES } from "@braingate/goals";
 import {
   CodexIsolationVerifier,
   ShadowDogfoodRunner,
@@ -39,7 +42,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { reconciliationNotice } from "./tasks-cli.js";
-import { WriteDogfoodRunner, buildWriteTaskPlan, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, buildWriteTaskPlan, directWriteCapable, isWriteProvider, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
 import { ProjectSnapshotProvider } from "@braingate/execution";
 import { DogfoodStore } from "@braingate/dogfood";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf } from "./finalization.js";
@@ -110,24 +113,6 @@ function safeError(error: unknown): { readonly code: string; readonly message: s
   if (error instanceof BrainGateInvariantError) return Object.freeze({ code: error.code, message: error.message });
   if (error instanceof RangeError) return Object.freeze({ code: "CLI_RANGE_ERROR", message: error.message });
   return Object.freeze({ code: "CLI_UNEXPECTED", message: "Unexpected BrainGate operator failure. Raw error details were suppressed." });
-}
-
-function projectFromManifest(state: OperatorStatePaths, manifest: string, cwd: string): RegisteredProject {
-  // Walks upward, because init writes the manifest at the repository root and this may be run
-  // from any directory beneath it.
-  const path = findManifest(cwd, manifest);
-  // A missing manifest is the ordinary "you are not in a registered project" case, especially
-  // now that `braingate` is on PATH and gets run from anywhere. Without this it reached the
-  // catch-all and printed CLI_UNEXPECTED with details suppressed, which says nothing about
-  // what to do next. The message names the relative path only, never the resolved one.
-  if (!existsSync(path)) {
-    throw new BrainGateInvariantError(
-      "CLI_PROJECT_NOT_FOUND",
-      `No BrainGate project found here (looked for ${manifest} in the current directory). Run \`braingate init --project-id <id> --name <name>\` inside the repository, or pass --project <manifest>.`,
-    );
-  }
-  const registry = new ProjectRegistry(state.home);
-  return registry.loadFile(path);
 }
 
 /**
@@ -337,7 +322,7 @@ function runtimeFor(
   if (entries.filter((entry) => entry.configured).length === 0) {
     throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Add a scored model definition with `braingate models add --definition <file>`. ");
   }
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     const quota = store.latest();
     const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota, backoff: store.activeRefusalBackoffs() });
@@ -372,18 +357,18 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
     spend.set(key, current);
   }
   if (spend.size === 0) return;
-  const store = new GlobalQuotaStore(state.globalDir);
+  const store = openQuotaStore(state.globalDir);
   try {
     recordPoolSpend(store, [...spend.values()]);
     recordPoolLoad(store);
   } finally { store.close(); }
 }
 
-function snapshotProvider(state: OperatorStatePaths, project: RegisteredProject): () => DashboardSnapshot {
+function snapshotProvider(state: OperatorStatePaths, scope: ExecutionScope): () => DashboardSnapshot {
   return () => {
-    const ledger = new TaskLedger(project);
-    const quota = new GlobalQuotaStore(state.globalDir);
-    try { return buildDashboardSnapshot({ projects: [{ project, ledger }], quotaStore: quota }); }
+    const ledger = new TaskLedger(scope.project);
+    const quota = openQuotaStore(state.globalDir);
+    try { return buildDashboardSnapshot({ projects: [{ project: scope.project, ledger }], quotaStore: quota }); }
     finally { ledger.close(); quota.close(); }
   };
 }
@@ -404,7 +389,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       // init and dogfood are dispatched before this handler is reached, so they were absent
       // from the only listing a new user sees — which left the two commands they actually
       // need undiscoverable. The listing describes every command the binary accepts.
-      data = { commands: ["init", "dogfood", "doctor", "discover", "providers", "models", "memory", "shadow", "write", "status", "dashboard"] };
+      data = { commands: ["repl", "init", "dogfood", "doctor", "discover", "providers", "models", "memory", "shadow", "write", "status", "dashboard"] };
       emit(
         json,
         data,
@@ -412,10 +397,22 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "BrainGate — one local control plane for the AI coding subscriptions you already use.",
           "",
           "Start here",
-          "  braingate init                       register the repository in the current directory",
+          "  braingate                            the interactive session: one conversation, one goal,",
+          "                                       across the CLIs you already pay for",
+          "  braingate init                       register the directory you are in as the workspace",
+          "  braingate init --rebind              move this project's registration to this workspace",
           "  braingate dogfood preflight          check readiness, zero model calls",
           '  braingate dogfood ask plan --task "<question>"',
           '  braingate dogfood ask run  --task "<question>" --execute',
+          "",
+          "In the interactive session",
+          "  /use <provider>/<model> [--fresh]    send the next work to this worker, keeping the goal",
+          "  /auto                                let BrainGate choose the worker again",
+          "  /worker                              who is selected, the goal, and what would resume",
+          "  /goal                                the goal: established findings, disputes, questions",
+          "  /new                                 set the current goal aside and start another",
+          "  /project                             the project and workspace this session is bound to",
+          "  /help                                everything else the session understands",
           "",
           "Everything else",
           "  discover     which provider CLIs are installed and how they are authenticated",
@@ -505,18 +502,39 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
             const status = shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now });
             return Object.freeze({ role, enabled: status.enabled, acceptedByOperator: status.acceptedByOperator, reason: status.reason });
           });
+          // The three questions the roles list alone could not answer: can this worker be pointed at
+          // the operator's own workspace, what kind of native session does it keep, and may it write.
+          // They are separate facts about one CLI, and flattening them into "enabled" is how a
+          // provider that runs natively looked identical to one that does not run at all.
+          const direct = shadowProviderRoleStatus(providerId, "primary", { ...(acceptances.find((item) => item.providerId === providerId) === undefined ? {} : { acceptance: acceptances.find((item) => item.providerId === providerId)! }), direct: true, now });
+          const session = RUNTIME_SESSION_POLICIES[providerId];
+          const write = Object.freeze({
+            direct: directWriteCapable(providerId),
+            worktree: isWriteProvider(providerId),
+          });
           return Object.freeze({
             providerId,
             shadow: shadowProviderStatus(providerId),
             acceptance: record === null ? null : Object.freeze({ acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, current: new Date(record.expiresAt).getTime() > now.getTime() }),
             roles,
+            direct: Object.freeze({ supported: nativeDirectCapable(providerId), primaryReachable: nativeDirectCapable(providerId) && direct.enabled, reason: direct.enabled ? null : direct.reason }),
+            session: Object.freeze({ idSource: session?.idSource ?? "none", continuityOffered: session?.resumeOffered === true }),
+            write,
           });
         });
         data = rows;
         emit(json, data, rows.map((row) => {
           const open = row.roles.filter((entry) => entry.enabled).map((entry) => entry.role);
           const how = row.roles.some((entry) => entry.acceptedByOperator) ? " (operator-accepted)" : "";
-          return `${row.providerId}: ${open.length === 0 ? "no roles" : open.join(", ")}${how}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
+          const native = row.direct.supported
+            ? `DIRECT: reachable as primary${row.direct.reason === null ? "" : " when selected"}`
+            : `DIRECT: none (${row.direct.reason ?? "no measured invocation"})`;
+          const session = row.session.continuityOffered ? `sessions: ${row.session.idSource}` : "sessions: goal handoff only";
+          const write = row.write.direct ? "write: DIRECT" : row.write.worktree ? "write: worktree" : "write: none";
+          // The roles list answers the staged question, so it says so: a provider whose only
+          // reachable route is DIRECT read as "no roles" beside a DIRECT line saying otherwise.
+          const route = row.shadow.enabled === false ? "staged (operator-accepted)" : "staged";
+          return `${row.providerId}: ${open.length === 0 ? `${route}: no roles` : `${route}: ${open.join(", ")}`}${how}\n    ${native} · ${session} · ${write}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
         }).join("\n"), stdout);
         return Object.freeze({ exitCode: 0, data });
       }
@@ -610,14 +628,14 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     if (command === "doctor") {
       const manifest = takeOption(args, "--project", true)!;
       noExtraArgs(args);
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const snapshots = await discovery(deps, state);
       const entries = new ModelCatalog(state.modelCatalogPath).load();
       const isolation = await codexIsolationStatus(snapshots, deps, env, true, state, CODEX_PROBE_VERSION);
       const grok = await grokProof(state, snapshots, deps, env, project);
       const grokSnapshot = await grokProof(state, snapshots, deps, env, project, "snapshot-read");
       const acceptances = loadAcceptances(state);
-      const store = new GlobalQuotaStore(state.globalDir);
+      const store = openQuotaStore(state.globalDir);
       let runtimes: readonly unknown[] = [];
       let backoffs: readonly RefusalBackoff[] = [];
       try {
@@ -679,8 +697,8 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     if (command === "status") {
       const manifest = takeOption(args, "--project", true)!;
       noExtraArgs(args);
-      const project = projectFromManifest(state, manifest, cwd);
-      data = snapshotProvider(state, project)();
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
+      data = snapshotProvider(state, scope)();
       const dashboard = data as DashboardSnapshot;
       // "who planned, who wrote, who reviewed" is the question this command exists to answer,
       // and every part of it was already in the data and shown as a count.
@@ -712,9 +730,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       // A read that finds something unfinished says so, and stops there: repairing is a separate,
       // explicit command. Saying nothing would leave the operator reading a summary of tasks that
       // are not finished being written.
-      const ledger = new TaskLedger(project);
+      const ledger = new TaskLedger(scope.project);
       try {
-        const notice = reconciliationNotice(project, ledger);
+        const notice = reconciliationNotice(scope, ledger);
         if (notice !== null) lines.push("", notice);
       } finally { ledger.close(); }
       emit(json, data, lines.join("\n"), stdout);
@@ -725,11 +743,11 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const manifest = takeOption(args, "--project", true)!;
       const portRaw = takeOption(args, "--port");
       noExtraArgs(args);
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const port = portRaw === undefined ? 0 : Number(portRaw);
       if (!Number.isInteger(port) || port < 0 || port > 65535) throw new BrainGateInvariantError("CLI_PORT_INVALID", "--port must be an integer from 0 to 65535.");
       const starter = deps.startDashboard ?? (async (provider, options) => await startDashboardServer(provider, options));
-      const started = await starter(snapshotProvider(state, project), { host: "127.0.0.1", port });
+      const started = await starter(snapshotProvider(state, scope), { host: "127.0.0.1", port });
       data = { url: started.url, projectId: project.projectId };
       emit(json, data, `BrainGate dashboard: ${started.url}`, stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -750,7 +768,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `write run`.");
 
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const repositoryPath = resolveWriteRepository(project, cwd, requestedRepo);
       const snapshots = await discovery(deps, state);
       const hydrated = runtimeFor(state, snapshots);
@@ -827,13 +845,13 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       }
 
       if (!json) stdout(`${classification.complexity}/${classification.risk} · creating isolated worktree · ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
-      const ledger = new TaskLedger(project);
-      const store = new DogfoodStore(project);
+      const ledger = new TaskLedger(scope.project);
+      const store = new DogfoodStore(scope.project);
       try {
         const runner = new WriteDogfoodRunner({
-          project,
+          project: scope.project,
           ledger,
-          finalizer: projectFinalizer({ project, ledger, store }),
+          finalizer: projectFinalizer({ project: scope.project, ledger, store }),
           router: hydrated.router,
           providers: snapshots,
           attestations,
@@ -895,7 +913,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       const attestations = attestation(args, state);
       noExtraArgs(args);
       if (subcommand === "plan" && execute) throw new BrainGateInvariantError("CLI_EXECUTE_INVALID", "--execute is valid only with `shadow run`.");
-      const project = projectFromManifest(state, manifest, cwd);
+      const { project, scope } = attachFromManifest(state, manifest, cwd);
       const snapshots = await discovery(deps, state);
       const hydrated = runtimeFor(state, snapshots);
       const classification = classifyTask({ text: task, mode: "ask" });
@@ -913,7 +931,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
       const acceptances = loadAcceptances(state);
       const plan = buildShadowTaskPlan({
-        project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
+        project: scope.project, cwd, router: hydrated.router, providers: snapshots, attestations, task, context,
         classification, budget, requiredContextTokens, optionalReview, acceptances,
         ...(codexIsolation === undefined ? {} : { codexIsolation }),
         ...(grokIsolation === undefined ? {} : { grokIsolation }),
@@ -928,16 +946,16 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
       }
 
       if (!json) stdout(`${classification.complexity}/${classification.risk} · executing ${plan.roles.map((role) => `${role.role}=${role.model.providerId}/${role.model.modelId}`).join(" · ")}\n`);
-      const ledger = new TaskLedger(project);
-      const store = new DogfoodStore(project);
+      const ledger = new TaskLedger(scope.project);
+      const store = new DogfoodStore(scope.project);
       try {
         const runner = new ShadowDogfoodRunner({
-          project,
+          project: scope.project,
           ledger,
-          finalizer: projectFinalizer({ project, ledger, store }),
+          finalizer: projectFinalizer({ project: scope.project, ledger, store }),
           router: hydrated.router,
           snapshots,
-          snapshotStore: new ProjectSnapshotProvider(project),
+          snapshotStore: new ProjectSnapshotProvider(scope.project),
           attestations,
           acceptances,
           ...(codexIsolation === undefined ? {} : { codexIsolation }),

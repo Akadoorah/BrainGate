@@ -1,7 +1,8 @@
 import { BrainGateInvariantError } from "@braingate/core";
-import type { ExecutionBudget, RegisteredProject, TaskClassification } from "@braingate/core";
+import type { ExecutionBudget, ExecutionProject, TaskClassification } from "@braingate/core";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
+import {
+  type RoutePin, CapabilityRouter, type ModelRef, type RouteResult } from "@braingate/router";
 import {
   assertShadowProjectCwd,
   planShadowInvocation,
@@ -100,8 +101,18 @@ function excludedProviders(input: {
   readonly providers: readonly ProviderSnapshot[];
   readonly role: "planner" | "primary" | "reviewer";
   readonly proof: ProviderProof;
+  /**
+   * The providers the operator named for this plan, which DIRECT reaches even where the staged
+   * gates close them.
+   *
+   * Deliberately the pinned set and not "every provider under DIRECT": selecting a worker is the
+   * operator's act, and widening the automatic route to the other subscriptions is a different
+   * decision from making the selected one work. The gates below still answer for every provider the
+   * operator did not name.
+   */
+  readonly directProviders?: readonly string[];
 }): readonly string[] {
-  return Object.freeze(input.providers.filter((snapshot) => {
+  const excludedList = Object.freeze(input.providers.filter((snapshot) => {
     const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
     // The same question the runner asks, from the same function: a plan that hid a provider the runner
     // would accept is as wrong as one that named a provider the runner would refuse — and the read
@@ -113,15 +124,22 @@ function excludedProviders(input: {
       ...(input.proof.grokIsolation === undefined ? {} : { grokIsolation: input.proof.grokIsolation }),
       ...(input.proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: input.proof.grokSnapshotIsolation }),
     }).eligible;
-    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible }).enabled) return true;
+    const directHere = (input.directProviders ?? []).includes(snapshot.providerId);
+
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
+    // The proofs below are for a staged or snapshot posture: a sandbox profile BrainGate wrote, and
+    // a copy it made. A DIRECT run has neither, so demanding them excluded exactly the worker the
+    // operator named — the plan refusing the model the operator had just asked for.
+    if (directHere) return false;
     if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
     if (snapshot.providerId === "xai" && (input.role === "primary" ? input.proof.grokSnapshotIsolation === undefined : input.proof.grokIsolation === undefined)) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
+  return excludedList;
 }
 
 export function buildShadowTaskPlan(input: {
-  readonly project: RegisteredProject;
+  readonly project: ExecutionProject;
   readonly cwd: string;
   readonly router: CapabilityRouter;
   readonly providers: readonly ProviderSnapshot[];
@@ -137,11 +155,21 @@ export function buildShadowTaskPlan(input: {
   readonly grokIsolation?: GrokIsolationAttestation;
   readonly acceptances?: readonly OperatorProviderAcceptance[];
   readonly task: string;
+  /** Whether this plan keeps the runtime's own harness: the DIRECT policy (ADR 0017). */
+  readonly nativeHarness?: boolean;
   readonly context: unknown;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
   readonly requiredContextTokens: number;
   readonly optionalReview?: boolean;
+  /**
+   * The worker the operator named by hand, when there is one.
+   *
+   * Applied to the primary route only. The planner and the reviewer are chosen for their
+   * independence from the primary, and pinning them would defeat the reason they exist; the operator
+   * chooses who does the work, not who checks it.
+   */
+  readonly pin?: RoutePin | undefined;
 }): ShadowTaskPlan {
   const cwd = assertShadowProjectCwd(input.project, input.cwd);
   const attestations = input.attestations ?? [];
@@ -156,7 +184,8 @@ export function buildShadowTaskPlan(input: {
     budget: input.budget,
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
-    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof }),
+    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(input.nativeHarness === true && input.pin !== undefined ? { directProviders: [input.pin.providerId] } : {}) }),
+    ...(input.pin === undefined ? {} : { pin: input.pin }),
   });
   const primaryModel = modelRef(primaryRoute);
   const primarySnapshot = snapshotFor(input.providers, primaryModel.providerId);
@@ -167,11 +196,15 @@ export function buildShadowTaskPlan(input: {
     ...(proof.grokIsolation === undefined ? {} : { grokIsolation: proof.grokIsolation }),
     ...(proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: proof.grokSnapshotIsolation }),
   }).eligible;
+  const nativeHarness = input.nativeHarness === true ? { nativeHarness: true } : {};
   const primaryInvocation = planShadowInvocation({
+    ...nativeHarness,
     snapshot: primarySnapshot,
     model: primaryModel,
     cwd,
-    ...(primarySnapshotEligible ? { snapshotPrimary: true, preview: true } : {}),
+    // Not under DIRECT: that policy reads the workspace itself, and a snapshot would put a copy
+    // between the worker and the files the previous worker left.
+    ...(primarySnapshotEligible && input.nativeHarness !== true ? { snapshotPrimary: true, preview: true } : {}),
     payload: payload("primary", input.task, input.context),
     fanOut: input.budget.maxConcurrentAgents > 1,
     ...measuredFor(input, primaryModel.providerId),
@@ -198,6 +231,7 @@ export function buildShadowTaskPlan(input: {
       model,
       route,
       invocation: previewShadowInvocation(planShadowInvocation({
+        ...nativeHarness,
         snapshot: snapshotFor(input.providers, model.providerId),
         model,
         cwd,
@@ -249,6 +283,7 @@ export function buildShadowTaskPlan(input: {
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({
+      ...nativeHarness,
       snapshot: snapshotFor(input.providers, reviewerModel.providerId),
       model: reviewerModel,
       cwd,

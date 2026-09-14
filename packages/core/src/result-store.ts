@@ -2,7 +2,8 @@ import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { isAbsolute, join, relative, resolve } from "node:path";
 import { BrainGateInvariantError } from "./errors.js";
-import { assertRegisteredProject, type RegisteredProject } from "./project-registry.js";
+import { assertRegisteredProject, type ExecutionProject } from "./project-registry.js";
+import type { ExecutionScope } from "./workspace.js";
 
 /**
  * A task's result, kept as a file rather than as a row.
@@ -80,9 +81,14 @@ export class ResultStore {
     this.#redact = options.redact;
   }
 
-  static fromProject(project: RegisteredProject, options: ResultStoreOptions): ResultStore {
+  /** Results are evidence about local files, so they live with the workspace that produced them. */
+  static fromProject(project: ExecutionProject, options: ResultStoreOptions): ResultStore {
     assertRegisteredProject(project);
     return new ResultStore(project.storageDir, options);
+  }
+
+  static fromScope(scope: ExecutionScope, options: ResultStoreOptions): ResultStore {
+    return new ResultStore(scope.storageDir, options);
   }
 
   absolutePath(relativePath: string): string {

@@ -4,8 +4,25 @@ import { existsSync, mkdtempSync, mkdirSync, unlinkSync, writeFileSync, symlinkS
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawnSync } from "node:child_process";
-import { BrainGateInvariantError, ProjectRegistry, parseProjectConfig } from "@braingate/core";
+import {
+  BrainGateInvariantError,
+  ProjectRegistry,
+  parseProjectConfig,
+  type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { WorktreeGuard } from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 function git(cwd: string, args: string[]) { const r = spawnSync("git", args, { cwd, encoding: "utf8" }); if (r.status !== 0) throw new Error(String(r.stderr)); }
 function setupRepo() {
@@ -13,8 +30,8 @@ function setupRepo() {
   git(repo, ["init", "-b", "main"]); writeFileSync(join(repo, "README.md"), "hello\n"); git(repo, ["add", "."]); git(repo, ["-c", "user.name=BrainGate Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init"]);
   git(other, ["init", "-b", "main"]); writeFileSync(join(other, "README.md"), "other\n"); git(other, ["add", "."]); git(other, ["-c", "user.name=BrainGate Test", "-c", "user.email=test@example.invalid", "commit", "-m", "init"]);
   const registry = new ProjectRegistry(join(root, "state"));
-  const project = registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] }));
-  const foreign = registry.register(parseProjectConfig({ project_id: "foreign", name: "Foreign", repositories: [other] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "sample", name: "Sample", repositories: [repo] })));
+  const foreign = workspace(registry.register(parseProjectConfig({ project_id: "foreign", name: "Foreign", repositories: [other] })));
   return { root, repo, other, project, foreign };
 }
 

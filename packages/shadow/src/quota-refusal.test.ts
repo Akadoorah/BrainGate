@@ -7,8 +7,19 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
+import { executionScopeFor, type ExecutionProject, type RegisteredProject } from "@braingate/core";
 import { providerQuotaRefusal, quotaReadings } from "./quota-readings.js";
 import { SubscriptionShadowAgentInvoker } from "./invoker.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
+
 
 const STREAM_REFUSAL = JSON.stringify({
   type: "assistant",
@@ -92,7 +103,7 @@ test("a refused attempt writes one failure event, not a second generic one", asy
   // The registry requires the repository to exist on disk.
   mkdirSync(join(root, "repo"), { recursive: true });
   const registry = new ProjectRegistry(join(root, "brain"));
-  const project = registry.register(parseProjectConfig({ project_id: "refusal-test", name: "Refusal Test", repositories: [join(root, "repo")] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: "refusal-test", name: "Refusal Test", repositories: [join(root, "repo")] })));
   const ledger = new TaskLedger(project);
   ledger.createTask({ title: "refused", complexity: "T2", risk: "low" });
   const taskId = ledger.listTasks()[0]!.taskId;

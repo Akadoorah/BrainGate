@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import Database from "better-sqlite3";
@@ -11,23 +11,36 @@ import {
   classifyTask,
   parseProjectConfig,
   type RegisteredProject,
+  type ExecutionProject,
+  executionScopeFor,
 } from "@braingate/core";
 import type { RouteResult } from "@braingate/router";
 import {
+
   GlobalQuotaStore,
   buildDashboardSnapshot,
   buildTaskBrief,
   buildTaskCard,
   normalizeTaskReceipt,
+  openQuotaStore,
   recordTaskBrief,
 } from "./index.js";
+
+/**
+ * Execution state is workspace-scoped: the fixture's own directory is a workspace like any other.
+ * A test that builds a project through this registry is asking for that directory's execution state,
+ * which is exactly what `executionScopeFor` resolves for a real command.
+ */
+function workspace(project: RegisteredProject): ExecutionProject {
+  return executionScopeFor(project, project.repositories[0]!).project;
+}
 
 function setupProject(name = "Waslo", id = "waslo") {
   const root = mkdtempSync(join(tmpdir(), "braingate-observe-"));
   const repo = join(root, "repo");
   mkdirSync(repo);
   const registry = new ProjectRegistry(join(root, "registry"));
-  const project = registry.register(parseProjectConfig({ project_id: id, name, repositories: [repo] }));
+  const project = workspace(registry.register(parseProjectConfig({ project_id: id, name, repositories: [repo] })));
   const ledger = new TaskLedger(project);
   return { root, project, ledger };
 }
@@ -212,4 +225,42 @@ test("the brief records the quota belief behind a choice, and who else could hav
     const stored = normalizeTaskReceipt(ledger.receipt(task.taskId)).brief;
     assert.deepEqual(stored?.route[0]?.rejected, brief.route[0]?.rejected);
   } finally { ledger.close(); }
+});
+
+// A write task has no brief and no workflow receipt, so the planned route is empty for it. The
+// executed roles are the same evidence the card's `execution` field is built from, so `/status`
+// reading the route from them cannot disagree with the receipt — before this it printed "no route
+// recorded" about a task whose own record named primary and reviewer (M20.7).
+test("a task with no planned route reports the roles its own events show answering", () => {
+  const { project, ledger } = setupProject();
+  try {
+    const task = ledger.createTask({ title: "Direct write", complexity: "T2", risk: "low" });
+    ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: "anthropic", model: "claude-sonnet-5", quotaPool: "claude-subscription" });
+    ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: "anthropic", model: "claude-sonnet-5", quotaPool: "claude-subscription", durationMs: 5 });
+
+    const card = buildTaskCard(project, normalizeTaskReceipt(ledger.receipt(task.taskId)));
+    assert.deepEqual(card.route.map((entry) => `${entry.role}=${entry.providerId}/${entry.modelId}`), ["primary=anthropic/claude-sonnet-5"]);
+    assert.equal(card.route[0]?.quotaPool, null, "an executed role carries no pool of its own, and none is invented");
+    assert.deepEqual(card.execution.map((entry) => entry.role), ["primary"], "and the route agrees with the execution record");
+  } finally { ledger.close(); }
+});
+
+test("a quota store that cannot be opened says which file and why, not CLI_UNEXPECTED", () => {
+  // The operator state directory is not always writable, and a run used to die as CLI_UNEXPECTED
+  // with the details suppressed: no cause, no path, nothing to act on. The failure is the same
+  // failure; it now has a name and a next step.
+  const root = mkdtempSync(join(tmpdir(), "braingate-quota-unopenable-"));
+  const blocked = join(root, "not-a-directory");
+  writeFileSync(blocked, "a file where the state directory would go\n");
+
+  assert.throws(
+    () => openQuotaStore(blocked),
+    (error: unknown) => {
+      assert.equal((error as { code?: string }).code, "QUOTA_STORE_UNAVAILABLE");
+      const message = (error as Error).message;
+      assert.match(message, /quota\.sqlite/, "the message must name the file");
+      assert.match(message, /BRAINGATE_HOME/, "and the way out");
+      return true;
+    },
+  );
 });

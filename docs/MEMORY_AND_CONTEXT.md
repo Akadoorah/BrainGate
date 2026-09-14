@@ -15,7 +15,8 @@ An interactive session keeps the last few turns so a follow-up like "and the oth
 resolves. That thread now survives closing the terminal, because closing a terminal is not the
 same as changing the subject — but it is not memory and never becomes memory:
 
-- it is kept with the project's own state, so two projects cannot see each other's;
+- it is kept with the **workspace's** own state, so two projects — and two workspaces of one
+  project — cannot see each other's;
 - it is redacted before it is written, because a file is the one place a secret in an answer
   would settle;
 - it holds the same few, truncated turns it always did, and expires after a few hours, so
@@ -23,6 +24,48 @@ same as changing the subject — but it is not memory and never becomes memory:
 - `/forget` deletes it;
 - nothing in it can reach canonical memory except by the operator writing it down through
   `/remember`, which starts at the same proposal gate as everything else.
+
+## The goal, beside the thread
+
+The thread is what was said. A **goal** is what was established, and it is the layer a worker is
+actually handed:
+
+- **Local history** — every turn, in the workspace's `goals.sqlite`, redacted before it is written.
+  This is the record, and it does not expire the way the eight-hour thread does.
+- **Goal state** — accepted findings, findings established but not the active cause, contrary claims
+  that have *not* displaced them, files changed, tests run, open questions, the next action. Compact
+  by construction: bounded lists with bounded entries, because a handoff carrying two hundred
+  findings fails the same way as one carrying none.
+- **Evidence references** — where the detail lives (task ids, artifacts), never a copy of it.
+- **Native session references** — `goal ↔ this runtime's session id`. The runtime owns the session;
+  BrainGate owns the reference, and stores no credentials and no session database. The reference is
+  bound to the workspace the session was written in, so continuing the same goal from another
+  workspace is a handoff and a fresh session, never a resume.
+
+A worker with no session for the goal is handed the **handoff**. A worker whose own session is being
+resumed is handed a **delta** — only what changed since that session last participated — because it
+already remembers its own turns, and re-sending them invites it to re-derive what it concluded. Both
+are bounded; neither is the raw transcript.
+
+## What is a workspace's, and what is a project's
+
+The line is not importance, it is **whether the thing is about local files or about the work.**
+
+| Project — durable knowledge | Workspace — execution truth |
+|---|---|
+| canonical memory and proposals | the conversation and every turn |
+| stable preferences and approved scope | goals, their state and their events |
+| the project identity and its registry | the task ledger and task events |
+| quota history and the audit trail | results and evidence about local files |
+| | the dogfood corpus and its priors |
+| | provider session references |
+| | snapshots, worktrees, fingerprints |
+
+Nothing crosses upward on its own. A worker finding, a diff, a test result, a local path, a provider
+session and the current goal are all statements about one directory, and the only way any of them
+becomes project knowledge is the operator promoting it through the same single-writer path
+everything else takes. When in doubt, state stays with the workspace: a fact filed too locally is a
+fact to promote later, and a fact filed too widely is one that quietly becomes true everywhere.
 
 ## Single-writer memory flow
 

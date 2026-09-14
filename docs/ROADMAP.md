@@ -95,6 +95,58 @@ field to stream.
 
 Full plan, measured provider evidence, and sequencing: [`MULTI_MODEL_PLAN.md`](MULTI_MODEL_PLAN.md).
 
+## Milestones 19-20 — Truth, and a goal above the task
+
+Two milestones that exist because dogfooding found them, not because a plan predicted them.
+
+- **M19 — Run integrity and truth.** ✅ Three vocabularies that had been one (ledger state, operator
+  outcome, review status) were separated and derived from exported runtime lists; a run's record is
+  written as a fixed sequence of idempotent steps that `tasks reconcile` completes from any prefix;
+  usage values are labelled `native`, `measured`, `estimated` or `unknown`, and only a provider's own
+  statement may set a quota state (ADR [0012](adr/0012-quota-state-is-native-only.md)).
+- **M20 — Native CLI control plane and shared goal context.** ✅ in two slices.
+  - **M20.1 — Conversation and Goal above Task.** A conversation and a goal became first-class
+    persistent entities in the project's own `goals.sqlite`; a task became a work unit of a goal;
+    goal state carries accepted, secondary and *disputed* findings, and a worker's contrary claim is
+    recorded beside an accepted one rather than replacing it. A follow-up inherits the complexity of
+    the goal it continues, and every worker is handed a bounded handoff built from that state.
+  - **M20.2 — Native session continuity and manual switching.** A provider-session registry records
+    `Goal ↔ runtime session` references with a resume mode that must be stated; a capability probe
+    decides per build whether a session may be named at all; a returning worker is given only what
+    changed while it was away; `/use`, `/auto`, `/worker` and `--fresh` switch workers without
+    losing the goal. ADR [0014](adr/0014-native-runtime-preservation.md) states the principle behind
+    all of it: the native runtime is the default execution mechanism, and BrainGate coordinates it
+    rather than replacing it.
+  - **M20.3 — Workspace identity, and Git as metadata.** A project gained workspaces: the identity of
+    a workspace is its canonical path, `braingate init` registers a plain directory, a subdirectory of
+    a repository, or a repository — Git is recorded as evidence (`gitRoot`, branch, `HEAD`, remote)
+    and decides nothing. The provider's `cwd`, the attachment refusal and `/project` speak in
+    workspaces now, and every command resolves the same binding through one implementation. ADR
+    [0015](adr/0015-workspace-identity.md).
+  - **M20.4 — Workspace-scoped execution state and goal binding.** Every store that describes local
+    execution moved to `<home>/projects/<projectId>/workspaces/<workspaceId>/`: the task ledger,
+    conversations and goals, the dogfood corpus, results and evidence, snapshots, worktrees and the
+    session thread. A goal records the workspace it belongs to and refuses by id when it is not this
+    one; a provider session is bound to project, workspace, goal, provider and model, so continuing
+    the same work elsewhere is a handoff and a fresh session rather than a native resume. Durable
+    knowledge stayed project-scoped, and memory refuses a workspace handle. State written before
+    workspaces existed is preserved read-only, never read and never migrated on a guess. ADR
+    [0016](adr/0016-workspace-scoped-execution-state.md). Still open, and next: the DIRECT/NATIVE
+    execution mode that makes a write in a workspace with no repository possible without a worktree,
+    and an explicit import tool for legacy state if one is ever wanted.
+
+  - **M20.5 — DIRECT/NATIVE workspace execution.** Execution policy became a first-class, chosen
+    concept — `direct`, `read-only`, `worktree`, `snapshot`, `unattended` — with DIRECT as the
+    ordinary interactive boundary: the native CLI runs in the selected workspace, shares the
+    filesystem with every other worker, leaves its changes there and commits nothing. Intent decides
+    what is wanted and can only narrow the boundary; the strict modes are unchanged and are selected
+    explicitly; and the workspace-change guard works with or without Git. Under DIRECT the Claude
+    invocation stops substituting BrainGate's tool allowlist, MCP refusal and declared subagents for
+    the CLI's own harness, and the plan's guarantees are updated to what the argv actually earns.
+    Grok, Codex and Antigravity refuse DIRECT with a named reason rather than running under an
+    unmeasured boundary. ADR [0017](adr/0017-direct-execution.md). Next: re-measuring those three
+    invocations against the installed builds, and an explicit commit workflow.
+
 ## Immediate technical hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.

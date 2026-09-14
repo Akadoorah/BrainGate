@@ -7,6 +7,8 @@ import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
 import { ProjectRegistry } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
+import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
+import type { ProviderSnapshot } from "@braingate/providers";
 import { activityLabel, grantLines, looksLikeWriteRequest, runRepl, withoutStreamedAnswer } from "./repl.js";
 
 function git(cwd: string, args: readonly string[]): void {
@@ -28,20 +30,99 @@ function project(): string {
   return repo;
 }
 
+/**
+ * A state directory of this session's own, with a catalogue in it.
+ *
+ * Without this the session resolves `~/.braingate` — the operator's real catalogue, acceptances and
+ * quota history — and writes a project's stores into it. Two tests in this file were failing on
+ * exactly that: the write hit a state directory the sandbox would not let them open, and the
+ * failure arrived as `CLI_UNEXPECTED` with the details suppressed, so the suite said "environment"
+ * and nothing more. A test that needs the operator's home to be writable is testing the machine.
+ */
+function operatorEnv(): NodeJS.ProcessEnv {
+  const home = mkdtempSync(join(tmpdir(), "braingate-repl-home-"));
+  const env = { BRAINGATE_HOME: home };
+  const catalog = new ModelCatalog(resolveOperatorState(env, home).modelCatalogPath);
+  for (const [providerId, modelId, coder, speed] of [
+    ["anthropic", "claude-sonnet-5", 95, "balanced"],
+    ["anthropic", "claude-haiku-4-5", 85, "fast"],
+  ] as const) {
+    catalog.upsert({
+      providerId, modelId, quotaPool: `${providerId}-subscription`,
+      capabilities: { coder, reviewer: 70, judge: 65 }, speed,
+      contextCapacity: 200_000, writeCapable: true, reasoning: coder, underlyingFamily: null,
+    });
+  }
+  return env;
+}
+
+/**
+ * One provider, as a snapshot the session can route against without asking the machine.
+ *
+ * The session used to discover providers for real, which made these tests depend on the operator's
+ * own Claude and Codex logins and take seconds each: with a redirected HOME the CLI reports itself
+ * logged out and two of them failed, and with the real HOME they were passing by accident. A
+ * planning test is about planning, so the discovery it needs is supplied.
+ */
+function snapshot(providerId: "anthropic" | "openai", models: readonly string[]): ProviderSnapshot {
+  const observedAt = "2026-09-13T00:00:00.000Z";
+  const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
+  return {
+    providerId,
+    displayName: providerId === "anthropic" ? "Claude Code" : "Codex CLI",
+    binary: providerId === "anthropic" ? "claude" : "codex",
+    available: obs(true),
+    version: obs("2.1.269"),
+    authState: obs("authenticated"),
+    authMode: obs("subscription"),
+    models: obs([...models]),
+    capabilities: obs({ headless: true, modelPinning: true, sessionIdPinning: true, outputFormats: ["json"], supportsMcp: true, supportsSubagents: true }),
+    quotaState: obs("unknown"),
+    quotaHint: obs(null),
+    quotaObservedAt: obs(null),
+    refusalBackoffUntil: obs(null),
+    observedAt,
+  } as unknown as ProviderSnapshot;
+}
+
 /** Drives a session from a fixed script of answers, capturing everything written. */
 function session(cwd: string, answers: readonly string[]) {
   const remaining = [...answers];
   const asked: string[] = [];
+  // How much had been printed when each question was put. The gate is an ordering, and a test that
+  // only checks a question was asked cannot tell that the plan it refers to came before it.
+  const askedAt: number[] = [];
   let out = ""; let err = "";
   return {
     asked,
+    askedAt,
     text: () => `${out}${err}`,
     run: () => runRepl({
       cwd,
+      env: operatorEnv(),
+      animate: false,
+      colour: false,
       stdout: (t) => { out += t; },
       stderr: (t) => { err += t; },
       // A null answer is end of input, which ends the session.
-      ask: async (question) => { asked.push(question); return remaining.shift() ?? null; },
+      ask: async (question) => { asked.push(question); askedAt.push(out.length + err.length); return remaining.shift() ?? null; },
+      discoverAll: async () => [snapshot("anthropic", ["claude-sonnet-5", "claude-haiku-4-5"]), snapshot("openai", ["gpt-6-astra"])],
+      probeCapabilities: async () => ({ features: { sessionIdPinning: { supported: true } } }),
+      measureCapabilities: async () => ({}),
+      verifyCodexIsolation: async (item: ProviderSnapshot) => ({
+        providerId: "openai" as const, source: "sandbox-self-test" as const,
+        version: item.version.value ?? "0.0.0", platform: "darwin" as const,
+        profileHash: "test-profile", policyHash: "test-policy",
+        observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        unrecognisedKeys: [], droppedKeys: [], droppedFeatureKeys: [],
+      }),
+      verifyGrokIsolation: async (item: ProviderSnapshot) => ({
+        providerId: "xai" as const, source: "sandbox-event-self-test" as const,
+        version: item.version.value ?? "0.0.0", platform: "darwin" as const,
+        profileHash: "test-profile", policyHash: "test-policy",
+        observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+        readableRoots: [], networkRestricted: true, configSurfaces: [],
+      }),
     }),
   };
 }
@@ -61,8 +142,15 @@ test("an instruction is recognised as a write and says so before asking", async 
   const repo = project();
   const s = session(repo, ["change the empty-state label to Nothing yet", "n"]);
   assert.equal(await s.run(), 0);
-  assert.match(s.text(), /write · isolated worktree/);
-  assert.ok(s.asked.some((q) => /never your checkout/.test(q)), "the write confirmation must say where the change lands");
+  // DIRECT is the default policy (ADR 0017), so the honest line names the workspace, not a
+  // worktree. The plan must also be printed before the question that lets it run: the operator
+  // cannot decline something they were never shown.
+  assert.match(s.text(), /write · direct · in your workspace/);
+  assert.ok(s.asked.some((q) => /changes files in your workspace, and nothing is committed/.test(q)), "the write confirmation must say where the change lands");
+  const gate = s.asked.findIndex((q) => /Run it\?/.test(q));
+  assert.ok(gate >= 0, "the run must be confirmed before it happens");
+  const planned = s.text().indexOf("write · direct · in your workspace");
+  assert.ok(planned >= 0 && planned < (s.askedAt[gate] ?? 0), "the plan was not shown before the confirmation");
 });
 
 test("write intent is detected from an instruction, not from a question", () => {
@@ -185,4 +273,27 @@ test("an answer that was streamed live is not printed a second time", () => {
   assert.equal(withoutStreamedAnswer(finished), "\nTask 8fbc9645 · observed=1 · outcome=approved");
   // Nothing recognisable to keep is better than repeating the whole answer.
   assert.equal(withoutStreamedAnswer("just an answer with no receipt"), "");
+});
+
+// ---------------------------------------------------------------- output is printed once
+
+/** What a run prints when the answer streamed live: the receipt, and the answer only once. */
+test("R: a streamed answer is not printed a second time by the final block", () => {
+  const block = "The theme is read from config.yml.\n\nTask 4f2c1a77-1111-4111-8111-111111111111 · observed=1 · outcome=SUCCESS\n";
+  const kept = withoutStreamedAnswer(block);
+  assert.doesNotMatch(kept, /The theme is read/, "the streamed answer is not repeated");
+  assert.match(kept, /Task 4f2c1a77/, "and the receipt survives");
+  // Nothing to keep when the run printed no receipt at all: printing the answer again would be the
+  // duplication this exists to prevent.
+  assert.equal(withoutStreamedAnswer("The theme is read from config.yml.\n"), "");
+});
+
+test("S: text a provider repeated itself is stored and printed once, not duplicated again", () => {
+  // The provider's own output is the provider's; BrainGate does not edit it. What it must not do is
+  // add a second copy on the way out. The receipt boundary is the whole mechanism.
+  const providerText = "The flag is unused.\nThe flag is unused.\n";
+  const block = `${providerText}\nTask 4f2c1a77-1111-4111-8111-111111111111 · observed=1 · outcome=SUCCESS\n`;
+  const kept = withoutStreamedAnswer(block);
+  assert.equal(kept.match(/The flag is unused\./g), null, "the answer stays out of the receipt block");
+  assert.equal(providerText.match(/The flag is unused\./g)?.length, 2, "and the provider's text is preserved as it was");
 });

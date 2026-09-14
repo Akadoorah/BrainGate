@@ -4,14 +4,24 @@ import { mkdirSync, mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
-import { ProjectRegistry, parseProjectId, type RegisteredProject, type TaskClassification } from "@braingate/core";
+import {
+  ProjectRegistry,
+  parseProjectId,
+  type RegisteredProject,
+  type TaskClassification,
+  type ExecutionProject,
+  executionScopeFor,
+} from "@braingate/core";
 import { DogfoodStore, emptyDogfoodPrior } from "./index.js";
 
-function registered(label: string): RegisteredProject {
+
+
+function registered(label: string): ExecutionProject {
   const root = mkdtempSync(join(tmpdir(), `braingate-migration-${label}-`));
   const repository = join(root, "repo");
   mkdirSync(repository);
-  return new ProjectRegistry(join(root, "home")).register({ projectId: parseProjectId(label), name: label, repositories: [repository] });
+  const registered = new ProjectRegistry(join(root, "home")).register({ projectId: parseProjectId(label), name: label, repositories: [repository] });
+  return executionScopeFor(registered, repository).project;
 }
 
 function classification(): TaskClassification {

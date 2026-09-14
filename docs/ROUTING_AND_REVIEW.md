@@ -31,7 +31,12 @@ Reviewer findings are bounded before being returned to the primary. If the task 
 
 ## Security gate
 
-This milestone only plans/routes and orchestrates abstract agents. Real provider CLI invokers remain disconnected from write-capable execution until the isolation gate defined in `SAFE_EXECUTION.md` is satisfied.
+Providers are executed, not merely planned for: read-only invocations run today, and write-capable
+execution runs inside worktrees once the isolation gate in `SAFE_EXECUTION.md` is satisfied and the
+provider is scored for the role (M11, M16). What a role may do is a *grant* earned per role, not a
+property of the provider — ADR [0010](adr/0010-tool-grants-are-earned-per-role.md) — and, since
+ADR [0014](adr/0014-native-runtime-preservation.md), the default interactive posture preserves the
+native runtime's own capabilities while an explicit policy overlay is what narrows them.
 
 ## Where quota pressure comes from
 

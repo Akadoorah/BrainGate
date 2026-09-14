@@ -3,7 +3,7 @@ import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { BrainGateInvariantError } from "./errors.js";
-import { assertRegisteredProject, type RegisteredProject } from "./project-registry.js";
+import { assertRegisteredProject, type ExecutionProject } from "./project-registry.js";
 import type { TaskComplexity, TaskRisk, TaskState } from "./task-outcome.js";
 
 // The vocabularies live in `task-outcome.ts` as runtime lists, so a validator and the type it
@@ -18,7 +18,28 @@ export interface CreateTaskInput {
   readonly risk?: TaskRisk;
   readonly route?: unknown;
   readonly memoryProposalRefs?: readonly string[];
+  /**
+   * The goal this task is a work unit of, when it continues one.
+   *
+   * Optional, and that is the migration: every task written before M20 has no goal, and every task
+   * written by a non-interactive surface may never have one. Linking is inherited from the caller
+   * rather than decided here — this table does not know what a goal is beyond its identifier, and
+   * deliberately so, because the goals live in their own database and ADR 0011 keeps this one
+   * metadata-only.
+   */
+  readonly goalId?: string | null;
+  readonly conversationId?: string | null;
 }
+
+/**
+ * The columns M20 added to `tasks`, as one list the migration and the mapper both read.
+ *
+ * Not a `user_version`: this database has been created by every Milestone since M0 and carries real
+ * task history, so rebuilding it to add two nullable columns would be the one change that could
+ * lose a record. `PRAGMA table_info` decides instead, which makes the migration idempotent and
+ * safe to run against a file written before this change and against one written after it.
+ */
+const TASK_GOAL_COLUMNS = ["goal_id", "conversation_id"] as const;
 
 export interface TaskRecord {
   readonly taskId: string;
@@ -30,6 +51,9 @@ export interface TaskRecord {
   readonly risk: TaskRisk | null;
   readonly route: unknown;
   readonly memoryProposalRefs: readonly string[];
+  /** The goal this task is a work unit of, or `null` for a task that stands alone. */
+  readonly goalId: string | null;
+  readonly conversationId: string | null;
   readonly createdAt: string;
   readonly updatedAt: string;
 }
@@ -84,6 +108,8 @@ interface TaskRow {
   risk: TaskRisk | null;
   route_json: string | null;
   memory_proposal_refs_json: string;
+  goal_id: string | null;
+  conversation_id: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -130,17 +156,23 @@ function mapTask(row: TaskRow): TaskRecord {
     risk: row.risk,
     route: parseJson(row.route_json),
     memoryProposalRefs: JSON.parse(row.memory_proposal_refs_json) as string[],
+    goalId: row.goal_id ?? null,
+    conversationId: row.conversation_id ?? null,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
 }
 
 export class TaskLedger {
-  readonly #project: RegisteredProject;
+  readonly #project: ExecutionProject;
   readonly #db: Database.Database;
   readonly databasePath: string;
 
-  constructor(project: RegisteredProject) {
+  /**
+   * Takes the workspace's execution handle, never the project's: the ledger describes work done in
+   * one directory, and `storageDir` here is that workspace's own.
+   */
+  constructor(project: ExecutionProject) {
     assertRegisteredProject(project);
     this.#project = project;
     mkdirSync(project.storageDir, { recursive: true });
@@ -170,8 +202,8 @@ export class TaskLedger {
       this.#db.prepare(`
         INSERT INTO tasks (
           task_id, project_id, title, state, intent, complexity, risk,
-          route_json, memory_proposal_refs_json, created_at, updated_at
-        ) VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?)
+          route_json, memory_proposal_refs_json, goal_id, conversation_id, created_at, updated_at
+        ) VALUES (?, ?, ?, 'created', ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `).run(
         taskId,
         this.#project.projectId,
@@ -181,6 +213,8 @@ export class TaskLedger {
         input.risk ?? null,
         routeJson,
         refsJson,
+        input.goalId ?? null,
+        input.conversationId ?? null,
         timestamp,
         timestamp,
       );
@@ -207,9 +241,49 @@ export class TaskLedger {
 
   listTasks(): readonly TaskRecord[] {
     const rows = this.#db.prepare(
-      "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC, task_id ASC",
+      // `rowid` breaks a tie on `created_at`, which two tasks created in the same millisecond share.
+      // A random tiebreak would make "the tasks under this goal" a different list on every read.
+      "SELECT * FROM tasks WHERE project_id = ? ORDER BY created_at ASC, rowid ASC",
     ).all(this.#project.projectId) as TaskRow[];
     return rows.map(mapTask);
+  }
+
+  /**
+   * The work units of one goal, oldest first.
+   *
+   * The read that makes a Goal a thing rather than a label: what has been tried under it, and in
+   * what order. Project-scoped like every other query here, so a goal id from another project
+   * returns nothing rather than another project's work.
+   */
+  listTasksForGoal(goalId: string): readonly TaskRecord[] {
+    const rows = this.#db.prepare(
+      "SELECT * FROM tasks WHERE project_id = ? AND goal_id = ? ORDER BY created_at ASC, rowid ASC",
+    ).all(this.#project.projectId, goalId) as TaskRow[];
+    return rows.map(mapTask);
+  }
+
+  /**
+   * Attaches an existing task to a goal.
+   *
+   * For the surfaces that learn the goal after the run rather than before it — a write path that
+   * creates its task inside the runner, for instance. Deliberately not a general-purpose mutator:
+   * it sets the link once, refuses to move a task that is already attached to another goal, and
+   * records the change as an event, so the timeline says when the work unit joined the goal rather
+   * than implying it was always there.
+   */
+  linkTaskToGoal(taskId: string, goalId: string, conversationId: string | null = null): TaskRecord {
+    const task = this.requireTask(taskId);
+    if (task.goalId !== null && task.goalId !== goalId) {
+      throw new BrainGateInvariantError("TASK_GOAL_CONFLICT", `Task ${taskId} already belongs to goal ${task.goalId}.`);
+    }
+    const timestamp = now();
+    const transaction = this.#db.transaction(() => {
+      this.#db.prepare("UPDATE tasks SET goal_id = ?, conversation_id = ?, updated_at = ? WHERE task_id = ? AND project_id = ?")
+        .run(goalId, conversationId, timestamp, taskId, this.#project.projectId);
+      this.#insertEvent(taskId, "task.goal_linked", null, null, { goalId, conversationId }, timestamp);
+    });
+    transaction();
+    return this.requireTask(taskId);
   }
 
   transition(taskId: string, toState: TaskState, payload: unknown = null): TaskRecord {
@@ -401,5 +475,29 @@ export class TaskLedger {
       CREATE INDEX IF NOT EXISTS idx_events_task_sequence ON task_events(task_id, sequence);
       CREATE INDEX IF NOT EXISTS idx_usage_task_sequence ON usage_records(task_id, sequence);
     `);
+    this.#addGoalColumns();
+  }
+
+  /**
+   * Adds the M20 goal link to a table that may predate it.
+   *
+   * `CREATE TABLE IF NOT EXISTS` is a no-op against an existing file, so a new column in that
+   * statement reaches a fresh database and no other. This is the other half, and it is the reason
+   * `TASK_GOAL_COLUMNS` exists as a list: the check, the ALTER and the mapper read the same two
+   * names, so a column cannot be added to one and forgotten in another.
+   *
+   * Both columns are nullable and unconstrained, which is what makes this additive rather than a
+   * rebuild. Every task written before M20 keeps its row, its events and its usage exactly as they
+   * were, and reads back with `goalId: null` — a task that stands alone, which is what it was.
+   */
+  #addGoalColumns(): void {
+    const existing = new Set(
+      (this.#db.pragma("table_info(tasks)") as readonly { readonly name: string }[]).map((column) => column.name),
+    );
+    for (const column of TASK_GOAL_COLUMNS) {
+      if (existing.has(column)) continue;
+      this.#db.exec(`ALTER TABLE tasks ADD COLUMN ${column} TEXT`);
+    }
+    this.#db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_project_goal ON tasks(project_id, goal_id, created_at)");
   }
 }
