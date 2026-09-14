@@ -78,6 +78,18 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
     const internalAllowedEnv = new Set(input.plan.allowedEnvKeys);
 
     try {
+      // Written for either mode before anything else: these are absolute paths outside the workspace
+      // — a response schema a CLI takes as a file — and a DIRECT run needs them precisely because it
+      // has no staged directory to put one in. Placed inside the staged branch first, which is why a
+      // real Codex read reported "Failed to read output schema file: No such file or directory".
+      for (const [externalPath, externalContent] of Object.entries(input.plan.externalFiles ?? {})) {
+        if (!isAbsolute(externalPath) || externalPath.includes("..")) {
+          throw new BrainGateInvariantError("SHADOW_EXTERNAL_FILE_INVALID", "An external file needs an absolute path outside the workspace.");
+        }
+        mkdirSync(dirname(externalPath), { recursive: true, mode: 0o700 });
+        writeFileSync(externalPath, externalContent, { encoding: "utf8", mode: 0o600, flag: "w" });
+      }
+
       if (input.plan.workspaceMode === "staged-clean" || input.plan.workspaceMode === "staged-read-snapshot") {
         // Both modes need an isolated home; only the staged one needs a workspace built here. The
         // snapshot is prepared before the call and handed in, so it is verified (and reused across a
@@ -146,14 +158,6 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
             overrides.GROK_HOME = operatorGrokHome;
           }
           overrides.HOME = isolatedHome;
-        }
-
-        for (const [path, content] of Object.entries(input.plan.externalFiles ?? {})) {
-          if (!isAbsolute(path) || path.includes("..")) {
-            throw new BrainGateInvariantError("SHADOW_EXTERNAL_FILE_INVALID", "An external file needs an absolute path outside the workspace.");
-          }
-          mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-          writeFileSync(path, content, { encoding: "utf8", mode: 0o600, flag: "w" });
         }
 
         for (const [name, content] of Object.entries(input.plan.stagedFiles ?? {})) {

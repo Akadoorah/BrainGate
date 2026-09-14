@@ -26,7 +26,8 @@ import {
 } from "@braingate/operator";
 import { CLI_FEATURES, ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, isProviderId, probeCliCapabilities, type CliCapabilityReport, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition, type ModelRef } from "@braingate/router";
-import { CODEX_PROBE_VERSION } from "@braingate/shadow";
+import { CODEX_PROBE_VERSION, nativeDirectCapable } from "@braingate/shadow";
+import { RUNTIME_SESSION_POLICIES } from "@braingate/goals";
 import {
   CodexIsolationVerifier,
   ShadowDogfoodRunner,
@@ -41,7 +42,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { reconciliationNotice } from "./tasks-cli.js";
-import { WriteDogfoodRunner, buildWriteTaskPlan, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, buildWriteTaskPlan, directWriteCapable, isWriteProvider, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
 import { ProjectSnapshotProvider } from "@braingate/execution";
 import { DogfoodStore } from "@braingate/dogfood";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf } from "./finalization.js";
@@ -501,18 +502,36 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
             const status = shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now });
             return Object.freeze({ role, enabled: status.enabled, acceptedByOperator: status.acceptedByOperator, reason: status.reason });
           });
+          // The three questions the roles list alone could not answer: can this worker be pointed at
+          // the operator's own workspace, what kind of native session does it keep, and may it write.
+          // They are separate facts about one CLI, and flattening them into "enabled" is how a
+          // provider that runs natively looked identical to one that does not run at all.
+          const direct = shadowProviderRoleStatus(providerId, "primary", { ...(acceptances.find((item) => item.providerId === providerId) === undefined ? {} : { acceptance: acceptances.find((item) => item.providerId === providerId)! }), direct: true, now });
+          const session = RUNTIME_SESSION_POLICIES[providerId];
+          const write = Object.freeze({
+            direct: directWriteCapable(providerId),
+            worktree: isWriteProvider(providerId),
+          });
           return Object.freeze({
             providerId,
             shadow: shadowProviderStatus(providerId),
             acceptance: record === null ? null : Object.freeze({ acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, current: new Date(record.expiresAt).getTime() > now.getTime() }),
             roles,
+            direct: Object.freeze({ supported: nativeDirectCapable(providerId), primaryReachable: nativeDirectCapable(providerId) && direct.enabled, reason: direct.enabled ? null : direct.reason }),
+            session: Object.freeze({ idSource: session?.idSource ?? "none", continuityOffered: session?.resumeOffered === true }),
+            write,
           });
         });
         data = rows;
         emit(json, data, rows.map((row) => {
           const open = row.roles.filter((entry) => entry.enabled).map((entry) => entry.role);
           const how = row.roles.some((entry) => entry.acceptedByOperator) ? " (operator-accepted)" : "";
-          return `${row.providerId}: ${open.length === 0 ? "no roles" : open.join(", ")}${how}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
+          const native = row.direct.supported
+            ? `DIRECT: reachable as primary${row.direct.reason === null ? "" : " when selected"}`
+            : `DIRECT: none (${row.direct.reason ?? "no measured invocation"})`;
+          const session = row.session.continuityOffered ? `sessions: ${row.session.idSource}` : "sessions: goal handoff only";
+          const write = row.write.direct ? "write: DIRECT" : row.write.worktree ? "write: worktree" : "write: none";
+          return `${row.providerId}: ${open.length === 0 ? "no roles" : open.join(", ")}${how}\n    ${native} · ${session} · ${write}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
         }).join("\n"), stdout);
         return Object.freeze({ exitCode: 0, data });
       }

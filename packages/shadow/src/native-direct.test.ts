@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
+import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { ModelRef } from "@braingate/router";
 import { nativeDirectCapable, planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
 import { STAGE_PATH_TOKEN, type PlannedNativeSession, type ShadowRolePayload } from "./types.js";
@@ -266,3 +270,35 @@ test("a provider with no measured DIRECT invocation still refuses one", () => {
 });
 
 
+
+test("a DIRECT Codex run's schema is written outside the workspace, before the process starts", async () => {
+  // Codex takes its response schema as a path, and a DIRECT run has no staged directory to put one
+  // in. The executor writes these files for either mode now: the first version wrote them inside the
+  // staged branch, and a real read failed with "Failed to read output schema file: No such file or
+  // directory" — the provider was right and BrainGate had not written the file it promised.
+  const root = mkdtempSync(join(tmpdir(), "braingate-direct-schema-"));
+  const workspace = join(root, "repo");
+  const schemaPath = join(root, "state", "shadow-schemas", "task.json");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const plan = planShadowInvocation({
+      snapshot: { ...snapshot("openai", ["openai-model"]), binary: "/bin/cat" } as ProviderSnapshot,
+      model: modelFor("openai"),
+      cwd: workspace,
+      nativeHarness: true,
+      payload,
+      schemaPath,
+      now: new Date("2026-09-14T01:00:00Z"),
+    });
+    assert.deepEqual(Object.keys(plan.externalFiles ?? {}), [schemaPath], "the plan names the file it needs");
+    assert.equal(plan.args.includes("--output-schema"), true, "and passes it to the CLI");
+
+    const executor = new NodeShadowProcessExecutor();
+    const result = await executor.run({
+      project: { projectId: "direct-schema", name: "Direct Schema", repositories: [workspace], storageDir: join(root, "state"), workspaceId: "direct-schema" } as never,
+      plan,
+    });
+    assert.equal(result.spawned, true);
+    assert.equal(JSON.parse(readFileSync(schemaPath, "utf8")).type, "object", "the schema is on disk where the plan said");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
