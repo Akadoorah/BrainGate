@@ -55,10 +55,18 @@ function worktree(): string {
 }
 
 test("the executing role is no longer one provider, and every one of them has to prove a boundary", () => {
-  assert.deepEqual([...WRITE_PROVIDERS], ["anthropic", "xai", "openai"]);
+  // Antigravity joined the list when it gained a measured DIRECT write. Its boundary is a different
+  // kind from the other two — the workspace the operator selected rather than a sandbox profile
+  // BrainGate wrote — so what it proves is stated per policy below instead of by membership alone.
+  assert.deepEqual([...WRITE_PROVIDERS], ["anthropic", "xai", "openai", "google"]);
   assert.throws(
     () => assertWriteEligible(snapshot("google" as ProviderId, "1.1.28"), model("google" as ProviderId, "gemini"), { now: NOW }),
-    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_PROVIDER_BLOCKED",
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_NATIVE_HARNESS_UNSUPPORTED",
+    "the worktree policy, which is what a write without nativeHarness runs under, has no profile for it",
+  );
+  assert.doesNotThrow(
+    () => assertWriteEligible(snapshot("google" as ProviderId, "1.1.28"), model("google" as ProviderId, "gemini"), { nativeHarness: true, now: NOW }),
+    "and the DIRECT policy does: the operator approved the run in their own workspace",
   );
 });
 

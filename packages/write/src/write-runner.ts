@@ -26,7 +26,7 @@ import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
-import { assertWriteEligible, planWriteInvocation } from "./write-profiles.js";
+import { WRITE_PROVIDERS, assertWriteEligible, directWriteCapable, planWriteInvocation } from "./write-profiles.js";
 import { changedPaths, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
 import type { ExecutionPolicyId } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
@@ -227,9 +227,13 @@ export function buildWriteTaskPlan(input: {
   // Every provider that cannot prove a bounded place to work is excluded here, rather than one
   // provider being named as the only one allowed to. The router then picks on capability among
   // whoever is left, which is what makes the executing role something more than one subscription.
+  const direct = input.policy === "direct" || input.policy === "unattended";
   const writeProof = {
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
     ...(input.grokWriteIsolation === undefined ? {} : { grokIsolation: input.grokWriteIsolation }),
+    // The policy decides which proof a write owes: a worktree write owes the sandbox self-test,
+    // and a DIRECT write owes the operator's approval of the workspace it edits.
+    ...(direct ? { nativeHarness: true } : {}),
   };
   const primaryExcluded = input.providers
     .filter((snapshot) => {
@@ -243,12 +247,16 @@ export function buildWriteTaskPlan(input: {
       }
     })
     .map((snapshot) => snapshot.providerId);
-  const direct = input.policy === "direct" || input.policy === "unattended";
   if (direct) {
     // Only the providers whose invocation can honestly run in the workspace. The rest are not
     // refused here but excluded from routing, so the answer to "which model" is decided by the
     // router among the ones that can, and the operator sees that in the plan.
-    primaryExcluded.push("openai", "xai");
+    primaryExcluded.push(...WRITE_PROVIDERS.filter((providerId) => !directWriteCapable(providerId)));
+    // And the automatic route keeps the shape it was accepted with: DIRECT work goes to the
+    // reference provider unless the operator named another worker. Making a selected worker run
+    // natively is this milestone; re-routing every write to another subscription is a different
+    // decision, and the operator makes it by naming the worker.
+    if (input.pin === undefined) primaryExcluded.push("openai", "google", "xai");
   }
   const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);
