@@ -333,15 +333,18 @@ export class ShadowDogfoodRunner {
       ...(this.#nativeHarness ? { direct: true } : {}),
     });
     const pinnedProviderId = this.#pin?.providerId;
-    // Which providers the policy can reach, from the same measurement the plan used. The staged roles
-    // are not DIRECT runs, so they keep the staged gates and are asked with no DIRECT bypass at all.
+    // Which providers the policy can reach, from the same measurement the plan used.
     const directProviders = this.#nativeHarness === true
       ? [...new Set([...(this.#routing.policy?.supportedProviders ?? []), ...(pinnedProviderId === undefined ? [] : [pinnedProviderId])])]
       : [];
-    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation);
+    // Every role, because under DIRECT the planner, the reviewer and the judge keep the runtime's
+    // own harness exactly as the primary does. Narrowing only the primary left the others judged by
+    // staged proofs about a sandbox this run does not use, which is how a plan came to name a
+    // staged-only provider for a role the invocation then refused.
+    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation, directProviders);
     const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation, directProviders);
-    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation);
-    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation, directProviders);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation, directProviders);
 
     // The state this task started from, measured before any provider is called.
     //

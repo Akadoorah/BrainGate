@@ -105,7 +105,9 @@ function excludedProviders(input: {
    * The providers this policy reaches even where the staged gates would close them.
    *
    * Under DIRECT that is every provider whose installed build can run the policy — measured by the
-   * caller and passed in — plus the pinned one. It used to be the pinned provider alone, on the
+   * caller and passed in — plus the pinned one. It applies to every role, not only the primary: a
+   * DIRECT run keeps the runtime's own harness for the planner and the reviewer too, so the staged
+   * proofs below are not what decides whether they can run. It used to be the pinned provider alone, on the
    * reasoning that selecting a worker was the operator's act; the automatic route then judged
    * everyone else by the *staged* proofs, so a provider that runs DIRECT perfectly well was
    * excluded from every automatic DIRECT turn for want of an attestation about a sandbox DIRECT
@@ -232,7 +234,7 @@ export function buildShadowTaskPlan(input: {
   // The planning pass, previewed before it is spent. A plan that showed only the executor would
   // hide the model the task actually leads with, which is the routing decision worth seeing.
   if (input.budget.separatePlanningPass && input.budget.maxPlanners > 0) {
-    const plannerExclusions = excludedProviders({ providers: input.providers, role: "planner", proof });
+    const plannerExclusions = excludedProviders({ providers: input.providers, role: "planner", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) });
     const routePlanner = (independence?: { readonly mode: "required"; readonly level: "cross-provider"; readonly models: readonly ModelRef[] }) => input.router.route({
       role: "planner",
       classification: input.classification,
@@ -240,6 +242,7 @@ export function buildShadowTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       ...(independence === undefined ? {} : { independence }),
+      ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
       excludeProviders: plannerExclusions,
     });
     const previewPlanner = (route: ReturnType<typeof routePlanner>, model: ModelRef): PlannedShadowRole => Object.freeze({
@@ -295,7 +298,8 @@ export function buildShadowTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence,
-      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", proof }),
+      ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
+      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({

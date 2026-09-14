@@ -277,6 +277,11 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
       writeRequired: false,
       independence,
+      // The policy is a gate on the *run*, not on the executing role alone: under DIRECT every role
+      // keeps the runtime's own harness, so a provider that cannot run the policy cannot run any of
+      // them. Without this the router happily chose a staged-only provider for the reviewer and the
+      // invocation refused it afterwards — a plan that named a worker nobody could dispatch.
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
       ...(reviewerExcluded === undefined ? {} : { excludeProviders: reviewerExcluded }),
       ...failover.routeOptions(),
     }).selected;
@@ -376,6 +381,7 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
       writeRequired: false,
       independence: { mode: "preferred", level: "cross-provider", models: [modelRef(primary), modelRef(reviewer)] },
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
       ...(judgeExcluded === undefined ? {} : { excludeProviders: judgeExcluded }),
       ...quotaExclusions(),
     }).selected;

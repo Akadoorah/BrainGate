@@ -138,7 +138,10 @@ test("a read task returns an answer that could only come from reading the reposi
     // Exit status is part of the contract: 0 only when the task completed cleanly. A reviewer
     // asking for changes exits 1, so a caller can tell "done" from "needs your eyes".
     assert.equal(run.status, 0, `run failed: ${run.stdout}${run.stderr}`);
-    assert.match(run.stdout, /outcome=completed/);
+    // The receipt's own word for a clean finish, which is what the exit status above also means. It
+    // was written as `completed` once; the vocabulary moved and this opt-in suite was not run, so the
+    // assertion outlived the string it was checking.
+    assert.match(run.stdout, /outcome=SUCCESS/);
     // The whole chain in one assertion: the provider was invoked with a usable environment,
     // it read the working tree, it satisfied the role contract, and the answer reached stdout.
     assert.match(run.stdout, new RegExp(CANARY), "the answer did not contain the canary, so nothing actually read the repository");
@@ -155,11 +158,15 @@ test("a write task changes the task worktree and leaves the source checkout byte
     const before = readFileSync(join(cli.repo, "labels.txt"), "utf8");
     const headBefore = cli.git(["rev-parse", "HEAD"]);
 
-    const plan = cli.run(["dogfood", "write", "plan", "--task", "In labels.txt, change the empty-state label to 'Nothing here yet, add your first item'"], 120_000);
+    // The strict mode, named rather than assumed. `direct` is the ordinary interactive boundary
+    // since ADR 0017 and it edits the workspace on purpose, so a test about a worktree that leaves
+    // the checkout byte-identical has to ask for one; its DIRECT counterpart is covered by the
+    // direct-write flow tests and by the real dogfood, where the change is the point.
+    const plan = cli.run(["dogfood", "write", "plan", "--policy", "worktree", "--task", "In labels.txt, change the empty-state label to 'Nothing here yet, add your first item'"], 120_000);
     assert.equal(plan.status, 0, `write plan failed: ${plan.stdout}${plan.stderr}`);
     assert.match(plan.stdout, /Zero provider model calls\. Zero worktrees\./);
 
-    const run = cli.run(["dogfood", "write", "run", "--task", "In labels.txt, change the empty-state label to 'Nothing here yet, add your first item'", "--execute"]);
+    const run = cli.run(["dogfood", "write", "run", "--policy", "worktree", "--task", "In labels.txt, change the empty-state label to 'Nothing here yet, add your first item'", "--execute"]);
     assert.equal(run.status, 0, `write run failed: ${run.stdout}${run.stderr}`);
     assert.match(run.stdout, /Changed: labels\.txt/, "the provider produced no reviewable change");
     assert.match(run.stdout, /No merge performed/);
@@ -266,7 +273,7 @@ test("each staged provider satisfies the role contract from its own CLI", { skip
  * on both — which is the whole argument for owning several subscriptions rather than the best
  * one.
  */
-test("a task the budget allows two approaches for spends two independent subscriptions on them", { skip: SKIP }, async () => {
+test("a T4 task spends more than one subscription, and names only workers that can run the policy", { skip: SKIP }, async () => {
   const cli = makeCli();
   try {
     register(cli);
@@ -277,13 +284,17 @@ test("a task the budget allows two approaches for spends two independent subscri
     // T4 is where the budget grants a second approach. If classification lands lower, the rest
     // of this test would silently prove nothing.
     assert.match(plan.stdout, /^T4\//m, `expected a T4 classification, got: ${plan.stdout}`);
-    // Grok is legitimately out of reach here: this repository lives in the temp directory, which
-    // every Grok sandbox profile grants, so its checkout-reachability self-test refuses. The
-    // second approach therefore comes from whichever other independent provider is available.
-    assert.match(plan.stdout, /planner-1=/, `the plan must name both planners before the run, not after: ${plan.stdout}`);
-    const planners = [...plan.stdout.matchAll(/planner-\d=([a-z-]+)\//g)].map((match) => match[1]);
-    assert.equal(planners.length, 2, `expected two planners in the plan, got: ${plan.stdout}`);
-    assert.notEqual(planners[0], planners[1], "a second approach from the same provider is not a second approach");
+    // A second approach needs a second provider that can run *this* policy. The default is DIRECT,
+    // and on this machine the only other planner above the T4 floor is Antigravity, which cannot run
+    // DIRECT at all (measured 2026-09-14) — so one planner is the honest answer, and the run below
+    // still spends two subscriptions because the reviewer comes from a third provider. What must not
+    // happen is the old behaviour: a plan naming a worker whose invocation is then refused, which is
+    // how this test failed before the policy gate reached the auxiliary roles.
+    assert.match(plan.stdout, /planner(-\d)?=/, `the plan must name its planner before the run, not after: ${plan.stdout}`);
+    const planners = [...plan.stdout.matchAll(/planner(-\d)?=([a-z-]+)\//g)].map((match) => match[2]!);
+    assert.ok(planners.length >= 1 && planners.length <= 2, `unexpected planners in the plan: ${plan.stdout}`);
+    if (planners.length === 2) assert.notEqual(planners[0], planners[1], "a second approach from the same provider is not a second approach");
+    assert.doesNotMatch(plan.stdout, /google\//, "a provider that cannot execute the policy is not named in the plan");
 
     // JSON, because the receipt is the evidence: which providers actually spent a call, taken
     // from the run itself rather than from a second command reading a shared history.

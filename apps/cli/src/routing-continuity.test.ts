@@ -34,12 +34,12 @@ function git(cwd: string, args: readonly string[]): void {
   if (result.status !== 0) throw new Error(String(result.stderr || result.stdout));
 }
 
-function modelCatalogEntry(state: ReturnType<typeof resolveOperatorState>, providerId: "anthropic" | "xai", modelId: string, coder: number, reasoning: number): void {
+function modelCatalogEntry(state: ReturnType<typeof resolveOperatorState>, providerId: "anthropic" | "xai" | "google", modelId: string, coder: number, reasoning: number, planner = 0): void {
   new ModelCatalog(state.modelCatalogPath).upsert({
     providerId,
     modelId,
-    quotaPool: providerId === "anthropic" ? "claude-subscription" : "grok-subscription",
-    capabilities: { coder, reviewer: 70, judge: 60 },
+    quotaPool: providerId === "anthropic" ? "claude-subscription" : providerId === "xai" ? "grok-subscription" : "antigravity-subscription",
+    capabilities: { coder, reviewer: 70, judge: 60, ...(planner === 0 ? {} : { planner }) },
     speed: "balanced",
     contextCapacity: 200_000,
     writeCapable: true,
@@ -75,15 +75,15 @@ function fixture(label: string): { readonly repo: string; readonly home: string;
   return { repo, home, env, state };
 }
 
-function snapshot(providerId: "anthropic" | "xai" = "anthropic"): ProviderSnapshot {
+function snapshot(providerId: "anthropic" | "xai" | "google" = "anthropic"): ProviderSnapshot {
   const observedAt = "2026-09-14T00:00:00.000Z";
   const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
   return {
     providerId,
-    displayName: providerId === "anthropic" ? "Claude Code" : "Grok CLI",
-    binary: providerId === "anthropic" ? "claude" : "grok",
+    displayName: providerId === "anthropic" ? "Claude Code" : providerId === "xai" ? "Grok CLI" : "Antigravity",
+    binary: providerId === "anthropic" ? "claude" : providerId === "xai" ? "grok" : "agy",
     available: obs(true),
-    version: obs(providerId === "anthropic" ? "2.1.270" : "1.0.24"),
+    version: obs(providerId === "anthropic" ? "2.1.270" : providerId === "xai" ? "1.0.24" : "1.2.2"),
     authState: obs("authenticated"),
     authMode: obs("subscription"),
     models: { value: null, evidence: "unknown", sourceCommand: null, observedAt },
@@ -200,17 +200,29 @@ test("an automatic DIRECT turn can reach a second subscription, not only the ref
   assert.equal(warm, "xai/grok-warm", "the warm worker on the second subscription continues the goal");
 });
 
-/** A provider CLI that records what it was asked to do and answers in the contracted shape. */
+/**
+ * A provider CLI that records what it was asked to do and answers in the contracted shape.
+ *
+ * Per provider, because the shapes genuinely differ: Claude returns its contract inside a JSON
+ * envelope, Grok streams the contract itself. A fake that answered one shape to both would pass
+ * whichever single-provider plan it was handed and prove nothing about a plan that spends more.
+ */
 class FakeShadowExecutor implements ShadowProcessExecutor {
   readonly calls: ShadowInvocationPlan[] = [];
   async run(input: { readonly plan: ShadowInvocationPlan }): Promise<ShadowProcessResult> {
     this.calls.push(input.plan);
+    const role = (input.plan as unknown as { readonly payload?: { readonly role?: string } }).payload?.role ?? "primary";
+    const contract = role === "reviewer"
+      ? { kind: "review", verdict: "approve", findings: [] }
+      : role === "judge"
+        ? { kind: "judge", verdict: "approve", rationale: "sound", findings: [] }
+        : { kind: "work", output: "the theme is in src/theme.ts" };
+    const body = JSON.stringify(contract);
+    const providerId = (input.plan as unknown as { readonly providerId?: string }).providerId ?? "anthropic";
     return {
       spawned: true,
       exitCode: 0,
-      // Grok streams the schema-constrained contract itself rather than an envelope around prose,
-      // so the fake answers the way that provider's build does.
-      stdout: JSON.stringify({ kind: "work", output: "the theme is in src/theme.ts" }),
+      stdout: providerId === "anthropic" ? JSON.stringify({ result: body }) : body,
       stderr: "",
       timedOut: false,
       durationMs: 4,
@@ -257,6 +269,53 @@ test("the run executes the worker the plan named, on whichever subscription it i
       `the record says why this worker won: ${String(primary?.selectedReasons?.join(", "))}`,
     );
     assert.deepEqual(executor.calls.length, 1, "one worker ran");
+  } finally {
+    ledger.close();
+  }
+});
+
+test("a role that cannot run the policy is not named, however good it is at that role", async () => {
+  const f = fixture("policy-role");
+  // The best planner on this machine is Antigravity (planner 98) and it cannot run a DIRECT
+  // invocation at all. The router used to choose it for the planner role anyway — the gate reached
+  // the primary and nothing else — and the invocation then refused it, so the whole plan failed with
+  // SHADOW_NATIVE_HARNESS_UNSUPPORTED before a single provider was called.
+  modelCatalogEntry(f.state, "google", "gemini-planner", 40, 90, 98);
+  modelCatalogEntry(f.state, "anthropic", "claude-strong", 96, 92, 90);
+  const providers = [snapshot("anthropic"), snapshot("google")];
+  const task = "Trace how session expiry is checked across the request path, find the root cause of the logout race, and propose a minimal fix.";
+
+  const executor = new FakeShadowExecutor();
+  const out = io();
+  const result = await runDogfoodCli(["dogfood", "ask", "run", "--task", task, "--policy", "direct", "--execute", "--json"], {
+    cwd: f.repo,
+    env: f.env,
+    discoverAll: async () => [...providers],
+    executor,
+    stdout: out.stdout,
+    stderr: out.stderr,
+  });
+  assert.equal(result.exitCode, 0, `${out.out()}\n${out.err()}`);
+
+  const registry = new ProjectRegistry(f.home);
+  const project = executionScopeFor(registry.loadFile(join(f.repo, ".brain", "project.json")), f.repo).project;
+  const ledger = new TaskLedger(project);
+  try {
+    const brief = ledger.receipt(ledger.listTasks()[0]!.taskId).events.find((event) => event.kind === "task.brief");
+    const route = (brief?.payload as { readonly route?: readonly { readonly role: string; readonly providerId: string; readonly rejected?: readonly { readonly providerId: string; readonly reasons: readonly string[] }[] }[] } | undefined)?.route ?? [];
+    assert.ok(route.length > 0, "the run recorded its routes");
+    for (const role of route) {
+      assert.notEqual(role.providerId, "google", `${role.role} must not be routed to a provider that cannot run the policy`);
+      const google = role.rejected?.find((rejection) => rejection.providerId === "google");
+      if (google === undefined) continue;
+      assert.ok(
+        google.reasons.includes("policy-not-supported:direct"),
+        `${role.role} rejects Antigravity for the policy, not for something incidental: ${google.reasons.join(", ")}`,
+      );
+    }
+    // And the planner that ran is the one the policy reaches.
+    const planner = route.find((role) => role.role === "planner");
+    if (planner !== undefined) assert.equal(planner.providerId, "anthropic");
   } finally {
     ledger.close();
   }

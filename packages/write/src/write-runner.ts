@@ -175,6 +175,8 @@ function routeWriteReviewer(input: {
   readonly requiredContextTokens: number;
   readonly primaryModel: ModelRef;
   readonly excludeProviders: readonly string[];
+  /** The policy this review runs under, when the caller measured which providers can execute it. */
+  readonly policy?: { readonly id: string; readonly supportedProviders: readonly string[] };
 }): RouteResult {
   const route = (independence: IndependenceConstraint): RouteResult => input.router.route({
     role: "reviewer",
@@ -183,6 +185,7 @@ function routeWriteReviewer(input: {
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
     independence,
+    ...(input.policy === undefined ? {} : { policy: input.policy }),
     excludeProviders: input.excludeProviders,
   });
   try {
@@ -286,6 +289,11 @@ export function buildWriteTaskPlan(input: {
       }
     })
     .map((snapshot) => snapshot.providerId);
+  // Which providers this policy reaches, when the caller measured it. `direct` decides whether it
+  // applies at all; the reviewer below asks the same question about the same set.
+  const capable = input.policyCapability?.id === "direct"
+    ? input.policyCapability.supportedProviders
+    : WRITE_PROVIDERS.filter((providerId) => directWriteCapable(providerId));
   if (direct) {
     // Only the providers whose invocation can honestly run in the workspace. The rest are not
     // refused here but excluded from routing, so the answer to "which model" is decided by the
@@ -302,9 +310,6 @@ export function buildWriteTaskPlan(input: {
     // subscriptions excluded, a task whose best worker is Grok or Codex could not reach it, and an
     // exhausted or refusing Claude pool left the write with no eligible worker at all instead of the
     // one that was actually free.
-    const capable = input.policyCapability?.id === "direct"
-      ? input.policyCapability.supportedProviders
-      : WRITE_PROVIDERS.filter((providerId) => directWriteCapable(providerId));
     primaryExcluded.push(...WRITE_PROVIDERS.filter((providerId) => !capable.includes(providerId)));
   }
   const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }), ...(input.continuity === undefined ? {} : { continuity: input.continuity }), excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
@@ -314,16 +319,23 @@ export function buildWriteTaskPlan(input: {
 
   const wantsReview = input.review ?? true;
   if (wantsReview) {
+    // A DIRECT review keeps the runtime's own harness, like the write it reviews, so the staged
+    // proofs this list is built from do not apply to it: a provider the caller measured as able to
+    // run the policy is a candidate here, and the policy gate below refuses the rest by name.
+    const stagedReviewerExclusions = reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? [], {
+      ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+      acceptances: input.acceptances ?? [],
+    });
     const reviewerRoute = routeWriteReviewer({
       router: input.router,
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       primaryModel,
-      excludeProviders: reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? [], {
-        ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
-        acceptances: input.acceptances ?? [],
-      }),
+      ...(direct && input.policyCapability !== undefined ? { policy: input.policyCapability } : {}),
+      excludeProviders: direct && input.policyCapability?.id === "direct"
+        ? stagedReviewerExclusions.filter((providerId) => !capable.includes(providerId))
+        : stagedReviewerExclusions,
     });
     const reviewerModel = modelRef(reviewerRoute);
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, workspace: reviewerModel.providerId === "openai" ? "staged-review" : "project-read-only" }));
