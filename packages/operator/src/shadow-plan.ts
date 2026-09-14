@@ -102,13 +102,14 @@ function excludedProviders(input: {
   readonly role: "planner" | "primary" | "reviewer";
   readonly proof: ProviderProof;
   /**
-   * The providers the operator named for this plan, which DIRECT reaches even where the staged
-   * gates close them.
+   * The providers this policy reaches even where the staged gates would close them.
    *
-   * Deliberately the pinned set and not "every provider under DIRECT": selecting a worker is the
-   * operator's act, and widening the automatic route to the other subscriptions is a different
-   * decision from making the selected one work. The gates below still answer for every provider the
-   * operator did not name.
+   * Under DIRECT that is every provider whose installed build can run the policy — measured by the
+   * caller and passed in — plus the pinned one. It used to be the pinned provider alone, on the
+   * reasoning that selecting a worker was the operator's act; the automatic route then judged
+   * everyone else by the *staged* proofs, so a provider that runs DIRECT perfectly well was
+   * excluded from every automatic DIRECT turn for want of an attestation about a sandbox DIRECT
+   * does not use. The staged roles still answer to the staged gates: they are not DIRECT runs.
    */
   readonly directProviders?: readonly string[];
 }): readonly string[] {
@@ -185,6 +186,12 @@ export function buildShadowTaskPlan(input: {
     ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
     acceptances: input.acceptances ?? [],
   });
+  // Which providers this policy can actually reach. Under DIRECT that is the measured set, not the
+  // operator's pin: the router is the thing choosing now, and it cannot choose a worker that was
+  // excluded by a gate the policy does not use.
+  const policyProviders = input.nativeHarness === true
+    ? [...new Set([...(input.policyCapability?.supportedProviders ?? []), ...(input.pin === undefined ? [] : [input.pin.providerId])])]
+    : [];
   const primaryRoute = input.router.route({
     role: "coder",
     classification: input.classification,
@@ -193,7 +200,7 @@ export function buildShadowTaskPlan(input: {
     writeRequired: false,
     ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
     ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
-    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(input.nativeHarness === true && input.pin !== undefined ? { directProviders: [input.pin.providerId] } : {}) }),
+    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
     ...(input.pin === undefined ? {} : { pin: input.pin }),
   });
   const primaryModel = modelRef(primaryRoute);

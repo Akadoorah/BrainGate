@@ -290,12 +290,22 @@ export function buildWriteTaskPlan(input: {
     // Only the providers whose invocation can honestly run in the workspace. The rest are not
     // refused here but excluded from routing, so the answer to "which model" is decided by the
     // router among the ones that can, and the operator sees that in the plan.
-    primaryExcluded.push(...WRITE_PROVIDERS.filter((providerId) => !directWriteCapable(providerId)));
-    // And the automatic route keeps the shape it was accepted with: DIRECT work goes to the
-    // reference provider unless the operator named another worker. Making a selected worker run
-    // natively is this milestone; re-routing every write to another subscription is a different
-    // decision, and the operator makes it by naming the worker.
-    if (input.pin === undefined) primaryExcluded.push("openai", "google", "xai");
+    //
+    // Where the caller measured this set from the installed builds, that measurement is the answer.
+    // The static table is the fallback for a caller that did not, and both say the same thing: which
+    // providers have a DIRECT write invocation at all.
+    //
+    // This used to narrow the automatic route to the reference provider unless the operator named
+    // one — `openai`, `google` and `xai` were pushed out by name whenever there was no pin. That was
+    // right while choosing the worker was the operator's act and DIRECT existed to make the named
+    // worker run natively. It is wrong now that the route is what chooses: with the other
+    // subscriptions excluded, a task whose best worker is Grok or Codex could not reach it, and an
+    // exhausted or refusing Claude pool left the write with no eligible worker at all instead of the
+    // one that was actually free.
+    const capable = input.policyCapability?.id === "direct"
+      ? input.policyCapability.supportedProviders
+      : WRITE_PROVIDERS.filter((providerId) => directWriteCapable(providerId));
+    primaryExcluded.push(...WRITE_PROVIDERS.filter((providerId) => !capable.includes(providerId)));
   }
   const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }), ...(input.continuity === undefined ? {} : { continuity: input.continuity }), excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);

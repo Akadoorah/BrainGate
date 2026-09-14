@@ -62,12 +62,16 @@ function exclusionsFor(
   role: WorkflowRole,
   isolation: { readonly codex?: CodexIsolationAttestation; readonly grok?: GrokIsolationAttestation; readonly grokSnapshot?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[]; readonly direct?: boolean } = {},
   /**
-   * The provider the operator named for this run, which DIRECT reaches through the staged gates.
+   * The providers this policy reaches through the staged gates.
    *
-   * A provider the operator did not name keeps every gate it had: making the selected worker work
-   * is this milestone, and quietly re-routing the default path to another subscription is not.
+   * Under DIRECT that is every provider measured as able to run it, plus any provider the operator
+   * named by hand. It used to be only the named one, on the reasoning that making the selected
+   * worker work was the milestone and re-routing the default path to another subscription was not.
+   * The route is what chooses now, and this is the function the *run* consults while the plan
+   * consults its own: leaving it narrowed here made the two disagree — the plan named a second
+   * subscription's worker and the run quietly spent the reference provider instead.
    */
-  pinnedProviderId?: string,
+  directProviders?: readonly string[],
 ): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
     const acceptance = (isolation.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
@@ -82,7 +86,7 @@ function exclusionsFor(
       ...(isolation.grok === undefined ? {} : { grokIsolation: isolation.grok }),
       ...(isolation.grokSnapshot === undefined ? {} : { grokSnapshotIsolation: isolation.grokSnapshot }),
     }).eligible;
-    const directHere = isolation.direct === true && pinnedProviderId !== undefined && snapshot.providerId === pinnedProviderId;
+    const directHere = isolation.direct === true && (directProviders ?? []).includes(snapshot.providerId);
     if (!shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
     // A provider whose isolation is proven per run, not per install, is not routable until this
     // run has the proof. Excluding it here means the router never selects it and the operator
@@ -329,10 +333,15 @@ export class ShadowDogfoodRunner {
       ...(this.#nativeHarness ? { direct: true } : {}),
     });
     const pinnedProviderId = this.#pin?.providerId;
-    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation, pinnedProviderId);
-    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation, pinnedProviderId);
-    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation, pinnedProviderId);
-    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation, pinnedProviderId);
+    // Which providers the policy can reach, from the same measurement the plan used. The staged roles
+    // are not DIRECT runs, so they keep the staged gates and are asked with no DIRECT bypass at all.
+    const directProviders = this.#nativeHarness === true
+      ? [...new Set([...(this.#routing.policy?.supportedProviders ?? []), ...(pinnedProviderId === undefined ? [] : [pinnedProviderId])])]
+      : [];
+    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation);
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation, directProviders);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation);
 
     // The state this task started from, measured before any provider is called.
     //
