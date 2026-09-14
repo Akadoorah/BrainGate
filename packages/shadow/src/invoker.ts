@@ -61,6 +61,40 @@ export function extractCodexAgentMessage(stdout: string): string {
 
 
 /**
+ * The session id a runtime reported for the run it just finished, when it reports one.
+ *
+ * Measured 2026-09-14: Codex opens its JSONL stream with
+ * `{"type":"thread.started","thread_id":"…"}` before any model work, and Antigravity's print-mode
+ * envelope carries `conversation_id`. Both are read here rather than guessed at, and a run that
+ * never reported one returns `null` — which is a fact about that run, not a failure.
+ *
+ * Deliberately not "the last session this CLI used": that would attach this goal's work to
+ * whatever the operator happened to run in their own terminal.
+ */
+export function reportedSessionIdOf(providerId: string, stdout: string): string | null {
+  if (providerId !== "openai" && providerId !== "google") return null;
+  let found: string | null = null;
+  for (const rawLine of stdout.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (line.length === 0 || !line.startsWith("{")) continue;
+    let event: Record<string, unknown>;
+    try { event = JSON.parse(line) as Record<string, unknown>; }
+    catch { continue; }
+    if (providerId === "openai") {
+      if (event.type === "thread.started" && typeof event.thread_id === "string") found = event.thread_id;
+      continue;
+    }
+    // Antigravity: the id sits on the envelope itself, and on the inner `result` of a streamed run.
+    if (typeof event.conversation_id === "string") found = event.conversation_id;
+    const result = event.result;
+    if (typeof result === "object" && result !== null && typeof (result as Record<string, unknown>).conversation_id === "string") {
+      found = (result as Record<string, unknown>).conversation_id as string;
+    }
+  }
+  return found;
+}
+
+/**
  * The answer from an Antigravity stream-json run.
  *
  * One NDJSON object per line, and the reply is in the last line that carries one — as a
@@ -380,13 +414,27 @@ export interface NativeSessionResolution {
   readonly note?: string | undefined;
 }
 
-export type NativeSessionResolver = (input: {
+export type NativeSessionResolver = ((input: {
   readonly role: string;
   readonly phase: string;
   readonly model: { readonly providerId: string; readonly modelId: string; readonly quotaPool: string };
   readonly task: string;
   readonly context: unknown;
-}) => Promise<NativeSessionResolution | null>;
+}) => Promise<NativeSessionResolution | null>) & {
+  /**
+   * What a run reported about its own session, when the runtime mints the id itself.
+   *
+   * A resolver that pins ids has nothing to report: the id was chosen before the call. This exists
+   * for the runtimes that publish theirs in their output, where the reference can only be recorded
+   * once the run has started saying what it is. Optional, because a caller that does not keep
+   * sessions has nothing to record — and a resolver that cannot record must not stop the run.
+   */
+  readonly reportReported?: (input: {
+    readonly providerId: string;
+    readonly modelId: string;
+    readonly sessionId: string;
+  }) => void;
+};
 
 export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   readonly #project: ExecutionProject;
@@ -641,6 +689,13 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         ...(this.#onText === undefined ? {} : { onText: this.#onText }),
         ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }),
       });
+      // What the runtime said about its own session, recorded while the run is still in hand. The
+      // resolver owns the goal this belongs to; this layer only knows what came back, and only a run
+      // that succeeded is worth recording a session for.
+      if (result.exitCode === 0 && session !== null && session.sessionId === null) {
+        const reported = reportedSessionIdOf(request.model.providerId, result.stdout);
+        if (reported !== null) this.#nativeSession?.reportReported?.({ providerId: request.model.providerId, modelId: request.model.modelId, sessionId: reported });
+      }
       // The copy the provider was given must still match its manifest, byte for byte, before anything
       // it said is believed. A run that wrote into it is a boundary violation whether or not it also
       // produced an answer — and an answer from a workspace that changed underneath it is not one

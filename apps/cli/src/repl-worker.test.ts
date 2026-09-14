@@ -43,7 +43,7 @@ function git(cwd: string, args: readonly string[]): void {
   if (result.status !== 0) throw new Error(String(result.stderr || result.stdout));
 }
 
-function snapshot(providerId: "anthropic" | "xai" | "openai", displayName: string, binary: string): ProviderSnapshot {
+function snapshot(providerId: "anthropic" | "xai" | "openai" | "google", displayName: string, binary: string): ProviderSnapshot {
   const observedAt = "2026-09-13T00:00:00.000Z";
   const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
   return {
@@ -82,6 +82,18 @@ interface Recorded {
  * was passed" is the entire question: pinning an id and resuming one are different acts, and a fake
  * that could not tell them apart would pass whichever implementation it was given.
  */
+/** The session a run was told to continue, in whichever shape its CLI says it. */
+function continuedSessionId(providerId: string, args: readonly string[]): string | null {
+  const flag = args.indexOf("--resume");
+  if (flag >= 0) return args[flag + 1] ?? null;
+  if (providerId === "openai" && args[0] === "exec" && args[1] === "resume") {
+    return args.find((argument) => /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(argument)) ?? null;
+  }
+  const conversation = args.indexOf("--conversation");
+  if (conversation >= 0) return args[conversation + 1] ?? null;
+  return null;
+}
+
 /** The last complete JSON object in a text, which is how a brief travels when it rides in argv. */
 function lastObjectIn(text: string): string | null {
   const end = text.lastIndexOf("}");
@@ -102,7 +114,11 @@ class FakeCli implements ShadowProcessExecutor {
     // that CLI takes its prompt as a flag value and has no stdin prompt mode. The fake reads all
     // three so a scenario can switch providers without the fixture deciding which CLI it is.
     const stdinBody = input.plan.stdin ?? input.plan.attachmentContent ?? "";
-    const promptArg = input.plan.args[input.plan.args.indexOf("-p") + 1] ?? "";
+    // `-p <prompt>` for Grok, `-p=<prompt>` for Antigravity: the attached form is one argv element,
+    // and reading the element after a flag that is not there would silently take the first argument.
+    const inlineIndex = input.plan.args.indexOf("-p");
+    const attached = input.plan.args.find((argument) => argument.startsWith("-p="));
+    const promptArg = (inlineIndex >= 0 ? input.plan.args[inlineIndex + 1] : undefined) ?? attached?.slice(3) ?? "";
     const source = stdinBody.trim().startsWith("{") ? stdinBody : promptArg;
     const payload = JSON.parse(lastObjectIn(source) ?? "{}") as { readonly role?: string; readonly task?: string; readonly context?: Record<string, unknown> };
     const args = [...input.plan.args];
@@ -117,8 +133,11 @@ class FakeCli implements ShadowProcessExecutor {
       task: payload.task ?? "",
       args,
       context: payload.context ?? {},
+      // Each CLI is told to continue a session in its own way: a `--resume` flag for Claude and
+      // Grok, a `resume` subcommand for Codex, `--conversation` for Antigravity. A fake that knew
+      // only the first would report "nothing was resumed" for a run that resumed correctly.
       sessionIdArg: at("--session-id"),
-      resumeArg: at("--resume"),
+      resumeArg: continuedSessionId(input.plan.providerId, args),
       noPersistence: args.includes("--no-session-persistence"),
     });
 
@@ -130,8 +149,49 @@ class FakeCli implements ShadowProcessExecutor {
       ? { kind: "review", verdict: "approve", findings: [] }
       : { kind: "work", output });
     input.onText?.(output);
+    // Each CLI answers in its own envelope, because BrainGate reads each one's own: a fake that
+    // spoke Claude's shape for every provider would prove nothing about the adapters.
+    if (input.plan.providerId === "openai") {
+      const threadId = this.#threadIdFor(input.plan.args);
+      const events = [
+        JSON.stringify({ type: "thread.started", thread_id: threadId }),
+        JSON.stringify({ type: "item.completed", item: { id: "item_0", type: "agent_message", text: work } }),
+      ].join("\n");
+      return { spawned: true, exitCode: 0, stdout: events, stderr: "", timedOut: false, durationMs: 5, removedEnvironmentKeys: [] };
+    }
+    if (input.plan.providerId === "google") {
+      const conversationId = this.#conversationIdFor(input.plan.args);
+      return {
+        spawned: true, exitCode: 0,
+        stdout: JSON.stringify({ conversation_id: conversationId, status: "SUCCESS", response: work, num_turns: 1, usage: { input_tokens: 10, output_tokens: 5 } }),
+        stderr: "", timedOut: false, durationMs: 5, removedEnvironmentKeys: [],
+      };
+    }
     return { spawned: true, exitCode: 0, stdout: JSON.stringify({ result: work }), stderr: "", timedOut: false, durationMs: 5, removedEnvironmentKeys: [] };
   }
+
+  /**
+   * The id a Codex-shaped run reports, honouring a resume the way the real CLI does.
+   *
+   * A resumed run echoes the id it was given; a fresh one mints a new one. That is the whole
+   * behaviour BrainGate has to be right about, so the fake is built to make getting it wrong visible.
+   */
+  #threadIdFor(args: readonly string[]): string {
+    const resumed = args[args.indexOf("exec") + 1] === "resume" ? args.find((argument) => /^[0-9a-f-]{36}$/.test(argument)) : undefined;
+    if (resumed !== undefined) return resumed;
+    this.freshIds += 1;
+    return `01a09d2f-73db-72b3-8029-6a4786c2eb${String(this.freshIds).padStart(2, "0")}`;
+  }
+
+  #conversationIdFor(args: readonly string[]): string {
+    const resumed = args.includes("--conversation") ? args[args.indexOf("--conversation") + 1] : undefined;
+    if (resumed !== undefined) return resumed;
+    this.freshIds += 1;
+    return `5e1e942f-772b-47e3-b220-e85f65fef3${String(this.freshIds).padStart(2, "0")}`;
+  }
+
+  /** How many fresh ids this fake has minted, so a test can tell "new" from "resumed". */
+  freshIds = 0;
 
   primaryCalls(): readonly Recorded[] {
     return this.calls.filter((call) => call.role === "primary");
@@ -146,7 +206,7 @@ class FakeCli implements ShadowProcessExecutor {
 
 function fixture(
   label: string,
-  models: readonly { providerId: "anthropic" | "xai" | "openai"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
+  models: readonly { providerId: "anthropic" | "xai" | "openai" | "google"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
     { providerId: "anthropic", modelId: "claude-sonnet", coder: 95, speed: "balanced" },
     { providerId: "anthropic", modelId: "claude-haiku", coder: 60, speed: "fast" },
     { providerId: "xai", modelId: "grok-fast", coder: 70, speed: "fast" },
@@ -219,6 +279,7 @@ function sessionOf(repo: string, env: NodeJS.ProcessEnv, cli: FakeCli, answers: 
         snapshot("anthropic", "Claude Code", "claude"),
         snapshot("xai", "Grok Build", "grok"),
         snapshot("openai", "Codex CLI", "codex"),
+        snapshot("google", "Antigravity", "agy"),
       ]).map((item) => (unavailable.has(item.providerId) ? { ...item, available: { ...item.available, value: false } } : item)),
       probeCapabilities: async (providerId: string) => ({
         features: { sessionIdPinning: { supported: pinning[providerId] ?? false } },
@@ -971,4 +1032,52 @@ test("N: a workspace with no repository attaches and reports Git as metadata it 
     assert.match(session.text(), /Project: +plain/);
     assert.match(session.text(), /Git: +none — this workspace is not inside a repository/);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------- K. reported-id continuity
+
+/**
+ * A runtime that mints its own session id, and BrainGate resuming it.
+ *
+ * Measured 2026-09-14: Codex publishes `thread.started.thread_id` as the first line of its JSONL
+ * stream and `exec resume <id>` continues it; Antigravity answers with a `conversation_id` and
+ * `--conversation <id>` continues that. Neither lets the caller name the id up front, so continuity
+ * here is two facts working together — the run reports an id, and BrainGate records it against the
+ * goal so the next compatible run can hand it back. A fake that minted an id but was never asked to
+ * resume it would pass whichever implementation it was given, which is why both halves are asserted.
+ */
+test("K: a runtime that reports its own session id is resumed on it, and never claims a pinned one", async () => {
+  for (const [providerId, modelId] of [["openai", "codex-fast"], ["google", "gemini-fast"]] as const) {
+    const f = fixture(`reported-${providerId}`, [{ providerId, modelId, coder: 100, speed: "fast" }]);
+    const cli = new FakeCli({ "Read the notes file": "Three lines about a launch screen." });
+    const session = sessionOf(f.repo, f.env, cli, [
+      `/use ${providerId}/${modelId}`,
+      "Read the notes file", "y",
+      "What did it say?", "y",
+    ], { pinning: { anthropic: true, xai: true, openai: false } });
+    try {
+      assert.equal(await session.run(), 0, session.text());
+      const calls = cli.primaryCalls().filter((call) => call.providerId === providerId);
+      assert.equal(calls.length, 2, `${providerId}: two turns, two invocations\n${session.text()}`);
+      const [first, second] = calls;
+
+      // The first turn cannot pin an id — this runtime does not accept one — so the run starts
+      // without a session flag and BrainGate learns the id from what came back.
+      assert.equal(first!.sessionIdArg, null, `${providerId}: nothing was pinned`);
+      assert.equal(first!.resumeArg, null, `${providerId}: and nothing was resumed`);
+
+      // The second turn hands that exact id back to the same worker, and pins nothing new.
+      assert.notEqual(second!.resumeArg, null, `${providerId}: the reported id was resumed`);
+      assert.equal(second!.sessionIdArg, null, `${providerId}: a resumed turn pins nothing`);
+      assert.match(session.text(), /resuming native session/, `${providerId}: and the terminal says so`);
+
+      const store = new GoalStore(f.project);
+      try {
+        const goal = store.activeGoal();
+        const registered = store.latestSessionFor(providerId, modelId);
+        assert.equal(registered?.sessionId, second!.resumeArg, `${providerId}: the session on record is the reported one`);
+        assert.equal(registered?.goalId, goal?.goalId, `${providerId}: and it belongs to this goal`);
+      } finally { store.close(); }
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  }
 });

@@ -12,24 +12,31 @@ import { isNativeSessionKind, type NativeSessionDecision, type NativeSessionKind
  * Measured 2026-09-13 against: claude 2.1.269, codex-cli 0.153.4, agy 1.2.2, grok 1.0.24,
  * copilot 0.0.358. Read from each CLI's own `--help`; no model call was made to obtain any of it.
  */
+/** How a runtime's session id becomes known to BrainGate. */
+export const SESSION_ID_SOURCES = ["pinned", "reported", "none"] as const;
+export type SessionIdSource = (typeof SESSION_ID_SOURCES)[number];
+
 export interface RuntimeSessionPolicy {
   /**
-   * Whether the caller may name the id of a session it is about to create.
+   * Where a fresh run's session id comes from.
    *
-   * This is the capability native continuity actually needs. A CLI that only mints ids reveals one
-   * after the fact, in whatever its output format happens to be, and a run that dies before its
-   * final envelope never reveals one at all — so the reference is not known until the work is over,
-   * which is exactly when it is too late to have recorded it reliably.
+   *   `pinned`   the caller names it before the run, so the reference exists even if the process
+   *              dies mid-run. Claude and Grok.
+   *   `reported` the CLI mints it and publishes it in its own output, which BrainGate reads back.
+   *              Codex (`thread.started.thread_id`) and Antigravity (`conversation_id`). Measured
+   *              2026-09-14: both publish it in the first structured line, before any model work,
+   *              so the window in which a run has no id yet is the window before it starts.
+   *   `none`     no id to be had; continuity is the goal handoff.
    */
-  readonly idPinning: boolean;
+  readonly idSource: SessionIdSource;
   /**
    * Whether invoking this runtime writes a session that can be resumed later.
    *
-   * Separate from `idPinning` because a runtime can pin an id *and* be told not to persist, and
+   * Separate from `idSource` because a runtime can pin an id *and* be told not to persist, and
    * because persistence has consequences of its own: it is state the provider keeps.
    */
   readonly persistsSessions: boolean;
-  /** The flag that names a new session, as `[flag, value]` pairs. Empty when `idPinning` is false. */
+  /** The flag that names a new session, as `[flag, value]` pairs. Empty when nothing can be pinned. */
   readonly newSessionArgs: (sessionId: string) => readonly string[];
   /** The flag that resumes an existing session. */
   readonly resumeArgs: (sessionId: string) => readonly string[];
@@ -53,11 +60,11 @@ export interface RuntimeSessionPolicy {
    * they disagree the reading wins, and it can only ever take the capability away — a build that
    * dropped `--session-id` refuses continuity rather than failing at the provider with a flag error.
    */
-  readonly probeFeature: "sessionIdPinning";
+  readonly probeFeature: "sessionIdPinning" | "sessionResume";
 }
 
 const ANTHROPIC_SESSION: RuntimeSessionPolicy = Object.freeze({
-  idPinning: true,
+  idSource: "pinned" as const,
   persistsSessions: true,
   newSessionArgs: (sessionId: string) => Object.freeze(["--session-id", sessionId]),
   resumeArgs: (sessionId: string) => Object.freeze(["--resume", sessionId]),
@@ -70,27 +77,33 @@ const ANTHROPIC_SESSION: RuntimeSessionPolicy = Object.freeze({
 export const RUNTIME_SESSION_POLICIES: Readonly<Record<ProviderId, RuntimeSessionPolicy>> = Object.freeze({
   anthropic: ANTHROPIC_SESSION,
   openai: Object.freeze({
-    idPinning: false,
+    // Measured 2026-09-14 against codex-cli 0.153.4: `codex exec --json` opens its stream with
+    // `{"type":"thread.started","thread_id":"…"}`, and `codex exec resume <id>` continued that
+    // session in a real probe — the second turn answered from the first turn's instruction.
+    idSource: "reported" as const,
     persistsSessions: true,
     newSessionArgs: () => Object.freeze([]),
     resumeArgs: (sessionId: string) => Object.freeze(["exec", "resume", sessionId]),
     noPersistenceArgs: Object.freeze(["--ephemeral"]),
-    resumeOffered: false,
-    notOfferedBecause: "provider-does-not-expose-session-ids" as const,
-    probeFeature: "sessionIdPinning" as const,
+    resumeOffered: true,
+    notOfferedBecause: null,
+    probeFeature: "sessionResume" as const,
   }),
   google: Object.freeze({
-    idPinning: false,
+    // Measured 2026-09-14 against agy 1.2.2: `--output-format json` answers with a
+    // `conversation_id`, and `--conversation <id>` continued it — the second run reported
+    // `num_turns: 2` and answered from the first run's instruction.
+    idSource: "reported" as const,
     persistsSessions: true,
     newSessionArgs: () => Object.freeze([]),
     resumeArgs: (sessionId: string) => Object.freeze(["--conversation", sessionId]),
     noPersistenceArgs: Object.freeze([]),
-    resumeOffered: false,
-    notOfferedBecause: "provider-does-not-expose-session-ids" as const,
-    probeFeature: "sessionIdPinning" as const,
+    resumeOffered: true,
+    notOfferedBecause: null,
+    probeFeature: "sessionResume" as const,
   }),
   xai: Object.freeze({
-    idPinning: true,
+    idSource: "pinned" as const,
     persistsSessions: true,
     newSessionArgs: (sessionId: string) => Object.freeze(["--session-id", sessionId]),
     resumeArgs: (sessionId: string) => Object.freeze(["--resume", sessionId]),
@@ -110,7 +123,7 @@ export const RUNTIME_SESSION_POLICIES: Readonly<Record<ProviderId, RuntimeSessio
     probeFeature: "sessionIdPinning" as const,
   }),
   "github-copilot": Object.freeze({
-    idPinning: false,
+    idSource: "none" as const,
     persistsSessions: true,
     newSessionArgs: () => Object.freeze([]),
     resumeArgs: (sessionId: string) => Object.freeze(["--resume", sessionId]),
@@ -230,7 +243,7 @@ export interface SessionResolutionRequest {
   /** Whether the caller asked for a fresh native session on purpose. */
   readonly freshRequested: boolean;
   /** The capability probe's reading for this build, when one was taken. */
-  readonly probedPinning: boolean | "unknown" | null;
+  readonly probedContinuity: boolean | "unknown" | null;
   readonly runtimeVersion: string | null;
   readonly workspace: string | null;
   readonly goalId: string | null;
@@ -262,21 +275,21 @@ export function resolveSessionDecision(input: SessionResolutionRequest & { reado
     return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: policy.notOfferedBecause, persistent: false });
   }
 
-  // The probe can only take the capability away. A build that no longer publishes the flag, or one
-  // nobody could read, is not a build to pin ids against.
-  if (input.probedPinning === false) {
+  // The probe can only take the capability away. A build that no longer publishes what continuity
+  // needs — the flag that names an id, or the subcommand that resumes one — is not a build to hold
+  // ids against, and neither is one nobody could read.
+  if (policy.idSource === "none" || input.probedContinuity === false) {
     return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: "provider-does-not-expose-session-ids" as const, persistent: false });
   }
-
-  if (!policy.idPinning) {
-    return Object.freeze({ ...base, kind: "handoff" as const, sessionId: null, reason: "provider-does-not-expose-session-ids" as const, persistent: false });
-  }
+  // A runtime that reports its own id cannot be given one: `fresh` without a session id is a run
+  // whose id BrainGate learns from the CLI's output, which the caller records when it sees it.
+  const reports = policy.idSource === "reported";
 
   if (input.freshRequested) {
     return Object.freeze({
       ...base,
       kind: "fresh" as const,
-      sessionId: randomUUID(),
+      sessionId: reports ? null : randomUUID(),
       resumeMode: "available" as const,
       reason: null,
       persistent: policy.persistsSessions,
@@ -285,12 +298,13 @@ export function resolveSessionDecision(input: SessionResolutionRequest & { reado
 
   const stored = input.stored;
   if (stored === null) {
-    // Nothing to resume, so a new session is created *with a known id* — that is the whole point of
-    // pinning, and it is why the next turn can resume even if this one dies.
+    // Nothing to resume, so a new session begins. Where the caller can name it, it does — that is
+    // what makes the reference survive an interrupted run. Where the runtime names it, the run
+    // starts without one and the id is recorded from the output that reports it.
     return Object.freeze({
       ...base,
       kind: "fresh" as const,
-      sessionId: randomUUID(),
+      sessionId: reports ? null : randomUUID(),
       resumeMode: "available" as const,
       reason: "not-yet-used" as const,
       persistent: policy.persistsSessions,
@@ -299,10 +313,12 @@ export function resolveSessionDecision(input: SessionResolutionRequest & { reado
 
   const unusable = sessionUnusableReason({ stored, goalId: input.goalId, runtimeVersion: input.runtimeVersion, workspace: input.workspace, ...(input.envelope === undefined ? {} : { envelope: input.envelope }) });
   if (unusable !== null) {
+    // The session it would have resumed is gone or wrong for this work. A pinning runtime is handed
+    // a new id here; a reporting one is simply run fresh, and the id it reports is recorded.
     return Object.freeze({
       ...base,
       kind: "fresh" as const,
-      sessionId: randomUUID(),
+      sessionId: reports ? null : randomUUID(),
       resumeMode: "available" as const,
       reason: unusable,
       persistent: policy.persistsSessions,
@@ -354,7 +370,7 @@ export function sessionUnusableReason(input: {
 
 /** The arguments a plan needs for a decision: the session flag, or the flag that suppresses one. */
 export function sessionArgs(policy: RuntimeSessionPolicy, decision: NativeSessionDecision): readonly string[] {
-  if (!policy.idPinning || decision.sessionId === null) return Object.freeze([]);
+  if (policy.idSource !== "pinned" || decision.sessionId === null) return Object.freeze([]);
   if (decision.kind === "resumed") return policy.resumeArgs(decision.sessionId);
   if (decision.kind === "fresh") return policy.newSessionArgs(decision.sessionId);
   return Object.freeze([]);
@@ -397,9 +413,20 @@ export function unsupportedSessionDecision(input: { readonly providerId: Provide
 export function describeSessionDecision(decision: NativeSessionDecision): string {
   switch (decision.kind) {
     case "resumed": return `resuming native session ${shortId(decision.sessionId)}`;
-    case "fresh": return decision.reason === "not-yet-used"
-      ? `new native session ${shortId(decision.sessionId)}`
-      : `new native session ${shortId(decision.sessionId)} (${describeReason(decision.reason)})`;
+    case "fresh": {
+      // A runtime that mints the id itself has none to show yet: the session is new and the CLI is
+      // about to name it. Printing "none" there was the ledger and the terminal disagreeing again —
+      // the decision was a new session, and `none` reads as no session at all. The shape of the
+      // line is unchanged wherever an id exists.
+      if (decision.sessionId === null) {
+        return decision.reason === "not-yet-used"
+          ? "new native session (the runtime names it)"
+          : `new native session (the runtime names it) (${describeReason(decision.reason)})`;
+      }
+      return decision.reason === "not-yet-used"
+        ? `new native session ${shortId(decision.sessionId)}`
+        : `new native session ${shortId(decision.sessionId)} (${describeReason(decision.reason)})`;
+    }
     case "unsupported": return `no native session (${describeReason(decision.reason)})`;
     case "disabled": return "native sessions disabled for this run";
     case "handoff": return `fresh invocation with a goal handoff (${describeReason(decision.reason)})`;

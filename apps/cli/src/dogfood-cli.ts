@@ -53,7 +53,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
-import { WriteDogfoodRunner, assertClaudeWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
 import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
@@ -657,26 +657,32 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"), state, CODEX_PROBE_VERSION);
   const grok = await grokProof(state, snapshots, deps, env, project);
   const acceptances = loadAcceptances(state);
-  const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer") => {
+  // DIRECT is the default policy, so readiness is asked under it: a provider whose only invocation
+  // BrainGate has measured is its native one in the workspace is ready for exactly that, and asking
+  // the staged question instead printed `ask=blocked` beside a run that then worked.
+  const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer", direct: boolean) => {
     const acceptance = acceptances.find((item) => item.providerId === providerId);
-    return shadowProviderRoleStatus(providerId, role, acceptance === undefined ? {} : { acceptance });
+    return shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), direct });
   };
   const providerById = new Map<string, ProviderSnapshot>(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
 
   const askCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && roleStatus(snapshot.providerId, "primary").enabled;
+    return snapshot !== undefined && snapshot.available.value === true && snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription" && roleStatus(snapshot.providerId, "primary", true).enabled;
   });
-  let writeCandidate = false;
-  for (const entry of configured) {
-    if (entry.providerId !== "anthropic" || !entry.configured || !entry.definition.writeCapable) continue;
-    const snapshot = providerById.get("anthropic");
-    if (snapshot === undefined) continue;
+  // A DIRECT write is ready when some configured, write-capable model's provider has a measured
+  // DIRECT write invocation. Claude is no longer the only answer to that, and the check is the same
+  // one the write path runs rather than a second opinion about it.
+  const directWriteCandidates = configured.filter((entry) => {
+    if (!entry.configured || !entry.definition.writeCapable) return false;
+    const snapshot = providerById.get(entry.providerId);
+    if (snapshot === undefined || snapshot.available.value !== true) return false;
     try {
-      assertClaudeWriteEligible(snapshot, { providerId: snapshot.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool });
-      writeCandidate = true;
-    } catch { /* reported as unavailable below */ }
-  }
+      assertWriteEligible(snapshot, { providerId: entry.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool }, { nativeHarness: true });
+      return true;
+    } catch { return false; }
+  });
+  const writeCandidate = directWriteCandidates.length > 0;
   const cleanForWrite = repositories.every((repo) => repo.clean);
   // A repository created a moment ago has a branch and no commit. Worktree writes branch from
   // a commit, so they cannot start yet — and saying that plainly beats letting the write path
@@ -684,7 +690,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const uncommitted = repositories.filter((repo) => repo.head === null);
   const reviewerCandidates = configured.filter((entry) => {
     const snapshot = providerById.get(entry.providerId);
-    if (snapshot === undefined || !roleStatus(snapshot.providerId, "reviewer").enabled) return false;
+    if (snapshot === undefined || !roleStatus(snapshot.providerId, "reviewer", false).enabled) return false;
     if (snapshot.providerId === "openai") return isolation.eligible;
     if (snapshot.providerId === "xai") return grok.eligible;
     return snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription";
@@ -693,7 +699,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const notes: string[] = [];
   if (configured.length === 0) blockers.push("No scored models are configured in the model catalog.");
   if (askCandidates.length === 0) blockers.push("No authenticated configured model is eligible as a read-only primary.");
-  if (!writeCandidate) blockers.push("No authenticated configured Claude model is eligible for M11 restricted writes.");
+  if (!writeCandidate) blockers.push("No authenticated configured model is eligible for a DIRECT write.");
   // Not blockers for the default policy: they are what the worktree policy needs, and a DIRECT write
   // is unaffected by either. Kept visible so an operator choosing `worktree` knows what it requires.
   if (!cleanForWrite) notes.push("At least one registered repository has uncommitted or untracked files; worktree writes require a clean source checkout, DIRECT writes do not.");
@@ -706,6 +712,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     providers: snapshots.map((snapshot) => ({ providerId: snapshot.providerId, available: snapshot.available.value, version: snapshot.version.value, authState: snapshot.authState.value, authMode: snapshot.authMode.value })),
     ask: { ready: askCandidates.length > 0, candidates: askCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`) },
     write: {
+      directCandidates: directWriteCandidates.map((entry) => `${entry.providerId}/${entry.modelId}`),
       // DIRECT is the ordinary interactive policy, and it does not need a clean checkout: it edits
       // the workspace the operator is working in, alongside whatever they already had uncommitted.
       // The cleanliness requirement belongs to the worktree policy, so it is reported separately

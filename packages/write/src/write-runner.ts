@@ -27,7 +27,7 @@ import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
 import { WRITE_PROVIDERS, assertWriteEligible, directWriteCapable, planWriteInvocation } from "./write-profiles.js";
-import { changedPaths, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
+import { changedPaths, reportedSessionIdOf, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
 import type { ExecutionPolicyId } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import { collectGuardedDiff } from "./diff-guard.js";
@@ -574,6 +574,12 @@ export class WriteDogfoodRunner {
       // alternative is what real dogfood produced — a write that cannot proceed because a reference
       // to a session that never came into existence is resumed forever.
       let recoveredFromMissingSession = false;
+      // A runtime that mints its own session id reports it in the output; the resolver records it
+      // against this goal so the next compatible write can continue it.
+      if (session !== null && session.decision.sessionId === null && result.exitCode === 0) {
+        const reported = reportedSessionIdOf(primary.model.providerId, result.stdout);
+        if (reported !== null) this.#nativeSession?.reportReported?.({ providerId: primary.model.providerId, modelId: primary.model.modelId, sessionId: reported });
+      }
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         const missing = sessionMissingFrom(`${result.stdout}\n${result.stderr}`);
         if (missing && session !== null && session.decision.kind === "resumed") {

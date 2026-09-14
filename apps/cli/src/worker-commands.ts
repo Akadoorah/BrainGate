@@ -204,11 +204,15 @@ export function createNativeSessionResolver(input: {
   /**
    * The capability probe's reading for a build, awaited.
    *
+   * The feature read is the one this provider's session policy names — the flag that pins an id, or
+   * the subcommand that resumes one — so a runtime that reports its own ids is judged on what it
+   * actually needs rather than on a pinning flag it has never had.
+   *
    * Allowed to be asynchronous because the first reading of a session may still be in flight, and
    * treating "not read yet" as a refusal would mean the first turn of every session could never
    * continue a session — which is the turn most likely to matter.
    */
-  readonly probedPinning: (providerId: string) => Promise<boolean | "unknown" | null> | boolean | "unknown" | null;
+  readonly probedContinuity: (providerId: string) => Promise<boolean | "unknown" | null> | boolean | "unknown" | null;
   readonly runtimeVersion: (providerId: string) => string | null;
   readonly workspace: () => string | null;
   /**
@@ -222,7 +226,37 @@ export function createNativeSessionResolver(input: {
   readonly policy: () => string;
   readonly onResolved: (summary: RunSessionSummary) => void;
 }): NativeSessionResolver {
-  return async ({ role, model, task, context }) => {
+  /**
+   * Records a session id the runtime minted and reported, against the goal this run belongs to.
+   *
+   * The other half of continuity: a pinned id is registered before the call because BrainGate chose
+   * it, and a reported one can only be registered after, because the CLI chose it. Both end up in
+   * the same place, with the same envelope, so the next compatible run resumes either without
+   * knowing which kind it was.
+   */
+  const reportReported = (reported: { readonly providerId: string; readonly modelId: string; readonly sessionId: string }): void => {
+    const goal = input.goal();
+    if (goal === null) return;
+    const providerId = reported.providerId as ProviderId;
+    const policy = RUNTIME_SESSION_POLICIES[providerId];
+    if (policy === undefined || policy.idSource !== "reported") return;
+    try {
+      input.goals.recordProviderSession({
+        providerId,
+        modelId: reported.modelId,
+        sessionId: reported.sessionId,
+        quotaPool: null,
+        resumeMode: "available",
+        status: "active",
+        runtimeVersion: input.runtimeVersion(providerId),
+        workspace: input.workspace(),
+        envelope: sessionEnvelopeFor({ intent: input.intent(), policy: input.policy(), role: "primary", providerId }),
+        goalId: goal.goalId,
+        conversationId: input.conversationId(),
+      });
+    } catch { /* a session that cannot be registered is a lost reference, not a lost run */ }
+  };
+  const resolver = (async ({ role, model, task, context }: Parameters<NativeSessionResolver>[0]) => {
     if (!SESSION_CONTINUITY_ROLES.includes(role)) return null;
     const goal = input.goal();
     if (goal === null) return null;
@@ -246,7 +280,7 @@ export function createNativeSessionResolver(input: {
       modelId: model.modelId,
       role,
       freshRequested: fresh,
-      probedPinning: await input.probedPinning(providerId),
+      probedContinuity: await input.probedContinuity(providerId),
       runtimeVersion: input.runtimeVersion(providerId),
       workspace: input.workspace(),
       goalId: goal.goalId,
@@ -264,11 +298,13 @@ export function createNativeSessionResolver(input: {
     // Registered before the call, not after. The id is one BrainGate chose, so the reference exists
     // even if the process dies mid-run — which is the property that makes a pinned id worth more
     // than an id read back from a provider's output.
+    // A reported-id runtime has no id yet: the run starts without one and the id is registered when
+    // the CLI publishes it, so there is nothing to write here.
     try {
-      input.goals.recordProviderSession({
+      if (decision.sessionId !== null) input.goals.recordProviderSession({
         providerId,
         modelId: model.modelId,
-        sessionId: decision.sessionId!,
+        sessionId: decision.sessionId,
         quotaPool: model.quotaPool,
         resumeMode: decision.resumeMode,
         status: "active",
@@ -319,7 +355,8 @@ export function createNativeSessionResolver(input: {
 
     input.onResolved(Object.freeze({ label, session: decision, delta: null }));
     return Object.freeze({ decision, note: describeReason(decision.reason) });
-  };
+  }) as NativeSessionResolver;
+  return Object.assign(resolver, { reportReported });
 }
 
 /**

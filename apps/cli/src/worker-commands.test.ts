@@ -39,7 +39,7 @@ function resolverFor(store: GoalStore, goalId: string, conversationId: string) {
     conversationId: () => conversationId,
     freshRequested: () => false,
     consumeFresh: () => { /* nothing armed in this test */ },
-    probedPinning: () => true,
+    probedContinuity: () => true,
     runtimeVersion: () => "2.1.269",
     workspace: () => "/a/stable/workspace",
     // The envelope this run executes under. A test that is about a write says so by overriding it.
@@ -137,7 +137,7 @@ test("a session made against another build, or another workspace, is not resumed
       modelId: "claude-sonnet",
       role: "primary",
       freshRequested: false,
-      probedPinning: true as const,
+      probedContinuity: true as const,
       goalId: goal.goalId,
     };
 
@@ -174,9 +174,9 @@ test("a session made against another build, or another workspace, is not resumed
     assert.equal(resumed.persistent, true, "a native runtime keeps its own session state unless told otherwise");
 
     // And an unreadable probe takes the capability away rather than leaving it standing.
-    const unprobed = resolveSessionDecision({ ...base, probedPinning: "unknown", runtimeVersion: "2.1.269", workspace: "/w", stored: same });
+    const unprobed = resolveSessionDecision({ ...base, probedContinuity: "unknown", runtimeVersion: "2.1.269", workspace: "/w", stored: same });
     assert.equal(unprobed.kind, "resumed", "unknown is not false: a probe that could not read the help does not remove a capability the runtime has");
-    const refused = resolveSessionDecision({ ...base, probedPinning: false, runtimeVersion: "2.1.269", workspace: "/w", stored: same });
+    const refused = resolveSessionDecision({ ...base, probedContinuity: false, runtimeVersion: "2.1.269", workspace: "/w", stored: same });
     assert.equal(refused.kind, "handoff");
     assert.equal(refused.reason, "provider-does-not-expose-session-ids");
   } finally { store.close(); }

@@ -52,7 +52,7 @@ function resolver(store: GoalStore, goalId: string, intent: "read" | "write") {
     conversationId: () => store.activeConversation()?.conversationId ?? null,
     freshRequested: () => false,
     consumeFresh: () => { /* nothing armed */ },
-    probedPinning: () => true,
+    probedContinuity: () => true,
     runtimeVersion: () => "2.1.269",
     workspace: () => "/w",
     intent: () => intent,

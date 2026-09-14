@@ -26,6 +26,8 @@ import {
 } from "@braingate/core";
 import {
   GoalStore,
+  RUNTIME_SESSION_POLICIES,
+  SESSION_ID_SOURCES,
   buildGoalContext,
   describeGoalDelta,
   describeSessionDecision,
@@ -209,6 +211,16 @@ function safeGoalFile(): string | null {
  * is asked lazily: a session that never switches workers never probes anything. The reading is a
  * gate rather than a hint — `sessionIdPinning` false or unknown refuses native continuity.
  */
+/** The capability feature that decides continuity for this provider, from its own policy. */
+export function sessionProbeFeature(providerId: string): "sessionIdPinning" | "sessionResume" {
+  return RUNTIME_SESSION_POLICIES[providerId as ProviderId]?.probeFeature ?? "sessionIdPinning";
+}
+
+/** How this provider's session id becomes known, from its own policy. */
+export function sessionIdSourceFor(providerId: string): (typeof SESSION_ID_SOURCES)[number] {
+  return RUNTIME_SESSION_POLICIES[providerId as ProviderId]?.idSource ?? "none";
+}
+
 class SessionCapabilityProbe {
   readonly #readings = new Map<string, boolean | "unknown">();
   readonly #pending = new Map<string, Promise<boolean | "unknown">>();
@@ -222,29 +234,33 @@ class SessionCapabilityProbe {
    * later one could use it — a session that started and finished in one turn would never resume,
    * which is the common case. Waiting one `--help` read is cheaper than being wrong about it.
    */
-  async pinning(providerId: string): Promise<boolean | "unknown" | null> {
+  async continuity(providerId: string): Promise<boolean | "unknown" | null> {
     if (this.probe === undefined) return null;
-    const known = this.#readings.get(providerId);
+    // Which feature decides is the provider's own answer, from the policy: a runtime that names the
+    // id itself is judged on `sessionResume`, not on a pinning flag it does not have.
+    const feature = sessionProbeFeature(providerId);
+    const key = `${providerId}:${feature}`;
+    const known = this.#readings.get(key);
     if (known !== undefined) return known;
-    const inFlight = this.#pending.get(providerId);
+    const inFlight = this.#pending.get(key);
     if (inFlight !== undefined) return await inFlight;
-    const promise = this.#read(providerId);
-    this.#pending.set(providerId, promise);
+    const promise = this.#read(providerId, feature);
+    this.#pending.set(key, promise);
     const value = await promise;
-    this.#pending.delete(providerId);
+    this.#pending.delete(key);
     return value;
   }
 
-  async #read(providerId: string): Promise<boolean | "unknown"> {
+  async #read(providerId: string, feature: "sessionIdPinning" | "sessionResume"): Promise<boolean | "unknown"> {
     try {
       const report = await this.probe?.(providerId);
-      const supported = report?.features.sessionIdPinning?.supported ?? "unknown";
-      this.#readings.set(providerId, supported);
+      const supported = report?.features[feature]?.supported ?? "unknown";
+      this.#readings.set(`${providerId}:${feature}`, supported);
       return supported;
     } catch {
       // A probe that could not run answers `unknown`, and an unknown refuses continuity. Silence
       // must never be able to grant a capability.
-      this.#readings.set(providerId, "unknown");
+      this.#readings.set(`${providerId}:${feature}`, "unknown");
       return "unknown";
     }
   }
@@ -422,7 +438,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     conversationId: () => goal.conversationId,
     freshRequested: () => worker.freshRequested,
     consumeFresh: () => { worker.freshRequested = false; },
-    probedPinning: (providerId) => worker.probe.pinning(providerId),
+    probedContinuity: (providerId) => worker.probe.continuity(providerId),
     runtimeVersion: (providerId) => worker.probe.runtimeVersion(providerId),
     // The workspace a session is bound to is the directory this session runs in — the same one the
     // attachment above verified, and the same one a native CLI gets as its cwd. A session recorded
@@ -694,9 +710,11 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       if (worker.selection.mode === "manual") {
         // Read the build's capability now, so the first run after the switch has a real answer
         // rather than an in-flight one. A failure here is harmless: unknown refuses continuity.
-        const pinning = await worker.probe.pinning(worker.selection.providerId);
-        if (pinning === true) deps.stdout("  Native session continuity: supported by the installed build.\n");
-        else if (pinning === false) deps.stdout("  Native session continuity: this build does not publish a session-id flag, so each turn will be a fresh invocation with a goal handoff.\n");
+        const continuity = await worker.probe.continuity(worker.selection.providerId);
+        const source = SESSION_ID_SOURCES.includes(sessionIdSourceFor(worker.selection.providerId)) ? sessionIdSourceFor(worker.selection.providerId) : "none";
+        if (continuity === true && source === "pinned") deps.stdout("  Native session continuity: supported by the installed build; BrainGate names the session and resumes it.\n");
+        else if (continuity === true && source === "reported") deps.stdout("  Native session continuity: this build reports the session it creates, and BrainGate resumes it on the next compatible turn.\n");
+        else if (continuity === false) deps.stdout("  Native session continuity: this build publishes no session to continue, so each turn is a fresh invocation with a goal handoff.\n");
         else deps.stdout("  Native session continuity: not confirmed for this build, so each turn will be a fresh invocation with a goal handoff.\n");
       }
       deps.stdout(`  ${result.message}\n`);
