@@ -14,6 +14,7 @@ import { jsonSchemaArgument, jsonSchemaFor } from "./response-schema.js";
 import { subagentsArgument } from "./subagents.js";
 import { grants, guaranteesFor, measuredSurface, resolveToolGrant, type MeasuredCapabilities, type ProviderGrantSurface, type ToolGrant } from "./tool-grants.js";
 import type { SnapshotPrimaryIneligibleReason } from "./snapshot-provider.js";
+import type { ShadowGuarantees } from "./types.js";
 import { NO_NATIVE_SESSION, STAGE_PATH_TOKEN, type OperatorProviderAcceptance, type PlannedNativeSession, type ShadowInvocationPlan, type ShadowInvocationPreview, type ShadowRolePayload, type SubscriptionAttestation } from "./types.js";
 
 const CLAUDE_MINIMUM = "2.1.248";
@@ -99,6 +100,17 @@ interface ProfileDefinition {
   /** True when project access is reachable only through an operator acceptance. */
   readonly needsOperatorAcceptance?: boolean;
   /**
+   * Whether this CLI has a DIRECT invocation: its own harness, in the workspace the operator chose.
+   *
+   * Separate from `enabled` and from `stagedRoles`, because DIRECT is a third way to reach a
+   * provider rather than a widening of the first two. A staged run substitutes BrainGate's argv for
+   * the CLI's and therefore needs an attestation about the sandbox BrainGate wrote; a DIRECT run
+   * keeps the CLI's own argv, points it at the workspace the operator selected, and is authorized by
+   * the operator's own approval of that run (ADR 0017). What BrainGate still owns is the workspace
+   * boundary, the diff it observes afterwards, and the grant it publishes — not the tool set.
+   */
+  readonly nativeDirect?: boolean;
+  /**
    * What this CLI can be asked for, from the flags it actually exposes (ADR 0010).
    *
    * Not a judgement about the provider: a CLI with no way to deny a tool cannot be granted one,
@@ -121,7 +133,7 @@ const INVOCABLE: ReadonlySet<ProviderId> = new Set<ProviderId>(["anthropic", "op
 export const STAGED_REQUEST_FILE = "braingate-request.txt";
 
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
-  anthropic: { providerId: "anthropic", enabled: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false } },
+  anthropic: { providerId: "anthropic", enabled: true, nativeDirect: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false } },
   // `--agent` selects an agent Copilot already has; it does not accept one BrainGate wrote, so
   // there is nothing here to bound and subagents stay closed.
   "github-copilot": { providerId: "github-copilot", enabled: true, minimumVersion: null, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: false } },
@@ -129,14 +141,14 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // restriction outlived its reason: a planner and a judge run in the same staged workspace,
   // under the same attestation, reading nothing the reviewer does not read. What stays closed is
   // `primary`, which would need the real checkout.
-  openai: { providerId: "openai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], snapshotPrimary: true, minimumVersion: null, blockedReason: "Staged roles only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
+  openai: { providerId: "openai", enabled: true, nativeDirect: true, stagedRoles: ["planner", "reviewer", "judge"], snapshotPrimary: true, minimumVersion: null, blockedReason: "Staged roles only; requires a current Codex sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: false, enforcedSandbox: true } },
   // Grok was blocked for two reasons, and grok 1.0.13 ended both (ADR 0009). `GROK_HOME` now
   // carries configuration and credentials together, so an isolated HOME removes the other
   // tool's settings file — `grok inspect` reports `Permissions: (none)` — while authentication
   // survives; and a custom sandbox profile that cannot be applied now aborts the run instead of
   // warning. What remains is proven per invocation by a self-test rather than assumed, so Grok
   // is enabled for staged roles and still closed for anything that reads the real checkout.
-  xai: { providerId: "xai", enabled: true, stagedRoles: ["planner", "reviewer", "judge"], snapshotPrimary: true, minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true } },
+  xai: { providerId: "xai", enabled: true, nativeDirect: true, stagedRoles: ["planner", "reviewer", "judge"], snapshotPrimary: true, minimumVersion: GROK_MINIMUM, blockedReason: "Staged roles only; requires a current Grok sandbox self-test attestation.", surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: true } },
   // Headless `agy` is fail-closed about tools — one needing permission is auto-denied, because
   // there is nobody to prompt, and the denial is reported in `denied_actions`. What is still
   // missing is any way to scope it per invocation: permissions and credentials share HOME, and
@@ -144,7 +156,7 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // one an isolated home the way it does for Codex and Grok. A staged run therefore keeps the
   // operator's real home, and what agy may reach elsewhere on the machine is unchecked — which
   // is the residual only the operator can accept (ADR 0008).
-  google: { providerId: "google", enabled: false, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
+  google: { providerId: "google", enabled: false, nativeDirect: true, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
 });
 
 /**
@@ -183,6 +195,17 @@ export function workspaceModeFor(providerId: ProviderId, role: WorkflowRole, sna
 /** Whether this build can run the given provider as read-primary against a snapshot at all. */
 export function snapshotPrimaryCapable(providerId: ProviderId): boolean {
   return PROFILES[providerId].snapshotPrimary === true;
+}
+
+/**
+ * Whether this build has a DIRECT invocation for the provider: its own harness, in the workspace.
+ *
+ * Exported so the status surfaces can distinguish "the CLI is available", "the CLI can be driven
+ * headlessly" and "BrainGate can point this CLI at the operator's own workspace" — three different
+ * facts that a single `enabled` boolean was flattening into one.
+ */
+export function nativeDirectCapable(providerId: ProviderId): boolean {
+  return PROFILES[providerId].nativeDirect === true;
 }
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
@@ -235,12 +258,12 @@ function assertProfile(
   acceptance: OperatorProviderAcceptance | undefined,
   role: WorkflowRole,
   now: Date,
-  eligibility: { readonly snapshotPrimary?: boolean } = {},
+  eligibility: { readonly snapshotPrimary?: boolean; readonly direct?: boolean } = {},
 ): ProfileDefinition {
   if (snapshot.providerId !== model.providerId) throw new BrainGateInvariantError("SHADOW_PROVIDER_MISMATCH", "Provider snapshot and routed model do not match.");
   const profile = PROFILES[snapshot.providerId];
   if (!profile.enabled) {
-    const status = shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now, snapshotPrimary: eligibility.snapshotPrimary === true });
+    const status = shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now, snapshotPrimary: eligibility.snapshotPrimary === true, direct: eligibility.direct === true });
     if (!status.enabled) throw new BrainGateInvariantError("SHADOW_PROVIDER_BLOCKED", status.reason ?? profile.blockedReason ?? "Provider shadow profile is blocked.");
   }
   if (snapshot.available.value !== true) throw new BrainGateInvariantError("SHADOW_PROVIDER_UNAVAILABLE", `${snapshot.displayName} CLI is unavailable.`);
@@ -334,15 +357,14 @@ export function planShadowInvocation(input: {
   const now = input.now ?? new Date();
   const snapshotPrimary = input.snapshotPrimary === true;
   const nativeHarness = input.nativeHarness === true;
-  if (nativeHarness && input.snapshot.providerId !== "anthropic") {
-    // Not a capability judgement about the CLI: it is about BrainGate's own argv for it. Codex and
-    // Grok are invoked with `--ignore-user-config`, `--ignore-rules` and a sandbox profile that was
-    // earned against a staged copy, and Antigravity with `--sandbox`; none of those is the runtime's
-    // normal harness, and re-deriving each one needs a measurement against the installed build that
-    // this slice did not take. Reported, not silently downgraded.
+  if (nativeHarness && PROFILES[input.snapshot.providerId].nativeDirect !== true) {
+    // Not a capability judgement about the CLI: it is about BrainGate's own argv for it. A provider
+    // without a DIRECT branch below is invoked with a staged-copy argv — `--ignore-user-config`,
+    // `--ignore-rules`, a sandbox profile earned against a copy — and re-deriving each one needs a
+    // measurement this build has not taken. Reported, not silently downgraded.
     throw new BrainGateInvariantError(
       "SHADOW_NATIVE_HARNESS_UNSUPPORTED",
-      `${input.snapshot.displayName} cannot yet run its own harness in the workspace through BrainGate: its invocation is built around a staged copy and a sandbox proof earned against it. Use the snapshot or worktree policy for it, or select a Claude model for a direct run.`,
+      `${input.snapshot.displayName} has no measured DIRECT invocation: its argv is built around a staged copy and a sandbox proof earned against it. Use the snapshot or worktree policy for it, or select a provider whose native harness BrainGate has measured.`,
     );
   }
   if (nativeHarness && snapshotPrimary) {
@@ -354,7 +376,7 @@ export function planShadowInvocation(input: {
   if (snapshotPrimary && input.preview !== true && (input.workspaceRoot === undefined || input.workspaceRoot.length === 0)) {
     throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROOT_REQUIRED", "A snapshot-primary run requires the prepared workspace it must read.");
   }
-  const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now, { snapshotPrimary });
+  const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now, { snapshotPrimary, direct: nativeHarness });
   const body = serializedPayload(input.payload);
   // The session decision, filled in with the real provider and model so the plan is
   // self-describing. Resolved once here rather than read from three places later.
@@ -477,6 +499,182 @@ export function planShadowInvocation(input: {
         isolatedUserConfig: !nativeHarness,
       })),
       ...(nativeHarness ? { nativeHarness: true } : {}),
+      minimumVersion: profile.minimumVersion,
+    });
+  }
+
+  // ------------------------------------------------------------------ DIRECT: the native harness
+  //
+  // Measured 2026-09-14 on this machine, by running each CLI once in a disposable git directory:
+  // codex-cli 0.153.4 (`exec --json -C <dir> -s read-only`, thread id in the first JSONL event),
+  // agy 1.2.2 (`--output-format json -p=...`, conversation id in the envelope), grok 1.0.24
+  // (`-p --cwd <dir>`, `--session-id`/`--resume`). Each takes a prompt non-interactively, runs in a
+  // working directory BrainGate chooses, and has a permission posture of its own that keeps a read
+  // from writing: Codex a kernel sandbox set to `read-only`, Grok `--permission-mode default` (in a
+  // headless run a tool that would prompt is refused by the CLI), Antigravity its print-mode
+  // default, which is fail-closed about any tool needing permission.
+  //
+  // What BrainGate does *not* do here is write the argv that substitutes for the CLI's harness:
+  // no tool allowlist, no MCP refusal, no isolated home, no staged copy. The operator approved this
+  // run in this workspace, and the runtime's own permission mode decides the rest (ADR 0017).
+  // The primary worker only. DIRECT is the policy the operator approves for the run they asked for;
+  // the planner and reviewer are BrainGate's own staged roles, chosen for independence from the
+  // primary, and they keep the staged posture they were built and attested for.
+  if (nativeHarness && input.payload.role === "primary") {
+    const directGrant = resolveToolGrant({
+      role: input.payload.role,
+      providerId: input.snapshot.providerId,
+      workspaceMode: "project",
+      writeMode: false,
+      // Honest per provider: Codex keeps a kernel sandbox BrainGate did not write, and the two that
+      // have none are not credited with one. No CLI here is handed a tool allowlist under DIRECT.
+      surface: {
+        isolatedPerInvocation: false,
+        toolDenial: false,
+        declaredSubagents: false,
+        enforcedSandbox: input.snapshot.providerId === "openai",
+      },
+      attested: false,
+      operatorAccepted: validOperatorAcceptance(input.acceptance, input.snapshot.providerId, now),
+      networkAccepted: validOperatorAcceptance(input.networkAcceptance, input.snapshot.providerId, now, "operator-accepted-network-access"),
+      fanOutAllowed: input.fanOut === true,
+    });
+    const directGuarantees = (base: Pick<ShadowGuarantees, "noProjectWrites" | "noShell" | "noNetworkTools" | "noMcp">) => guaranteesFor(directGrant, Object.freeze({
+      projectOnlyRead: true,
+      noProjectWrites: base.noProjectWrites,
+      noShell: base.noShell,
+      noNetworkTools: base.noNetworkTools,
+      noMcp: base.noMcp,
+      noSessionPersistence: !session.persistent,
+      isolatedUserConfig: false,
+    }));
+
+    if (input.snapshot.providerId === "openai") {
+      // `codex exec resume` accepts no `-C` and no `-s`: the working directory is the session's and
+      // the sandbox is set through the config override the resume subcommand does take. Measured on
+      // codex-cli 0.153.4 — `exec resume` rejects `-s` outright, and accepts `-c sandbox_mode="..."`.
+      const resumeId = session.kind === "resumed" && session.sessionId !== null ? session.sessionId : null;
+      const args = Object.freeze(resumeId === null
+        ? [
+          "exec",
+          "--json",
+          "-C", input.cwd,
+          "--sandbox", "read-only",
+          "--model", input.model.modelId,
+          ...(session.persistent ? [] : ["--ephemeral"]),
+          "-",
+        ]
+        : [
+          "exec", "resume",
+          "--json",
+          "--model", input.model.modelId,
+          "-c", 'sandbox_mode="read-only"',
+          ...(session.persistent ? [] : ["--ephemeral"]),
+          resumeId,
+          "-",
+        ]);
+      if (args.includes("--dangerously-bypass-approvals-and-sandbox") || args.includes("--add-dir") || args.includes("--ignore-user-config")) {
+        throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe or workspace-widening Codex flags are forbidden.");
+      }
+      return Object.freeze({
+        providerId: "openai",
+        executable: input.snapshot.binary,
+        args,
+        cwd: input.cwd,
+        workspaceMode: workspaceModeFor("openai", input.payload.role, false),
+        modelId: input.model.modelId,
+        quotaPool: input.model.quotaPool,
+        inputMode: "stdin",
+        stdin: body,
+        attachmentContent: null,
+        attachmentToken: null,
+        allowedEnvKeys: Object.freeze([]),
+        envOverrides: Object.freeze({}),
+        grant: directGrant,
+        nativeSession: session,
+        streamDialect: null,
+        guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false })),
+        nativeHarness: true,
+        minimumVersion: profile.minimumVersion,
+      });
+    }
+
+    if (input.snapshot.providerId === "xai") {
+      const args = Object.freeze([
+        "-p", `${SCHEMA_PROMPT}\n\n${body}`,
+        "--cwd", input.cwd,
+        "--output-format", "streaming-json",
+        "--model", input.model.modelId,
+        "--max-turns", String(maxTurns),
+        "--json-schema", schema,
+        "--verbatim",
+        // The runtime's own read posture. Passed explicitly rather than left to config, because a
+        // config that said `acceptEdits` would silently give a read run the write posture.
+        "--permission-mode", "default",
+        // Terminal presentation only: there is no alternate screen in a headless run.
+        "--no-alt-screen",
+        // No `--sandbox`: a profile is a staged-mode boundary BrainGate writes, and this run keeps
+        // the CLI's own configuration. No `--no-subagents`, no `--disable-web-search`, no `--deny`:
+        // those were BrainGate substituting its own harness, which DIRECT does not do.
+        ...(session.sessionId === null ? [] : session.kind === "resumed" ? ["--resume", session.sessionId] : ["--session-id", session.sessionId]),
+      ]);
+      if (args.some((argument) => argument === "--always-approve" || argument === "--dangerously-skip-permissions" || argument === "bypassPermissions" || argument === "--worktree")) {
+        throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe or worktree-creating Grok flags are forbidden for a DIRECT run.");
+      }
+      return Object.freeze({
+        providerId: "xai",
+        executable: input.snapshot.binary,
+        args,
+        cwd: input.cwd,
+        workspaceMode: workspaceModeFor("xai", input.payload.role, false),
+        modelId: input.model.modelId,
+        quotaPool: input.model.quotaPool,
+        inputMode: "stdin",
+        stdin: "",
+        attachmentContent: null,
+        attachmentToken: null,
+        allowedEnvKeys: Object.freeze(["GROK_HOME"]),
+        envOverrides: Object.freeze({}),
+        grant: directGrant,
+        nativeSession: session,
+        streamDialect: "xai",
+        guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: true, noNetworkTools: false, noMcp: false })),
+        nativeHarness: true,
+        minimumVersion: profile.minimumVersion,
+      });
+    }
+
+    // Antigravity. `-p` takes its value attached, which is also the only form that cannot be broken
+    // by an option landing between the flag and the prompt.
+    const args = Object.freeze([
+      "--output-format", "json",
+      "--model", input.model.modelId,
+      "--effort", "medium",
+      ...(session.kind === "resumed" && session.sessionId !== null ? ["--conversation", session.sessionId] : []),
+      `-p=${SCHEMA_PROMPT}\n\n${body}`,
+    ]);
+    if (args.some((argument) => argument === "--dangerously-skip-permissions" || argument === "--sandbox" || argument === "--add-dir" || argument === "--mode" || argument.startsWith("--mode="))) {
+      throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe, sandboxed or workspace-widening Antigravity flags are forbidden for a DIRECT read.");
+    }
+    return Object.freeze({
+      providerId: "google",
+      executable: input.snapshot.binary,
+      args,
+      cwd: input.cwd,
+      workspaceMode: workspaceModeFor("google", input.payload.role, false),
+      modelId: input.model.modelId,
+      quotaPool: input.model.quotaPool,
+      inputMode: "stdin",
+      stdin: "",
+      attachmentContent: null,
+      attachmentToken: null,
+      allowedEnvKeys: Object.freeze([]),
+      envOverrides: Object.freeze({}),
+      grant: directGrant,
+      nativeSession: session,
+      streamDialect: null,
+      guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: true, noNetworkTools: false, noMcp: false })),
+      nativeHarness: true,
       minimumVersion: profile.minimumVersion,
     });
   }
@@ -767,9 +965,30 @@ export function validOperatorAcceptance(
 export function shadowProviderRoleStatus(
   providerId: ProviderId,
   role: WorkflowRole,
-  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date; readonly snapshotPrimary?: boolean } = {},
+  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date; readonly snapshotPrimary?: boolean; readonly direct?: boolean } = {},
 ): Readonly<{ enabled: boolean; reason: string | null; acceptedByOperator: boolean }> {
   const profile = PROFILES[providerId];
+
+  // DIRECT first, because it is a different question from every branch below. Those ask what
+  // BrainGate can *prove* about a sandbox it wrote or a copy it made; this one asks whether the
+  // operator pointed a worker at their own workspace and approved the run. The provider's own
+  // permission mode is the boundary inside it, which is exactly how Claude has run under DIRECT
+  // since ADR 0017 — and the reason a staged-only or acceptance-gated provider is not thereby
+  // excluded: what those gates withhold is BrainGate's staged harness, not the CLI itself.
+  if (options.direct === true && role === "primary") {
+    if (profile.nativeDirect !== true) {
+      return Object.freeze({
+        enabled: false,
+        reason: `${profile.blockedReason ?? "Provider has no DIRECT invocation."} BrainGate has no measured native invocation for it.`,
+        acceptedByOperator: false,
+      });
+    }
+    return Object.freeze({
+      enabled: true,
+      reason: "Runs its own harness in the selected workspace under the DIRECT policy; the operator approves the run, and the runtime's own permission mode decides what it may do inside.",
+      acceptedByOperator: false,
+    });
+  }
 
   if (!profile.enabled) {
     if (!INVOCABLE.has(providerId)) {

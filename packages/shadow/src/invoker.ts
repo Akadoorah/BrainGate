@@ -558,7 +558,10 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     // Read-primary only, and only for a provider whose sandbox BrainGate can currently attest. A
     // reviewer on the same provider keeps its staged workspace: the role decides the mode, not the
     // provider, so an attestation for one role never silently changes how another one executes.
-    const snapshotPrimary = request.role === "primary" && snapshotPrimaryEligibility({
+    // A DIRECT run reads the workspace the operator selected. Substituting a copy for it would
+    // make the plan say `project` and the run read something else, which is the one thing the
+    // DIRECT contract forbids outright.
+    const snapshotPrimary = this.#nativeHarness !== true && request.role === "primary" && snapshotPrimaryEligibility({
       providerId: snapshot.providerId,
       snapshot,
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),

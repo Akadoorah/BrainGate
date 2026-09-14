@@ -101,6 +101,16 @@ function excludedProviders(input: {
   readonly providers: readonly ProviderSnapshot[];
   readonly role: "planner" | "primary" | "reviewer";
   readonly proof: ProviderProof;
+  /**
+   * The providers the operator named for this plan, which DIRECT reaches even where the staged
+   * gates close them.
+   *
+   * Deliberately the pinned set and not "every provider under DIRECT": selecting a worker is the
+   * operator's act, and widening the automatic route to the other subscriptions is a different
+   * decision from making the selected one work. The gates below still answer for every provider the
+   * operator did not name.
+   */
+  readonly directProviders?: readonly string[];
 }): readonly string[] {
   return Object.freeze(input.providers.filter((snapshot) => {
     const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
@@ -114,7 +124,8 @@ function excludedProviders(input: {
       ...(input.proof.grokIsolation === undefined ? {} : { grokIsolation: input.proof.grokIsolation }),
       ...(input.proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: input.proof.grokSnapshotIsolation }),
     }).eligible;
-    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible }).enabled) return true;
+    const directHere = (input.directProviders ?? []).includes(snapshot.providerId);
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
     if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
     if (snapshot.providerId === "xai" && (input.role === "primary" ? input.proof.grokSnapshotIsolation === undefined : input.proof.grokIsolation === undefined)) return true;
     return false;
@@ -167,7 +178,7 @@ export function buildShadowTaskPlan(input: {
     budget: input.budget,
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
-    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof }),
+    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(input.nativeHarness === true && input.pin !== undefined ? { directProviders: [input.pin.providerId] } : {}) }),
     ...(input.pin === undefined ? {} : { pin: input.pin }),
   });
   const primaryModel = modelRef(primaryRoute);
@@ -185,7 +196,9 @@ export function buildShadowTaskPlan(input: {
     snapshot: primarySnapshot,
     model: primaryModel,
     cwd,
-    ...(primarySnapshotEligible ? { snapshotPrimary: true, preview: true } : {}),
+    // Not under DIRECT: that policy reads the workspace itself, and a snapshot would put a copy
+    // between the worker and the files the previous worker left.
+    ...(primarySnapshotEligible && input.nativeHarness !== true ? { snapshotPrimary: true, preview: true } : {}),
     payload: payload("primary", input.task, input.context),
     fanOut: input.budget.maxConcurrentAgents > 1,
     ...measuredFor(input, primaryModel.providerId),

@@ -82,13 +82,29 @@ interface Recorded {
  * was passed" is the entire question: pinning an id and resuming one are different acts, and a fake
  * that could not tell them apart would pass whichever implementation it was given.
  */
+/** The last complete JSON object in a text, which is how a brief travels when it rides in argv. */
+function lastObjectIn(text: string): string | null {
+  const end = text.lastIndexOf("}");
+  if (end < 0) return null;
+  for (let start = text.indexOf("{"); start >= 0 && start < end; start = text.indexOf("{", start + 1)) {
+    try { JSON.parse(text.slice(start, end + 1)); return text.slice(start, end + 1); } catch { /* not this one */ }
+  }
+  return null;
+}
+
 class FakeCli implements ShadowProcessExecutor {
   readonly calls: Recorded[] = [];
   constructor(private readonly answers: Readonly<Record<string, string>> = {}) {}
 
   async run(input: { project: ExecutionProject; plan: ShadowInvocationPlan; onText?: (text: string) => void }): Promise<ShadowProcessResult> {
-    const body = input.plan.stdin ?? input.plan.attachmentContent ?? "";
-    const payload = JSON.parse(body) as { readonly role?: string; readonly task?: string; readonly context?: Record<string, unknown> };
+    // Where the brief arrives depends on the provider's own invocation: Claude and Codex read it
+    // from stdin, a staged Grok run from a file, and a DIRECT Grok run in the `-p` argument, because
+    // that CLI takes its prompt as a flag value and has no stdin prompt mode. The fake reads all
+    // three so a scenario can switch providers without the fixture deciding which CLI it is.
+    const stdinBody = input.plan.stdin ?? input.plan.attachmentContent ?? "";
+    const promptArg = input.plan.args[input.plan.args.indexOf("-p") + 1] ?? "";
+    const source = stdinBody.trim().startsWith("{") ? stdinBody : promptArg;
+    const payload = JSON.parse(lastObjectIn(source) ?? "{}") as { readonly role?: string; readonly task?: string; readonly context?: Record<string, unknown> };
     const args = [...input.plan.args];
     const at = (flag: string): string | null => {
       const index = args.indexOf(flag);

@@ -78,18 +78,20 @@ function scopeFor(home: string, cwd: string) {
   return executionScopeFor(project, cwd);
 }
 
-function snapshot(providerId: "anthropic" | "openai"): ProviderSnapshot {
+function snapshot(providerId: "anthropic" | "openai" | "github-copilot"): ProviderSnapshot {
   const observedAt = "2026-09-20T00:00:00.000Z";
   const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
+  const display = providerId === "anthropic" ? "Claude Code" : providerId === "openai" ? "Codex CLI" : "Copilot";
+  const binary = providerId === "anthropic" ? "claude" : providerId === "openai" ? "codex" : "copilot";
   return {
     providerId,
-    displayName: providerId === "anthropic" ? "Claude Code" : "Codex CLI",
-    binary: providerId === "anthropic" ? "claude" : "codex",
+    displayName: display,
+    binary,
     available: obs(true),
     version: obs("2.1.269"),
     authState: obs("authenticated"),
     authMode: obs("subscription"),
-    models: obs(["claude-sonnet", "claude-haiku"]),
+    models: obs(providerId === "anthropic" ? ["claude-sonnet", "claude-haiku"] : providerId === "openai" ? ["gpt-review"] : ["copilot-review"]),
     capabilities: obs({ headless: true, modelPinning: true, sessionIdPinning: true, outputFormats: ["json"], supportsMcp: true, supportsSubagents: true }),
     quotaState: obs("unknown"),
     quotaHint: obs(null),
@@ -493,10 +495,23 @@ test("the DIRECT invocation keeps the runtime's harness and drops BrainGate's le
   assert.equal(direct.guarantees.noMcp, false, "and the guarantees say what is actually true");
   assert.equal(strict.guarantees.noMcp, true);
   assert.equal(direct.workspaceMode, "project", "the run happens in the workspace");
-  // A provider whose invocation is built around a staged copy refuses rather than pretending.
-  assert.throws(() => planShadowInvocation({
+  // The other providers have measured DIRECT invocations of their own, and they keep their own
+  // harness in the workspace exactly as Claude does: the operator's own configuration, no isolated
+  // home, no tool allowlist, and a read posture the CLI already has.
+  const codex = planShadowInvocation({
     snapshot: snapshot("openai"), model: { providerId: "openai", modelId: "gpt-review", quotaPool: "chatgpt-subscription" },
     cwd: "/workspace", nativeHarness: true,
-    payload: { schemaVersion: 1, role: "reviewer", phase: "preflight", task: "review", findings: Object.freeze([]), candidateOutput: null, context: {}, responseContract: Object.freeze({ kind: "review", verdict: ["approve"], findings: "string[]" }) },
-  }), /cannot yet run its own harness/);
+    payload: { schemaVersion: 1, role: "primary", phase: "preflight", task: "inspect auth.dart", findings: Object.freeze([]), candidateOutput: null, context: {}, responseContract: Object.freeze({ kind: "work", output: "string" }) },
+  });
+  assert.equal(codex.workspaceMode, "project");
+  assert.equal(codex.nativeHarness, true);
+  assert.match(joined(codex), /-C \/workspace/);
+  assert.match(joined(codex), /--sandbox read-only/, "a read keeps the CLI's own read-only policy");
+  assert.doesNotMatch(joined(codex), /--ignore-user-config|--add-dir|--dangerously-bypass/);
+  // A provider with no measured DIRECT invocation still refuses rather than pretending.
+  assert.throws(() => planShadowInvocation({
+    snapshot: snapshot("github-copilot"), model: { providerId: "github-copilot", modelId: "copilot-review", quotaPool: "copilot-subscription" },
+    cwd: "/workspace", nativeHarness: true,
+    payload: { schemaVersion: 1, role: "primary", phase: "preflight", task: "inspect auth.dart", findings: Object.freeze([]), candidateOutput: null, context: {}, responseContract: Object.freeze({ kind: "work", output: "string" }) },
+  }), /no measured DIRECT invocation|cannot yet run its own harness/);
 });

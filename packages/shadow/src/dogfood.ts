@@ -59,7 +59,14 @@ function acceptanceFor(acceptances: readonly OperatorProviderAcceptance[], provi
 function exclusionsFor(
   snapshots: readonly ProviderSnapshot[],
   role: WorkflowRole,
-  isolation: { readonly codex?: CodexIsolationAttestation; readonly grok?: GrokIsolationAttestation; readonly grokSnapshot?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[] } = {},
+  isolation: { readonly codex?: CodexIsolationAttestation; readonly grok?: GrokIsolationAttestation; readonly grokSnapshot?: GrokIsolationAttestation; readonly acceptances?: readonly OperatorProviderAcceptance[]; readonly direct?: boolean } = {},
+  /**
+   * The provider the operator named for this run, which DIRECT reaches through the staged gates.
+   *
+   * A provider the operator did not name keeps every gate it had: making the selected worker work
+   * is this milestone, and quietly re-routing the default path to another subscription is not.
+   */
+  pinnedProviderId?: string,
 ): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
     const acceptance = (isolation.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
@@ -74,12 +81,16 @@ function exclusionsFor(
       ...(isolation.grok === undefined ? {} : { grokIsolation: isolation.grok }),
       ...(isolation.grokSnapshot === undefined ? {} : { grokSnapshotIsolation: isolation.grokSnapshot }),
     }).eligible;
-    if (!shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible }).enabled) return true;
+    const directHere = isolation.direct === true && pinnedProviderId !== undefined && snapshot.providerId === pinnedProviderId;
+    if (!shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
     // A provider whose isolation is proven per run, not per install, is not routable until this
     // run has the proof. Excluding it here means the router never selects it and the operator
     // never sees a plan naming a model the invocation would then refuse.
-    if (snapshot.providerId === "openai" && role === "reviewer" && isolation.codex === undefined) return true;
-    if (snapshot.providerId === "xai" && isolation.grok === undefined) return true;
+    //
+    // Under DIRECT there is no staged sandbox to prove: the run keeps the CLI's own harness in the
+    // workspace the operator selected, so the attestation gate does not apply to it.
+    if (!directHere && snapshot.providerId === "openai" && role === "reviewer" && isolation.codex === undefined) return true;
+    if (!directHere && snapshot.providerId === "xai" && isolation.grok === undefined) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
 }
@@ -288,11 +299,13 @@ export class ShadowDogfoodRunner {
       ...(this.#grokIsolation === undefined ? {} : { grok: this.#grokIsolation }),
       ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshot: this.#grokSnapshotIsolation }),
       acceptances: this.#acceptances,
+      ...(this.#nativeHarness ? { direct: true } : {}),
     });
-    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation);
-    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation);
-    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation);
-    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation);
+    const pinnedProviderId = this.#pin?.providerId;
+    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation, pinnedProviderId);
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation, pinnedProviderId);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation, pinnedProviderId);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation, pinnedProviderId);
 
     // The state this task started from, measured before any provider is called.
     //
@@ -300,7 +313,7 @@ export class ShadowDogfoodRunner {
     // Recording the fingerprint now is what makes the later copy provably the same project the
     // planner and the context were read from: without it, an edit made while the planner worked would
     // silently be handed to the provider that answered.
-    const snapshotMayBeNeeded = this.#snapshotStore !== undefined && this.#snapshots.some((item) => snapshotPrimaryEligibility({
+    const snapshotMayBeNeeded = this.#nativeHarness !== true && this.#snapshotStore !== undefined && this.#snapshots.some((item) => snapshotPrimaryEligibility({
       providerId: item.providerId,
       snapshot: item,
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
@@ -335,7 +348,7 @@ export class ShadowDogfoodRunner {
       model: primaryRef,
       cwd,
       payload: preflightPayload("primary", input.task, input.context),
-      ...(primarySnapshotEligible ? { snapshotPrimary: true, preview: true } : {}),
+      ...(primarySnapshotEligible && this.#nativeHarness !== true ? { snapshotPrimary: true, preview: true } : {}),
       ...attestationFor(this.#attestations, primaryRef.providerId),
       ...acceptanceFor(this.#acceptances, primaryRef.providerId),
       // A provider whose isolation is proven per run is only constructible with its proof in hand,
