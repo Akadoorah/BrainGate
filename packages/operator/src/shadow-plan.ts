@@ -112,7 +112,7 @@ function excludedProviders(input: {
    */
   readonly directProviders?: readonly string[];
 }): readonly string[] {
-  return Object.freeze(input.providers.filter((snapshot) => {
+  const excludedList = Object.freeze(input.providers.filter((snapshot) => {
     const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
     // The same question the runner asks, from the same function: a plan that hid a provider the runner
     // would accept is as wrong as one that named a provider the runner would refuse — and the read
@@ -125,11 +125,17 @@ function excludedProviders(input: {
       ...(input.proof.grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: input.proof.grokSnapshotIsolation }),
     }).eligible;
     const directHere = (input.directProviders ?? []).includes(snapshot.providerId);
+
     if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
+    // The proofs below are for a staged or snapshot posture: a sandbox profile BrainGate wrote, and
+    // a copy it made. A DIRECT run has neither, so demanding them excluded exactly the worker the
+    // operator named — the plan refusing the model the operator had just asked for.
+    if (directHere) return false;
     if (snapshot.providerId === "openai" && input.role === "reviewer" && input.proof.codexIsolation === undefined) return true;
     if (snapshot.providerId === "xai" && (input.role === "primary" ? input.proof.grokSnapshotIsolation === undefined : input.proof.grokIsolation === undefined)) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
+  return excludedList;
 }
 
 export function buildShadowTaskPlan(input: {

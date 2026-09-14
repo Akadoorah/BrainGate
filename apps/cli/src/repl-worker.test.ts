@@ -43,7 +43,7 @@ function git(cwd: string, args: readonly string[]): void {
   if (result.status !== 0) throw new Error(String(result.stderr || result.stdout));
 }
 
-function snapshot(providerId: "anthropic" | "xai" | "openai" | "google", displayName: string, binary: string): ProviderSnapshot {
+function snapshot(providerId: "anthropic" | "xai" | "openai" | "google" | "github-copilot", displayName: string, binary: string): ProviderSnapshot {
   const observedAt = "2026-09-13T00:00:00.000Z";
   const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
   return {
@@ -206,7 +206,7 @@ class FakeCli implements ShadowProcessExecutor {
 
 function fixture(
   label: string,
-  models: readonly { providerId: "anthropic" | "xai" | "openai" | "google"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
+  models: readonly { providerId: "anthropic" | "xai" | "openai" | "google" | "github-copilot"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
     { providerId: "anthropic", modelId: "claude-sonnet", coder: 95, speed: "balanced" },
     { providerId: "anthropic", modelId: "claude-haiku", coder: 60, speed: "fast" },
     { providerId: "xai", modelId: "grok-fast", coder: 70, speed: "fast" },
@@ -280,6 +280,7 @@ function sessionOf(repo: string, env: NodeJS.ProcessEnv, cli: FakeCli, answers: 
         snapshot("xai", "Grok Build", "grok"),
         snapshot("openai", "Codex CLI", "codex"),
         snapshot("google", "Antigravity", "agy"),
+        snapshot("github-copilot", "Copilot", "copilot"),
       ]).map((item) => (unavailable.has(item.providerId) ? { ...item, available: { ...item.available, value: false } } : item)),
       probeCapabilities: async (providerId: string) => ({
         features: { sessionIdPinning: { supported: pinning[providerId] ?? false } },
@@ -421,11 +422,15 @@ test("B: switching provider continues the same goal and hands the new worker the
 });
 
 test("B: a pin to a provider that is deliberately excluded refuses instead of routing around it", async () => {
-  const f = fixture("excluded-provider");
+  const f = fixture("excluded-provider", [{ providerId: "github-copilot", modelId: "copilot-fast", coder: 90, speed: "fast" }]);
   const cli = new FakeCli();
-  // Grok is excluded as a read primary: its sandbox grants write access to its own working
-  // directory, so a project copy it can rewrite is not a read-only workspace (ADR 0013).
-  const session = sessionOf(f.repo, f.env, cli, ["/use xai/grok-fast", "Investigate the idle logout", "y"]);
+  // Copilot has no measured DIRECT invocation, so it is excluded as a read primary under the
+  // default policy and the pin is refused rather than quietly given to someone else.
+  //
+  // Grok used to be the example here, because it could only run staged roles; the multi-provider
+  // milestone measured its native invocation and it now runs when the operator names it, so the
+  // test moved to the provider that is still closed rather than to the behaviour that changed.
+  const session = sessionOf(f.repo, f.env, cli, ["/use github-copilot/copilot-fast", "Investigate the idle logout", "y"]);
   assert.equal(await session.run(), 0);
   assert.equal(cli.calls.length, 0, "an excluded provider must not be invoked by a manual pin");
   assert.match(session.text(), /ROUTE_MANUAL_INELIGIBLE/);

@@ -89,8 +89,9 @@ function exclusionsFor(
     //
     // Under DIRECT there is no staged sandbox to prove: the run keeps the CLI's own harness in the
     // workspace the operator selected, so the attestation gate does not apply to it.
-    if (!directHere && snapshot.providerId === "openai" && role === "reviewer" && isolation.codex === undefined) return true;
-    if (!directHere && snapshot.providerId === "xai" && isolation.grok === undefined) return true;
+    if (directHere) return false;
+    if (snapshot.providerId === "openai" && role === "reviewer" && isolation.codex === undefined) return true;
+    if (snapshot.providerId === "xai" && (role === "primary" ? isolation.grokSnapshot === undefined : isolation.grok === undefined)) return true;
     return false;
   }).map((snapshot) => snapshot.providerId));
 }
@@ -176,6 +177,7 @@ export class ShadowDogfoodRunner {
   readonly #executor: ShadowProcessExecutor | undefined;
   readonly #pin: RoutePin | undefined;
   readonly #nativeHarness: boolean;
+  readonly #policy: string | null;
   readonly #nativeSession: NativeSessionResolver | undefined;
   readonly #snapshotStore: TaskSnapshotProvider | undefined;
   readonly #finalizer: TaskFinalizer;
@@ -237,6 +239,14 @@ export class ShadowDogfoodRunner {
     readonly onQuotaReading?: (reading: QuotaReading & { readonly quotaPool: string }) => void;
     /** Whether this run keeps the runtime's own harness: the DIRECT policy (ADR 0017). */
     readonly nativeHarness?: boolean;
+    /**
+     * The execution policy this run is under, recorded on the task.
+     *
+     * Passed rather than inferred from `nativeHarness`: the flag says which invocation shape to
+     * build, and the policy is the operator's decision that produced it. A task row that named the
+     * wrong one would make `/status` and `tasks show` disagree with the plan the operator approved.
+     */
+    readonly policy?: string;
   }) {
     this.#project = input.project;
     this.#ledger = input.ledger;
@@ -250,6 +260,7 @@ export class ShadowDogfoodRunner {
     this.#executor = input.executor;
     this.#pin = input.pin;
     this.#nativeHarness = input.nativeHarness === true;
+    this.#policy = input.policy ?? null;
     this.#nativeSession = input.nativeSession;
     this.#snapshotStore = input.snapshotStore;
     this.#finalizer = input.finalizer;
@@ -396,6 +407,13 @@ export class ShadowDogfoodRunner {
       // task that stands alone rather than a task attached to an invented goal.
       goalId: input.goalId ?? null,
       conversationId: input.conversationId ?? null,
+      // The routed roles, where every reader already looks for a route. A read task recorded none,
+      // so `tasks show` could name the model a task ran on only from its receipt while a write task
+      // named it on the row — two answers to one question, and one of them empty.
+      route: Object.freeze({
+        policy: this.#policy ?? (this.#nativeHarness ? "direct" : "worktree"),
+        roles: Object.freeze(routes.map((route) => ({ role: route.role, providerId: route.selected.model.definition.providerId, modelId: route.selected.model.definition.modelId }))),
+      }),
     });
     // Recorded here — after the task exists, before the first provider call — so the copy a later
     // failover takes is provably of the state this task started from.

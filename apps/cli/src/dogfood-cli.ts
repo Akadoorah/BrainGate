@@ -793,6 +793,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
+    console.error("ASKPROBE", String(policy), String(deps.pin === undefined ? "nopin" : deps.pin.providerId));
     const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
@@ -840,7 +841,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // and deduplicated because a task may spend several phases on the same model.
     const servedBy: string[] = [];
     try {
-      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, nativeHarness: policy === "direct", snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
+      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, nativeHarness: policy === "direct", policy, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
         if (activity.stage === "started") {
           const attribution = `${activity.provider}/${activity.model}`;
           if (!servedBy.includes(attribution)) servedBy.push(attribution);

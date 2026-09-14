@@ -86,6 +86,46 @@ function isInterrogative(clause: string): boolean {
   return /\?\s*$/.test(clause.trim()) || /^\s*(which|what|where|who|when|why|how|is|are|does|do|can|could|should|would)\b/i.test(clause);
 }
 
+/**
+ * Write verbs that are also ordinary nouns, and so only ask for a change in imperative position.
+ *
+ * `document` produced a false WRITE on a read request the first time a cross-provider scenario ran:
+ * "Summarize the test document in this workspace." is a request to read a file whose name happens to
+ * contain the word. The same is true of `format`, `patch`, `split` and the rest — "the format is
+ * wrong" is a report, "format the file" is an instruction — and a false WRITE is the dangerous
+ * direction: it hands a read request the authority to change the workspace once the operator
+ * approves the line they were shown.
+ *
+ * Imperative position means the verb leads its clause, after nothing but a courtesy or a discourse
+ * marker. `document` also stays a cue for the phrasings that actually ask for it: "Document the
+ * helper", "Please document the flags", "then document the response".
+ */
+const NOUN_AMBIGUOUS_VERBS: readonly string[] = Object.freeze([
+  "clean", "cleanup", "correct", "document", "drop", "extract", "format", "inline", "patch",
+  "split", "swap", "trim",
+]);
+
+/** Words that may precede an imperative without making it something other than one. */
+const IMPERATIVE_PREFIXES: readonly string[] = Object.freeze([
+  "please", "now", "then", "also", "kindly", "first", "next", "finally", "just", "simply",
+  "and", "but", "so", "go", "ahead", "you", "can", "could", "would", "will", "should", "must",
+  "i", "want", "need", "like", "to", "let's", "lets", "we", "let", "us",
+]);
+
+/**
+ * Whether a noun-ambiguous cue is being used as a verb here.
+ *
+ * Only the words before it in the clause matter, and every one of them has to be something that can
+ * introduce an instruction. "the test document" fails on `the`, `test`; "document the flags" passes
+ * with nothing before it.
+ */
+function isImperative(clause: string, index: number): boolean {
+  const before = clause.slice(0, index).toLowerCase().replace(/[^a-z'\s]/g, " ").trim();
+  if (before.length === 0) return true;
+  const words = before.split(/\s+/).filter((word) => word.length > 0);
+  return words.length <= 4 && words.every((word) => IMPERATIVE_PREFIXES.includes(word));
+}
+
 /** Whether the write verb at `index` is governed by a negation or a hypothetical frame. */
 function isBounded(clause: string, index: number): boolean {
   const before = clause.slice(0, index);
@@ -114,7 +154,9 @@ export function classifyRequestIntent(text: string): RequestIntent {
     // Every occurrence, not just the first: a clause can bound one verb and still ask for another
     // ("without touching the config, add the flag").
     for (let match = verb.exec(clause); match !== null; match = verb.exec(clause)) {
-      if (!isBounded(clause, match.index)) return "write";
+      if (isBounded(clause, match.index)) continue;
+      if (NOUN_AMBIGUOUS_VERBS.includes(match[0].toLowerCase()) && !isImperative(clause, match.index)) continue;
+      return "write";
     }
   }
   return "read";
