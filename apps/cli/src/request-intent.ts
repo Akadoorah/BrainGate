@@ -103,6 +103,12 @@ function isInterrogative(clause: string): boolean {
 const NOUN_AMBIGUOUS_VERBS: readonly string[] = Object.freeze([
   "clean", "cleanup", "correct", "document", "drop", "extract", "format", "inline", "patch",
   "split", "swap", "trim",
+  // `write` is the sharpest of these: it is the name of the thing BrainGate is *asking about* in
+  // half the questions an operator asks about a session. A real acceptance prompt — "state which
+  // provider wrote marker 1 … and what happened to the Codex write attempt that was cancelled" —
+  // was classified as a WRITE and ran the write path, where a correctly cautious worker changed
+  // nothing and the task ended as a failure. The noun is everywhere; the imperative is not.
+  "write",
 ]);
 
 /** Words that may precede an imperative without making it something other than one. */

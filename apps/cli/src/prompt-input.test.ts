@@ -5,6 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { createPromptInput, displayWidth, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
+import { classifyRequestIntent } from "./request-intent.js";
 
 /**
  * Prompt input correctness: paste is a boundary, not a race.
@@ -956,4 +957,31 @@ process.exit(0);
     // The request typed after the deletions is what the composer submitted — through a real terminal.
     assert.equal(shown.includes(`ANSWER["typed request"]`), true, `the typed request was submitted\n${shown.slice(-300)}`);
   } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+// ---------------------------------------------------------------- intent is not a noun
+
+/**
+ * A question *about* a write is not a request to write.
+ *
+ * The acceptance prompt that found this asked Claude to report which worker wrote which marker and
+ * what happened to a cancelled write attempt. It was classified as a WRITE, so the run took the write
+ * path: a correctly cautious worker changed nothing, and a read-only question was recorded as a
+ * failed write. `write` is a noun in that sentence — the name of the thing being asked about — and it
+ * is the sharpest case of a word that is both, because it is the subject of half the questions an
+ * operator asks about a session.
+ */
+test("W1: a question about a write is a read, and a request to write is still a write", () => {
+  assert.equal(
+    classifyRequestIntent("Read docs/notes.md from disk and quote both marker lines exactly. Then, from the BrainGate goal history you were given, state which provider and model wrote marker 1 and which wrote marker 2, and what happened to the Codex write attempt that was cancelled. Do not modify anything."),
+    "read",
+  );
+  assert.equal(classifyRequestIntent("Which worker wrote marker 1?"), "read");
+  assert.equal(classifyRequestIntent("Summarize the write attempts in this goal."), "read");
+  assert.equal(classifyRequestIntent("What did the cancelled write attempt do?"), "read");
+  // The imperative is unchanged: a request that leads with the verb is a request to write.
+  assert.equal(classifyRequestIntent("Write the marker into docs/notes.md"), "write");
+  assert.equal(classifyRequestIntent("Please write a summary to docs/summary.md"), "write");
+  assert.equal(classifyRequestIntent("Then write the second marker line."), "write");
+  assert.equal(classifyRequestIntent("Append exactly one inert marker comment line to docs/notes.md"), "write");
 });
