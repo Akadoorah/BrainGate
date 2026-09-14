@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
-import { CODEX_PROBE_VERSION } from "@braingate/shadow";
+import { CODEX_PROBE_VERSION, nativeDirectCapable } from "@braingate/shadow";
 import { ProjectSnapshotProvider } from "@braingate/execution";
 import type { NativeSessionResolver, TaskSnapshotProvider } from "@braingate/shadow";
 import {
@@ -55,7 +55,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
-import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, directWriteCapable, type WriteProviderExecutor } from "@braingate/write";
 import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
@@ -126,6 +126,17 @@ export interface DogfoodCliDependencies {
    * interactive session, which is the only surface where a person is choosing.
    */
   readonly pin?: { readonly providerId: string; readonly modelId: string } | undefined;
+  /**
+   * The sessions this goal already holds, compatible with what this run is for.
+   *
+   * Supplied by the caller that owns the goal store. Automatic routing uses it to prefer continuing a
+   * worker over switching to one that is only marginally better, and never as a gate: a warm worker
+   * that cannot do the work still loses.
+   */
+  readonly continuity?: {
+    readonly warm: readonly { readonly providerId: string; readonly modelId: string }[];
+    readonly previous?: { readonly providerId: string; readonly modelId: string } | null;
+  } | undefined;
   /**
    * Asked per invocation whether this run continues a native provider session.
    *
@@ -820,7 +831,12 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
-    const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
+    // Which providers can execute this policy, measured from the installed builds rather than
+    // assumed: a DIRECT read needs a CLI BrainGate can point at the workspace.
+    const policyCapability = policy === "direct"
+      ? Object.freeze({ id: "direct" as const, supportedProviders: Object.freeze(snapshots.filter((item) => nativeDirectCapable(item.providerId)).map((item) => item.providerId)) })
+      : undefined;
+    const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
     // terminal prints; `complexity`, `risk`, `promptComplexity` and `roleLines` are the same facts as
@@ -867,7 +883,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // and deduplicated because a task may spend several phases on the same model.
     const servedBy: string[] = [];
     try {
-      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, nativeHarness: policy === "direct", policy, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
+      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, nativeHarness: policy === "direct", policy, ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
         if (activity.stage === "started") {
           const attribution = `${activity.provider}/${activity.model}`;
           if (!servedBy.includes(attribution)) servedBy.push(attribution);
@@ -955,7 +971,12 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const grokWrite = await grokProof(state, snapshots, deps, env, project, GROK_WRITE_SANDBOX);
     const grokWriteIsolation = grokWrite.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildWriteTaskPlan({ policy, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    // A DIRECT write needs a measured write posture, which is a different set from a DIRECT read: a
+    // CLI can be able to inspect the workspace and unable to change it.
+    const policyCapability = policy === "direct"
+      ? Object.freeze({ id: "direct" as const, supportedProviders: Object.freeze(snapshots.filter((item) => directWriteCapable(item.providerId)).map((item) => item.providerId)) })
+      : undefined;
+    const plan = buildWriteTaskPlan({ policy, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The same structural fields the read plan carries, so a caller that continues a goal reads one
     // shape whichever mode the request took. `summary` is what the terminal prints; the tiers are

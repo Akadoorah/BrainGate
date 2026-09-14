@@ -731,6 +731,31 @@ export class GoalStore {
     return null;
   }
 
+  /**
+   * Every session this goal holds that a request under `envelope` may resume, newest first.
+   *
+   * The routing layer asks a different question from the resolver: not "which session does this
+   * provider get", but "which workers already hold this goal". The answer is the same compatibility
+   * rule — a session created for a read is not a warm session for a write — enumerated across every
+   * worker rather than looked up for one, because a router comparing two candidates has to know
+   * which of them is continuing work and which is starting cold.
+   *
+   * The envelope is a function of the provider because permission posture is: the same request asks
+   * Claude to accept edits and tells a non-primary role to change nothing, so one request has as many
+   * envelopes as it has candidate runtimes.
+   */
+  sessionsForGoal(goalId: string, envelopeFor: (providerId: ProviderId) => SessionExecutionEnvelope): readonly ProviderSessionRecord[] {
+    const rows = this.#db.prepare(
+      "SELECT * FROM provider_sessions WHERE project_id = ? AND goal_id = ? AND status = 'active' AND (workspace_id IS NULL OR workspace_id = ?) ORDER BY last_used_at DESC, session_id DESC",
+    ).all(this.#project.projectId, goalId, this.#workspaceId) as SessionRow[];
+    const compatible: ProviderSessionRecord[] = [];
+    for (const row of rows) {
+      const record = mapSession(row);
+      if (sessionEnvelopeReason(record.envelope, envelopeFor(record.providerId)) === null) compatible.push(record);
+    }
+    return Object.freeze(compatible);
+  }
+
   latestSessionFor(providerId: ProviderId, modelId: string | null): ProviderSessionRecord | null {
     // A session with no workspace id is one written before M20.4 into this workspace's own file, so
     // it is this workspace's. One that names a different workspace is not, and is not resumed.

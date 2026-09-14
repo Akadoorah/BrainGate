@@ -157,6 +157,13 @@ export function buildShadowTaskPlan(input: {
   readonly task: string;
   /** Whether this plan keeps the runtime's own harness: the DIRECT policy (ADR 0017). */
   readonly nativeHarness?: boolean;
+  /** Which providers can execute this policy, measured from the installed builds by the caller. */
+  readonly policyCapability?: { readonly id: string; readonly supportedProviders: readonly string[] };
+  /** The sessions this goal already holds: a warm worker wins a close call, never a real gap. */
+  readonly continuity?: {
+    readonly warm: readonly { readonly providerId: string; readonly modelId: string }[];
+    readonly previous?: { readonly providerId: string; readonly modelId: string } | null;
+  };
   readonly context: unknown;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
@@ -184,6 +191,8 @@ export function buildShadowTaskPlan(input: {
     budget: input.budget,
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
+    ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
+    ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
     excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(input.nativeHarness === true && input.pin !== undefined ? { directProviders: [input.pin.providerId] } : {}) }),
     ...(input.pin === undefined ? {} : { pin: input.pin }),
   });

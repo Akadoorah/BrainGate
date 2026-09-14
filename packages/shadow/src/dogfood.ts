@@ -24,6 +24,7 @@ import { WorkflowEngine, type WorkflowReceipt, type WorkflowRole, type WorkflowO
 import type { CodexIsolationAttestation } from "./codex-isolation.js";
 import type { GrokIsolationAttestation } from "./grok-isolation.js";
 import { SubscriptionShadowAgentInvoker, type NativeSessionResolver, type RoleActivity } from "./invoker.js";
+import type { RouteContinuity } from "@braingate/router";
 import type { QuotaReading } from "./quota-readings.js";
 import { planShadowInvocation, shadowProviderRoleStatus, snapshotPrimaryEligibility } from "./profiles.js";
 import type { TaskSnapshotProvider } from "./snapshot-provider.js";
@@ -176,6 +177,8 @@ export class ShadowDogfoodRunner {
   readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
   readonly #pin: RoutePin | undefined;
+  /** The routing inputs the operator's policy and the goal's sessions contribute. */
+  readonly #routing: { readonly policy?: { readonly id: string; readonly supportedProviders: readonly string[] }; readonly continuity?: RouteContinuity } ;
   readonly #nativeHarness: boolean;
   readonly #policy: string | null;
   readonly #nativeSession: NativeSessionResolver | undefined;
@@ -211,6 +214,15 @@ export class ShadowDogfoodRunner {
      * never route around a policy.
      */
     readonly pin?: RoutePin | undefined;
+    /**
+     * Which providers can execute this run's policy, and the sessions the goal already holds.
+     *
+     * Both are measured or owned above this layer — the CLI measured the first from the installed
+     * builds, the goal store owns the second — and both are optional: a runner told nothing routes
+     * exactly as it did before.
+     */
+    readonly policyCapability?: { readonly id: string; readonly supportedProviders: readonly string[] };
+    readonly continuity?: RouteContinuity;
     /** Asked per invocation whether this run continues a native provider session. */
     readonly nativeSession?: NativeSessionResolver | undefined;
     /**
@@ -259,6 +271,10 @@ export class ShadowDogfoodRunner {
     this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
     this.#executor = input.executor;
     this.#pin = input.pin;
+    this.#routing = Object.freeze({
+      ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
+      ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
+    });
     this.#nativeHarness = input.nativeHarness === true;
     this.#policy = input.policy ?? null;
     this.#nativeSession = input.nativeSession;
@@ -339,7 +355,7 @@ export class ShadowDogfoodRunner {
       catch { /* a sweep that cannot run is not a reason to refuse the task */ }
     }
 
-    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, excludeProviders: primaryExcluded, ...(this.#pin === undefined ? {} : { pin: this.#pin }) });
+    const primaryRoute = this.#router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, ...this.#routing, excludeProviders: primaryExcluded, ...(this.#pin === undefined ? {} : { pin: this.#pin }) });
     const routes: RouteResult[] = [primaryRoute];
     const primaryRef = modelRef(primaryRoute);
     const primarySnapshot = snapshotFor(this.#snapshots, primaryRef.providerId);
@@ -516,7 +532,7 @@ export class ShadowDogfoodRunner {
       // The state the workspace was in before this run, for the verification below. Taken with or
       // without Git, because a workspace is a directory rather than a repository.
       const sourceBefore = snapshotWorkspace(cwd);
-      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, ...(this.#pin === undefined ? {} : { pin: this.#pin }), excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
+      const workflow = await new WorkflowEngine(this.#router, invoker).run({ task: input.task, classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: false, optionalReview: input.optionalReview ?? false, ...this.#routing, ...(this.#pin === undefined ? {} : { pin: this.#pin }), excludeProviders: { planner: plannerExcluded, primary: primaryExcluded, reviewer: reviewerExcluded, judge: judgeExcluded } });
       workflowReceipt = workflow;
       assertWorkspaceUnchanged(cwd, sourceBefore, "this read-only run");
       this.#ledger.transition(task.taskId, "verifying", { shadow: true, outcome: workflow.outcome });

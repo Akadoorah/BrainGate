@@ -104,6 +104,44 @@ export interface RouteRequest {
    */
   readonly excludeQuotaPools?: readonly string[];
   readonly maxFallbacks?: number;
+  /**
+   * The execution policy this run is under, and the providers that can execute it.
+   *
+   * Not a provider list BrainGate hard-codes: the caller measures which builds have an invocation
+   * for the policy (a DIRECT read needs a CLI that can be pointed at the workspace; a DIRECT write
+   * needs one with a scoped accept-edits posture) and passes the answer as data. A model whose
+   * provider cannot execute the policy is refused with a reason, so a run never reaches a worker
+   * that would have to be re-routed after the operator approved it.
+   */
+  readonly policy?: RoutePolicyRequirement;
+  /**
+   * Sessions this goal already holds, so that continuing one can beat switching.
+   *
+   * The router is told *which* models have a compatible session, never what a session is: the goal
+   * store owns that. What it does with the fact is a preference, not a gate — a warm model wins a
+   * close call and loses a real capability gap, which is the difference between "do not switch
+   * needlessly" and "never switch".
+   */
+  readonly continuity?: RouteContinuity;
+}
+
+export interface RoutePolicyRequirement {
+  /** The policy id, as it appears in the receipt: `direct`, `worktree`, `snapshot`, … */
+  readonly id: string;
+  /** Providers whose installed build can execute that policy. */
+  readonly supportedProviders: readonly string[];
+}
+
+export interface RouteContinuity {
+  /** `provider/model` pairs holding a session compatible with this run's intent and policy. */
+  readonly warm: readonly RouteModelIdentity[];
+  /** The model the previous turn of this goal ran on, when there was one. */
+  readonly previous?: RouteModelIdentity | null;
+}
+
+export interface RouteModelIdentity {
+  readonly providerId: string;
+  readonly modelId: string;
 }
 
 export interface RouteCandidate {

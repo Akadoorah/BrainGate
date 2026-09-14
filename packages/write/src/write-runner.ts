@@ -20,7 +20,7 @@ import {
 } from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RoutePin, type RouteResult } from "@braingate/router";
+import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteContinuity, type RoutePin, type RouteResult } from "@braingate/router";
 import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
@@ -251,6 +251,15 @@ export function buildWriteTaskPlan(input: {
    * reviewer would defeat the reason a reviewer exists.
    */
   readonly pin?: RoutePin | undefined;
+  /**
+   * Which providers can execute this policy, and the sessions the goal already holds.
+   *
+   * A write under DIRECT may only go to a provider with a measured DIRECT write invocation: the
+   * caller knows which those are, and the router refuses the rest by name rather than after the
+   * operator has approved the run.
+   */
+  readonly policyCapability?: { readonly id: string; readonly supportedProviders: readonly string[] };
+  readonly continuity?: RouteContinuity;
 }): WriteTaskPlan {
   assertM11Scope(input.classification);
   if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("WRITE_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
@@ -288,7 +297,7 @@ export function buildWriteTaskPlan(input: {
     // decision, and the operator makes it by naming the worker.
     if (input.pin === undefined) primaryExcluded.push("openai", "google", "xai");
   }
-  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
+  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }), ...(input.continuity === undefined ? {} : { continuity: input.continuity }), excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);
   assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProof);
   const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: direct ? "workspace" : "task-worktree" })];

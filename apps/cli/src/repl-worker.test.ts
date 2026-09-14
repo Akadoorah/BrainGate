@@ -559,15 +559,20 @@ test("F: /auto restores automatic routing", async () => {
     "/use anthropic/claude-haiku",
     "Investigate the idle logout", "y",
     "/auto",
+    "/worker",
     "What else could cause it?", "y",
   ]);
   assert.equal(await session.run(), 0);
   const models = cli.primaryCalls().map((call) => call.modelId);
   assert.equal(models[0], "claude-haiku", "the manual choice was used");
-  // What `/auto` must do is release the pin, not pick a particular model: which model the router
-  // then prefers is routing policy, and retuning that is a different milestone.
-  assert.notEqual(models[1], "claude-haiku", "automatic selection must not still be pinned");
+  // What `/auto` must do is release the pin, not pick a particular model — so the proof is that the
+  // session reports automatic selection, not that some other model ran. This test used to require a
+  // different model on the next turn, which was the old router's behaviour rather than the contract:
+  // a follow-up that a warm worker already holds is exactly the turn automatic routing should keep
+  // with it, and asserting inequality here would have made that improvement look like a regression.
   assert.match(session.text(), /Automatic selection restored/);
+  assert.match(session.text(), /Worker: auto — BrainGate routes each turn/);
+  assert.notEqual(models[1], undefined, "the automatic turn still ran, under a model the router chose");
 });
 
 // ---------------------------------------------------------------- G. fresh session

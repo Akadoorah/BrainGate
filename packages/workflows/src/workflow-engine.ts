@@ -113,12 +113,19 @@ export class WorkflowEngine {
     });
 
     const primaryExcluded = input.excludeProviders?.primary;
+    // Which providers can execute this run's policy, and which sessions the goal already holds. The
+    // engine does not know either; the caller measured the first and owns the second.
+    const routing = {
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
+      ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
+    };
     const routePrimary = (): RouteCandidate => this.#router.route({
       role: "coder",
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: input.writeRequired,
+      ...routing,
       ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
       // The operator's own choice, carried onto the run. Every gate still applies to it: a pin
       // narrows which model is considered and excuses it from nothing.
@@ -183,6 +190,7 @@ export class WorkflowEngine {
         budget: input.budget,
         requiredContextTokens: input.requiredContextTokens,
         writeRequired: false,
+        ...(input.policy === undefined ? {} : { policy: input.policy }),
         ...(independence === undefined ? {} : { independence }),
         ...(plannerExcluded === undefined ? {} : { excludeProviders: plannerExcluded }),
         ...failover.routeOptions(),

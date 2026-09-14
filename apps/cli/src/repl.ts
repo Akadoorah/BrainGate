@@ -30,6 +30,7 @@ import {
   SESSION_ID_SOURCES,
   buildGoalContext,
   describeGoalDelta,
+  sessionEnvelopeFor,
   describeSessionDecision,
   inheritedComplexityFloor,
   renderHandoff,
@@ -404,6 +405,50 @@ interface WorkerLoopState {
   readonly versions: Map<string, string | null>;
 }
 
+/**
+ * The routing layer's view of what this goal already holds.
+ *
+ * Two facts, from two places, because they answer different questions. `warm` is which workers hold a
+ * session this request could resume — read through the same envelope rule the resolver uses, so the
+ * router can never be told a session is warm that the run would then refuse. `previous` is who
+ * actually produced the last turn, from the timeline's own attribution, which is what makes "continue
+ * with the worker that was already here" a fact rather than an assumption.
+ *
+ * Absent when the goal has neither, so a first turn routes exactly as it would with no continuity
+ * signal at all: this is a preference between close candidates, not a floor under them.
+ */
+export function routingContinuity(input: {
+  readonly goals: GoalStore;
+  readonly goalId: string;
+  readonly conversationId: string;
+  readonly intent: "read" | "write";
+  readonly policy: string;
+}): { readonly warm: readonly { readonly providerId: string; readonly modelId: string }[]; readonly previous?: { readonly providerId: string; readonly modelId: string } | null } | undefined {
+  const warm: { providerId: string; modelId: string }[] = [];
+  for (const record of input.goals.sessionsForGoal(input.goalId, (providerId) => sessionEnvelopeFor({ intent: input.intent, policy: input.policy, role: "primary", providerId }))) {
+    if (record.modelId === null) continue;
+    if (warm.some((item) => item.providerId === record.providerId && item.modelId === record.modelId)) continue;
+    warm.push({ providerId: record.providerId, modelId: record.modelId });
+  }
+  let previous: { providerId: string; modelId: string } | null = null;
+  // The newest turn that names a worker. A turn with no attribution is a turn whose worker is not
+  // known, and reading past it to an older one would describe a handoff that did not happen.
+  for (const turn of [...input.goals.recentTurns(input.conversationId, 8)].reverse()) {
+    // This goal's own turns. A conversation can hold several goals, and a turn that belongs to
+    // another one is not the previous worker *here* — counting it would report a handoff that never
+    // happened, on the strength of a conversation the two goals happen to share.
+    if (turn.goalId !== input.goalId) continue;
+    const last = turn.attributedTo[turn.attributedTo.length - 1];
+    if (last === undefined) continue;
+    const slash = last.indexOf("/");
+    if (slash <= 0 || slash === last.length - 1) continue;
+    previous = { providerId: last.slice(0, slash), modelId: last.slice(slash + 1) };
+    break;
+  }
+  if (warm.length === 0 && previous === null) return undefined;
+  return Object.freeze({ warm: Object.freeze(warm), ...(previous === null ? {} : { previous }) });
+}
+
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const spec = executionPolicyForIntent({ policy: worker.policy, intent: mode === "write" ? "write" : "read" });
@@ -450,6 +495,16 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     policy: () => worker.policy,
     onResolved: (summary) => { worker.lastRun = summary; },
   });
+  // Who this goal already has, which is the half of a routing decision the words cannot carry. A
+  // warm worker is one that worked this goal under this exact boundary; a request that changed
+  // intent or policy has no warm worker, because the session it would resume was told otherwise.
+  const continuity = goal === null || goals === null ? undefined : routingContinuity({
+    goals,
+    goalId: goal.goalId,
+    conversationId: goal.conversationId,
+    intent: requestIntent,
+    policy: worker.policy,
+  });
   const goalDeps = {
     ...(goal === null || goalLayers === null ? {} : {
       goalContext: goalLayers.context,
@@ -459,6 +514,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     }),
     ...(pin === undefined ? {} : { pin }),
     ...(nativeSession === undefined ? {} : { nativeSession }),
+    ...(continuity === undefined ? {} : { continuity }),
   };
 
   const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });

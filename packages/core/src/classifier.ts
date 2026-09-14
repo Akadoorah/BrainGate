@@ -76,6 +76,9 @@ const BREADTH_TERMS = [
   // and T1 in Arabic — the cheapest model, no planning pass, no reviewer. An operator who works
   // in Arabic was being quietly under-budgeted for exactly the kind of task that needs the most.
   "افحص", "فحص", "تدقيق", "دقق", "راجع", "مراجعة", "تغطية", "نقص", "تسلسل", "شامل", "شاملة", "بالكامل", "جميع ", "تحليل",
+  // The verb forms of the same cues, which is how a request is actually phrased: "قارن" is compare
+  // as an instruction and "مقارنة" is comparison as a subject, and only the first was listed.
+  "قارن", "بالتفصيل", "تفصيل", "تتبع", "حلل", "تحقق", "استقص", "افهم",
 ];
 
 const FEATURE_TERMS = ["feature", "refactor", "integration", "endpoint", "workflow", "ميزة", "خاصية", "تكامل", "واجهة"];
@@ -96,6 +99,52 @@ function normalize(text: string): string {
     .replace(/[\u064B-\u065F\u0670\u0640]/g, "")
     .replace(/\s+/g, " ")
     .trim();
+}
+
+/**
+ * The sentences of a request, so a cue is read where it appears rather than across the whole text.
+ *
+ * Splitting on sentence punctuation and newlines is what keeps a paragraph of background apart from
+ * the line that asks for something — "Here is the background… The payment migration touched the
+ * checkout path. What does the delete handler do?" is one request and three sentences, and only one
+ * of them is the request.
+ */
+function sentences(text: string): readonly string[] {
+  return Object.freeze(
+    text
+      .split(/[\n;•]|(?<=[.!?…])\s+|[؟?]\s*/u)
+      .map((sentence) => sentence.trim())
+      .filter((sentence) => sentence.length > 0),
+  );
+}
+
+/** Words, which is the comparable unit of size across scripts in a way characters are not. */
+function wordCount(text: string): number {
+  return text.split(/\s+/).filter((word) => word.length > 0).length;
+}
+
+/**
+ * The part of a request that asks for something, which is where scope cues belong.
+ *
+ * Scope is a property of the *request*, not of everything the operator wrote around it. Measured on
+ * a real prompt: a one-line question — "What does the delete handler do?" — preceded by three
+ * sentences of background mentioning a payment migration classified T4, because the cue chain read
+ * the word `migration` out of the context. The same shape in Arabic classified T0 in English's
+ * absence of cues and T4 with them. Either way the model that answered was chosen for the
+ * background, not for the question.
+ *
+ * So the cue chain below reads the sentences that carry the request: a question in ask mode, a
+ * write verb in write and review modes, a question or an implementation verb otherwise. When no
+ * sentence qualifies — an unusual request, or one phrased in a way these cues do not recognise —
+ * the whole text is used, because falling back to everything is the conservative direction: it can
+ * only ever ask for more budget than the request needs, never less.
+ */
+function requestedText(text: string, mode: TaskMode): string {
+  const parts = sentences(text);
+  if (parts.length <= 1) return text;
+  const cues = mode === "ask" ? QUESTION_TERMS : [...WRITE_TERMS, ...FEATURE_TERMS, ...QUESTION_TERMS];
+  const asking = parts.filter((sentence) => hasAny(sentence, cues));
+  return asking.length === 0 ? text : asking.join(" ");
 }
 
 function hasAny(text: string, terms: readonly string[]): boolean {
@@ -194,7 +243,13 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
     };
   }
 
-  if (text.length <= 120 && hasAny(text, QUESTION_TERMS)) {
+  // "Small" is a property of the request, not of how many characters its script spends: Arabic packs
+  // a substantial investigation into fewer characters than English does, and a character threshold
+  // written for English rated a sixteen-word Arabic request as a lookup. Words, one sentence, and a
+  // generous character ceiling for a single long sentence.
+  const asked = requestedText(text, mode);
+  const askedWords = wordCount(asked);
+  if (askedWords <= 12 && sentences(asked).length <= 1 && asked.length <= 200 && hasAny(asked, QUESTION_TERMS)) {
     complexity = "T0";
     confidence = 0.85;
     reasons.push("small-question-cue");
@@ -212,7 +267,7 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
 
   // Applied before the cue chain below so a broad question cannot be pinned back down to T0 by
   // also containing a question word: "what do you think about X in the app" contains both.
-  const broad = hasAny(text, BREADTH_TERMS);
+  const broad = hasAny(asked, BREADTH_TERMS);
   if (broad) {
     complexity = maxComplexity(complexity, "T2");
     confidence = Math.max(confidence, 0.75);
@@ -221,15 +276,15 @@ export function classifyTask(input: ClassificationInput): TaskClassification {
 
   // A schema artifact is architecture-level work whatever the sentence says; a directory whose name
   // merely contains the word is not. Both halves are needed, and they are different questions.
-  if (hasCue(withoutConstraints(text.replace(PATH_TOKEN, " ")), ARCHITECTURE_TERMS) || artifact.schemaMigration) {
+  if (hasCue(withoutConstraints(asked.replace(PATH_TOKEN, " ")), ARCHITECTURE_TERMS) || artifact.schemaMigration) {
     complexity = "T4";
     confidence = Math.max(confidence, 0.95);
     reasons.push("architecture-or-migration-cue");
-  } else if (hasAny(text, DEBUG_TERMS)) {
+  } else if (hasAny(asked, DEBUG_TERMS)) {
     complexity = maxComplexity(complexity, "T2");
     confidence = Math.max(confidence, 0.82);
     reasons.push("debugging-cue");
-  } else if ((hasAny(text, FEATURE_TERMS) || hasAny(text, WRITE_TERMS)) && !(mode === "ask" && reasons.includes("small-question-cue"))) {
+  } else if ((hasAny(asked, FEATURE_TERMS) || hasAny(asked, WRITE_TERMS)) && !(mode === "ask" && reasons.includes("small-question-cue"))) {
     // A short question that happens to contain an implementation word is still a question:
     // "where is the paywall logic implemented?" asks about code that exists, and rating it as
     // implementation work gave a lookup more budget than a whole-application review.
