@@ -38,6 +38,24 @@ const SCHEMA_PROMPT = [
 ].join(" ");
 
 /**
+ * The instruction for a DIRECT read: the workspace itself is the source, and the worker has tools.
+ *
+ * The staged prompt says "do not run commands, access the network, or use external tools", which is
+ * right for a run whose whole input is the payload and whose tools are denied. Reused under DIRECT
+ * it is a contradiction, and real dogfood showed what a worker does with one: Codex and Antigravity
+ * both answered "the file's contents were not provided, and I am prohibited from reading it", the
+ * contract parse failed, and two providers looked broken while the bug was the instruction.
+ */
+const DIRECT_PROMPT = [
+  "You receive one JSON request object (appended below this instruction).",
+  "Use its `task` field as the request and its `context` field as supporting data.",
+  "You are running in the workspace itself: inspect the files it names with your own tools, and answer from what you actually find there.",
+  "Do not modify any file unless the task asks for a change.",
+  "Answer with real values you produce; the response shape is enforced for you.",
+  "If you cannot complete the request, still answer in that shape and put the reason in the text field.",
+].join(" ");
+
+/**
  * The flags that name or continue a native session, from the decision that was made.
  *
  * It reads the decision rather than the runtime, so one place decides and one place acts: a decision
@@ -417,7 +435,7 @@ export function planShadowInvocation(input: {
   if (input.snapshot.providerId === "anthropic") {
     const args = Object.freeze([
       "--restricted",
-      "-p", SCHEMA_PROMPT,
+      "-p", nativeHarness ? DIRECT_PROMPT : SCHEMA_PROMPT,
       // A token stream, so a waiting terminal sees the answer being written rather than a
       // spinner. `--verbose` is not optional here: this build refuses stream-json without it.
       // The executor keeps only the lines the parse reads, so the extra events cost no cap.
@@ -601,7 +619,7 @@ export function planShadowInvocation(input: {
 
     if (input.snapshot.providerId === "xai") {
       const args = Object.freeze([
-        "-p", `${SCHEMA_PROMPT}\n\n${body}`,
+        "-p", `${DIRECT_PROMPT}\n\n${body}`,
         "--cwd", input.cwd,
         "--output-format", "streaming-json",
         "--model", input.model.modelId,
@@ -651,7 +669,7 @@ export function planShadowInvocation(input: {
       "--model", input.model.modelId,
       "--effort", "medium",
       ...(session.kind === "resumed" && session.sessionId !== null ? ["--conversation", session.sessionId] : []),
-      `-p=${SCHEMA_PROMPT}\n\n${body}`,
+      `-p=${DIRECT_PROMPT}\n\n${body}`,
     ]);
     if (args.some((argument) => argument === "--dangerously-skip-permissions" || argument === "--sandbox" || argument === "--add-dir" || argument === "--mode" || argument.startsWith("--mode="))) {
       throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe, sandboxed or workspace-widening Antigravity flags are forbidden for a DIRECT read.");

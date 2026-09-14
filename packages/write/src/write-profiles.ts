@@ -228,7 +228,10 @@ function brief(input: WriteInvocationInput): string {
     context: input.context,
     findings: Object.freeze([...(input.findings ?? [])]),
     candidateOutput: input.candidateOutput ?? null,
-    constraints: Object.freeze({ smallChangeOnly: true, worktreeOnly: true, noSecrets: true, noAgentConfigChanges: true }),
+    // `worktreeOnly` was hard-coded true, so a DIRECT worker was told its change had to stay inside a
+    // task worktree while its cwd was the operator's workspace — a contradiction in the brief, and
+    // the kind a careful worker resolves by changing nothing.
+    constraints: Object.freeze({ smallChangeOnly: true, worktreeOnly: input.nativeHarness !== true, noSecrets: true, noAgentConfigChanges: true }),
     responseContract: WRITE_SCHEMA,
   }));
   if (body.length === 0 || body.length > 2_000_000) throw new BrainGateInvariantError("WRITE_PAYLOAD_INVALID", "Write payload must be between 1 and 2,000,000 characters.");

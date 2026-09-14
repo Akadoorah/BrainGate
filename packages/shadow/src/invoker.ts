@@ -164,6 +164,21 @@ export function lastJsonLine(stdout: string, pick: (event: Record<string, unknow
   return latest;
 }
 
+/**
+ * The answer a run produced, in whichever dialect its CLI speaks, or `null` when it produced none.
+ *
+ * Exported because the write path needs the same reading: a builder that understood only Claude's
+ * envelope reported "no report was returned by the worker" for a Codex, Grok or Antigravity run that
+ * had answered perfectly well, and an unparseable answer had no words attached to diagnose it.
+ */
+export function providerAnswerText(providerId: string, stdout: string): string | null {
+  try {
+    return unwrapProviderOutput(providerId as ProviderId, stdout);
+  } catch {
+    return null;
+  }
+}
+
 function unwrapProviderOutput(providerId: ProviderId, stdout: string): string {
   const trimmed = stdout.trim();
   if (providerId === "openai") return extractCodexAgentMessage(trimmed);
@@ -681,6 +696,10 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     }
     this.#event("shadow.provider.started", safeMeta);
     this.#activity({ ...safeMeta, stage: "started", grant: Object.freeze([...plan.grant.granted]) });
+    // What the run said, kept for the failure path. A message like "the provider did not return
+    // parseable JSON" is a diagnosis with no evidence in it, and the evidence is the answer that
+    // failed to parse — which the process-level failure branch already keeps and this one did not.
+    let observedStdout: string | null = null;
     try {
       const result = await this.#executor.run({
         project: this.#project,
@@ -706,6 +725,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           throw new BrainGateInvariantError("SHADOW_SNAPSHOT_MUTATED", "The provider's read-only project snapshot changed during the run, so its output is discarded.");
         }
       }
+      observedStdout = result.stdoutTail ?? result.stdout;
       if (!result.spawned || result.timedOut || result.exitCode !== 0) {
         const failureKind = result.timedOut ? "timeout" : "provider-failed";
         // Recognised before the event is written, so the refusal is in the failure record itself and
@@ -796,6 +816,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           failureKind: error instanceof BrainGateInvariantError ? failureKindFromCode(error.code) : "unknown",
           code: error instanceof BrainGateInvariantError ? error.code : "UNKNOWN",
           error: redactSecrets(error instanceof Error ? error.message : String(error)).slice(0, 500),
+          ...(observedStdout === null ? {} : { stdoutTail: redactSecrets(observedStdout).slice(-2_000) }),
         });
       }
       throw error;

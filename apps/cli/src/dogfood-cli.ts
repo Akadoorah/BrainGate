@@ -793,7 +793,6 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
     const measured = await measuredCapabilities(deps);
-    console.error("ASKPROBE", String(policy), String(deps.pin === undefined ? "nopin" : deps.pin.providerId));
     const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the

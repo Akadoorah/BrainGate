@@ -27,7 +27,7 @@ import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
 import { WRITE_PROVIDERS, assertWriteEligible, directWriteCapable, planWriteInvocation } from "./write-profiles.js";
-import { changedPaths, reportedSessionIdOf, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
+import { changedPaths, providerAnswerText, reportedSessionIdOf, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
 import type { ExecutionPolicyId } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
 import { collectGuardedDiff } from "./diff-guard.js";
@@ -100,7 +100,20 @@ function assertM11Scope(classification: TaskClassification): void {
  * Anything unreadable is reported as unreadable rather than invented, and the text is bounded and
  * redacted before it reaches the ledger.
  */
-function workerReportOf(stdout: string): string {
+/** The last complete JSON object in a text, which is how a narrating worker still answers. */
+function lastBalancedObjectIn(text: string): Record<string, unknown> | null {
+  const end = text.lastIndexOf("}");
+  if (end < 0) return null;
+  for (let start = text.indexOf("{"); start >= 0 && start < end; start = text.indexOf("{", start + 1)) {
+    try {
+      const parsed = JSON.parse(text.slice(start, end + 1)) as unknown;
+      if (typeof parsed === "object" && parsed !== null) return parsed as Record<string, unknown>;
+    } catch { /* not this one */ }
+  }
+  return null;
+}
+
+function workerReportOf(stdout: string, providerId?: string): string {
   const envelope = ((): Record<string, unknown> | null => {
     try {
       const parsed = JSON.parse(stdout.trim()) as unknown;
@@ -117,8 +130,25 @@ function workerReportOf(stdout: string): string {
     } catch { return null; }
   })();
   const summary = envelope?.summary;
-  if (typeof summary !== "string" || summary.trim().length === 0) return "no report was returned by the worker";
-  return redactSecrets(summary.trim()).slice(0, 2_000);
+  if (typeof summary === "string" && summary.trim().length > 0) return redactSecrets(summary.trim()).slice(0, 2_000);
+  // Claude's is not the only envelope. A Codex run answers in JSONL, Grok and Antigravity in their
+  // own single objects, and all three were reported as "no report" while having reported clearly.
+  if (providerId !== undefined) {
+    const answer = providerAnswerText(providerId, stdout);
+    if (answer !== null) {
+      const inner = ((): Record<string, unknown> | null => {
+        try {
+          const parsed = JSON.parse(answer) as unknown;
+          if (typeof parsed !== "object" || parsed === null) return null;
+          return parsed as Record<string, unknown>;
+        } catch { return lastBalancedObjectIn(answer); }
+      })();
+      const nested = inner?.summary;
+      const text = typeof nested === "string" && nested.trim().length > 0 ? nested : answer;
+      if (text.trim().length > 0) return redactSecrets(text.trim()).slice(0, 2_000);
+    }
+  }
+  return "no report was returned by the worker";
 }
 
 /**
@@ -630,7 +660,7 @@ export class WriteDogfoodRunner {
       // What the worker said it did. The write profile answers with a `summary`, and nothing read
       // it: a worker that replied "I could not edit the file" left no trace at all, which is how a
       // real dogfood task ended with `result = none · 0 bytes` and no explanation.
-      const report = workerReportOf(result.stdout);
+      const report = workerReportOf(result.stdout, primary.model.providerId);
       this.#ledger.appendEvent(task.taskId, "write.primary.reported", { role: "primary", provider: primary.model.providerId, model: primary.model.modelId, report });
 
       // A visual task runs a second, artifact-producing invocation in the same worktree. It is
