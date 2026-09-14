@@ -164,32 +164,33 @@ test("a resumed Grok session is continued by id, and a fresh one is pinned", () 
   assert.equal(fresh.includes("--resume"), false);
 });
 
-test("Antigravity DIRECT reads in the workspace, fail-closed and without a conversation on a fresh run", () => {
-  const plan = readPlan("google");
-  const args = [...plan.args];
-  assert.equal(plan.workspaceMode, "project");
-  assert.equal(plan.cwd, WORKSPACE, "agy has no cwd flag: the process working directory is the workspace");
-  assert.deepEqual(args.slice(args.indexOf("--output-format"), args.indexOf("--output-format") + 2), ["--output-format", "json"], "one envelope carries the answer and the conversation id");
-  const prompt = args.find((argument) => argument.startsWith("-p="));
-  assert.notEqual(prompt, undefined, "the prompt is attached to -p, the one form no option can separate");
-  assert.equal(args.includes("--mode"), false, "a read is not the accept-edits posture");
-  assert.equal(args.includes("accept-edits"), false);
-  assert.equal(args.includes("--dangerously-skip-permissions"), false);
-  for (const flag of SUBSTITUTED_HARNESS_FLAGS) assert.equal(args.includes(flag), false, `${flag} is not Antigravity's own harness`);
-  assertNoForeignSandbox(args, "google");
-  assert.equal(args.includes("--conversation"), false, "nothing to resume on a fresh run");
-});
-
-test("a resumed Antigravity conversation is continued by id", () => {
-  const args = [...readPlan("google", { kind: "resumed", sessionId: "5e1e942f-772b-47e3-b220-e85f65fef3f6", persistent: true }).args];
-  assert.deepEqual(args.slice(args.indexOf("--conversation"), args.indexOf("--conversation") + 2), ["--conversation", "5e1e942f-772b-47e3-b220-e85f65fef3f6"]);
+test("Antigravity is refused a DIRECT run, with the measurement as the reason", () => {
+  // Not "untried": agy 1.2.2 was measured on 2026-09-14 and auto-denied `read_file` under
+  // `--mode accept-edits`, under `--mode plan` and under `--sandbox`; once a project-local
+  // allow-rule permitted reads it denied `command` instead. What remains is a blanket bypass or a
+  // persistent change to the operator's own settings, and neither is BrainGate's to make quietly.
+  assert.throws(
+    () => planShadowInvocation({
+      snapshot: snapshot("google", ["google-model"]),
+      model: modelFor("google"),
+      cwd: WORKSPACE,
+      nativeHarness: true,
+      payload,
+      now: new Date("2026-09-14T01:00:00Z"),
+    }),
+    /auto-denies every tool|SHADOW_PROVIDER_BLOCKED/,
+  );
+  const status = shadowProviderRoleStatus("google", "primary", { direct: true });
+  assert.equal(status.enabled, false);
+  assert.match(String(status.reason), /auto-denies every tool/, "the reason carries the measurement, not a shrug");
+  assert.match(String(status.reason), /permissions\.allow|dangerously-skip-permissions/, "and says what would open it");
 });
 
 test("a provider with no measured DIRECT invocation still refuses one", () => {
   assert.equal(nativeDirectCapable("anthropic"), true);
   assert.equal(nativeDirectCapable("openai"), true);
   assert.equal(nativeDirectCapable("xai"), true);
-  assert.equal(nativeDirectCapable("google"), true);
+  assert.equal(nativeDirectCapable("google"), false, "measured: headless Antigravity auto-denies the tools a DIRECT run needs");
   assert.equal(nativeDirectCapable("github-copilot"), false, "copilot has not been measured for it");
   assert.throws(
     () => planShadowInvocation({
@@ -203,19 +204,65 @@ test("a provider with no measured DIRECT invocation still refuses one", () => {
   );
 });
 
-test("DIRECT reaches the primary role for a provider the staged gates close", () => {
-  // Google is the sharpest case: closed outright without an operator acceptance, because a staged
-  // run keeps the operator's real home and BrainGate cannot scope it. A DIRECT run is a different
-  // question — the operator selected this worker and approved this run in their own workspace — and
-  // the answer is different for that reason rather than because the gate was relaxed.
-  const staged = shadowProviderRoleStatus("google", "primary");
-  assert.equal(staged.enabled, false, "the staged route is still closed");
-  const direct = shadowProviderRoleStatus("google", "primary", { direct: true });
-  assert.equal(direct.enabled, true, "and the DIRECT route is open");
+test("DIRECT reaches a provider the staged gates close, and does not pretend for one it cannot", () => {
+  // Codex is the case the gate used to answer wrongly: staged roles only, so a primary read was
+  // declared unreachable until the operator named it — at which point the measured DIRECT
+  // invocation is exactly what runs.
+  assert.equal(shadowProviderRoleStatus("openai", "primary").enabled, false, "the staged route closes it");
+  const direct = shadowProviderRoleStatus("openai", "primary", { direct: true });
+  assert.equal(direct.enabled, true, "and the DIRECT route opens it");
   assert.match(String(direct.reason), /DIRECT/, "with a reason that says which route it is");
+
+  // Antigravity is the case where both routes are closed, and the reason says which measurement
+  // closed the second one rather than implying nobody looked.
+  const google = shadowProviderRoleStatus("google", "primary", { direct: true });
+  assert.equal(google.enabled, false);
+  assert.match(String(google.reason), /auto-denies every tool/);
 
   // A provider with no DIRECT profile is not reachable this way either.
   assert.equal(shadowProviderRoleStatus("github-copilot", "primary", { direct: true }).enabled, false);
   // And DIRECT is a statement about the primary worker, not a way to reach the staged roles.
   assert.equal(shadowProviderRoleStatus("google", "planner", { direct: true }).enabled, false);
 });
+
+test("Antigravity is refused a DIRECT run, with the measurement as the reason", () => {
+  // Not "untried": agy 1.2.2 was measured on 2026-09-14 and auto-denied `read_file` under
+  // `--mode accept-edits`, under `--mode plan` and under `--sandbox`; once a project-local
+  // allow-rule permitted reads it denied `command` instead. What remains is a blanket bypass or a
+  // persistent change to the operator's own settings, and neither is BrainGate's to make quietly.
+  assert.throws(
+    () => planShadowInvocation({
+      snapshot: snapshot("google", ["google-model"]),
+      model: modelFor("google"),
+      cwd: WORKSPACE,
+      nativeHarness: true,
+      payload,
+      now: new Date("2026-09-14T01:00:00Z"),
+    }),
+    /auto-denies every tool|SHADOW_PROVIDER_BLOCKED/,
+  );
+  const status = shadowProviderRoleStatus("google", "primary", { direct: true });
+  assert.equal(status.enabled, false);
+  assert.match(String(status.reason), /auto-denies every tool/, "the reason carries the measurement, not a shrug");
+  assert.match(String(status.reason), /permissions\.allow|dangerously-skip-permissions/, "and says what would open it");
+});
+
+test("a provider with no measured DIRECT invocation still refuses one", () => {
+  assert.equal(nativeDirectCapable("anthropic"), true);
+  assert.equal(nativeDirectCapable("openai"), true);
+  assert.equal(nativeDirectCapable("xai"), true);
+  assert.equal(nativeDirectCapable("google"), false, "measured: headless Antigravity auto-denies the tools a DIRECT run needs");
+  assert.equal(nativeDirectCapable("github-copilot"), false, "copilot has not been measured for it");
+  assert.throws(
+    () => planShadowInvocation({
+      snapshot: snapshot("github-copilot", ["copilot-model"]),
+      model: modelFor("github-copilot"),
+      cwd: WORKSPACE,
+      nativeHarness: true,
+      payload,
+    }),
+    /SHADOW_NATIVE_HARNESS_UNSUPPORTED|no measured DIRECT invocation/,
+  );
+});
+
+

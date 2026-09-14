@@ -1146,7 +1146,17 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       throw new BrainGateInvariantError("CLI_SUBCOMMAND_INVALID", "dogfood requires preflight, ask, write, feedback, report, or export.");
     } finally { store.close(); }
   } catch (error) {
-    const safe = safeError(error);
+    let safe = safeError(error);
+    // A pinned worker that the gates refuse says "provider-excluded", which names the fact and not
+    // the reason. Where the provider has a recorded measurement, the operator gets it here — the one
+    // place every command's failure passes through — so "why can't I use the worker I chose" has an
+    // answer and a next step instead of a shrug.
+    const advice = safe.code === "ROUTE_MANUAL_INELIGIBLE" && deps.pin !== undefined
+      ? shadowProviderRoleStatus(deps.pin.providerId as ProviderSnapshot["providerId"], "primary", { direct: true })
+      : null;
+    if (advice !== null && !advice.enabled && advice.reason !== null) {
+      safe = Object.freeze({ code: safe.code, message: `${safe.message}\n  ${deps.pin?.providerId} is blocked for this policy: ${advice.reason}` });
+    }
     // Whether anything was recorded for this attempt is the one thing the operator cannot infer
     // from the error itself, and it decides what they do next: fix a flag, or read a task.
     const recorded = taskWasRecorded(error);

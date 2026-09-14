@@ -120,6 +120,14 @@ export interface ShadowInvocationPlan {
    * rather than into a temporary file the sandbox would refuse to open.
    */
   readonly stagedFiles?: Readonly<Record<string, string>>;
+  /**
+   * Files the run needs at an absolute path outside the workspace, written by the executor.
+   *
+   * A DIRECT run has no staged directory to put a schema in, and the schema must not land in the
+   * operator's workspace where the file the worker is about to edit could pick it up. The write path
+   * has had exactly this surface since M11; this is the read path's.
+   */
+  readonly externalFiles?: Readonly<Record<string, string>>;
   readonly allowedEnvKeys: readonly string[];
   readonly envOverrides: Readonly<Record<string, string>>;
   /**

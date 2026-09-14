@@ -266,7 +266,7 @@ test("one goal, one workspace, four native workers: reads everywhere, DIRECT wri
     // 1. Claude reads the document.
     "/use anthropic/claude-sonnet-5",
     "Summarize the test document in this workspace.", "y",
-    // 2. Antigravity reads the same document from the same workspace.
+    // 2. Antigravity is asked for the same read and refused, with the measurement as the reason.
     "/use google/gemini-3.8-flash-medium",
     "Read the same file from the current workspace and tell me what the previous worker established.", "y",
     // 3. Codex inspects it, with no modification.
@@ -305,7 +305,11 @@ test("one goal, one workspace, four native workers: reads everywhere, DIRECT wri
 
       // All four providers were reached, and the two non-Claude writers wrote the real file.
       assert.equal(workers.readsFor("anthropic").length >= 2, true, "Claude read first and summarized last");
-      assert.equal(workers.readsFor("google").length, 1, "Antigravity read the file");
+      // Antigravity cannot run a DIRECT read at all — measured, not assumed — so the honest
+      // outcome is a refusal that names the measurement rather than an invocation that half-works.
+      assert.equal(workers.readsFor("google").length, 0, "Antigravity is not invoked for a DIRECT read");
+      assert.match(text, /auto-denies every tool/, "and the operator is told why, with the measurement");
+      assert.match(text, /permissions\.allow|dangerously-skip-permissions/, "and what would open it");
       assert.equal(workers.readsFor("xai").length, 1, `Grok verified the file: reads=${JSON.stringify(workers.reads.map((c) => c.providerId))}\nPLANS:\n${[...text.matchAll(/(read-only|write) · [^\n]*/g)].map((m) => m[0]).join("\n")}\nTAIL:\n${text.slice(-700)}`);
       assert.equal(workers.writesFor("xai").length, 1, "Grok performed a DIRECT write");
       assert.equal(workers.writesFor("openai").length, 1, "and so did Codex");
@@ -331,17 +335,23 @@ test("one goal, one workspace, four native workers: reads everywhere, DIRECT wri
       assert.equal(workers.writesFor("xai")[0]!.pinned !== null, true, "and Grok names the one it writes in");
 
       // The whole sequence is one conversation, and every task belongs to the one goal.
+      // Seven turns, not eight: the refused Antigravity request is not a turn. A plan that never
+      // became work leaves no history behind, which is the same rule a failed confirmation follows.
       const turns = goals.recentTurns(goal!.conversationId, 50);
-      assert.equal(turns.length, 8, `every turn is on the timeline\n${text}`);
+      assert.equal(turns.length, 7, `every turn that ran is on the timeline, and only those\n${text}`);
       const tasks = ledger.listTasks().filter((task) => task.goalId === goal!.goalId);
-      assert.equal(tasks.length, 8, "and every task recorded the goal it was a work unit of");
+      assert.equal(tasks.length, 7, "and every task recorded the goal it was a work unit of");
+      assert.equal(tasks.some((task) => task.title.startsWith("Read the same file from the current workspace")), false, "the refused worker left no task");
       for (const task of tasks) assert.notEqual(task.route, null, `${task.taskId} recorded its route`);
 
       // Session decisions are on the record for each provider, with the envelope they ran under.
       const sessions = goals.listProviderSessions();
-      for (const providerId of ["anthropic", "google", "openai", "xai"]) {
+      for (const providerId of ["anthropic", "openai", "xai"]) {
         assert.equal(sessions.some((item) => item.providerId === providerId), true, `${providerId} has a session on record`);
       }
+      // And the provider that never ran holds no session: a refusal is not a turn, so it leaves no
+      // reference behind either.
+      assert.equal(sessions.some((item) => item.providerId === "google"), false, "the refused provider holds no session");
       const reported = codexReads[1]!.resumed;
       const codexSession = sessions.find((item) => item.providerId === "openai" && item.sessionId === reported);
       assert.notEqual(codexSession, undefined, "the id Codex reported is on record");

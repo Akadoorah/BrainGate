@@ -1052,7 +1052,9 @@ test("N: a workspace with no repository attaches and reports Git as metadata it 
  * resume it would pass whichever implementation it was given, which is why both halves are asserted.
  */
 test("K: a runtime that reports its own session id is resumed on it, and never claims a pinned one", async () => {
-  for (const [providerId, modelId] of [["openai", "codex-fast"], ["google", "gemini-fast"]] as const) {
+  // Codex only: Antigravity has the same reported-id shape but cannot run a DIRECT read at all,
+  // which its own test records rather than this one asserting a capability that was measured away.
+  for (const [providerId, modelId] of [["openai", "codex-fast"]] as const) {
     const f = fixture(`reported-${providerId}`, [{ providerId, modelId, coder: 100, speed: "fast" }]);
     const cli = new FakeCli({ "Read the notes file": "Three lines about a launch screen." });
     const session = sessionOf(f.repo, f.env, cli, [

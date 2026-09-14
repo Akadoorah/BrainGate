@@ -28,7 +28,7 @@ import type { WriteProviderPlan } from "./types.js";
  * human. Those apply identically whoever did the typing (ADR 0008). What a second provider has
  * to add is a bounded place to work — which is exactly what a grant now expresses (ADR 0010).
  */
-export const WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["anthropic", "xai", "openai", "google"]);
+export const WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["anthropic", "xai", "openai"]);
 
 export function isWriteProvider(providerId: string): providerId is ProviderId {
   return (WRITE_PROVIDERS as readonly string[]).includes(providerId);
@@ -47,7 +47,7 @@ const GROK_MINIMUM = "1.0.13";
  * ADR 0017: this is the set of providers that gained a DIRECT write in the multi-provider
  * milestone, and `directWriteCapable` is the question callers should ask instead of membership.
  */
-export const DIRECT_WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["xai", "openai", "google"]);
+export const DIRECT_WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["xai", "openai"]);
 
 /** Whether this provider may write the workspace itself under the DIRECT policy. */
 export function directWriteCapable(providerId: ProviderId): boolean {
@@ -345,30 +345,7 @@ function planDirectWrite(input: WriteInvocationInput): WriteProviderPlan {
   if (input.snapshot.providerId !== "google") {
     throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${input.snapshot.displayName} has no measured DIRECT write invocation.`);
   }
-  const args = Object.freeze([
-    "--output-format", "json",
-    "--model", input.model.modelId,
-    "--effort", "medium",
-    // Antigravity's own accept-edits mode: the edit tools are approved, the rest are not.
-    "--mode", "accept-edits",
-    ...(resumedId === null ? [] : ["--conversation", resumedId]),
-    `-p=${WRITE_INSTRUCTION}\n\n${body}`,
-  ]);
-  if (args.some((argument) => argument === "--dangerously-skip-permissions" || argument === "--sandbox" || argument === "--add-dir" || argument === "--new-project")) {
-    throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe, sandboxed or workspace-widening Antigravity flags are forbidden for a DIRECT write.");
-  }
-  return Object.freeze({
-    providerId: "google",
-    executable: input.snapshot.binary,
-    args,
-    cwd: input.cwd,
-    modelId: input.model.modelId,
-    quotaPool: input.model.quotaPool,
-    stdin: "",
-    allowedEnvKeys: Object.freeze([]),
-    envOverrides: Object.freeze({}),
-    grant,
-  });
+  throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${input.snapshot.displayName} auto-denies every tool it would need in headless mode, so BrainGate has no DIRECT write for it. Its DIRECT read is blocked for the same reason.`);
 }
 
 /**

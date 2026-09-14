@@ -1,3 +1,4 @@
+import { join } from "node:path";
 import { BrainGateInvariantError, ProviderQuotaRefusalError, failureKindFromCode, type ExecutionProject, type TaskLedger } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { redactSecrets } from "@braingate/security";
@@ -650,10 +651,17 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
         model: request.model.modelId,
       });
     }
+    // A schema for the runs whose CLI enforces one from a path: Codex, on the DIRECT path only, since
+    // a staged run puts it in the staged workspace. Written under this project's storage, never in
+    // the workspace the run is reading.
+    const schemaPath = this.#nativeHarness && request.model.providerId === "openai" && this.#taskId !== null
+      ? join(this.#project.storageDir, "shadow-schemas", `${this.#taskId}.json`)
+      : undefined;
     const plan = planShadowInvocation({
       snapshot,
       model: request.model,
       ...(session === null ? {} : { nativeSession: session }),
+      ...(schemaPath === undefined ? {} : { schemaPath }),
       ...(this.#nativeHarness ? { nativeHarness: true } : {}),
       cwd: this.#cwd,
       ...(snapshotEvidence === null ? {} : { snapshotPrimary: true, workspaceRoot: snapshotEvidence.root }),

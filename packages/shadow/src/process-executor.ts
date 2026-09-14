@@ -1,5 +1,5 @@
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from "node:fs";
-import { isAbsolute, join, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn } from "node:child_process";
 import { BrainGateInvariantError, type ExecutionProject } from "@braingate/core";
@@ -146,6 +146,14 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
             overrides.GROK_HOME = operatorGrokHome;
           }
           overrides.HOME = isolatedHome;
+        }
+
+        for (const [path, content] of Object.entries(input.plan.externalFiles ?? {})) {
+          if (!isAbsolute(path) || path.includes("..")) {
+            throw new BrainGateInvariantError("SHADOW_EXTERNAL_FILE_INVALID", "An external file needs an absolute path outside the workspace.");
+          }
+          mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+          writeFileSync(path, content, { encoding: "utf8", mode: 0o600, flag: "w" });
         }
 
         for (const [name, content] of Object.entries(input.plan.stagedFiles ?? {})) {

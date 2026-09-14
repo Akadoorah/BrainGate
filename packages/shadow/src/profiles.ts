@@ -129,6 +129,14 @@ interface ProfileDefinition {
    */
   readonly nativeDirect?: boolean;
   /**
+   * Why a CLI that looks like it could run natively cannot, with the measurement.
+   *
+   * Recorded rather than left as a bare `false`, because the difference between "untried" and
+   * "measured and blocked" is the difference between a limitation and an omission — and because the
+   * operator is the one who can lift it.
+   */
+  readonly nativeDirectBlockedBecause?: string;
+  /**
    * What this CLI can be asked for, from the flags it actually exposes (ADR 0010).
    *
    * Not a judgement about the provider: a CLI with no way to deny a tool cannot be granted one,
@@ -174,7 +182,16 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // one an isolated home the way it does for Codex and Grok. A staged run therefore keeps the
   // operator's real home, and what agy may reach elsewhere on the machine is unchecked — which
   // is the residual only the operator can accept (ADR 0008).
-  google: { providerId: "google", enabled: false, nativeDirect: true, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
+  // Measured 2026-09-14 against agy 1.2.2, and the answer is no: headless Antigravity auto-denies
+  // every tool that would need a prompt, and a DIRECT run needs tools — it has to read the workspace
+  // it was pointed at. `--mode accept-edits` was denied for `read_file`, `--mode plan` was denied for
+  // `read_file`, `--sandbox` was denied for `read_file`, and with a project-local allow-rule for
+  // reads it was then denied for `command`. What is left is `--dangerously-skip-permissions`, which
+  // approves every tool with no scope BrainGate can see, or a persistent allow-rule set in the
+  // operator's own settings.json. BrainGate will not write the second on the operator's behalf and
+  // will not pass the first without their decision, so the capability is marked blocked rather than
+  // claimed — and the refusal says which two things would lift it.
+  google: { providerId: "google", enabled: false, nativeDirect: false, nativeDirectBlockedBecause: "Antigravity auto-denies every tool it would need in headless mode (measured 2026-09-14 on agy 1.2.2: read_file denied under --mode accept-edits, --mode plan and --sandbox; command denied once reads were allowed), so a DIRECT run cannot inspect the workspace. Add the allow-rules it needs under permissions.allow in its settings.json, or accept --dangerously-skip-permissions, and this opens.", stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
 });
 
 /**
@@ -370,6 +387,15 @@ export function planShadowInvocation(input: {
    * because a plan that says `nativeHarness` and an argv that ignores user config is a lie.
    */
   readonly nativeHarness?: boolean;
+  /**
+   * Where a DIRECT Codex run's response schema is written, when one is supplied.
+   *
+   * Codex takes the schema as a path and enforces it; without one the model narrates, and a real run
+   * did exactly that — it read the workspace correctly with its own tools and then answered in prose,
+   * which the role contract could not parse. The file lives outside the workspace so it cannot join
+   * the diff, and at an absolute path the run is not confined to.
+   */
+  readonly schemaPath?: string;
   readonly now?: Date;
 }): ShadowInvocationPlan {
   const now = input.now ?? new Date();
@@ -380,9 +406,10 @@ export function planShadowInvocation(input: {
     // without a DIRECT branch below is invoked with a staged-copy argv — `--ignore-user-config`,
     // `--ignore-rules`, a sandbox profile earned against a copy — and re-deriving each one needs a
     // measurement this build has not taken. Reported, not silently downgraded.
+    const blocked = PROFILES[input.snapshot.providerId].nativeDirectBlockedBecause;
     throw new BrainGateInvariantError(
       "SHADOW_NATIVE_HARNESS_UNSUPPORTED",
-      `${input.snapshot.displayName} has no measured DIRECT invocation: its argv is built around a staged copy and a sandbox proof earned against it. Use the snapshot or worktree policy for it, or select a provider whose native harness BrainGate has measured.`,
+      blocked ?? `${input.snapshot.displayName} has no measured DIRECT invocation: its argv is built around a staged copy and a sandbox proof earned against it. Use the snapshot or worktree policy for it, or select a provider whose native harness BrainGate has measured.`,
     );
   }
   if (nativeHarness && snapshotPrimary) {
@@ -572,6 +599,7 @@ export function planShadowInvocation(input: {
       // the sandbox is set through the config override the resume subcommand does take. Measured on
       // codex-cli 0.153.4 — `exec resume` rejects `-s` outright, and accepts `-c sandbox_mode="..."`.
       const resumeId = session.kind === "resumed" && session.sessionId !== null ? session.sessionId : null;
+      const schemaArgs = input.schemaPath === undefined ? [] : ["--output-schema", input.schemaPath];
       const args = Object.freeze(resumeId === null
         ? [
           "exec",
@@ -580,6 +608,7 @@ export function planShadowInvocation(input: {
           "--sandbox", "read-only",
           "--model", input.model.modelId,
           ...(session.persistent ? [] : ["--ephemeral"]),
+          ...schemaArgs,
           "-",
         ]
         : [
@@ -588,6 +617,7 @@ export function planShadowInvocation(input: {
           "--model", input.model.modelId,
           "-c", 'sandbox_mode="read-only"',
           ...(session.persistent ? [] : ["--ephemeral"]),
+          ...schemaArgs,
           resumeId,
           "-",
         ]);
@@ -613,6 +643,7 @@ export function planShadowInvocation(input: {
         streamDialect: null,
         guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false })),
         nativeHarness: true,
+        ...(input.schemaPath === undefined ? {} : { externalFiles: Object.freeze({ [input.schemaPath]: schema }) }),
         minimumVersion: profile.minimumVersion,
       });
     }
@@ -997,7 +1028,7 @@ export function shadowProviderRoleStatus(
     if (profile.nativeDirect !== true) {
       return Object.freeze({
         enabled: false,
-        reason: `${profile.blockedReason ?? "Provider has no DIRECT invocation."} BrainGate has no measured native invocation for it.`,
+        reason: profile.nativeDirectBlockedBecause ?? `${profile.blockedReason ?? "Provider has no DIRECT invocation."} BrainGate has no measured native invocation for it.`,
         acceptedByOperator: false,
       });
     }

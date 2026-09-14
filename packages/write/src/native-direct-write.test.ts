@@ -57,10 +57,11 @@ function writePlan(providerId: ProviderId, session?: { kind: "fresh" | "resumed"
 }
 
 test("a DIRECT write is planned for every provider on the measured list, and only those", () => {
-  assert.deepEqual([...DIRECT_WRITE_PROVIDERS], ["xai", "openai", "google"], "measured after Claude, which is the reference implementation");
+  assert.deepEqual([...DIRECT_WRITE_PROVIDERS], ["xai", "openai"], "measured after Claude, which is the reference implementation");
   assert.equal(directWriteCapable("anthropic"), true, "Claude has had one since ADR 0017");
   for (const providerId of DIRECT_WRITE_PROVIDERS) assert.equal(directWriteCapable(providerId), true);
   assert.equal(directWriteCapable("github-copilot"), false);
+  assert.equal(directWriteCapable("google"), false, "Antigravity cannot obtain the tools a headless DIRECT write needs");
   assert.equal(directWriteCapable("openai"), true);
   for (const providerId of DIRECT_WRITE_PROVIDERS) {
     const plan = writePlan(providerId);
@@ -113,14 +114,20 @@ test("Grok DIRECT continues its session by id, and pins a new one when it has on
   assert.equal(fresh.includes("--resume"), false);
 });
 
-test("Antigravity DIRECT writes in its accept-edits mode, and continues a conversation when it has one", () => {
-  const plan = writePlan("google");
-  const args = [...plan.args];
-  assert.deepEqual(args.slice(args.indexOf("--mode"), args.indexOf("--mode") + 2), ["--mode", "accept-edits"]);
-  assert.equal(args.some((argument) => argument.startsWith("-p=")), true, "the prompt is attached to -p");
-  for (const flag of ["--dangerously-skip-permissions", "--sandbox", "--add-dir", "--new-project"]) assert.equal(args.includes(flag), false, `${flag} is a bypass or widens the workspace`);
-  const resumed = [...writePlan("google", { kind: "resumed", sessionId: "5e1e942f-772b-47e3-b220-e85f65fef3f6", persistent: true }).args];
-  assert.deepEqual(resumed.slice(resumed.indexOf("--conversation"), resumed.indexOf("--conversation") + 2), ["--conversation", "5e1e942f-772b-47e3-b220-e85f65fef3f6"]);
+test("Antigravity is refused a DIRECT write for the same measured reason as its read", () => {
+  assert.throws(
+    () => planWriteInvocation({
+      snapshot: snapshot("google", "1.2.2"),
+      model: { providerId: "google", modelId: "google-model", quotaPool: "google-subscription" },
+      cwd: WORKSPACE,
+      nativeHarness: true,
+      task: "Append one inert comment line.",
+      context: Object.freeze({}),
+      schemaPath: SCHEMA_PATH,
+      now: new Date("2026-09-14T01:00:00Z"),
+    }),
+    /no write profile|DIRECT write profile only|auto-denies every tool/,
+  );
 });
 
 test("a DIRECT write needs no sandbox self-test, because it does not use one BrainGate wrote", () => {
@@ -145,6 +152,6 @@ test("Antigravity has no worktree write profile, so that policy refuses it rathe
       schemaPath: SCHEMA_PATH,
       now: new Date("2026-09-14T01:00:00Z"),
     }),
-    /DIRECT write profile only/,
+    /no write profile|DIRECT write profile only/,
   );
 });
