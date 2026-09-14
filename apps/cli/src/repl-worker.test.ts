@@ -878,15 +878,18 @@ test("M: a pasted multiline request stays pending until Enter, then submits once
   // Four lines, not three: the paste ended with a newline, so its last line is empty — and that is
   // kept rather than trimmed, because it is what the operator pasted.
   assert.match(terminal.written(), /pasted 4 lines — Enter sends, Ctrl\+C clears/, "the draft is visible as pending");
-  assert.match(terminal.written(), /Find why users are logged out/, "and the pasted text is echoed as the lines it is");
+  // The pending view is one row showing the tail of the draft, with its line breaks marked: the
+  // composer owns one row so that no redraw can reach the output above it (see prompt-input.ts).
+  assert.match(terminal.written(), /Keep the answer concise/, "the end of the draft is what is shown while it is pending");
 
-  // The explicit submit, and only then.
+  // The explicit submit, and only then — and the whole request is echoed as output.
   terminal.enter();
   assert.equal(
     await request,
     "Find why users are logged out.\nTrace the session path.\nKeep the answer concise.\n",
     "the whole paste is one request, exactly as pasted",
   );
+  assert.match(terminal.written(), /Find why users are logged out\.\r\nTrace the session path\./, "and the submitted request is echoed in full, as the lines it is");
 });
 
 test("M: a paste followed by typing and one Enter is still one request", async () => {

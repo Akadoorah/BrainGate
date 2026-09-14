@@ -521,10 +521,27 @@ export class WriteDogfoodRunner {
       finalized = true;
       this.#finalizer.finalize(finalization);
     };
+    /**
+     * Who did the work, written before the receipt that has to carry it.
+     *
+     * This used to be appended only in the `finally`, which runs *after* the return expression has
+     * been evaluated — so the receipt handed back to the caller was a snapshot from before its own
+     * execution record existed. The read path's receipt has always carried it; the write path's did
+     * not, which is why a write turn reached the goal delta with no attribution at all and the
+     * operator was told "another worker" about a change whose author the ledger knew.
+     */
+    let executionRecorded = false;
+    const recordExecution = (): void => {
+      if (executionRecorded) return;
+      executionRecorded = true;
+      try { this.#ledger.appendEvent(task.taskId, "task.execution", executionRecord(executionAttribution({ events: this.#ledger.receipt(task.taskId).events, planned: observationRolesFor(plan.roles) }))); }
+      catch { /* evidence, not the run's own error: never replace it */ }
+    };
     // The receipt is read after finalization, not while building the return value: a return
     // expression is evaluated before the surrounding `finally` runs, so reading it there would
     // report the state from before the outcome was recorded.
     const finish = (): TaskReceipt => {
+      recordExecution();
       complete();
       return this.#ledger.receipt(task.taskId);
     };
@@ -831,9 +848,9 @@ export class WriteDogfoodRunner {
       // if the release throws: an unremovable worktree must not also lose the task's outcome.
       try { worktrees.close(); }
       finally {
-        // The attribution is durable before the observation that reads it.
-        try { this.#ledger.appendEvent(task.taskId, "task.execution", executionRecord(executionAttribution({ events: this.#ledger.receipt(task.taskId).events, planned: observationRolesFor(plan.roles) }))); }
-        catch { /* evidence, not the run's own error: never replace it */ }
+        // The attribution is durable before the observation that reads it, and this is the crash
+        // path's only chance to write it: a run that never reached `finish` still records who ran.
+        recordExecution();
         try { complete(); } catch { /* an incomplete record is reconciled later, not hidden */ }
       }
     }

@@ -23,6 +23,8 @@ import {
   DEFAULT_EXECUTION_POLICY,
   executionPolicySpec,
   type ExecutionPolicyId,
+  recordedExecutionAttribution,
+  type TaskEvent,
 } from "@braingate/core";
 import {
   DogfoodStore,
@@ -163,6 +165,31 @@ interface CodexIsolationStatus {
   readonly eligible: boolean;
   readonly attestation: CodexIsolationAttestation | null;
   readonly reason: string | null;
+}
+
+/**
+ * Who actually did the work, read from the task's own execution record.
+ *
+ * The plan says who *would* run; `task.execution` is written by the runner that watched the
+ * invocations and says who did. Attribution derived anywhere else — from streamed activity, from the
+ * prose of an answer, from a marker left in a file — is a second derivation of one fact, and the two
+ * disagree the moment either is wrong. A real smoke showed exactly that: read turns recorded
+ * `["anthropic/claude-sonnet-5"]` and `["xai/grok-4.6"]` while both WRITE turns recorded `[]`, so the
+ * goal delta said "another worker" about work whose author was on the ledger the whole time.
+ *
+ * Only roles that completed are named: a role that was routed and then failed did not produce the
+ * turn, and naming it would attribute the work to a worker that never finished it.
+ */
+function executedBy(receipt: { readonly events: readonly TaskEvent[] } | null): readonly string[] {
+  const roles = receipt === null ? null : recordedExecutionAttribution(receipt.events);
+  if (roles === null) return Object.freeze([]);
+  const names: string[] = [];
+  for (const role of roles) {
+    if (role.status !== "completed") continue;
+    const name = `${role.providerId}/${role.modelId}`;
+    if (!names.includes(name)) names.push(name);
+  }
+  return Object.freeze(names);
 }
 
 function removeFlag(args: string[], name: string): boolean {
@@ -849,7 +876,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       }, ...(deps.onText === undefined ? {} : { onText: deps.onText }), ...(deps.onThinking === undefined ? {} : { onThinking: deps.onThinking }), onQuotaReading: (reading) => { pendingQuotaReadings.push(reading); }, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }) });
       const result = await runner.run({ title: taskTitleFor(task), task, cwd, classification: effective, budget, requiredContextTokens, context, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), contextSummary: { memoryRecords: memory.recordCount, explicitCandidates: 0, includedItems: 1 + memory.recordCount, estimatedTokens: requiredContextTokens + memory.estimatedTokens, truncatedItems: memory.truncated, sourceLabels: memory.recordCount === 0 ? ["dogfood-minimal-context"] : ["dogfood-minimal-context", "project-canonical-memory"] }, optionalReview, dryRun: false });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_RECEIPT_MISSING", "Executed dogfood ask did not produce a task receipt.");
-      deps.onTurnAttribution?.(Object.freeze([...servedBy]));
+      deps.onTurnAttribution?.(executedBy(result.taskReceipt));
       // The runner recorded the outcome, the result and the observation; this reads them back
       // rather than deciding again. A second derivation here is how the screen and the ledger end
       // up disagreeing about the same task.
@@ -968,6 +995,9 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, policy, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
+      // A write turn is a turn like any other, and the goal history has to name the worker that made
+      // the change: a later worker reading the delta must be able to tell who wrote what.
+      deps.onTurnAttribution?.(executedBy(result.taskReceipt));
       // Read back what the runner recorded, so the screen and the ledger cannot disagree.
       const recorded = recordedOutcomeOf(result.taskReceipt);
       const observationSequence = store.find(result.taskId)?.sequence ?? null;

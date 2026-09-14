@@ -1,6 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createPromptInput, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawnSync } from "node:child_process";
+import { createPromptInput, displayWidth, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
 
 /**
  * Prompt input correctness: paste is a boundary, not a race.
@@ -23,7 +27,7 @@ class Terminal {
   rawModes: boolean[] = [];
   readonly input: PromptInput;
 
-  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void } = {}) {
+  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number } = {}) {
     this.input = createPromptInput({
       input: {
         on: (event: string, listener: never) => {
@@ -36,6 +40,8 @@ class Terminal {
       },
       write: (text: string) => { this.#written.push(text); options.onWrite?.(text); },
       terminal: options.terminal ?? true,
+      // A width wide enough that the draft fits, unless a test is about the fitting.
+      columns: options.columns ?? 200,
     });
   }
 
@@ -107,6 +113,13 @@ class VirtualTerminal {
         index += 4;
         continue;
       }
+      if (rest.startsWith("\u001b[2K")) {
+        // Erase the whole row the cursor is on, cursor unmoved. This is the only erase the composer
+        // emits now: it owns one row, and clearing that row cannot reach any other.
+        this.#rows[this.#row] = "";
+        index += 4;
+        continue;
+      }
       if (rest.startsWith("\u001b[J")) {
         // Erase from the cursor to the end of the display: this row keeps what is left of it, every
         // row below it is gone. This is the whole mechanism the redraw relies on.
@@ -144,9 +157,9 @@ class VirtualTerminal {
 }
 
 /** A terminal that both records bytes and displays them. */
-function displayTerminal(): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
+function displayTerminal(options: { readonly columns?: number } = {}): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
   const screen = new VirtualTerminal();
-  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); } });
+  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); }, ...(options.columns === undefined ? {} : { columns: options.columns }) });
   return { terminal, screen };
 }
 
@@ -534,7 +547,10 @@ test("F: an Arabic multiline paste keeps its lines and its order", async () => {
   const content = "\u0645\u0631\u062D\u0628\u0627\n\u062C\u0631\u0628 \u062A\u0639\u062F\u064A\u0644 \u0627\u0644\u0645\u0644\u0641\n\u0644\u0627 \u062A\u0639\u0645\u0644 commit";
   terminal.paste(content.replace(/\n/g, "\r"), { splitAt: 5 });
   await terminal.input.idle();
-  assert.equal(screen.screen(), `> ${content}\n  [pasted 3 lines — Enter sends, Ctrl+C clears]`, "all three lines are on screen, in order, once");
+  // One row, with the line breaks shown as `↵`. The buffer still holds three lines — asserted below —
+  // and the row is the whole draft as far as the width allows, which is what keeps the cursor on a row
+  // whose height this module does not have to count.
+  assert.equal(screen.screen(), `> ${content.replace(/\n/g, "\u21b5")}  [pasted 3 lines — Enter sends, Ctrl+C clears]`, "the draft is on one row, in order, once");
   terminal.enter();
   assert.equal(await pending, content, "the pasted text is the draft, normalised once");
 });
@@ -549,13 +565,13 @@ test("G: Backspace after an Arabic paste edits the logical draft", async () => {
   await terminal.input.idle();
   // The notice is part of the render, not a line written once: it is reprinted with the draft, so it
   // can never become a stale suffix, and it is still true — the draft is still the pasted text.
-  const notice = "\n  [pasted 2 lines — Enter sends, Ctrl+C clears]";
+  const notice = "  [pasted 2 lines — Enter sends, Ctrl+C clears]";
   terminal.chunk("\u007f");
   await terminal.input.idle();
-  assert.equal(screen.screen(), `> ${first}\n\u062C\u0631${notice}`, "the last letter of the last line goes");
+  assert.equal(screen.screen(), `> ${first}\u21b5\u062C\u0631${notice}`, "the last letter of the last line goes");
   terminal.chunk("\u007f");
   await terminal.input.idle();
-  assert.equal(screen.screen(), `> ${first}\n\u062C${notice}`, "and the next, on the same line");
+  assert.equal(screen.screen(), `> ${first}\u21b5\u062C${notice}`, "and the next, on the same line");
   terminal.chunk("\u007f");
   terminal.chunk("\u007f");
   await terminal.input.idle();
@@ -596,7 +612,7 @@ test("I: Ctrl+C clears an Arabic draft without submitting any of it", async () =
   assert.equal(await pending, "\u0644\u0627", "and what is typed afterwards is what is submitted");
 });
 
-test("J: every edit is a fresh render from the anchor, never an incremental cell erase", async () => {
+test("J: every edit is a one-row redraw, and the cursor is never moved up", async () => {
   const { terminal, screen } = displayTerminal();
   const pending = terminal.input.ask("> ");
   terminal.type(MARHABA + MARHABA);
@@ -612,11 +628,18 @@ test("J: every edit is a fresh render from the anchor, never an incremental cell
   assert.doesNotMatch(bytes, /\u007f/, "and no erase byte is written to the terminal at all");
   assert.doesNotMatch(bytes, /\u001b\[[0-9]*D/, "nor a cursor-left");
 
-  // Each deletion cleared from the anchor down and reprinted the draft: one erase-to-end-of-display
-  // per edit — ten characters typed one byte at a time, then five Backspaces — and no render that
-  // reprints only part of the draft. Nothing incremental is attempted anywhere in the stream.
-  assert.equal(bytes.split("\u001b[J").length - 1, 15, "one full redraw per edit, and nothing else");
-  assert.equal(screen.screen(), `> ${MARHABA}`, "and the screen is the draft as it stands, with no stale suffix");
+  // And the newer mechanism's own hazard, asserted gone as well: the cursor never leaves the row the
+  // composer owns. No cursor-up, no cursor-down, and no erase-to-end-of-display — the three bytes that
+  // together let a mis-counted anchor delete the operator's history.
+  assert.doesNotMatch(bytes, /\u001b\[[0-9]*A/, "the cursor is never moved up");
+  assert.doesNotMatch(bytes, /\u001b\[1B/, "nor down off the draft's row");
+  assert.doesNotMatch(bytes, /\u001b\[J/, "nor is anything erased below this row");
+
+  // Each deletion cleared its own row and reprinted the draft: one erase-line per edit — ten
+  // characters typed one byte at a time, then five Backspaces — and no render that reprints only part
+  // of the draft. Nothing incremental is attempted anywhere in the stream.
+  assert.equal(bytes.split("\u001b[2K").length - 1, 15, "one row redraw per edit, and nothing else");
+  assert.equal(screen.screen(), `> ${MARHABA}`, "and the row is the draft as it stands, with no stale suffix");
   terminal.enter();
   assert.equal(await pending, MARHABA);
 });
@@ -672,7 +695,16 @@ test("Q: the display shows the pasted draft rather than a re-rendering of it", a
   // Every line of the draft is on screen, in order, once. Before the composer normalised pasted line
   // endings this is what broke: the CRs were kept, so each line was written over the one before it and
   // the operator read a sentence that had never been typed.
-  assert.equal(screen.screen(), `> ${DOGFOOD_REQUEST}\n  [pasted 8 lines — Enter sends, Ctrl+C clears]`);
+  // One row: the draft's tail as far as the default width allows, its line breaks shown, and the count
+  // of lines it holds. The full text is asserted where it belongs — in what is submitted.
+  const shown = DOGFOOD_REQUEST.replace(/\n/g, "\u21b5");
+  const row = screen.screen();
+  assert.equal(row.startsWith("> "), true);
+  assert.equal(row.endsWith("  [pasted 8 lines — Enter sends, Ctrl+C clears]"), true, `the line count is on the row: ${row}`);
+  assert.equal(row.includes("\u21b5"), true, "and the line breaks are visible as such");
+  const draftOnRow = row.slice(2, row.indexOf("  [pasted"));
+  assert.equal(shown.endsWith(draftOnRow.startsWith("\u2026") ? draftOnRow.slice(1) : draftOnRow), true, "what is shown is the tail of the draft, not a re-rendering of it");
+  assert.equal(draftOnRow.endsWith("later."), true, "and the end of the draft is what stayed visible, because that is where the cursor is");
   assert.equal(screen.screen().indexOf("1. which file you selected,") > screen.screen().indexOf("Tell me:"), true, "the list appears in order");
   assert.equal(screen.screen().indexOf("3. one harmless") > screen.screen().indexOf("2. why it is safe"), true);
   // A CR the composer writes is positioning its own output. A CR inside the *draft* is content, and
@@ -716,4 +748,212 @@ test("the request that reaches the caller is the composed draft, exactly", async
   // This string is what the REPL stores as the conversation turn, the task request and the goal's
   // objective. It is the draft; nothing downstream re-derives or trims it.
   assert.equal(delivered, `${DOGFOOD_REQUEST}\n`);
+});
+
+// ---------------------------------------------------------------- history is never touched
+
+/**
+ * The defect this section exists for, in the operator's words: "I paste multiline text, press
+ * Backspace repeatedly, and the terminal display becomes corrupted — it can visually continue
+ * deleting text that belongs to earlier BrainGate output."
+ *
+ * It did. The composer kept an anchor counted as `lines + notice`, which is not the number of rows a
+ * draft occupies: a four-line draft moved the cursor up eight rows, and every redraw after that
+ * cleared from several rows above the draft — inside the run's own output — and reprinted. Deleting
+ * the draft walked that erase further up the screen, so the operator watched history disappear line
+ * by line.
+ *
+ * The composer now owns exactly one row and never moves the cursor off it, so these tests assert the
+ * invariant directly: whatever was on screen before the prompt is still there afterwards, byte for
+ * byte, however the draft is edited. They fail against the old renderer and cannot be satisfied by
+ * arithmetic that happens to be right for one terminal width.
+ */
+
+/** Some output of the kind a run prints before the next prompt. */
+function printRunOutput(screen: VirtualTerminal): string {
+  screen.write("Dogfood preflight m21: ask=ready · write=ready · configured=10 · model calls=0\r\n");
+  screen.write("  read-only · direct · in your workspace · T1/low · primary=anthropic/claude-sonnet-5\r\n");
+  screen.write("Task 11111111-2222-3333-4444-555555555555 · observed=1 · outcome=SUCCESS\r\n");
+  screen.write("  session: new native session abc12345\r\n");
+  return screen.screen();
+}
+
+const MULTILINGUAL_DRAFT = [
+  "english line",
+  "سطر عربي للاختبار",
+  "emoji: 👩‍💻🚀",
+  "another long line that wraps in a normal terminal width — ".repeat(3).trimEnd(),
+].join("\n");
+
+test("H1: deleting a pasted multilingual draft leaves every earlier line intact", async () => {
+  const { terminal, screen } = displayTerminal({ columns: 60 });
+  const history = printRunOutput(screen);
+  const pending = terminal.input.ask("> ");
+  terminal.paste(MULTILINGUAL_DRAFT);
+  await terminal.input.idle();
+  const whilePasted = screen.screen();
+  assert.notEqual(whilePasted, history, "the draft is on screen");
+
+  // Delete the whole draft, then keep pressing Backspace.
+  for (let index = 0; index < 400; index += 1) terminal.chunk("\u007f");
+  await terminal.input.idle();
+
+  const after = screen.screen();
+  assert.equal(history.split("\n").every((line) => after.includes(line)), true, `every earlier line is still present\n${after}`);
+  assert.equal(after.endsWith(`> `) || after.endsWith(">"), true, `and the prompt is on the last row, empty\n${JSON.stringify(after.slice(-40))}`);
+  assert.equal(after.includes("سطر"), false, "no stale Arabic remains");
+  assert.equal(after.includes("👩"), false, "and no broken emoji grapheme remains");
+  const bytes = screen.bytes();
+  assert.doesNotMatch(bytes, /\u001b\[[0-9]*A/, "the cursor was never moved up");
+  assert.doesNotMatch(bytes, /\u001b\[J/, "and nothing below the composer's row was ever erased");
+
+  // The prompt still works: type a request, submit it once.
+  terminal.type("second request");
+  terminal.enter();
+  assert.equal(await pending, "second request", "typing after the deletions works, and submits once");
+});
+
+test("H2: the earlier output is byte-for-byte identical after the whole edit sequence", async () => {
+  const { terminal, screen } = displayTerminal({ columns: 60 });
+  const history = printRunOutput(screen);
+  const pending = terminal.input.ask("> ");
+  terminal.paste(MULTILINGUAL_DRAFT);
+  await terminal.input.idle();
+  terminal.chunk("\u007f".repeat(30));           // delete part of the last line
+  terminal.type("replacement tail");             // type something new
+  await terminal.input.idle();
+  terminal.chunk("\u007f".repeat(60));           // delete that and more
+  terminal.type("final");
+  await terminal.input.idle();
+  terminal.chunk("\u007f".repeat(200));          // delete the rest, then keep going
+  await terminal.input.idle();
+
+  const rows = screen.screen().split("\n");
+  assert.deepEqual(rows.slice(0, history.split("\n").length), history.split("\n"), "the run's own output, unchanged and unmoved");
+  assert.equal(screen.cursorRow().startsWith(">"), true, "the cursor is on the prompt row");
+  terminal.enter();
+  assert.equal(await pending, "", "the draft was fully deleted, so Enter submits an empty request");
+});
+
+test("H3: an Arabic-only paste deletes to empty, and extra Backspaces are a no-op", async () => {
+  const { terminal, screen } = displayTerminal({ columns: 60 });
+  const history = printRunOutput(screen);
+  const pending = terminal.input.ask("> ");
+  const arabic = "مرحبا بالعالم";
+  terminal.paste(arabic);
+  await terminal.input.idle();
+  for (let index = 0; index < arabic.length; index += 1) terminal.chunk("\u007f");
+  await terminal.input.idle();
+  const emptied = screen.screen();
+  const before = screen.bytes().length;
+  for (let index = 0; index < 25; index += 1) terminal.chunk("\u007f");
+  await terminal.input.idle();
+  assert.equal(screen.screen(), emptied, "Backspace on an empty draft changes nothing on screen");
+  assert.equal(screen.bytes().length, before, "and writes no bytes at all — not even a redraw");
+  assert.equal(emptied.includes(history), true, "the earlier output survived the whole sequence");
+  terminal.enter();
+  assert.equal(await pending, "", "an empty draft submits as empty");
+});
+
+test("H4: the draft's row never exceeds the terminal width, so it can never soft-wrap", async () => {
+  // A soft-wrapped row is the thing the removed anchor could not count. The composer keeps the row
+  // inside the width instead, showing the tail — where the cursor is — with an ellipsis.
+  const width = 40;
+  const { terminal, screen } = displayTerminal({ columns: width });
+  const pending = terminal.input.ask("> ");
+  terminal.paste(MULTILINGUAL_DRAFT);
+  await terminal.input.idle();
+  const row = screen.cursorRow();
+  assert.equal(displayWidth(row) <= width, true, `the row fits: ${displayWidth(row)} <= ${width}`);
+  assert.equal(row.startsWith("> …"), true, `the trimmed head is marked: ${JSON.stringify(row)}`);
+  assert.equal(row.includes("\n"), false, "and the row is one row, whatever the draft holds");
+  terminal.enter();
+  assert.equal(await pending, MULTILINGUAL_DRAFT, "while the draft itself is complete, exactly as pasted");
+});
+
+test("H4b: a narrow terminal gets the compact line count, and the draft before the notice", async () => {
+  const { terminal, screen } = displayTerminal({ columns: 40 });
+  const pending = terminal.input.ask("> ");
+  terminal.paste("one\ntwo");
+  await terminal.input.idle();
+  // The full notice does not fit beside the draft, so the count is shortened: the suffix is dropped
+  // before the draft is, because knowing what you typed matters more than knowing how many lines it is.
+  assert.equal(screen.cursorRow(), "> one\u21b5two[2 lines]", "line breaks are shown, with the compact count");
+  terminal.enter();
+  assert.equal(await pending, "one\ntwo");
+});
+
+test("H5: a submitted multiline draft is echoed in full, as output below the composer's row", async () => {
+  const { terminal, screen } = displayTerminal({ columns: 60 });
+  const history = printRunOutput(screen);
+  const pending = terminal.input.ask("> ");
+  terminal.paste(MULTILINGUAL_DRAFT);
+  await terminal.input.idle();
+  terminal.enter();
+  assert.equal(await pending, MULTILINGUAL_DRAFT);
+  const after = screen.screen();
+  assert.equal(after.includes(history), true, "what ran before is still there");
+  for (const line of MULTILINGUAL_DRAFT.split("\n")) {
+    assert.equal(after.includes(line), true, `the submitted draft is on screen: ${line.slice(0, 30)}`);
+  }
+});
+
+// ---------------------------------------------------------------- a real pseudo-terminal
+
+/**
+ * The same invariant, through a real PTY rather than a mocked key stream.
+ *
+ * Everything above drives `createPromptInput` in-process, which is exact about the composer and says
+ * nothing about what a terminal does with the bytes: a real one echoes what it is given, and in raw
+ * mode it does not. This test runs the composer on a genuine pseudo-terminal (`script`), feeds it a
+ * paste and 400 Backspaces the way the operator did, interprets the captured output with the same
+ * emulator, and asserts what a person would have seen.
+ *
+ * Skipped where `script` is unavailable; run on this machine as part of the M21 correctness pass.
+ */
+const TSX_IMPORT = import.meta.resolve("tsx");
+
+test("PTY: a real terminal keeps its history when a pasted draft is deleted", { skip: process.platform === "darwin" ? false : "POSIX `script` only" }, async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-pty-"));
+  const driver = join(root, "driver.mts");
+  writeFileSync(driver, `import { createPromptInput } from ${JSON.stringify(new URL("./prompt-input.ts", import.meta.url).pathname)};
+const write = (text) => { process.stdout.write(text); };
+// A watchdog, so a stuck PTY fails the test instead of hanging it: the suite runs many files at
+// once, and a driver that never returns would otherwise sit until the spawn timeout.
+setTimeout(() => { write("\\r\\nDRIVER-TIMEOUT\\r\\n"); process.exit(3); }, 20_000).unref();
+write("history one: preflight ask=ready · write=ready\\r\\n");
+write("history two: Task 11111111-2222-3333-4444-555555555555 · outcome=SUCCESS\\r\\n");
+const input = createPromptInput({ input: process.stdin, write, terminal: true, columns: 60 });
+const answer = await input.ask("> ");
+input.close();
+write("\\r\\nANSWER[" + JSON.stringify(answer) + "]\\r\\n");
+process.exit(0);
+`);
+  const draft = "english line\nسطر عربي للاختبار\nemoji: 👩‍💻🚀\nanother long line that wraps in a normal terminal width";
+  const keys = `${PASTE_START}${draft}${PASTE_END}${"\u007f".repeat(400)}typed request\r`;
+  // The keys go through a file rather than a pipe: `script` needs a terminal on its own stdin, and
+  // the harness gives it a socket, which it refuses ("tcgetattr/ioctl: Operation not supported").
+  const keyFile = join(root, "keys.bin");
+  writeFileSync(keyFile, keys);
+  const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
+  try {
+    // Paced, like a person: the tty echoes input until the composer puts it in raw mode, and keys
+    // written before the driver starts are echoed by the kernel rather than composed by BrainGate.
+    // That echo is the terminal's, not this module's — but a test that cannot tell them apart would
+    // report a bug that no operator could see.
+    const result = spawnSync("/bin/sh", ["-c", `{ sleep 1.5; cat ${quote(keyFile)}; } | script -q /dev/null ${quote(process.execPath)} --import ${quote(TSX_IMPORT)} ${quote(driver)}`], {
+      encoding: "buffer",
+      timeout: 120_000,
+    });
+    assert.equal(result.status, 0, `driver exited cleanly: ${String(result.stderr).slice(0, 300)}`);
+    const screen = new VirtualTerminal();
+    screen.write(result.stdout.toString("utf8"));
+    const shown = screen.screen();
+    assert.equal(shown.includes("history one: preflight ask=ready · write=ready"), true, `the first line of history survived\n${shown.slice(-400)}`);
+    assert.equal(shown.includes("history two: Task 11111111"), true, "and the second");
+    assert.equal(shown.includes("سطر"), false, "no stale Arabic survived the deletions");
+    assert.equal(shown.includes("👩"), false, "and no broken emoji");
+    // The request typed after the deletions is what the composer submitted — through a real terminal.
+    assert.equal(shown.includes(`ANSWER["typed request"]`), true, `the typed request was submitted\n${shown.slice(-300)}`);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

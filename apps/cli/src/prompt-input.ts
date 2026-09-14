@@ -84,12 +84,15 @@ const BACKSPACE_ALT = "\b";
 const INTERRUPT = "\u0003";
 const EOT = "\u0004";
 
-/** Cursor up `rows`, from the anchor to the first line of the draft. Never emitted with 0. */
-const cursorUp = (rows: number): string => `\u001b[${String(rows)}A`;
-/** Cursor down one row, column unchanged. Used to step off the last line of a multi-line draft. */
-const CURSOR_DOWN = "\u001b[1B";
-/** Erase from the cursor to the end of the display, cursor unmoved. */
-const ERASE_DOWN = "\u001b[J";
+/**
+ * Erase the row the cursor is on, cursor unmoved.
+ *
+ * `2K` rather than `J`: the composer owns exactly one row, and clearing to the end of the *display*
+ * from a row whose number this module had mis-counted is what erased the operator's history.
+ */
+const ERASE_LINE = "\u001b[2K";
+/** How a line break inside the draft is shown, now that the draft is drawn on one row. */
+const LINE_BREAK = "\u21b5";
 
 /**
  * Grapheme clusters. The unit a person means by "a character", and the unit Backspace deletes.
@@ -202,6 +205,14 @@ export interface PromptInputOptions {
   readonly terminal?: boolean;
   /** The marker shown when a paste lands, so a pending multiline draft is visible as one. */
   readonly continuation?: string;
+  /**
+   * How wide the terminal is, for deciding how much of the draft fits on its one row.
+   *
+   * Injected so a test can pin it, read from the terminal otherwise. The module only ever uses it to
+   * show *less*: it never wraps text itself, because a row this code wrapped is a row whose height it
+   * would then have to count — the arithmetic that corrupted history.
+   */
+  readonly columns?: number;
 }
 
 export interface PromptInput {
@@ -228,6 +239,61 @@ function partialMarkerPrefix(text: string, marker: string): string {
   return "";
 }
 
+/**
+ * How many terminal cells a grapheme is assumed to occupy.
+ *
+ * Exact for printable ASCII, and two for everything else. CJK and emoji really are two cells; the
+ * scripts that are one — Arabic, Hebrew, Greek — are over-counted, which can only make the visible
+ * window shorter than it needed to be. Under-counting is the failure to avoid: a row this module
+ * believes is 40 cells and is really 90 gets soft-wrapped by the terminal onto a second row, and a
+ * wrapped row is precisely what the removed anchor arithmetic could not count.
+ */
+function cellWidth(character: string): number {
+  const point = character.codePointAt(0) ?? 0;
+  return character.length === 1 && point >= 0x20 && point < 0x7f ? 1 : 2;
+}
+
+/** The width of a whole string, by the same rule. Exported so a test can assert what fits. */
+export function displayWidth(text: string): number {
+  let total = 0;
+  for (let rest = text; rest.length > 0;) {
+    const character = lastGrapheme(rest);
+    if (character.length === 0) break;
+    total += cellWidth(character);
+    rest = rest.slice(0, rest.length - character.length);
+  }
+  return total;
+}
+
+/**
+ * The tail of `text` that fits in `budget` cells, prefixed with `…` when the head was trimmed.
+ *
+ * The tail, because the cursor sits at the end of the draft: a window showing the beginning while the
+ * operator typed at the end would hide their own keystrokes.
+ */
+export function fitTail(text: string, budget: number): string {
+  if (budget <= 0) return "";
+  const parts: string[] = [];
+  let used = 0;
+  let rest = text;
+  while (rest.length > 0) {
+    const character = lastGrapheme(rest);
+    if (character.length === 0) break;
+    const width = cellWidth(character);
+    if (used + width > budget) break;
+    parts.unshift(character);
+    used += width;
+    rest = rest.slice(0, rest.length - character.length);
+  }
+  if (rest.length === 0) return text;
+  while (parts.length > 0 && used + 1 > budget) {
+    const dropped = parts.shift();
+    if (dropped === undefined) break;
+    used -= cellWidth(dropped);
+  }
+  return `…${parts.join("")}`;
+}
+
 export function createPromptInput(options: PromptInputOptions): PromptInput {
   const terminal = options.terminal ?? options.input.isTTY === true;
   const continuation = options.continuation ?? "  ";
@@ -241,24 +307,6 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   let pending = "";
   /** Inside a bracketed paste. Newlines in here are content, and the end marker is not a submit. */
   let pasting = false;
-  /**
-   * Whether the last thing written left the cursor on an empty line.
-   *
-   * Not an assumption about the terminal — a count of the line breaks this module itself wrote. It is
-   * what lets the paste notice go on the row after the draft without stepping over the last line when
-   * the draft already ends with a line break of its own.
-   */
-  let cursorOnFreshLine = false;
-  /**
-   * The anchor: how many rows above the cursor the first line of the draft sits.
-   *
-   * Recomputed by every render rather than adjusted by each edit, because that is the whole point.
-   * The draft is reprinted from a known place instead of being edited cell by cell in a place this
-   * module cannot measure.
-   */
-  let rowsAboveDraftStart = 0;
-  /** The line count the last render reported as pending, or 0 when there is no notice showing. */
-  let pasteNoticeLines = 0;
   let closed = false;
 
   const write = options.write;
@@ -287,65 +335,77 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     // Every line of the draft, exactly as it was composed. A trailing newline the operator typed is
     // part of what they wrote, and removing it here would be this module editing a request.
     const answer = draft;
+    const shown = prompt ?? "";
     draft = "";
-    forgetRender();
-    write(NEWLINE);
+    // The request is echoed as *output*: the one-row draft view is replaced by the same text laid out
+    // over as many rows as it has lines, so what was submitted stays on screen exactly as it did when
+    // the composer drew drafts across rows. It is written below the composer's row and never
+    // re-entered, which makes it history like any other printed line — and this is the only place in
+    // this module that writes a newline into the display.
+    write(`${CR}${ERASE_LINE}${shown}${answer}`.split(LF).join(NEWLINE) + NEWLINE);
     deliver(answer);
   };
 
   const clearDraft = (): void => {
     draft = "";
-    forgetRender();
-    write(`^C${NEWLINE}`);
+    write(`${CR}${ERASE_LINE}^C${NEWLINE}`);
     if (prompt !== null) write(prompt);
   };
 
-  /** No draft is on screen any more, so there is nothing to move back to or clear. */
-  const forgetRender = (): void => {
-    rowsAboveDraftStart = 0;
-    pasteNoticeLines = 0;
-    cursorOnFreshLine = true;
+  /**
+   * How wide the terminal is. Read from the options when a caller pins it, from the terminal
+   * otherwise, and never below a width that could hold a prompt and one character.
+   */
+  const terminalWidth = (): number => {
+    const value = options.columns ?? process.stdout.columns ?? 80;
+    return Number.isFinite(value) && value > 12 ? Math.floor(value) : 80;
   };
 
   /**
-   * Prints the draft as the terminal should currently be showing it, returning the cursor to the end.
+   * The draft as the one row the composer owns: line breaks shown, control bytes hidden, tail kept.
    *
-   * The order matters and is the fix: move to the anchor the previous render left the draft at, erase
-   * everything from there down, and print the draft again in full. Nothing here decides how wide a
-   * character is, which cell it occupies, or which way the terminal will lay it out — a line is
-   * cleared as *a line*, not as a run of cells counted from the cursor. An emoji, an Arabic letter
-   * with two diacritics, and a Latin word are all just text to be reprinted, and whatever the
-   * terminal does with them, the screen ends up showing the draft the buffer actually holds.
+   * The notice is appended to the same row rather than written under the draft. A second row would be
+   * a row whose position this module has to remember in order to erase, which is the arithmetic that
+   * erased the operator's history — so the operator is told how many lines are pending *inside* the
+   * row, when there is width for it, and told nothing when there is not. The suffix is dropped before
+   * the draft is: knowing what you typed matters more than knowing how many lines it is.
+   */
+  const draftRow = (): string => {
+    const lines = draft.split(LF).length - 1;
+    const flat = draft.replace(/\n/g, LINE_BREAK).replace(/[\u0000-\u001f\u007f]/g, " ");
+    if (lines === 0) return fitTail(flat, terminalWidth() - displayWidth(prompt ?? "") - 1);
+    const count = String(lines + 1);
+    const roomy = `${continuation}[pasted ${count} lines — Enter sends, Ctrl+C clears]`;
+    const compact = `[${count} lines]`;
+    for (const suffix of [roomy, compact, ""]) {
+      const budget = terminalWidth() - displayWidth(prompt ?? "") - displayWidth(suffix) - 1;
+      // At least a few characters of the draft itself, or the notice is not worth the width.
+      if (budget >= 6) return `${fitTail(flat, budget)}${suffix}`;
+    }
+    return fitTail(flat, Math.max(1, terminalWidth() - displayWidth(prompt ?? "") - 1));
+  };
+
+  /**
+   * Repaints the prompt and the draft on the composer's own row, and nothing else.
    *
-   * Reached after every edit, which is why Backspace can be correct without knowing anything about
-   * the text it just deleted.
+   * Carriage return, erase this row, reprint. The cursor never moves up, so no byte written here can
+   * reach a row that already held output: the invariant is structural rather than arithmetic. Nothing
+   * is erased in place either — the row is cleared as a row — so an emoji, an Arabic letter with two
+   * diacritics and a Latin word are all just text, and whatever the terminal does with them, the row
+   * ends up showing the draft the buffer actually holds.
+   *
+   * Reached after every edit, which is why Backspace can be correct without knowing anything about the
+   * text it just deleted.
    */
   const redraw = (): void => {
     if (prompt === null) return;
-    const lines = draft.split(LF).length - 1;
-    if (rowsAboveDraftStart > 0) write(cursorUp(rowsAboveDraftStart));
-    write(`${CR}${ERASE_DOWN}${prompt}${draft}`);
-    pasteNoticeLines = 0;
-    if (lines > 0) {
-      // The line count is said once per pending draft, under it, the way a multiline composer
-      // behaves. It is drawn inside the region that was just cleared, so it can never be a stale
-      // suffix: the next redraw erases it along with everything else below the anchor.
-      pasteNoticeLines = lines + 1;
-      if (!cursorOnFreshLine) write(CURSOR_DOWN);
-      write(`${CR}${continuation}[pasted ${String(lines + 1)} lines — Enter sends, Ctrl+C clears]`);
-    }
-    // Where the cursor now is, measured from the first line of the draft: one row per line, plus the
-    // notice's own row when one is showing. The cursor ends the render where the text ends, so the
-    // same anchor is still the draft's first line next time.
-    rowsAboveDraftStart = lines + pasteNoticeLines;
-    cursorOnFreshLine = false;
+    write(`${CR}${ERASE_LINE}${prompt}${draftRow()}`);
   };
 
   /** Appends typed or pasted text to the logical buffer, then prints the buffer again. */
   const append = (text: string): void => {
     if (text.length === 0) return;
     draft += text;
-    cursorOnFreshLine = text.endsWith(LF);
     redraw();
   };
 
@@ -376,7 +436,6 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     const removed = lastGrapheme(draft);
     if (removed.length === 0) return;
     draft = draft.slice(0, draft.length - removed.length);
-    cursorOnFreshLine = draft.endsWith(LF);
     redraw();
   };
 
@@ -519,11 +578,6 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     const queued = submitted.shift();
     if (queued !== undefined) return queued;
     prompt = question;
-    forgetRender();
-    // A question that ends its own line leaves the cursor on an empty row, and one that does not
-    // leaves it mid-row. Every prompt this CLI writes today is the second kind; the fact is taken from
-    // the string rather than assumed, so the geometry stays right if that ever changes.
-    cursorOnFreshLine = question.endsWith(LF);
     write(question);
     return await new Promise<string | null>((resolve) => { waiter = resolve; });
   };
