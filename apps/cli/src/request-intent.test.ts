@@ -108,3 +108,123 @@ test("a noun that happens to be a write verb does not make a read a write", () =
   // And asking for one is still a write.
   assert.equal(classifyRequestIntent("Append a comment line to the README."), "write");
 });
+
+// ---------------------------------------------------------------- the adversarial matrix
+
+/**
+ * The failure that produced this architecture, and everything like it.
+ *
+ * The rule the matrix tests is not "these sentences are reads" but "these *shapes* are reads": a
+ * question, a statement, a negation, a hypothesis, a quotation, or a sentence whose head word is not
+ * a verb. Every entry on the right is the same vocabulary used as a request. A classifier built from
+ * keywords cannot separate the two columns; one built from directive structure and requested effect
+ * separates them without knowing which words are dangerous.
+ */
+const NON_WRITES: readonly string[] = [
+  // The reported failure, and its neighbours.
+  "hello after delete",
+  "hello",
+  "thanks, that worked",
+  // Questions *about* the vocabulary.
+  "what does delete mean?",
+  "explain how write mode works",
+  "explain the payment migration",
+  "describe the auth flow",
+  "which files did the write touch?",
+  "tell me about the checkout flow",
+  "how does the security configuration work",
+  "what happened to the cancelled write attempt?",
+  // Quoted, negated and hypothetical mentions.
+  'why was "remove auth middleware" blocked?',
+  "explain 'delete README.md'",
+  "do not delete or modify anything",
+  "don't run the migration yet",
+  "what would happen if we removed the auth middleware?",
+  // Statements, descriptions and reports.
+  "read this file and tell me whether it deletes anything",
+  "summarize the security migration",
+  "state which provider wrote marker 2",
+  "I see the auth middleware was removed",
+  "the payment migration is described in docs/payments.md",
+  "the delete failed earlier",
+  "no changes needed",
+  "nothing to do here",
+  "is the migration safe?",
+  "removing auth is blocked, right?",
+  // Arabic: questions about the actions, and negations.
+  "شو يعني حذف الملف؟",
+  "اشرح لي نظام الدفع والمصادقة بدون تعديل شيء",
+  'لماذا طلب "احذف الملف" يعتبر خطير؟',
+  "لماذا لا يمكن حذف الملف؟",
+  "ما معنى تعديل نظام الدفع؟",
+  "هل يمكن حذف هذا الملف؟",
+  "شو صار بالـ write attempt الملغى؟",
+  "هل هذا الملف آمن للتعديل؟",
+  "أريد أن أعرف كيف يعمل نظام الدفع",
+  "مرحبا بعد الحذف",
+];
+
+const WRITES: readonly string[] = [
+  // The examples the acceptance named.
+  "delete README.md",
+  "remove the auth middleware",
+  "modify the payment migration",
+  "update the security configuration",
+  "append this line to the file",
+  "احذف هذا الملف",
+  "عدل نظام المصادقة",
+  "غير ملف الدفع",
+  // Politeness is not a read.
+  "please delete the temporary file",
+  "can you delete the log file?",
+  "I want you to remove the dead code",
+  "من فضلك احذف الملف المؤقت",
+  "ممكن تعدل ملف الدفع؟",
+  "أضف سطر تعليق إلى الملف",
+  // The session's own write requests, verbatim.
+  "Apply the agreed harmless comment-only change to the selected README file:",
+  "Append one inert comment line:",
+  "Add a second comment line in the same style.",
+  "change the empty-state label to Nothing yet",
+  "Write the marker into docs/notes.md",
+  "rename the helper to something clearer",
+  "fix the typo in the README",
+  // A qualifier or a constraint before the verb does not cancel it.
+  "Now apply the change you proposed.",
+  "Also rename that variable while you are there.",
+  "Go ahead and update the config value.",
+  "Without touching the config, add the flag to the CLI.",
+  "Do not commit anything, just make the edit.",
+  "Which file is safest to change? Now change it.",
+];
+
+test("the adversarial matrix: effect decides, vocabulary does not", () => {
+  for (const prompt of NON_WRITES) {
+    assert.equal(classifyRequestIntent(prompt), "read", `should be a read: ${prompt}`);
+  }
+  for (const prompt of WRITES) {
+    assert.equal(classifyRequestIntent(prompt), "write", `should be a write: ${prompt}`);
+  }
+});
+
+test("long, multiline and mixed prompts are judged by their directive clauses", () => {
+  const long = [
+    "Here is the context you asked for.",
+    "The payment migration touched the checkout path, and the auth middleware was removed last week.",
+    "Do not modify anything: this is background.",
+    "",
+    "Please summarize what changed.",
+  ].join("\n");
+  assert.equal(classifyRequestIntent(long), "read", "a long explanation with an observe directive is a read");
+
+  const longWrite = [
+    "Here is the context you asked for.",
+    "The payment migration touched the checkout path.",
+    "",
+    "Append one line to docs/notes.md and do not touch anything else.",
+  ].join("\n");
+  assert.equal(classifyRequestIntent(longWrite), "write", "and the same shape with a mutating directive is a write");
+
+  const mixed = "اشرح لي ما حدث في الدفع.\n\nاحذف الملف المؤقت بعد ذلك.";
+  assert.equal(classifyRequestIntent(mixed), "write", "the Arabic directive decides, whatever precedes it");
+});

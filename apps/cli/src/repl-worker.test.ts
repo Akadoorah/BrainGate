@@ -877,10 +877,9 @@ test("M: a pasted multiline request stays pending until Enter, then submits once
   await terminal.prompt.idle();
   // Four lines, not three: the paste ended with a newline, so its last line is empty — and that is
   // kept rather than trimmed, because it is what the operator pasted.
-  assert.match(terminal.written(), /pasted 4 lines — Enter sends, Ctrl\+C clears/, "the draft is visible as pending");
-  // The pending view is one row showing the tail of the draft, with its line breaks marked: the
-  // composer owns one row so that no redraw can reach the output above it (see prompt-input.ts).
-  assert.match(terminal.written(), /Keep the answer concise/, "the end of the draft is what is shown while it is pending");
+  // The draft is painted as its own lines, in full: a pending multiline request looks like itself.
+  assert.match(terminal.written(), /Find why users are logged out\.\r\nTrace the session path\.\r\nKeep the answer concise\./, "the whole draft is visible while it is pending");
+  assert.doesNotMatch(terminal.written(), /pasted \d+ lines/, "and there is no notice to announce what the screen already shows");
 
   // The explicit submit, and only then — and the whole request is echoed as output.
   terminal.enter();

@@ -1,169 +1,241 @@
 /**
- * What the operator is asking for, decided from the requested effect.
+ * What the operator is asking for: an answer, or a change to the workspace.
  *
- * This exists because real dogfood classified a write as a read, twice, deterministically:
+ * ## Why this is not a keyword search
  *
- * ```text
- * Apply the agreed harmless comment-only change to the selected README file.
- * Modify only that file, do not commit, do not create a branch, do not use git reset, …
- * ```
+ * The first version looked for a write verb anywhere in the request, and real use broke it in both
+ * directions at once: "hello after delete" was classified as a WRITE, and so was "state which provider
+ * wrote marker 2 … and what happened to the cancelled write attempt" — a request to *report*, which
+ * then ran the write path and failed. Every word that mattered in those sentences was a word being
+ * talked *about*.
  *
- * The old rule was `^\s*(add|append|change|…)\b` — a write verb at the *start* of the request, from a
- * list that did not contain "apply" or "modify". Two things were wrong with it, and only fixing both
- * makes the class of bug go away:
+ * Vocabulary cannot answer this question, because the same word is a request in one sentence and a
+ * subject in the next. What separates them is structure:
  *
- * 1. **Position.** A write verb can follow a qualifier ("Now apply…", "Please change…") or a first
- *    line, and the request is still a write.
- * 2. **Constraints are not negations of the effect.** "Do not commit", "do not create a branch",
- *    "do not use git reset" bound *how* the change is made. Read as negations of the request, they
- *    turned a write into a read — and worse, the read was then given to a native session that had
- *    been created under a standing "analyze only; do not modify files" instruction, which refused it.
+ *   1. **Is the clause a directive at all?** A request is imperative — the verb leads the clause — or
+ *      it arrives through an explicit frame ("please …", "can you …", "I want you to …", "من فضلك"،
+ *      "ممكن"). Questions, statements, negations, hypotheticals and quoted text are not directives,
+ *      whatever vocabulary they contain.
+ *   2. **If it is a directive, what does its head verb ask for?** Only a verb whose effect is a
+ *      *change to the workspace* makes this a write. "read", "explain", "summarize" and "verify" are
+ *      directives too; they ask for an answer.
  *
- * So the rule is about the requested effect:
+ * So delete, write, remove, auth, payment and checkout are inert unless one of them is the head verb
+ * of a directive clause. In "hello after delete" the head is `hello`; in "what does delete mean?" the
+ * clause is a question; in "why was \"remove auth middleware\" blocked?" the phrase is quoted. None of
+ * them reaches the mutate list, and none of them is a write.
  *
- * - a write verb, in a clause that is neither negated nor hypothetical, asks for a change;
- * - a verb under a negative constraint ("do not modify anything", "without creating a branch") is
- *   part of the boundary, not the request;
- * - a question about how something *would* be done asks for an answer, not for the change.
+ * ## What still counts
  *
- * Getting this wrong in the other direction is safe by construction — the mode is named in the
- * confirmation line before anything runs — but it is also the difference between a write that
- * happens and a write that is refused by a session that was told not to touch anything.
+ * `delete README.md`, `remove the auth middleware`, `احذف هذا الملف`, `عدل نظام المصادقة` — head verb,
+ * imperative, mutating effect: WRITE, and every existing write protection applies exactly as before.
+ * This module only decides whether the write path is entered; the risk gate inside it is untouched.
+ * Because a false READ is the more dangerous of the two errors, a request phrased politely is still a
+ * request: "can you delete the file?" is a write.
+ *
+ * On the Arabic side the lists hold imperative and second-person verb forms (`احذف`, `تحذف`, `عدل`,
+ * `غير`, `أضف`) and never verbal nouns (`حذف`, `تعديل`). "شو يعني حذف الملف؟" says *deletion* — a thing
+ * being asked about — and is not a request even before the question word is considered.
  */
-
-/** Verbs whose object is a change to the workspace. */
-const WRITE_VERBS: readonly string[] = Object.freeze([
-  // `comment` is deliberately absent: as a noun it is everywhere ("confirm the comment is there"),
-  // and as a verb it is rare enough that the surrounding words — add, append, insert, apply — carry
-  // the directive. It produced a false WRITE on a read request in the acceptance scenario.
-  "add", "adjust", "annotate", "append", "apply", "bump", "change", "clean", "cleanup",
-  "convert", "correct", "create", "delete", "document", "drop", "edit", "extract", "fix", "format",
-  "implement", "improve", "inline", "insert", "migrate", "modify", "move", "patch", "polish",
-  "refactor", "remove", "rename", "reorder", "replace", "restore", "rewrite", "set", "simplify",
-  "split", "swap", "tidy", "trim", "update", "upgrade", "write",
-]);
-
-/**
- * Words that make a clause a question or a hypothesis rather than an instruction.
- *
- * "Tell me how you would implement it" contains a write verb and asks for nothing to be written.
- * These are matched against the text *before* the verb, because that is where the framing lives.
- */
-const HYPOTHETICAL_FRAMES: readonly RegExp[] = Object.freeze([
-  /\bhow (would|do|does|can|could|should|might) (you|i|we|one|it)\b/i,
-  /\bhow to\b/i,
-  /\bwhat would (you|need|have to)\b/i,
-  /\bwhat (needs?|would need) to change\b/i,
-  /\bwhere (is|are|would)\b/i,
-  /\btell me how\b/i,
-  /\bexplain how\b/i,
-  /\bdescribe how\b/i,
-  /\bwalk me through how\b/i,
-  /\bsuggest how\b/i,
-  /\bwould you\b/i,
-  /\bshould i\b/i,
-  /\bwhat('s| is) the (best|right) way\b/i,
-]);
-
-/** Words that make a write verb part of a boundary rather than a request. */
-const NEGATIONS: readonly RegExp[] = Object.freeze([
-  /\b(do not|don't|does not|doesn't|never|without|avoid|no)\s+(\w+\s+){0,3}$/i,
-  /\bnot\s+(\w+\s+){0,2}$/i,
-]);
-
-/**
- * Clauses, so a negation or a frame is judged where it appears rather than across the whole request.
- *
- * Splitting on sentence and list punctuation is what keeps "Modify only that file, do not commit"
- * apart: the first clause asks for the change, the second bounds it.
- */
-function clauses(text: string): readonly string[] {
-  return Object.freeze(text.split(/[\n;.•]|(?<=[.!?])\s+|,\s+(?=(?:and\s+)?(?:do not|don't|never|without|but)\b)/i).map((clause) => clause.trim()).filter((clause) => clause.length > 0));
-}
-
-/** Whether the clause is a question rather than an instruction. */
-function isInterrogative(clause: string): boolean {
-  return /\?\s*$/.test(clause.trim()) || /^\s*(which|what|where|who|when|why|how|is|are|does|do|can|could|should|would)\b/i.test(clause);
-}
-
-/**
- * Write verbs that are also ordinary nouns, and so only ask for a change in imperative position.
- *
- * `document` produced a false WRITE on a read request the first time a cross-provider scenario ran:
- * "Summarize the test document in this workspace." is a request to read a file whose name happens to
- * contain the word. The same is true of `format`, `patch`, `split` and the rest — "the format is
- * wrong" is a report, "format the file" is an instruction — and a false WRITE is the dangerous
- * direction: it hands a read request the authority to change the workspace once the operator
- * approves the line they were shown.
- *
- * Imperative position means the verb leads its clause, after nothing but a courtesy or a discourse
- * marker. `document` also stays a cue for the phrasings that actually ask for it: "Document the
- * helper", "Please document the flags", "then document the response".
- */
-const NOUN_AMBIGUOUS_VERBS: readonly string[] = Object.freeze([
-  "clean", "cleanup", "correct", "document", "drop", "extract", "format", "inline", "patch",
-  "split", "swap", "trim",
-  // `write` is the sharpest of these: it is the name of the thing BrainGate is *asking about* in
-  // half the questions an operator asks about a session. A real acceptance prompt — "state which
-  // provider wrote marker 1 … and what happened to the Codex write attempt that was cancelled" —
-  // was classified as a WRITE and ran the write path, where a correctly cautious worker changed
-  // nothing and the task ended as a failure. The noun is everywhere; the imperative is not.
-  "write",
-]);
-
-/** Words that may precede an imperative without making it something other than one. */
-const IMPERATIVE_PREFIXES: readonly string[] = Object.freeze([
-  "please", "now", "then", "also", "kindly", "first", "next", "finally", "just", "simply",
-  "and", "but", "so", "go", "ahead", "you", "can", "could", "would", "will", "should", "must",
-  "i", "want", "need", "like", "to", "let's", "lets", "we", "let", "us",
-]);
-
-/**
- * Whether a noun-ambiguous cue is being used as a verb here.
- *
- * Only the words before it in the clause matter, and every one of them has to be something that can
- * introduce an instruction. "the test document" fails on `the`, `test`; "document the flags" passes
- * with nothing before it.
- */
-function isImperative(clause: string, index: number): boolean {
-  const before = clause.slice(0, index).toLowerCase().replace(/[^a-z'\s]/g, " ").trim();
-  if (before.length === 0) return true;
-  const words = before.split(/\s+/).filter((word) => word.length > 0);
-  return words.length <= 4 && words.every((word) => IMPERATIVE_PREFIXES.includes(word));
-}
-
-/** Whether the write verb at `index` is governed by a negation or a hypothetical frame. */
-function isBounded(clause: string, index: number): boolean {
-  const before = clause.slice(0, index);
-  // A write verb in the infinitive, inside a question, is what the question is *about*: "which file
-  // is safest to change?" asks for an answer, not for a change. Real usage produced exactly that
-  // phrasing, and it was the first turn of the acceptance scenario.
-  if (isInterrogative(clause) && /\bto\s*$/i.test(before)) return true;
-  // A negation in the same clause, close enough to govern this verb: "do not use git reset", "without
-  // creating a branch". Distance is bounded so an earlier constraint cannot silence a later verb.
-  if (NEGATIONS.some((pattern) => pattern.test(before))) return true;
-  return HYPOTHETICAL_FRAMES.some((pattern) => pattern.test(before)) || HYPOTHETICAL_FRAMES.some((pattern) => pattern.test(clause));
-}
 
 export type RequestIntent = "read" | "write";
 
 /**
- * The requested effect of a request: a change to the workspace, or an answer about it.
+ * Lead-ins that may precede an imperative without changing what it is.
  *
- * Deterministic and cheap: no model, no history, no scoring. Everything the operator can do in the
- * session is behind a confirmation that names this mode, so the cost of being wrong is a visible
- * line and a `n`, not a wrong action.
+ * Kept short on purpose. Every word here is one a person can put in front of an instruction without
+ * making it something else, and a content word is not in the list — that is the mechanism: "hello
+ * after delete" has `hello` before `delete`, so `delete` is not the head and the sentence is not an
+ * instruction.
+ */
+const LEAD_INS: readonly string[] = Object.freeze([
+  "please", "now", "then", "also", "kindly", "first", "firstly", "second", "next", "finally", "just",
+  "simply", "and", "but", "so", "go", "ahead", "ok", "okay", "hey", "hi", "well", "actually",
+]);
+
+/**
+ * Frames that make a sentence a request even when it is phrased as a question.
+ *
+ * "can you delete the file?" is a request, and so is "can you explain this?" — the frame decides that
+ * there is a request here, and the head verb decides which one. These are checked before the question
+ * test, because the question mark is what makes the request polite rather than what makes it a
+ * question.
+ */
+const REQUEST_FRAMES: readonly RegExp[] = Object.freeze([
+  /\b(can|could|would|will)\s+you\b/i,
+  /\b(i|we)\s+(want|need|would\s+like|'d\s+like)\s+(you\s+)?to\b/i,
+  /\bplease\b/i,
+  /\bgo\s+ahead\s+and\b/i,
+  /\blet'?s\b/i,
+  /من\s+فضلك/,
+  /ممكن/,
+  /هل\s+يمكنك/,
+  /(أ|ا)ريد\s+(أن|ان)/,
+  /بدي/,
+  /لو\s+سمحت/,
+]);
+
+/**
+ * Words that open a question: a clause starting with one is asking, whatever else it contains.
+ *
+ * "What would you change about this design?" contains a request frame ("would you") and is still a
+ * question — the question word is what the sentence is *about*. That is why these are checked before
+ * any frame, while the auxiliaries below are not.
+ */
+const WH_START = /^(what|which|where|who|whom|whose|when|why|how|شو|ايش|إيش|ما|ماذا|لماذا|ليش|كيف|هل|وين|أين|اين|متى|اي|أي)\b/i;
+
+/** Auxiliaries that open a question — unless a request frame follows, as in "can you delete it?". */
+const AUX_START = /^(is|are|was|were|am|does|do|did|has|have|had|can|could|should|would|will|may|might)\b/i;
+
+/** The frames that make an auxiliary-led clause a request rather than a question. */
+const FRAMED_START = /^(can|could|would|will)\s+you\b|^(please\b|من\s+فضلك|ممكن|هل\s+يمكنك)/i;
+
+/**
+ * What makes a clause a boundary rather than a request.
+ *
+ * A negation or a hypothetical in the same clause means the verb is being *talked about*: "do not
+ * delete anything", "if you were to remove the middleware". Distance is bounded so an earlier
+ * constraint cannot silence a later, separate instruction.
+ */
+const BOUNDING: readonly RegExp[] = Object.freeze([
+  /\b(do not|don't|does not|doesn't|never|without|avoid|no)\s+(\w+\s+){0,3}$/i,
+  /\bnot\s+(\w+\s+){0,2}$/i,
+  /\b(if|whether|unless|suppose|supposing|assuming|imagine|hypothetically)\b/i,
+  /(لا|بدون|دون)\s+(\S+\s+){0,2}$/,
+  /(لو|اذا|إذا|إن|ان)\b/,
+]);
+
+/**
+ * Verbs whose effect is a change to the workspace.
+ *
+ * The only vocabulary that decides anything, and it is consulted only for the head verb of a
+ * directive clause — so one of these words appearing anywhere else in a sentence changes nothing. It
+ * errs towards inclusion: a false entry turns a discussion into a task that stops at the confirmation
+ * line, while a missing entry turns a real change into a question that answers instead of doing the
+ * work.
+ */
+const MUTATE: readonly string[] = Object.freeze([
+  "add", "adjust", "annotate", "append", "apply", "bump", "change", "clean", "cleanup", "commit",
+  "convert", "correct", "create", "delete", "deploy", "document", "drop", "edit", "erase", "extract",
+  "fix", "format", "generate", "implement", "improve", "inline", "insert", "install", "migrate",
+  "make", "modify", "move", "patch", "polish", "publish", "refactor", "remove", "rename", "reorder",
+  "replace", "restore", "revert", "rewrite", "scaffold", "set", "simplify", "split", "stage", "swap",
+  "tidy", "trim", "undo", "update", "upgrade", "write",
+]);
+
+/**
+ * The same list as Arabic imperative and second-person verb forms.
+ *
+ * Verb forms only. The verbal nouns (`حذف` deletion, `تعديل` modification, `كتابة` writing) are how
+ * these actions are *named*, so they are deliberately absent.
+ */
+const MUTATE_ARABIC: readonly string[] = Object.freeze([
+  "احذف", "احذفي", "تحذف", "امسح", "امسحي", "تمسح", "عدل", "عدلي", "تعدل", "غير", "غيري", "تغير",
+  "أضف", "اضف", "أضيفي", "تضيف", "اكتب", "اكتبي", "تكتب", "أنشئ", "انشئ", "تنشئ", "أصلح", "اصلح",
+  "تصلح", "حدث", "حدثي", "تحدث", "انقل", "انقلي", "تنقل", "أعد", "اعد", "تعيد", "استبدل", "استبدلي",
+  "تستبدل", "طبق", "طبيقي", "تطبق", "رتب", "رتّب", "نظف", "نظّف",
+]);
+
+/**
+ * Tokens that make a head verb nominal rather than imperative.
+ *
+ * "delete of the file", "write mode", "delete attempt" — a verb followed by one of these is a noun in
+ * a sentence about the action, not an instruction to perform it.
+ */
+const NOMINAL_FOLLOWERS: readonly string[] = Object.freeze([
+  "of", "is", "are", "was", "were", "mode", "operation", "attempt", "request",
+  "failed", "fails", "happened", "happens", "means", "meaning", "blocked", "allowed", "supported",
+]);
+
+/** Clauses, so a negation or a frame is judged where it appears rather than across the whole request. */
+function clauses(text: string): readonly string[] {
+  return Object.freeze(
+    text
+      .split(/[\n;.•]|(?<=[.!?])\s+|,\s+/i)
+      .map((clause) => clause.trim())
+      .filter((clause) => clause.length > 0),
+  );
+}
+
+/** The clause with quoted spans blanked out: a phrase in quotes is mentioned, not requested. */
+function withoutQuotes(clause: string): string {
+  return clause
+    .replace(/"[^"]*"/g, " ")
+    .replace(/“[^”]*”/g, " ")
+    .replace(/«[^»]*»/g, " ")
+    .replace(/`[^`]*`/g, " ")
+    .replace(/'[^']{2,}'/g, " ");
+}
+
+/** Words, punctuation dropped, lower-cased, in order. */
+function words(text: string): readonly string[] {
+  return Object.freeze(
+    text
+      .toLowerCase()
+      .replace(/[^\p{L}\p{N}'\s]/gu, " ")
+      .split(/\s+/)
+      .filter((word) => word.length > 0),
+  );
+}
+
+/**
+ * The head verb of a clause, or `null` when it does not lead with one.
+ *
+ * The head is the first word that is not a lead-in — so a clause opening with `hello`, `the`, `this`,
+ * `explain` or `what` has no mutating head, and one opening with `delete` or `احذف` does. A request
+ * frame moves the search to just after it, which is what makes "I want you to delete the log" a
+ * request rather than a statement about a want.
+ */
+function headVerb(clause: string): string | null {
+  const cleaned = withoutQuotes(clause);
+  if (BOUNDING.some((pattern) => pattern.test(cleaned))) return null;
+  let search = cleaned;
+  for (const frame of REQUEST_FRAMES) {
+    const match = frame.exec(cleaned);
+    if (match === null) continue;
+    search = cleaned.slice(match.index + match[0].length);
+    break;
+  }
+  const parts = words(search);
+  let index = 0;
+  while (index < parts.length && LEAD_INS.includes(parts[index]!)) index += 1;
+  const head = parts[index];
+  if (head === undefined) return null;
+  // A head that is not a mutating verb is not this kind of directive: "hello after delete" leads with
+  // `hello`, and "explain the migration" leads with a verb that asks for an answer.
+  if (!MUTATE.includes(head) && !MUTATE_ARABIC.includes(head)) return null;
+  const follower = parts[index + 1];
+  if (follower !== undefined && NOMINAL_FOLLOWERS.includes(follower)) return null;
+  return head;
+}
+
+/**
+ * Whether the clause asks a question rather than giving an instruction.
+ *
+ * A question can still be a request — "can you delete the file?" — which is why the frame test comes
+ * first and a framed clause is never treated as a question.
+ */
+function isQuestion(clause: string): boolean {
+  const cleaned = withoutQuotes(clause).trim();
+  if (WH_START.test(cleaned)) return true;
+  if (/\?\s*$/.test(cleaned)) return !FRAMED_START.test(cleaned) && !REQUEST_FRAMES.some((pattern) => pattern.test(cleaned.slice(0, 24)));
+  if (AUX_START.test(cleaned)) return !FRAMED_START.test(cleaned);
+  return false;
+}
+
+/**
+ * The requested effect: a change to the workspace, or an answer about it.
+ *
+ * Deterministic and cheap: no model, no history, no scoring. Everything the operator can do is behind
+ * a confirmation that names this mode, so the cost of being wrong is a visible line and an `n` — but
+ * the two directions are not equally bad, which is why a directive with a mutating head is a write
+ * even when it is phrased politely, and a sentence that merely mentions a change is not.
  */
 export function classifyRequestIntent(text: string): RequestIntent {
   for (const clause of clauses(text)) {
-    const verb = new RegExp(`\\b(${WRITE_VERBS.join("|")})\\b`, "gi");
-    // Every occurrence, not just the first: a clause can bound one verb and still ask for another
-    // ("without touching the config, add the flag").
-    for (let match = verb.exec(clause); match !== null; match = verb.exec(clause)) {
-      if (isBounded(clause, match.index)) continue;
-      if (NOUN_AMBIGUOUS_VERBS.includes(match[0].toLowerCase()) && !isImperative(clause, match.index)) continue;
-      return "write";
-    }
+    if (isQuestion(clause)) continue;
+    if (headVerb(clause) === null) continue;
+    return "write";
   }
   return "read";
 }

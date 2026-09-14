@@ -26,34 +26,29 @@
  * Nothing here waits, sleeps or measures time. The paste boundary is a byte sequence, the submit is
  * a byte, and the state machine is a function of those two facts.
  *
- * ## The logical draft and the visible line are two different things
+ * ## The editable region, and why it is anchored by the terminal
  *
- * Real dogfood typed `مرحبا` into macOS Terminal and pressed Backspace, and the screen kept showing
- * letters that had been deleted. Two independent assumptions had been made, and Arabic broke both:
+ * The composer keeps a real buffer and a cursor *index into it* (always on a grapheme boundary), and
+ * renders that buffer the way a terminal would: every line as it was typed, wrapping normally, the
+ * cursor placed where the operator put it. Left/Right move by grapheme, Up/Down by line (keeping the
+ * column), Home/End to the ends of the line, Backspace and Delete around the cursor.
  *
- * 1. **One JavaScript character is one character.** `draft.slice(0, -1)` removes a UTF-16 code unit.
- *    For `ا` that is the whole letter; for an emoji, a combining mark, or a flagged sequence it is
- *    half a character — a lone surrogate or an orphaned diacritic left in the buffer, still submitted.
- *    Deletion is now one *grapheme cluster*, via `Intl.Segmenter` where it exists.
- * 2. **One grapheme is one terminal cell that can be erased in place.** `\u007f \u007f` moves the
- *    cursor back one column, overwrites it with a space, and moves back again. That is only true for
- *    single-width, left-to-right text that the terminal lays out in logical order. Arabic is shaped
- *    and reordered by the terminal, so the cell to the left of the cursor is generally *not* the
- *    character that was deleted — the erase lands somewhere else and the old glyph stays on screen.
+ * The whole region is repainted from an anchor the **terminal** holds, not one this module counts:
+ * `ESC 7` saves the cursor where the prompt ends, and every redraw is `ESC 8` (back to that exact
+ * spot) + `ESC [ J` (erase from there down) + the buffer again. Two earlier designs moved the cursor
+ * by a row count this module computed — first from the draft's logical line count, then from a
+ * one-row window — and the first of them erased the operator's history, because the terminal decides
+ * how many rows text occupies and a soft-wrapped line made the count wrong. Asking the terminal where
+ * the anchor is removes the arithmetic: erasing downwards from the end of the prompt can only touch
+ * rows the composer itself wrote, however the draft wrapped, however wide the characters are, and
+ * however the terminal reorders bidirectional text.
  *
- * So the module keeps an **anchor**, not a running cursor: the row the first line of the draft sits
- * on, counted from where the cursor ends up after a render. Every edit mutates the logical buffer
- * first, then clears from that anchor to the end of the display and prints the whole draft again. The
- * terminal is left to shape and order whatever it is handed, which is the one thing it can do
- * correctly for text this module cannot measure. What is on screen after a redraw is the draft, in
- * full, every time — nothing incremental is assumed about how many cells a character occupies or which
- * direction it was laid out in.
- *
- * Cursor keys are deliberately not honoured. Left and Right cannot be implemented safely above a
- * terminal that owns BiDi reordering: logical position and visual column stop being the same thing,
- * and moving one cell is a guess about shaping, width and direction. Guessing is what produced this
- * bug. Until a real line editor exists here — one that measures width and tracks the terminal's own
- * direction — the composer supports **append at the end, grapheme-aware Backspace at the end, and a
+ * The cursor's *visual* position is still computed here, because a cursor has to be placed somewhere.
+ * That arithmetic is allowed to be approximate for exotic width combinations — it can put the cursor
+ * a cell off on a line of emoji — but it cannot damage anything: the worst case is a cursor drawn in
+ * the wrong cell inside the region that was just reprinted, never a row of history touched.
+ * Escape sequences the composer does not implement — function keys, mouse reports, bracketed-paste
+ * status replies — are consumed whole and ignored, so nothing unrecognised ever reaches the buffer.
  * full redraw**, and consumes every escape sequence it does not implement rather than acting on it.
  */
 
@@ -85,14 +80,20 @@ const INTERRUPT = "\u0003";
 const EOT = "\u0004";
 
 /**
- * Erase the row the cursor is on, cursor unmoved.
+ * Save and restore the cursor position (DECSC/DECRC).
  *
- * `2K` rather than `J`: the composer owns exactly one row, and clearing to the end of the *display*
- * from a row whose number this module had mis-counted is what erased the operator's history.
+ * The anchor is the terminal's memory, not this module's arithmetic: everything the composer erases
+ * is measured from the spot the terminal itself remembers, which is why a mis-counted row can no
+ * longer reach the operator's history.
  */
-const ERASE_LINE = "\u001b[2K";
-/** How a line break inside the draft is shown, now that the draft is drawn on one row. */
-const LINE_BREAK = "\u21b5";
+const SAVE_CURSOR = "\u001b7";
+const RESTORE_CURSOR = "\u001b8";
+/** Erase from the cursor to the end of the display, cursor unmoved. */
+const ERASE_DOWN = "\u001b[J";
+/** Put the cursor in a given column of the current row, 1-based. */
+const column = (value: number): string => `\u001b[${String(Math.max(1, value))}G`;
+/** Cursor up `rows`, for placing the cursor inside the region just reprinted. */
+const cursorUp = (rows: number): string => `\u001b[${String(rows)}A`;
 
 /**
  * Grapheme clusters. The unit a person means by "a character", and the unit Backspace deletes.
@@ -240,66 +241,137 @@ function partialMarkerPrefix(text: string, marker: string): string {
 }
 
 /**
- * How many terminal cells a grapheme is assumed to occupy.
+ * How many cells one grapheme occupies, as far as this module needs to know.
  *
- * Exact for printable ASCII, and two for everything else. CJK and emoji really are two cells; the
- * scripts that are one — Arabic, Hebrew, Greek — are over-counted, which can only make the visible
- * window shorter than it needed to be. Under-counting is the failure to avoid: a row this module
- * believes is 40 cells and is really 90 gets soft-wrapped by the terminal onto a second row, and a
- * wrapped row is precisely what the removed anchor arithmetic could not count.
+ * Correct for the cases a person can see: zero for combining marks and joiners, two for the East
+ * Asian wide and emoji ranges, one otherwise. A cursor placed with this is right for English, Arabic
+ * and emoji; where it is wrong — an unusual width table, a terminal that renders a sequence as one
+ * glyph — the cursor may sit a cell away from the ideal spot inside the region that was just
+ * reprinted. It cannot touch anything else, because the region's bounds come from the terminal.
  */
 function cellWidth(character: string): number {
+  if (character.length === 0) return 0;
+  if (COMBINING.test(character) || character === ZWJ || SKIN_TONE.test(character)) return 0;
+  if (/^[\uFE00-\uFE0F\u{E0100}-\u{E01EF}]$/u.test(character)) return 0;
   const point = character.codePointAt(0) ?? 0;
-  return character.length === 1 && point >= 0x20 && point < 0x7f ? 1 : 2;
+  // East Asian Wide and Fullwidth, and the emoji planes: two cells.
+  if (
+    (point >= 0x1100 && point <= 0x115f) || (point >= 0x2e80 && point <= 0x303e) ||
+    (point >= 0x3041 && point <= 0x33ff) || (point >= 0x3400 && point <= 0x4dbf) ||
+    (point >= 0x4e00 && point <= 0x9fff) || (point >= 0xa000 && point <= 0xa4cf) ||
+    (point >= 0xac00 && point <= 0xd7a3) || (point >= 0xf900 && point <= 0xfaff) ||
+    (point >= 0xfe30 && point <= 0xfe6f) || (point >= 0xff00 && point <= 0xff60) ||
+    (point >= 0xffe0 && point <= 0xffe6) || (point >= 0x1f300 && point <= 0x1faff) ||
+    (point >= 0x20000 && point <= 0x3fffd)
+  ) return 2;
+  // A regional indicator is half of a flag; the pair is two cells, so one each.
+  if (REGIONAL.test(character)) return 1;
+  return 1;
 }
 
-/** The width of a whole string, by the same rule. Exported so a test can assert what fits. */
+/** The grapheme clusters of `text`, in order. */
+export function graphemes(text: string): readonly string[] {
+  if (segmenter !== null) return [...segmenter.segment(text)].map((part) => part.segment);
+  const parts: string[] = [];
+  let rest = text;
+  while (rest.length > 0) {
+    const next = fallbackFirstGrapheme(rest);
+    if (next.length === 0) break;
+    parts.push(next);
+    rest = rest.slice(next.length);
+  }
+  return parts;
+}
+
+/** The width of a whole string, in the cells its graphemes occupy. */
 export function displayWidth(text: string): number {
   let total = 0;
-  for (let rest = text; rest.length > 0;) {
-    const character = lastGrapheme(rest);
-    if (character.length === 0) break;
-    total += cellWidth(character);
-    rest = rest.slice(0, rest.length - character.length);
-  }
+  for (const character of graphemes(text)) total += cellWidth(character);
   return total;
 }
 
 /**
- * The tail of `text` that fits in `budget` cells, prefixed with `…` when the head was trimmed.
+ * The first grapheme of `text`, for the fallback splitter.
  *
- * The tail, because the cursor sits at the end of the draft: a window showing the beginning while the
- * operator typed at the end would hide their own keystrokes.
+ * The mirror of `fallbackLastGrapheme`: take one base, then everything that attaches to it. It exists
+ * so the fallback path can split forwards as well as backwards with the same rules, rather than
+ * growing a second, differently-wrong notion of where a character ends.
  */
-export function fitTail(text: string, budget: number): string {
-  if (budget <= 0) return "";
-  const parts: string[] = [];
-  let used = 0;
-  let rest = text;
-  while (rest.length > 0) {
-    const character = lastGrapheme(rest);
-    if (character.length === 0) break;
-    const width = cellWidth(character);
-    if (used + width > budget) break;
-    parts.unshift(character);
-    used += width;
-    rest = rest.slice(0, rest.length - character.length);
+export function fallbackFirstGrapheme(text: string): string {
+  const points = Array.from(text);
+  if (points.length === 0) return "";
+  const first = points[0]!;
+  if (first === ZWJ) return first;
+  let index = 1;
+  const attaches = (point: string): boolean =>
+    point === ZWJ || point === KEYCAP || COMBINING.test(point) || SKIN_TONE.test(point);
+  while (index < points.length && attaches(points[index]!)) {
+    const point = points[index]!;
+    index += 1;
+    // A joiner pulls in the character after it: an emoji ZWJ sequence is one grapheme.
+    if (point === ZWJ && index < points.length) index += 1;
   }
-  if (rest.length === 0) return text;
-  while (parts.length > 0 && used + 1 > budget) {
-    const dropped = parts.shift();
-    if (dropped === undefined) break;
-    used -= cellWidth(dropped);
-  }
-  return `…${parts.join("")}`;
+  return points.slice(0, index).join("");
 }
+
+interface Position {
+  /** Which rendered row of the region the cursor is on, 0-based. */
+  readonly row: number;
+  /** How many cells into that row, 0-based. */
+  readonly column: number;
+  /** How many rows the whole draft occupies once wrapped. */
+  readonly rows: number;
+}
+
+/**
+ * Where the cursor sits in the rendered draft, and how tall the draft is.
+ *
+ * Computed from the buffer, the cursor index and the terminal's width — never from what is on
+ * screen. The renderer prints the draft and then moves to this position, so a wrong answer here is a
+ * cursor in the wrong cell of the region that was just reprinted; it is never able to reach a row the
+ * composer did not write, because the region's bounds come from the terminal's own saved position.
+ */
+export function cursorPosition(draft: string, cursor: number, columns: number): Position {
+  const width = columns > 0 ? columns : 80;
+  const lines = draft.split(LF);
+  const before = draft.slice(0, cursor);
+  const consumed = before.split(LF);
+  const cursorLine = consumed.length - 1;
+  const columnCells = displayWidth(consumed[cursorLine] ?? "");
+  const rowsFor = (text: string): number => Math.max(1, Math.ceil(displayWidth(text) / width));
+  let rows = 0;
+  let row = 0;
+  for (let index = 0; index < lines.length; index += 1) {
+    const height = rowsFor(lines[index] ?? "");
+    if (index < cursorLine) row += height;
+    rows += height;
+  }
+  row += Math.floor(columnCells / width);
+  return Object.freeze({ row, column: columnCells % width, rows });
+}
+
+/**
+ * Paste content, with its line endings normalised and nothing else touched.
+ *
+ * A terminal is free to send CR for a pasted newline — macOS Terminal does — and a CR left in the
+ * stored request is not a cosmetic problem: every renderer that follows honours it, so the cursor
+ * returns to column 0 and the next line is written *over* the previous one. Real dogfood stored a
+ * goal objective containing `\r\r` where its blank lines were, and `/goal` displayed a spliced
+ * sentence that never existed in what was pasted.
+ *
+ * So the normalisation happens here, once, on the way in: CRLF and lone CR become LF. Everything
+ * else — blank lines, numbered lists, punctuation, a trailing newline — is kept exactly, because the
+ * draft that is submitted has to be the text that was pasted.
+ */
+const normalisePaste = (text: string): string => text.replace(/\r\n?/g, LF);
 
 export function createPromptInput(options: PromptInputOptions): PromptInput {
   const terminal = options.terminal ?? options.input.isTTY === true;
-  const continuation = options.continuation ?? "  ";
 
-  /** The draft being composed: everything the operator has entered and not yet submitted. */
+  /** The draft: the whole editable buffer, exactly what will be submitted. */
   let draft = "";
+  /** Where editing happens, as a UTF-16 index into `draft`, always on a grapheme boundary. */
+  let cursor = 0;
   /** The question of the ask currently waiting, or `null` between asks. */
   let prompt: string | null = null;
   let waiter: ((answer: string | null) => void) | null = null;
@@ -310,9 +382,13 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   let closed = false;
 
   const write = options.write;
-
-  /** One submitted answer, delivered to whoever is asking or queued for the ask that comes next. */
   const submitted: string[] = [];
+
+  /** How wide the terminal is now. Re-read on every render, so a resize is picked up by the next key. */
+  const terminalWidth = (): number => {
+    const value = options.columns ?? process.stdout.columns ?? 80;
+    return Number.isFinite(value) && value > 8 ? Math.floor(value) : 80;
+  };
 
   const deliver = (answer: string): void => {
     if (waiter === null) { submitted.push(answer); return; }
@@ -331,112 +407,136 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     resolve?.(null);
   };
 
+  /** The draft as the terminal should show it: its own lines, with a real carriage return per break. */
+  const rendered = (): string => draft.split(LF).join(NEWLINE);
+
+  /**
+   * Paints the region: back to the terminal's anchor, clear downwards, print the buffer, place the
+   * cursor. Nothing above the anchor is addressed, and the anchor is the terminal's own memory of
+   * where the prompt ended — so this is bounded by construction rather than by arithmetic.
+   */
+  const redraw = (): void => {
+    if (prompt === null) return;
+    const columns = terminalWidth();
+    write(`${RESTORE_CURSOR}${ERASE_DOWN}${rendered()}`);
+    const position = cursorPosition(draft, cursor, columns);
+    const up = position.rows - 1 - position.row;
+    if (up > 0) write(cursorUp(up));
+    write(column(position.column + 1));
+  };
+
+  /** Inserts text at the cursor — typed or pasted — and repaints. */
+  const insert = (text: string): void => {
+    if (text.length === 0) return;
+    draft = draft.slice(0, cursor) + text + draft.slice(cursor);
+    cursor += text.length;
+    redraw();
+  };
+
   const submit = (): void => {
-    // Every line of the draft, exactly as it was composed. A trailing newline the operator typed is
-    // part of what they wrote, and removing it here would be this module editing a request.
+    // Every grapheme of the buffer, exactly as composed, and exactly once.
     const answer = draft;
-    const shown = prompt ?? "";
     draft = "";
-    // The request is echoed as *output*: the one-row draft view is replaced by the same text laid out
-    // over as many rows as it has lines, so what was submitted stays on screen exactly as it did when
-    // the composer drew drafts across rows. It is written below the composer's row and never
-    // re-entered, which makes it history like any other printed line — and this is the only place in
-    // this module that writes a newline into the display.
-    write(`${CR}${ERASE_LINE}${shown}${answer}`.split(LF).join(NEWLINE) + NEWLINE);
+    cursor = 0;
+    // The request stays on screen as output, over as many rows as it has lines: it is written below
+    // the anchor and never re-entered, so it is history like anything else the session printed.
+    write(`${RESTORE_CURSOR}${ERASE_DOWN}${answer.split(LF).join(NEWLINE)}${NEWLINE}`);
     deliver(answer);
   };
 
   const clearDraft = (): void => {
     draft = "";
-    write(`${CR}${ERASE_LINE}^C${NEWLINE}`);
-    if (prompt !== null) write(prompt);
-  };
-
-  /**
-   * How wide the terminal is. Read from the options when a caller pins it, from the terminal
-   * otherwise, and never below a width that could hold a prompt and one character.
-   */
-  const terminalWidth = (): number => {
-    const value = options.columns ?? process.stdout.columns ?? 80;
-    return Number.isFinite(value) && value > 12 ? Math.floor(value) : 80;
-  };
-
-  /**
-   * The draft as the one row the composer owns: line breaks shown, control bytes hidden, tail kept.
-   *
-   * The notice is appended to the same row rather than written under the draft. A second row would be
-   * a row whose position this module has to remember in order to erase, which is the arithmetic that
-   * erased the operator's history — so the operator is told how many lines are pending *inside* the
-   * row, when there is width for it, and told nothing when there is not. The suffix is dropped before
-   * the draft is: knowing what you typed matters more than knowing how many lines it is.
-   */
-  const draftRow = (): string => {
-    const lines = draft.split(LF).length - 1;
-    const flat = draft.replace(/\n/g, LINE_BREAK).replace(/[\u0000-\u001f\u007f]/g, " ");
-    if (lines === 0) return fitTail(flat, terminalWidth() - displayWidth(prompt ?? "") - 1);
-    const count = String(lines + 1);
-    const roomy = `${continuation}[pasted ${count} lines — Enter sends, Ctrl+C clears]`;
-    const compact = `[${count} lines]`;
-    for (const suffix of [roomy, compact, ""]) {
-      const budget = terminalWidth() - displayWidth(prompt ?? "") - displayWidth(suffix) - 1;
-      // At least a few characters of the draft itself, or the notice is not worth the width.
-      if (budget >= 6) return `${fitTail(flat, budget)}${suffix}`;
+    cursor = 0;
+    write(`${RESTORE_CURSOR}${ERASE_DOWN}^C${NEWLINE}`);
+    if (prompt !== null) {
+      // The prompt is written again on the fresh row, and the anchor moves with it.
+      write(prompt);
+      write(SAVE_CURSOR);
     }
-    return fitTail(flat, Math.max(1, terminalWidth() - displayWidth(prompt ?? "") - 1));
   };
 
-  /**
-   * Repaints the prompt and the draft on the composer's own row, and nothing else.
-   *
-   * Carriage return, erase this row, reprint. The cursor never moves up, so no byte written here can
-   * reach a row that already held output: the invariant is structural rather than arithmetic. Nothing
-   * is erased in place either — the row is cleared as a row — so an emoji, an Arabic letter with two
-   * diacritics and a Latin word are all just text, and whatever the terminal does with them, the row
-   * ends up showing the draft the buffer actually holds.
-   *
-   * Reached after every edit, which is why Backspace can be correct without knowing anything about the
-   * text it just deleted.
-   */
-  const redraw = (): void => {
-    if (prompt === null) return;
-    write(`${CR}${ERASE_LINE}${prompt}${draftRow()}`);
+  /** One grapheme before the cursor, or `""` at the start of the buffer. */
+  const beforeCursor = (): string => (cursor === 0 ? "" : lastGrapheme(draft.slice(0, cursor)));
+
+  /** One grapheme at the cursor, or `""` at the end of the buffer. */
+  const atCursor = (): string => {
+    if (cursor >= draft.length) return "";
+    const [first] = graphemes(draft.slice(cursor));
+    return first ?? "";
   };
 
-  /** Appends typed or pasted text to the logical buffer, then prints the buffer again. */
-  const append = (text: string): void => {
-    if (text.length === 0) return;
-    draft += text;
-    redraw();
-  };
-
-  /**
-   * Paste content, with its line endings normalised and nothing else touched.
-   *
-   * A terminal is free to send CR for a pasted newline — macOS Terminal does — and a CR left in the
-   * stored request is not a cosmetic problem: every renderer that follows honours it, so the cursor
-   * returns to column 0 and the next line is written *over* the previous one. Real dogfood stored a
-   * goal objective containing `\r\r` where its blank lines were, and `/goal` displayed a spliced
-   * sentence ("…reversible DIRECT-mod" + "3. one harmless…") that never existed in what was pasted.
-   *
-   * So the normalisation happens here, once, on the way in: CRLF and lone CR become LF. Everything
-   * else — blank lines, numbered lists, punctuation, a trailing newline — is kept exactly, because
-   * the draft that is submitted has to be the text that was pasted.
-   */
-  const normalisePaste = (text: string): string => text.replace(/\r\n?/g, LF);
-
-  /**
-   * Backspace: one user-perceived character off the end of the logical buffer, then a fresh render.
-   *
-   * The buffer is edited first and the display is made to agree afterwards, in that order, because
-   * the reverse is what broke: an incremental erase describes a *screen state* the module cannot
-   * verify for shaped text, while the draft is plain data it can always get right.
-   */
   const backspace = (): void => {
-    if (draft.length === 0) return;
-    const removed = lastGrapheme(draft);
+    const removed = beforeCursor();
+    // At the beginning this is a no-op — and a no-op that writes nothing, so the terminal is not
+    // repainted for a keystroke that changed nothing.
     if (removed.length === 0) return;
-    draft = draft.slice(0, draft.length - removed.length);
+    draft = draft.slice(0, cursor - removed.length) + draft.slice(cursor);
+    cursor -= removed.length;
     redraw();
+  };
+
+  const deleteForward = (): void => {
+    const removed = atCursor();
+    if (removed.length === 0) return;
+    draft = draft.slice(0, cursor) + draft.slice(cursor + removed.length);
+    redraw();
+  };
+
+  /** Where the cursor is, as line and grapheme column, for vertical movement. */
+  const lineAndColumn = (): { readonly line: number; readonly offset: number } => {
+    const before = draft.slice(0, cursor);
+    const line = before.split(LF).length - 1;
+    const offset = graphemes(before.slice(before.lastIndexOf(LF) + 1)).length;
+    return { line, offset };
+  };
+
+  const placeCursor = (line: number, offset: number): void => {
+    const lines = draft.split(LF);
+    const target = Math.max(0, Math.min(line, lines.length - 1));
+    let start = 0;
+    for (let index = 0; index < target; index += 1) start += (lines[index] ?? "").length + 1;
+    const parts = graphemes(lines[target] ?? "");
+    const take = Math.max(0, Math.min(offset, parts.length));
+    const text = parts.slice(0, take).join("");
+    cursor = start + text.length;
+    redraw();
+  };
+
+  const moveLeft = (): void => {
+    const removed = beforeCursor();
+    if (removed.length === 0) return;
+    cursor -= removed.length;
+    redraw();
+  };
+
+  const moveRight = (): void => {
+    const next = atCursor();
+    if (next.length === 0) return;
+    cursor += next.length;
+    redraw();
+  };
+
+  const moveUp = (): void => {
+    const { line, offset } = lineAndColumn();
+    if (line === 0) return;
+    placeCursor(line - 1, offset);
+  };
+
+  const moveDown = (): void => {
+    const { line, offset } = lineAndColumn();
+    if (line >= draft.split(LF).length - 1) return;
+    placeCursor(line + 1, offset);
+  };
+
+  const moveHome = (): void => {
+    const { line } = lineAndColumn();
+    placeCursor(line, 0);
+  };
+
+  const moveEnd = (): void => {
+    const { line } = lineAndColumn();
+    const lines = draft.split(LF);
+    placeCursor(line, graphemes(lines[line] ?? "").length);
   };
 
   const feed = (chunk: string): void => {
@@ -445,7 +545,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
       if (pasting) {
         const end = pending.indexOf(PASTE_END);
         if (end >= 0) {
-          append(normalisePaste(pending.slice(0, end)));
+          insert(normalisePaste(pending.slice(0, end)));
           pending = pending.slice(end + PASTE_END.length);
           pasting = false;
           continue;
@@ -454,13 +554,13 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
         // pasted as text.
         const held = partialMarkerPrefix(pending, PASTE_END);
         if (held.length > 0) {
-          append(normalisePaste(pending.slice(0, pending.length - held.length)));
+          insert(normalisePaste(pending.slice(0, pending.length - held.length)));
           pending = held;
         } else {
           // A CR at the very end of a chunk may be half of a CRLF, so it is held until the next
           // chunk says which it was.
           const heldCr = pending.endsWith(CR) ? CR : "";
-          append(normalisePaste(heldCr.length > 0 ? pending.slice(0, -1) : pending));
+          insert(normalisePaste(heldCr.length > 0 ? pending.slice(0, -1) : pending));
           pending = heldCr;
         }
         return;
@@ -481,6 +581,27 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
         case "backspace":
           backspace();
           break;
+        case "delete":
+          deleteForward();
+          break;
+        case "left":
+          moveLeft();
+          break;
+        case "right":
+          moveRight();
+          break;
+        case "up":
+          moveUp();
+          break;
+        case "down":
+          moveDown();
+          break;
+        case "home":
+          moveHome();
+          break;
+        case "end":
+          moveEnd();
+          break;
         case "interrupt":
           if (draft.length > 0) clearDraft(); else endSession();
           break;
@@ -488,7 +609,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
           if (draft.length === 0) endSession();
           break;
         case "text":
-          append(next.text);
+          insert(next.text);
           break;
         case "ignore":
           break;
@@ -497,30 +618,41 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   };
 
   type Token =
-    | { readonly kind: "text" | "submit" | "backspace" | "interrupt" | "eof" | "ignore"; readonly text: string; readonly length: number }
+    | { readonly kind: "text" | "submit" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "interrupt" | "eof" | "ignore"; readonly text: string; readonly length: number }
     | { readonly kind: "paste-start"; readonly text: string; readonly length: number };
+
+  /** The movement and editing keys this composer implements, by the sequence a terminal sends. */
+  const KEYS: readonly (readonly [readonly string[], Token["kind"]])[] = Object.freeze([
+    [["\u001b[A", "\u001b[1A", "\u001bOA"], "up"],
+    [["\u001b[B", "\u001b[1B", "\u001bOB"], "down"],
+    [["\u001b[C", "\u001b[1C", "\u001bOC"], "right"],
+    [["\u001b[D", "\u001b[1D", "\u001bOD"], "left"],
+    [["\u001b[H", "\u001b[1~", "\u001b[7~", "\u001bOH"], "home"],
+    [["\u001b[F", "\u001b[1K", "\u001b[4~", "\u001b[8~", "\u001bOF"], "end"],
+    [["\u001b[3~"], "delete"],
+  ]);
 
   /**
    * The next thing the byte stream says, or `null` when it does not say enough yet.
    *
-   * Ordered by what can be longest: the paste marker first, then a whole escape sequence, then the
-   * single bytes. An incomplete escape sequence stops the parse rather than being dropped, because
-   * the rest of it is in the next chunk.
+   * Ordered by what can be longest: the paste marker first, then the keys this composer implements,
+   * then a whole escape sequence — an unimplemented key, a mouse report, a bracketed-paste status
+   * reply — consumed and dropped rather than half-parsed, then the single bytes. An incomplete
+   * escape sequence stops the parse rather than being dropped, because the rest is in the next chunk.
    */
   function nextToken(text: string): Token | null {
     if (text.length === 0) return null;
     if (text.startsWith(PASTE_START)) return { kind: "paste-start", text: PASTE_START, length: PASTE_START.length };
     const held = partialMarkerPrefix(text, PASTE_START);
     if (held.length > 0 && held.length === text.length) return null;
-    // Every other escape sequence — Left, Right, Home, End, a function key, a mouse report — is
-    // consumed whole and ignored. This is the deliberate limitation described at the top of the file:
-    // a cursor key means "move to that place in the text", and for shaped or bidirectional text this
-    // module cannot know where "that place" is, because the terminal reorders what it is given. A
-    // Left arrow that guessed one code point or one cell would put the next Backspace in a position
-    // the operator did not choose and would corrupt the draft while looking like it worked. So the
-    // key is dropped rather than half-implemented: the draft is edited at the end, and the escape
-    // sequence never reaches the buffer.
-    if (text.startsWith("\x1b")) {
+    for (const [sequences, kind] of KEYS) {
+      for (const sequence of sequences) {
+        if (text.startsWith(sequence)) return { kind, text: sequence, length: sequence.length };
+        // A prefix of a movement key: wait for the rest rather than treating ESC as a key of its own.
+        if (sequence.startsWith(text) && text.startsWith("\u001b")) return null;
+      }
+    }
+    if (text.startsWith("\u001b")) {
       const end = escapeEnd(text);
       if (end === null) return null;
       return { kind: "ignore", text: text.slice(0, end), length: end };
@@ -530,24 +662,28 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     if (char === BACKSPACE || char === BACKSPACE_ALT) return { kind: "backspace", text: char, length: 1 };
     if (char === INTERRUPT) return { kind: "interrupt", text: char, length: 1 };
     if (char === EOT) return { kind: "eof", text: char, length: 1 };
+    // Ctrl+A and Ctrl+E, which every shell user's fingers know.
+    if (char === "\u0001") return { kind: "home", text: char, length: 1 };
+    if (char === "\u0005") return { kind: "end", text: char, length: 1 };
     if (char < " ") {
       // Any other control byte is not part of a request, and is dropped rather than pasted in.
       return { kind: "ignore", text: char, length: 1 };
     }
     // Plain text, up to whatever comes next: this is the common case and it stays one token.
-    const stop = text.slice(1).search(/[\r\n\u007f\b\u0003\u0004\x1b]/);
-    const length = stop < 0 ? text.length : stop + 1;
-    return { kind: "text", text: text.slice(0, length), length };
+    const stop = text.slice(1).search(/[\r\n\u007f\b\u0003\u0004\u0001\u0005\x1b]/);
+    const end = stop < 0 ? text.length : stop + 1;
+    return { kind: "text", text: text.slice(0, end), length: end };
   }
 
-  /** Where an escape sequence ends, or `null` when this chunk does not contain all of it. */
+  /** The length of the escape sequence starting at 0, or `null` when it is not complete yet. */
   function escapeEnd(text: string): number | null {
-    if (text.length < 2) return null;
+    if (!text.startsWith("\u001b")) return null;
+    if (text.length === 1) return null;
     const second = text[1]!;
     if (second === "[") {
-      // CSI: parameter and intermediate bytes, then one final byte in @–~.
       for (let index = 2; index < text.length; index += 1) {
         const code = text.charCodeAt(index);
+        // Final byte of a CSI sequence: 0x40-0x7E.
         if (code >= 0x40 && code <= 0x7e) return index + 1;
       }
       return null;
@@ -578,7 +714,12 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     const queued = submitted.shift();
     if (queued !== undefined) return queued;
     prompt = question;
+    draft = "";
+    cursor = 0;
     write(question);
+    // The anchor: wherever the terminal says the cursor is once the prompt has been written. Every
+    // redraw returns here, which is what bounds the region to rows this module owns.
+    write(SAVE_CURSOR);
     return await new Promise<string | null>((resolve) => { waiter = resolve; });
   };
 
