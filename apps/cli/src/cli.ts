@@ -531,7 +531,10 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
             : `DIRECT: none (${row.direct.reason ?? "no measured invocation"})`;
           const session = row.session.continuityOffered ? `sessions: ${row.session.idSource}` : "sessions: goal handoff only";
           const write = row.write.direct ? "write: DIRECT" : row.write.worktree ? "write: worktree" : "write: none";
-          return `${row.providerId}: ${open.length === 0 ? "no roles" : open.join(", ")}${how}\n    ${native} · ${session} · ${write}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
+          // The roles list answers the staged question, so it says so: a provider whose only
+          // reachable route is DIRECT read as "no roles" beside a DIRECT line saying otherwise.
+          const route = row.shadow.enabled === false ? "staged (operator-accepted)" : "staged";
+          return `${row.providerId}: ${open.length === 0 ? `${route}: no roles` : `${route}: ${open.join(", ")}`}${how}\n    ${native} · ${session} · ${write}\n    ${row.roles.find((entry) => !entry.enabled)?.reason ?? "no restrictions"}`;
         }).join("\n"), stdout);
         return Object.freeze({ exitCode: 0, data });
       }
