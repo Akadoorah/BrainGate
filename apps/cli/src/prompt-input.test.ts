@@ -1130,9 +1130,11 @@ process.exit(0);
   writeFileSync(keyFile, keys, "utf8");
   const quote = (value: string): string => `'${value.replaceAll("'", "'\\''")}'`;
   try {
-    // Paced, like a person: the tty echoes input until the composer puts it in raw mode, and keys
+    // Delayed, like a person: the tty echoes input until the composer puts it in raw mode, and keys
     // written before the driver starts are echoed by the kernel rather than composed by BrainGate.
-    const result = spawnSync("/bin/sh", ["-c", `{ sleep 1.5; cat ${quote(keyFile)}; } | script -q /dev/null ${quote(process.execPath)} --import ${quote(TSX_IMPORT)} ${quote(driver)}`], {
+    // Three seconds, because the whole suite runs its files at once and a driver can be slow to
+    // start; the driver's own watchdog is what keeps a stuck pty from hanging the run.
+    const result = spawnSync("/bin/sh", ["-c", `{ sleep 3; cat ${quote(keyFile)}; } | script -q /dev/null ${quote(process.execPath)} --import ${quote(TSX_IMPORT)} ${quote(driver)}`], {
       encoding: "buffer",
       timeout: 120_000,
     });
