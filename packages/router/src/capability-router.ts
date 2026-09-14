@@ -150,7 +150,6 @@ export class CapabilityRouter {
       const because = pinned !== undefined
         ? pinned.reasons.join(", ")
         : `it is not registered for role ${request.role}${request.writeRequired ? " with write support" : ""}`;
-      console.error("ROUTEPROBE", request.role, String(request.writeRequired), JSON.stringify(pin), JSON.stringify(request.excludeProviders ?? []), new Error("here").stack?.split("\n").slice(2, 6).join(" <- "));
       throw new BrainGateInvariantError(
         "ROUTE_MANUAL_INELIGIBLE",
         `${pin.providerId}/${pin.modelId} cannot run this work: ${because}. Nothing was routed elsewhere. Use /auto to return to automatic selection.`,
