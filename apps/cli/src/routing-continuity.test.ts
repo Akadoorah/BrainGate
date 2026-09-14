@@ -252,6 +252,10 @@ test("the run executes the worker the plan named, on whichever subscription it i
     const route = (brief?.payload as { readonly route?: readonly { readonly role: string; readonly providerId: string; readonly modelId: string; readonly selectedReasons?: readonly string[] }[] } | undefined)?.route ?? [];
     const primary = route.find((role) => role.role === "coder" || role.role === "primary");
     assert.equal(`${String(primary?.providerId)}/${String(primary?.modelId)}`, planned, "the run's own route record names the worker the plan named");
+    assert.ok(
+      (primary?.selectedReasons ?? []).includes("continuity:warm-session"),
+      `the record says why this worker won: ${String(primary?.selectedReasons?.join(", "))}`,
+    );
     assert.deepEqual(executor.calls.length, 1, "one worker ran");
   } finally {
     ledger.close();

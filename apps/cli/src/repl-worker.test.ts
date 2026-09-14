@@ -207,7 +207,13 @@ class FakeCli implements ShadowProcessExecutor {
 function fixture(
   label: string,
   models: readonly { providerId: "anthropic" | "xai" | "openai" | "google" | "github-copilot"; modelId: string; coder: number; speed: "fast" | "balanced" | "deep"; writeCapable?: boolean }[] = [
-    { providerId: "anthropic", modelId: "claude-sonnet", coder: 95, speed: "balanced" },
+    // The provider the session scenarios are about, and the strongest worker in this catalogue at
+    // every tier — deliberately, because these scenarios are about session continuity rather than
+    // about which subscription wins. Now that an automatic DIRECT turn may route to any provider
+    // whose build can run it, a fixture where a fast Grok model outranked this one on a lookup would
+    // have every scenario resuming a worker it never started. Cross-subscription automatic routing,
+    // including the fast-and-cheap case, is proved in `routing-continuity.test.ts`.
+    { providerId: "anthropic", modelId: "claude-sonnet", coder: 95, speed: "fast" },
     { providerId: "anthropic", modelId: "claude-haiku", coder: 60, speed: "fast" },
     { providerId: "xai", modelId: "grok-fast", coder: 70, speed: "fast" },
     { providerId: "openai", modelId: "gpt-review", coder: 80, speed: "balanced" },
@@ -573,6 +579,27 @@ test("F: /auto restores automatic routing", async () => {
   assert.match(session.text(), /Automatic selection restored/);
   assert.match(session.text(), /Worker: auto — BrainGate routes each turn/);
   assert.notEqual(models[1], undefined, "the automatic turn still ran, under a model the router chose");
+});
+
+test("P: after /auto the automatic route keeps the goal with the warm worker, and resumes its session", async () => {
+  const f = fixture("warm-auto");
+  const cli = new FakeCli();
+  const session = sessionOf(f.repo, f.env, cli, [
+    "/use anthropic/claude-haiku",
+    "Investigate the idle logout", "y",
+    "/auto",
+    "What else could cause it?", "y",
+  ]);
+  assert.equal(await session.run(), 0);
+  const calls = cli.primaryCalls();
+  assert.equal(calls.length, 2, "two turns, two primary invocations");
+  assert.equal(calls[0]!.modelId, "claude-haiku", "the manual choice ran the first turn");
+  // The catalogue holds a stronger worker (claude-sonnet) and a faster one on another subscription
+  // (grok-fast), and both are eligible for this request. The turn still goes to the worker that
+  // already holds the goal: continuing costs nothing, switching re-reads what it already read.
+  assert.equal(calls[1]!.modelId, "claude-haiku", "a warm worker keeps a turn it is capable of");
+  assert.equal(calls[1]!.resumeArg, calls[0]!.sessionIdArg, "and the session it holds is the one resumed");
+  assert.match(session.text(), /Automatic selection restored/);
 });
 
 // ---------------------------------------------------------------- G. fresh session
