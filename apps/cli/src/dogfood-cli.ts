@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, writeFileSync } from
 import { basename, dirname, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { conservativeTokenEstimate } from "@braingate/context";
-import { CODEX_PROBE_VERSION } from "@braingate/shadow";
+import { CODEX_PROBE_VERSION, nativeDirectCapable } from "@braingate/shadow";
 import { ProjectSnapshotProvider } from "@braingate/execution";
 import type { NativeSessionResolver, TaskSnapshotProvider } from "@braingate/shadow";
 import {
@@ -35,7 +35,7 @@ import {
 } from "@braingate/dogfood";
 import { WINDOW_UTILIZATION_METRIC, openQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
-import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, type ProviderSnapshot } from "@braingate/providers";
+import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, readAntigravityHeadlessPermissions, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
 import {
   CodexIsolationVerifier,
@@ -55,7 +55,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
-import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, directWriteCapable, type WriteProviderExecutor } from "@braingate/write";
 import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
@@ -126,6 +126,17 @@ export interface DogfoodCliDependencies {
    * interactive session, which is the only surface where a person is choosing.
    */
   readonly pin?: { readonly providerId: string; readonly modelId: string } | undefined;
+  /**
+   * The sessions this goal already holds, compatible with what this run is for.
+   *
+   * Supplied by the caller that owns the goal store. Automatic routing uses it to prefer continuing a
+   * worker over switching to one that is only marginally better, and never as a gate: a warm worker
+   * that cannot do the work still loses.
+   */
+  readonly continuity?: {
+    readonly warm: readonly { readonly providerId: string; readonly modelId: string }[];
+    readonly previous?: { readonly providerId: string; readonly modelId: string } | null;
+  } | undefined;
   /**
    * Asked per invocation whether this run continues a native provider session.
    *
@@ -656,7 +667,7 @@ function recordQuotaReading(state: OperatorStatePaths, readings: readonly (Quota
  * about a flag can be narrowed by what this build actually has — the difference between a run
  * that is refused here with a reason and one that fails at the provider with a flag error.
  */
-async function measuredCapabilities(deps: DogfoodCliDependencies): Promise<Readonly<Record<string, MeasuredCapabilities>>> {
+async function measuredCapabilities(deps: DogfoodCliDependencies, env: NodeJS.ProcessEnv = process.env, workspace?: string): Promise<Readonly<Record<string, MeasuredCapabilities>>> {
   if (deps.measureCapabilities !== undefined) return await deps.measureCapabilities();
   const runner = new NodeProbeRunner();
   const entries = await Promise.all(PROVIDER_IDS.map(async (providerId) => {
@@ -669,7 +680,24 @@ async function measuredCapabilities(deps: DogfoodCliDependencies): Promise<Reado
       return null;
     }
   }));
-  return Object.freeze(Object.fromEntries(entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null)));
+  const measured: Record<string, MeasuredCapabilities> = Object.fromEntries(entries.filter((entry): entry is NonNullable<typeof entry> => entry !== null));
+  // Antigravity's DIRECT gate is not in its help text: it is the operator's own settings file, read
+  // here and never written. Free, like the help probes, and taken every time so a rule the operator
+  // adds opens the gate on the next request rather than after a restart.
+  return Object.freeze({ ...measured, google: withAntigravityPermissions(measured.google, env, workspace) });
+}
+
+/** The help-text reading for Antigravity, with what its settings allow a headless run to do. */
+function withAntigravityPermissions(base: MeasuredCapabilities | undefined, env: NodeJS.ProcessEnv, workspace?: string): MeasuredCapabilities {
+  const permissions = readAntigravityHeadlessPermissions({ env, ...(workspace === undefined ? {} : { workspace }) });
+  return Object.freeze({
+    toolDenial: base?.toolDenial ?? "unknown",
+    declaredSubagents: base?.declaredSubagents ?? "unknown",
+    sandbox: base?.sandbox ?? "unknown",
+    sessionIdPinning: base?.sessionIdPinning ?? "unknown",
+    headlessReads: permissions.reads,
+    headlessShell: permissions.shell,
+  });
 }
 
 async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: string, env: NodeJS.ProcessEnv, json: boolean, stdout: (text: string) => void): Promise<DogfoodCliResult> {
@@ -684,12 +712,14 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   const isolation = await codexIsolationStatus(snapshots, deps, env, configured.some((entry) => entry.providerId === "openai"), state, CODEX_PROBE_VERSION);
   const grok = await grokProof(state, snapshots, deps, env, project);
   const acceptances = loadAcceptances(state);
+  const oauth = attestations(false, state);
+  const measured = await measuredCapabilities(deps, env, cwd);
   // DIRECT is the default policy, so readiness is asked under it: a provider whose only invocation
   // BrainGate has measured is its native one in the workspace is ready for exactly that, and asking
   // the staged question instead printed `ask=blocked` beside a run that then worked.
   const roleStatus = (providerId: ProviderSnapshot["providerId"], role: "primary" | "reviewer", direct: boolean) => {
     const acceptance = acceptances.find((item) => item.providerId === providerId);
-    return shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), direct });
+    return shadowProviderRoleStatus(providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), direct, measured: measured[providerId] ?? null });
   };
   const providerById = new Map<string, ProviderSnapshot>(snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
 
@@ -705,7 +735,7 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
     const snapshot = providerById.get(entry.providerId);
     if (snapshot === undefined || snapshot.available.value !== true) return false;
     try {
-      assertWriteEligible(snapshot, { providerId: entry.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool }, { nativeHarness: true });
+      assertWriteEligible(snapshot, { providerId: entry.providerId, modelId: entry.modelId, quotaPool: entry.definition.quotaPool }, { nativeHarness: true, measured: measured[entry.providerId] ?? null, attestations: oauth });
       return true;
     } catch { return false; }
   });
@@ -819,8 +849,14 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const grokSnapshot = await grokProof(state, snapshots, deps, env, project, undefined, "snapshot-read");
     const grokSnapshotIsolation = grokSnapshot.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const measured = await measuredCapabilities(deps);
-    const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
+    const measured = await measuredCapabilities(deps, env, cwd);
+    // Which providers can execute this policy, measured from the installed builds rather than
+    // assumed: a DIRECT read needs a CLI BrainGate can point at the workspace — and for Antigravity,
+    // one whose own settings let a headless run read it.
+    const policyCapability = policy === "direct"
+      ? Object.freeze({ id: "direct" as const, supportedProviders: Object.freeze(snapshots.filter((item) => nativeDirectCapable(item.providerId, measured[item.providerId] ?? null)).map((item) => item.providerId)) })
+      : undefined;
+    const plan = buildShadowTaskPlan({ project: scope.project, cwd, router: runtime.router, providers: snapshots, measured, nativeHarness: policy === "direct", ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), attestations: oauth, task, context, classification: effective, budget, requiredContextTokens, optionalReview, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }) });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The plan, in both readings the operator gets. `summary` and `grantLines` are the text the
     // terminal prints; `complexity`, `risk`, `promptComplexity` and `roleLines` are the same facts as
@@ -867,7 +903,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     // and deduplicated because a task may spend several phases on the same model.
     const servedBy: string[] = [];
     try {
-      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, nativeHarness: policy === "direct", policy, snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
+      const runner = new ShadowDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, snapshots, attestations: oauth, acceptances, measured, nativeHarness: policy === "direct", policy, ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), snapshotStore: deps.snapshotStore ?? new ProjectSnapshotProvider(scope.project), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation }), ...(deps.executor === undefined ? {} : { executor: deps.executor }), onRoleActivity: (activity) => {
         if (activity.stage === "started") {
           const attribution = `${activity.provider}/${activity.model}`;
           if (!servedBy.includes(attribution)) servedBy.push(attribution);
@@ -955,7 +991,13 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const grokWrite = await grokProof(state, snapshots, deps, env, project, GROK_WRITE_SANDBOX);
     const grokWriteIsolation = grokWrite.attestation ?? undefined;
     const acceptances = loadAcceptances(state);
-    const plan = buildWriteTaskPlan({ policy, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const measured = await measuredCapabilities(deps, env, repositoryPath);
+    // A DIRECT write needs a measured write posture, which is a different set from a DIRECT read: a
+    // CLI can be able to inspect the workspace and unable to change it.
+    const policyCapability = policy === "direct"
+      ? Object.freeze({ id: "direct" as const, supportedProviders: Object.freeze(snapshots.filter((item) => directWriteCapable(item.providerId, measured[item.providerId] ?? null)).map((item) => item.providerId)) })
+      : undefined;
+    const plan = buildWriteTaskPlan({ policy, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, measured, ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The same structural fields the read plan carries, so a caller that continues a goal reads one
     // shape whichever mode the request took. `summary` is what the terminal prints; the tiers are
@@ -992,7 +1034,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const ledger = new TaskLedger(scope.project);
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
-      const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
+      const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, measured, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
       const result = await runner.run({ task, repositoryPath, baseRef, policy, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       // A write turn is a turn like any other, and the goal history has to name the worker that made

@@ -24,7 +24,7 @@ import {
   resolveOperatorState,
   type OperatorStatePaths,
 } from "@braingate/operator";
-import { CLI_FEATURES, ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, isProviderId, probeCliCapabilities, type CliCapabilityReport, type ProviderSnapshot } from "@braingate/providers";
+import { CLI_FEATURES, ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, isProviderId, probeCliCapabilities, readAntigravityHeadlessPermissions, type CliCapabilityReport, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition, type ModelRef } from "@braingate/router";
 import { CODEX_PROBE_VERSION, nativeDirectCapable } from "@braingate/shadow";
 import { RUNTIME_SESSION_POLICIES } from "@braingate/goals";
@@ -495,6 +495,11 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
         noExtraArgs(args);
         const acceptances = loadAcceptances(state);
         const now = new Date();
+        // Antigravity's DIRECT answer lives in its own settings file, not in a constant; read it so
+        // this listing says what the next request would actually be offered.
+        const antigravity = readAntigravityHeadlessPermissions({ env, workspace: cwd });
+        const measured = Object.freeze({ google: Object.freeze({ toolDenial: "unknown" as const, declaredSubagents: "unknown" as const, sandbox: "unknown" as const, sessionIdPinning: "unknown" as const, headlessReads: antigravity.reads, headlessShell: antigravity.shell }) });
+        const measuredFor = (providerId: string) => (providerId === "google" ? measured.google : null);
         const rows = PROVIDER_IDS.map((providerId) => {
           const record = store.find(providerId);
           const roles = (["planner", "primary", "reviewer", "judge"] as const).map((role) => {
@@ -506,10 +511,10 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           // the operator's own workspace, what kind of native session does it keep, and may it write.
           // They are separate facts about one CLI, and flattening them into "enabled" is how a
           // provider that runs natively looked identical to one that does not run at all.
-          const direct = shadowProviderRoleStatus(providerId, "primary", { ...(acceptances.find((item) => item.providerId === providerId) === undefined ? {} : { acceptance: acceptances.find((item) => item.providerId === providerId)! }), direct: true, now });
+          const direct = shadowProviderRoleStatus(providerId, "primary", { ...(acceptances.find((item) => item.providerId === providerId) === undefined ? {} : { acceptance: acceptances.find((item) => item.providerId === providerId)! }), direct: true, now, measured: measuredFor(providerId) });
           const session = RUNTIME_SESSION_POLICIES[providerId];
           const write = Object.freeze({
-            direct: directWriteCapable(providerId),
+            direct: directWriteCapable(providerId, measuredFor(providerId)),
             worktree: isWriteProvider(providerId),
           });
           return Object.freeze({
@@ -517,7 +522,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
             shadow: shadowProviderStatus(providerId),
             acceptance: record === null ? null : Object.freeze({ acceptedAt: record.acceptedAt, expiresAt: record.expiresAt, current: new Date(record.expiresAt).getTime() > now.getTime() }),
             roles,
-            direct: Object.freeze({ supported: nativeDirectCapable(providerId), primaryReachable: nativeDirectCapable(providerId) && direct.enabled, reason: direct.enabled ? null : direct.reason }),
+            direct: Object.freeze({ supported: nativeDirectCapable(providerId, measuredFor(providerId)), primaryReachable: nativeDirectCapable(providerId, measuredFor(providerId)) && direct.enabled, reason: direct.enabled ? null : direct.reason }),
             session: Object.freeze({ idSource: session?.idSource ?? "none", continuityOffered: session?.resumeOffered === true }),
             write,
           });

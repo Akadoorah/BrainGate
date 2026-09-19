@@ -16,6 +16,21 @@ const MIN_CAPABILITY: Readonly<Record<TaskComplexity, number>> = Object.freeze({
 const SPEED_BONUS_LOW: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 45, balanced: 18, deep: 0 });
 const SPEED_BONUS_HIGH: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 0, balanced: 6, deep: 12 });
 /**
+ * How much of the capability range above the floor is worth paying for, by tier.
+ *
+ * The value preference used to apply at T0 and T1 only, which left T2 — ordinary work, and every
+ * write at all, since a write starts at T2 — decided purely by capability. A one-line documentation
+ * append therefore bought the strongest model in the catalogue: the tier that most needs a value
+ * preference was the one tier that had none. T2 now keeps a little over half of the range (a
+ * balanced model wins a simple append; a genuinely harder T2 still reaches the strong end), and T3
+ * and above keep the whole range, because there the capability difference is the point.
+ */
+const VALUE_SQUASH: Readonly<Record<TaskComplexity, number>> = Object.freeze({ T0: 0.25, T1: 0.25, T2: 0.55, T3: 1, T4: 1 });
+/** Reasoning is worth more as the work gets harder, and least when the floor already decided it. */
+const REASONING_WEIGHT: Readonly<Record<TaskComplexity, number>> = Object.freeze({ T0: 0.3, T1: 0.3, T2: 0.4, T3: 0.45, T4: 0.45 });
+/** Speed is worth most on ordinary work, and least where depth is the reason the task exists. */
+const SPEED_BONUS_MID: Readonly<Record<SpeedClass, number>> = Object.freeze({ fast: 26, balanced: 14, deep: 0 });
+/**
  * What a known quota state costs a candidate.
  *
  * `unknown` is deliberately absent. It used to carry a penalty of fourteen points, which is a
@@ -26,6 +41,22 @@ const SPEED_BONUS_HIGH: Readonly<Record<SpeedClass, number>> = Object.freeze({ f
  * `exhausted` stays infinite: a provider that said it is refusing calls is not a fallback.
  */
 const QUOTA_PENALTY: Readonly<Partial<Record<QuotaState, number>>> = Object.freeze({ healthy: 0, limited: 30, exhausted: Number.POSITIVE_INFINITY });
+/**
+ * What continuing an existing session is worth, in the same units as capability.
+ *
+ * A worker that already holds a compatible session for this goal starts where the last turn left it,
+ * with the files it read and the decisions it made; a switch starts from the handoff and re-reads
+ * what it needs. That difference is real and it is not free, so a warm model wins a close call.
+ *
+ * It is a constant, not a multiplier, for the reason the whole scorer is additive: a preference that
+ * scales with capability would make a strong model unswitchable and a weak one permanently replaced.
+ * Twenty-six points is roughly thirteen capability points — wider than the run-to-run noise between
+ * neighbouring models, narrower than a tier. A T3 task with a warm T2-grade worker still goes to a
+ * cold T4-grade one, which is the property the escalation test pins.
+ */
+const CONTINUITY_WARM_BONUS = 26;
+/** Extra for the model that actually ran the previous turn: the same session, not merely a warm one. */
+const CONTINUITY_PREVIOUS_BONUS = 10;
 
 function ref(model: RegisteredModel): ModelRef {
   return Object.freeze({ providerId: model.definition.providerId, modelId: model.definition.modelId, quotaPool: model.definition.quotaPool });
@@ -72,6 +103,9 @@ export class CapabilityRouter {
     const maxFallbacks = Math.max(0, Math.min(3, Math.floor(request.maxFallbacks ?? 2)));
     const floor = capabilityFloor(request);
     const excluded = new Set(request.excludeProviders ?? []);
+  const policyProviders = request.policy === undefined ? null : new Set(request.policy.supportedProviders);
+  const warm = new Set((request.continuity?.warm ?? []).map((identity) => `${identity.providerId}\u0000${identity.modelId}`));
+  const previous = request.continuity?.previous ?? null;
     const excludedPools = new Set(request.excludeQuotaPools ?? []);
     const accepted: RouteCandidate[] = [];
     const rejected: RouteRejection[] = [];
@@ -99,6 +133,9 @@ export class CapabilityRouter {
       if (capability < floor) reasons.push(`capability-below-floor:${capability}<${floor}`);
       if (definition.contextCapacity < request.requiredContextTokens) reasons.push("context-capacity-too-small");
       if (request.writeRequired && !definition.writeCapable) reasons.push("write-not-supported");
+      // The execution policy is a gate, not a preference: a worker that cannot run the policy the
+      // operator approved cannot do this task at all, however strong it is.
+      if (policyProviders !== null && !policyProviders.has(definition.providerId)) reasons.push(`policy-not-supported:${request.policy?.id ?? "unknown"}`);
       if (request.independence?.mode === "required" && request.independence.models.some((other) => violatesIndependence(modelRef, other, independenceLevel))) {
         reasons.push(`independence-required:${independenceLevel}`);
       }
@@ -112,11 +149,13 @@ export class CapabilityRouter {
         continue;
       }
 
-      const scoreReasons: string[] = [`capability:${capability}`, `reasoning:${definition.reasoning}`, `quota:${runtime.quotaState}`];
-      const lowComplexity = request.classification.complexity === "T0" || request.classification.complexity === "T1";
-      const effectiveCapability = lowComplexity ? floor + (capability - floor) * 0.25 : capability;
-      let score = effectiveCapability * 2 + definition.reasoning * (lowComplexity ? 0.30 : 0.45);
-      score += lowComplexity ? SPEED_BONUS_LOW[definition.speed] : SPEED_BONUS_HIGH[definition.speed];
+      const tier = request.classification.complexity;
+      const scoreReasons: string[] = [`capability:${capability}`, `reasoning:${definition.reasoning}`, `quota:${runtime.quotaState}`, `tier:${tier}`];
+      const lowComplexity = tier === "T0" || tier === "T1";
+      const ordinary = tier === "T2";
+      const effectiveCapability = floor + (capability - floor) * VALUE_SQUASH[tier];
+      let score = effectiveCapability * 2 + definition.reasoning * REASONING_WEIGHT[tier];
+      score += lowComplexity ? SPEED_BONUS_LOW[definition.speed] : ordinary ? SPEED_BONUS_MID[definition.speed] : SPEED_BONUS_HIGH[definition.speed];
       score -= QUOTA_PENALTY[runtime.quotaState] ?? 0;
       if (runtime.quotaHint !== null) {
         score -= runtime.quotaHint * 28;
@@ -128,6 +167,20 @@ export class CapabilityRouter {
         if (penalty.reason !== null) scoreReasons.push(penalty.reason);
       }
       if (request.classification.risk === "critical" && definition.speed === "deep") score += 8;
+      // Continuing beats switching, all else being close: the session already holds this goal's work.
+      if (warm.has(`${definition.providerId}\u0000${definition.modelId}`)) {
+        score += CONTINUITY_WARM_BONUS;
+        scoreReasons.push("continuity:warm-session");
+        if (previous !== null && previous.providerId === definition.providerId && previous.modelId === definition.modelId) {
+          score += CONTINUITY_PREVIOUS_BONUS;
+          scoreReasons.push("continuity:previous-worker");
+        }
+      } else if (previous !== null && previous.providerId === definition.providerId) {
+        // Same provider, different model: a smaller switch than changing CLI entirely, and the
+        // provider's own session store is already warm.
+        score += 6;
+        scoreReasons.push("continuity:same-provider");
+      }
       accepted.push(Object.freeze({ model, score: Math.round(score * 100) / 100, reasons: Object.freeze(scoreReasons) }));
     }
 
@@ -182,6 +235,8 @@ export class CapabilityRouter {
         `complexity:${request.classification.complexity}`,
         `risk:${request.classification.risk}`,
         `capability-floor:${floor}`,
+        ...(request.policy === undefined ? [] : [`policy:${request.policy.id}`]),
+        ...(request.continuity === undefined ? [] : [`warm-sessions:${String(warm.size)}`]),
         `selected:${selected.model.definition.providerId}/${selected.model.definition.modelId}`,
       ]),
     });

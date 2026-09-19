@@ -20,13 +20,13 @@ import {
 } from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import type { ProviderSnapshot } from "@braingate/providers";
-import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RoutePin, type RouteResult } from "@braingate/router";
+import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteContinuity, type RoutePin, type RouteResult } from "@braingate/router";
 import { readdirSync, type Dirent } from "node:fs";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
-import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
+import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type MeasuredCapabilities, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
 import { NodeClaudeWriteExecutor } from "./claude-write-profile.js";
-import { WRITE_PROVIDERS, assertWriteEligible, directWriteCapable, planWriteInvocation } from "./write-profiles.js";
+import { DIRECT_WRITE_CANDIDATES, assertWriteEligible, directWriteCapable, planWriteInvocation } from "./write-profiles.js";
 import { changedPaths, providerAnswerText, reportedSessionIdOf, snapshotWorkspace, workspaceChangesSince, type NativeSessionResolver, type WorkspaceSnapshot } from "@braingate/shadow";
 import type { ExecutionPolicyId } from "@braingate/core";
 import { redactSecrets } from "@braingate/security";
@@ -175,6 +175,8 @@ function routeWriteReviewer(input: {
   readonly requiredContextTokens: number;
   readonly primaryModel: ModelRef;
   readonly excludeProviders: readonly string[];
+  /** The policy this review runs under, when the caller measured which providers can execute it. */
+  readonly policy?: { readonly id: string; readonly supportedProviders: readonly string[] };
 }): RouteResult {
   const route = (independence: IndependenceConstraint): RouteResult => input.router.route({
     role: "reviewer",
@@ -183,6 +185,7 @@ function routeWriteReviewer(input: {
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
     independence,
+    ...(input.policy === undefined ? {} : { policy: input.policy }),
     excludeProviders: input.excludeProviders,
   });
   try {
@@ -230,6 +233,13 @@ export function buildWriteTaskPlan(input: {
   readonly acceptances?: readonly OperatorProviderAcceptance[];
   /** The proof a Grok *write* needs, earned under the write sandbox profile rather than the read one. */
   readonly grokWriteIsolation?: GrokIsolationAttestation;
+  /**
+   * What a capability probe found per provider, when one has been run.
+   *
+   * The read path's reading, handed to the write path unchanged. It decides Antigravity's DIRECT
+   * write, which is gated on the operator's own settings allowing headless reads.
+   */
+  readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
   readonly requiredContextTokens: number;
@@ -251,6 +261,15 @@ export function buildWriteTaskPlan(input: {
    * reviewer would defeat the reason a reviewer exists.
    */
   readonly pin?: RoutePin | undefined;
+  /**
+   * Which providers can execute this policy, and the sessions the goal already holds.
+   *
+   * A write under DIRECT may only go to a provider with a measured DIRECT write invocation: the
+   * caller knows which those are, and the router refuses the rest by name rather than after the
+   * operator has approved the run.
+   */
+  readonly policyCapability?: { readonly id: string; readonly supportedProviders: readonly string[] };
+  readonly continuity?: RouteContinuity;
 }): WriteTaskPlan {
   assertM11Scope(input.classification);
   if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("WRITE_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
@@ -258,17 +277,21 @@ export function buildWriteTaskPlan(input: {
   // provider being named as the only one allowed to. The router then picks on capability among
   // whoever is left, which is what makes the executing role something more than one subscription.
   const direct = input.policy === "direct" || input.policy === "unattended";
-  const writeProof = {
+  const writeProofFor = (providerId: string) => ({
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
     ...(input.grokWriteIsolation === undefined ? {} : { grokIsolation: input.grokWriteIsolation }),
     // The policy decides which proof a write owes: a worktree write owes the sandbox self-test,
     // and a DIRECT write owes the operator's approval of the workspace it edits.
     ...(direct ? { nativeHarness: true } : {}),
-  };
+    // The per-machine reading for this provider: what its installed build, and for Antigravity its
+    // own settings, allow a headless run to do.
+    measured: input.measured?.[providerId] ?? null,
+    attestations: input.attestations ?? [],
+  });
   const primaryExcluded = input.providers
     .filter((snapshot) => {
       try {
-        assertWriteEligible(snapshot, { providerId: snapshot.providerId, modelId: "", quotaPool: "" }, writeProof);
+        assertWriteEligible(snapshot, { providerId: snapshot.providerId, modelId: "", quotaPool: "" }, writeProofFor(snapshot.providerId));
         return false;
       } catch (error) {
         // A model id this loop cannot know is checked per-model below; anything else disqualifies
@@ -277,34 +300,53 @@ export function buildWriteTaskPlan(input: {
       }
     })
     .map((snapshot) => snapshot.providerId);
+  // Which providers this policy reaches, when the caller measured it. `direct` decides whether it
+  // applies at all; the reviewer below asks the same question about the same set.
+  const capable = input.policyCapability?.id === "direct"
+    ? input.policyCapability.supportedProviders
+    : DIRECT_WRITE_CANDIDATES.filter((providerId) => directWriteCapable(providerId, input.measured?.[providerId] ?? null));
   if (direct) {
     // Only the providers whose invocation can honestly run in the workspace. The rest are not
     // refused here but excluded from routing, so the answer to "which model" is decided by the
     // router among the ones that can, and the operator sees that in the plan.
-    primaryExcluded.push(...WRITE_PROVIDERS.filter((providerId) => !directWriteCapable(providerId)));
-    // And the automatic route keeps the shape it was accepted with: DIRECT work goes to the
-    // reference provider unless the operator named another worker. Making a selected worker run
-    // natively is this milestone; re-routing every write to another subscription is a different
-    // decision, and the operator makes it by naming the worker.
-    if (input.pin === undefined) primaryExcluded.push("openai", "google", "xai");
+    //
+    // Where the caller measured this set from the installed builds, that measurement is the answer.
+    // The static table is the fallback for a caller that did not, and both say the same thing: which
+    // providers have a DIRECT write invocation at all.
+    //
+    // This used to narrow the automatic route to the reference provider unless the operator named
+    // one — `openai`, `google` and `xai` were pushed out by name whenever there was no pin. That was
+    // right while choosing the worker was the operator's act and DIRECT existed to make the named
+    // worker run natively. It is wrong now that the route is what chooses: with the other
+    // subscriptions excluded, a task whose best worker is Grok or Codex could not reach it, and an
+    // exhausted or refusing Claude pool left the write with no eligible worker at all instead of the
+    // one that was actually free.
+    primaryExcluded.push(...DIRECT_WRITE_CANDIDATES.filter((providerId) => !capable.includes(providerId)));
   }
-  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
+  const primaryRoute = input.router.route({ role: "coder", classification: input.classification, budget: input.budget, requiredContextTokens: input.requiredContextTokens, writeRequired: true, ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }), ...(input.continuity === undefined ? {} : { continuity: input.continuity }), excludeProviders: [...new Set(primaryExcluded)], ...(input.pin === undefined ? {} : { pin: input.pin }) });
   const primaryModel = modelRef(primaryRoute);
-  assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProof);
+  assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProofFor(primaryModel.providerId));
   const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: direct ? "workspace" : "task-worktree" })];
 
   const wantsReview = input.review ?? true;
   if (wantsReview) {
+    // A DIRECT review keeps the runtime's own harness, like the write it reviews, so the staged
+    // proofs this list is built from do not apply to it: a provider the caller measured as able to
+    // run the policy is a candidate here, and the policy gate below refuses the rest by name.
+    const stagedReviewerExclusions = reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? [], {
+      ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
+      acceptances: input.acceptances ?? [],
+    });
     const reviewerRoute = routeWriteReviewer({
       router: input.router,
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       primaryModel,
-      excludeProviders: reviewerExclusions(input.providers, input.codexIsolation, input.attestations ?? [], {
-        ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
-        acceptances: input.acceptances ?? [],
-      }),
+      ...(direct && input.policyCapability !== undefined ? { policy: input.policyCapability } : {}),
+      excludeProviders: direct && input.policyCapability?.id === "direct"
+        ? stagedReviewerExclusions.filter((providerId) => !capable.includes(providerId))
+        : stagedReviewerExclusions,
     });
     const reviewerModel = modelRef(reviewerRoute);
     roles.push(Object.freeze({ role: "reviewer", model: reviewerModel, route: reviewerRoute, workspace: reviewerModel.providerId === "openai" ? "staged-review" : "project-read-only" }));
@@ -336,6 +378,7 @@ export class WriteDogfoodRunner {
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #grokWriteIsolation: GrokIsolationAttestation | undefined;
+  readonly #measured: Readonly<Record<string, MeasuredCapabilities>> | undefined;
   readonly #acceptances: readonly OperatorProviderAcceptance[];
   readonly #nativeSession: NativeSessionResolver | undefined;
   readonly #finalizer: TaskFinalizer;
@@ -356,6 +399,8 @@ export class WriteDogfoodRunner {
     readonly grokIsolation?: GrokIsolationAttestation;
     /** The proof a Grok write needs, earned under the write sandbox profile. */
     readonly grokWriteIsolation?: GrokIsolationAttestation;
+    /** What a capability probe found per provider; decides Antigravity's DIRECT write and travels to its review. */
+    readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
     readonly writer?: WriteProviderExecutor;
     readonly reviewExecutor?: ShadowProcessExecutor;
     /** Executor for the artifact-producing pass; defaults to the real one. */
@@ -381,6 +426,7 @@ export class WriteDogfoodRunner {
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#grokWriteIsolation = input.grokWriteIsolation;
+    this.#measured = input.measured;
     this.#acceptances = input.acceptances ?? [];
     this.#writer = input.writer ?? new NodeClaudeWriteExecutor();
     this.#reviewExecutor = input.reviewExecutor;
@@ -439,6 +485,7 @@ export class WriteDogfoodRunner {
       ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
       ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
       ...(this.#grokWriteIsolation === undefined ? {} : { grokWriteIsolation: this.#grokWriteIsolation }),
+      ...(this.#measured === undefined ? {} : { measured: this.#measured }),
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
@@ -610,6 +657,8 @@ export class WriteDogfoodRunner {
         ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
         // The write profile's proof, not the reviewer's: they are different policies.
         ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
+        measured: this.#measured?.[primarySnapshot.providerId] ?? null,
+        attestations: this.#attestations,
       });
       // The write path recorded no provider events at all: a task that spent a subscription and
       // came back empty left nothing saying a call had happened. These are the same event kinds
@@ -643,6 +692,8 @@ export class WriteDogfoodRunner {
             task: input.task, context: input.context, maxTurns: input.budget.maxInspectionTurns, schemaPath,
             ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
             ...(this.#grokWriteIsolation === undefined ? {} : { grokIsolation: this.#grokWriteIsolation }),
+            measured: this.#measured?.[primarySnapshot.providerId] ?? null,
+            attestations: this.#attestations,
           });
           result = await this.#writer.run({ plan: freshInvocation, timeoutMs: input.budget.maxInspectionMs, ...(input.env === undefined ? {} : { env: input.env }) });
         }
@@ -778,6 +829,7 @@ export class WriteDogfoodRunner {
           acceptances: this.#acceptances,
           ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }),
           ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }),
+          ...(this.#measured === undefined ? {} : { measured: this.#measured }),
           context: {
             changedFiles: guarded.changedFiles,
             mode: direct ? "workspace-change-review" : "worktree-diff-review",

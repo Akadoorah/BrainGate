@@ -102,15 +102,20 @@ function excludedProviders(input: {
   readonly role: "planner" | "primary" | "reviewer";
   readonly proof: ProviderProof;
   /**
-   * The providers the operator named for this plan, which DIRECT reaches even where the staged
-   * gates close them.
+   * The providers this policy reaches even where the staged gates would close them.
    *
-   * Deliberately the pinned set and not "every provider under DIRECT": selecting a worker is the
-   * operator's act, and widening the automatic route to the other subscriptions is a different
-   * decision from making the selected one work. The gates below still answer for every provider the
-   * operator did not name.
+   * Under DIRECT that is every provider whose installed build can run the policy — measured by the
+   * caller and passed in — plus the pinned one. It applies to every role, not only the primary: a
+   * DIRECT run keeps the runtime's own harness for the planner and the reviewer too, so the staged
+   * proofs below are not what decides whether they can run. It used to be the pinned provider alone, on the
+   * reasoning that selecting a worker was the operator's act; the automatic route then judged
+   * everyone else by the *staged* proofs, so a provider that runs DIRECT perfectly well was
+   * excluded from every automatic DIRECT turn for want of an attestation about a sandbox DIRECT
+   * does not use. The staged roles still answer to the staged gates: they are not DIRECT runs.
    */
   readonly directProviders?: readonly string[];
+  /** The per-provider capability reading; Antigravity's DIRECT answer is in it, so the status has to see it. */
+  readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
 }): readonly string[] {
   const excludedList = Object.freeze(input.providers.filter((snapshot) => {
     const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
@@ -126,7 +131,7 @@ function excludedProviders(input: {
     }).eligible;
     const directHere = (input.directProviders ?? []).includes(snapshot.providerId);
 
-    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere, measured: input.measured?.[snapshot.providerId] ?? null }).enabled) return true;
     // The proofs below are for a staged or snapshot posture: a sandbox profile BrainGate wrote, and
     // a copy it made. A DIRECT run has neither, so demanding them excluded exactly the worker the
     // operator named — the plan refusing the model the operator had just asked for.
@@ -157,6 +162,13 @@ export function buildShadowTaskPlan(input: {
   readonly task: string;
   /** Whether this plan keeps the runtime's own harness: the DIRECT policy (ADR 0017). */
   readonly nativeHarness?: boolean;
+  /** Which providers can execute this policy, measured from the installed builds by the caller. */
+  readonly policyCapability?: { readonly id: string; readonly supportedProviders: readonly string[] };
+  /** The sessions this goal already holds: a warm worker wins a close call, never a real gap. */
+  readonly continuity?: {
+    readonly warm: readonly { readonly providerId: string; readonly modelId: string }[];
+    readonly previous?: { readonly providerId: string; readonly modelId: string } | null;
+  };
   readonly context: unknown;
   readonly classification: TaskClassification;
   readonly budget: ExecutionBudget;
@@ -178,13 +190,21 @@ export function buildShadowTaskPlan(input: {
     ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
     acceptances: input.acceptances ?? [],
   });
+  // Which providers this policy can actually reach. Under DIRECT that is the measured set, not the
+  // operator's pin: the router is the thing choosing now, and it cannot choose a worker that was
+  // excluded by a gate the policy does not use.
+  const policyProviders = input.nativeHarness === true
+    ? [...new Set([...(input.policyCapability?.supportedProviders ?? []), ...(input.pin === undefined ? [] : [input.pin.providerId])])]
+    : [];
   const primaryRoute = input.router.route({
     role: "coder",
     classification: input.classification,
     budget: input.budget,
     requiredContextTokens: input.requiredContextTokens,
     writeRequired: false,
-    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(input.nativeHarness === true && input.pin !== undefined ? { directProviders: [input.pin.providerId] } : {}) }),
+    ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
+    ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
+    excludeProviders: excludedProviders({ providers: input.providers, ...(input.measured === undefined ? {} : { measured: input.measured }), role: "primary", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
     ...(input.pin === undefined ? {} : { pin: input.pin }),
   });
   const primaryModel = modelRef(primaryRoute);
@@ -216,7 +236,7 @@ export function buildShadowTaskPlan(input: {
   // The planning pass, previewed before it is spent. A plan that showed only the executor would
   // hide the model the task actually leads with, which is the routing decision worth seeing.
   if (input.budget.separatePlanningPass && input.budget.maxPlanners > 0) {
-    const plannerExclusions = excludedProviders({ providers: input.providers, role: "planner", proof });
+    const plannerExclusions = excludedProviders({ providers: input.providers, ...(input.measured === undefined ? {} : { measured: input.measured }), role: "planner", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) });
     const routePlanner = (independence?: { readonly mode: "required"; readonly level: "cross-provider"; readonly models: readonly ModelRef[] }) => input.router.route({
       role: "planner",
       classification: input.classification,
@@ -224,6 +244,7 @@ export function buildShadowTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       ...(independence === undefined ? {} : { independence }),
+      ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
       excludeProviders: plannerExclusions,
     });
     const previewPlanner = (route: ReturnType<typeof routePlanner>, model: ModelRef): PlannedShadowRole => Object.freeze({
@@ -279,7 +300,8 @@ export function buildShadowTaskPlan(input: {
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: false,
       independence,
-      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", proof }),
+      ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
+      excludeProviders: excludedProviders({ providers: input.providers, ...(input.measured === undefined ? {} : { measured: input.measured }), role: "reviewer", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({

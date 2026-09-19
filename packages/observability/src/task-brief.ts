@@ -47,6 +47,15 @@ export interface TaskBriefRouteRole {
   readonly quotaHint: number | null;
   readonly quotaObservedAt: string | null;
   readonly rationale: readonly string[];
+  /**
+   * Why *this* candidate won, in the router's own terms: the tier it was judged at, its capability,
+   * and whether a warm session or the previous worker decided it.
+   *
+   * `rationale` above is the request's, and `rejected` below is everyone else's. Between them they
+   * answered "why not Codex?" and left "so why this one?" to be reconstructed from a score nobody
+   * recorded — which is the question an operator actually asks of an automatic choice.
+   */
+  readonly selectedReasons: readonly string[];
   readonly fallbackCount: number;
   /** Who else could have taken this role, and what disqualified them. */
   readonly rejected: readonly {
@@ -153,6 +162,7 @@ function routeRole(route: RouteResult): TaskBriefRouteRole {
     quotaHint: runtime.quotaHint === null ? null : Math.round(runtime.quotaHint * 1000) / 1000,
     quotaObservedAt: runtime.quotaObservedAt,
     rationale: sanitizeList(route.rationale, 12),
+    selectedReasons: sanitizeList(route.selected.reasons, 8),
     fallbackCount: route.fallbacks.length,
     // The reasons a candidate lost are what turn "it chose Anthropic" into an explanation. They
     // were computed and dropped before this, so the only person who could answer "why not Codex?"

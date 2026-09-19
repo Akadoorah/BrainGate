@@ -290,6 +290,22 @@ Use one project at a time:
 
 For the first 20-30 tasks, label complexity/outcome consistently. Treat every isolation, routing, quota, memory, or classification failure as a regression before widening the write boundary.
 
+## Antigravity under DIRECT
+
+Antigravity's print mode auto-denies every tool that would have prompted, and takes no allow-list per
+invocation, so a DIRECT run on it can start only when its own settings allow headless reads and shell
+commands (measured on agy 1.2.7: with the read rule alone it still reaches for the shell to read a
+file). The rules are the operator's to add, in Antigravity's own file, and BrainGate reads it and never
+writes it:
+
+```json
+{ "permissions": { "allow": ["read_file(*)", "command(*)"] } }
+```
+
+in `~/.gemini/antigravity-cli/settings.json`. Until then `providers list` shows `DIRECT: none` for it with the same instruction, and a
+`/use google/...` turn is refused with it. Once the rule is there, Antigravity reads and writes the
+workspace like the other three, and its conversation id is resumed across turns (ADR 0020).
+
 ## Continuity between runs
 
 A dogfood run is a work unit of a goal. The interactive session keeps a short thread so a follow-up

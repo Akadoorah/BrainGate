@@ -214,6 +214,14 @@ export interface PromptInputOptions {
    * would then have to count — the arithmetic that corrupted history.
    */
   readonly columns?: number;
+  /**
+   * What to offer under the draft as it is typed, when anything.
+   *
+   * The composer draws the suggestions below the draft inside its own region, and Tab replaces the
+   * draft with the first one's `insert`. Injected, because the composer knows nothing about slash
+   * commands: the session does, and a test can pass any table it likes.
+   */
+  readonly suggest?: (draft: string) => readonly { readonly label: string; readonly hint: string; readonly insert: string }[];
 }
 
 export interface PromptInput {
@@ -331,18 +339,23 @@ interface Position {
  * cursor in the wrong cell of the region that was just reprinted; it is never able to reach a row the
  * composer did not write, because the region's bounds come from the terminal's own saved position.
  */
-export function cursorPosition(draft: string, cursor: number, columns: number): Position {
+export function cursorPosition(draft: string, cursor: number, columns: number, offset = 0): Position {
   const width = columns > 0 ? columns : 80;
   const lines = draft.split(LF);
   const before = draft.slice(0, cursor);
   const consumed = before.split(LF);
   const cursorLine = consumed.length - 1;
-  const columnCells = displayWidth(consumed[cursorLine] ?? "");
-  const rowsFor = (text: string): number => Math.max(1, Math.ceil(displayWidth(text) / width));
+  // The first row of the region begins after the prompt, so the draft's first line is `offset`
+  // cells in already. Without this the cursor was placed `offset` cells too far left on every
+  // single-line draft: "> how ca" with the cursor drawn on the "c". Every later line starts at
+  // column 1, after the carriage return the renderer writes.
+  const cells = (index: number, text: string): number => displayWidth(text) + (index === 0 ? offset : 0);
+  const columnCells = cells(cursorLine, consumed[cursorLine] ?? "");
+  const rowsFor = (index: number, text: string): number => Math.max(1, Math.ceil(cells(index, text) / width));
   let rows = 0;
   let row = 0;
   for (let index = 0; index < lines.length; index += 1) {
-    const height = rowsFor(lines[index] ?? "");
+    const height = rowsFor(index, lines[index] ?? "");
     if (index < cursorLine) row += height;
     rows += height;
   }
@@ -415,14 +428,52 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
    * cursor. Nothing above the anchor is addressed, and the anchor is the terminal's own memory of
    * where the prompt ended — so this is bounded by construction rather than by arithmetic.
    */
+  /** The suggestions for the draft as it is now, or none when nothing offers any. */
+  const suggestions = (): readonly { readonly label: string; readonly hint: string; readonly insert: string }[] =>
+    (terminal && options.suggest !== undefined ? options.suggest(draft) : []);
+
+  /**
+   * The menu under the draft: one row per suggestion, each cut to the terminal's width so a row
+   * cannot wrap and throw the cursor arithmetic off by a line the composer did not count.
+   */
+  const menuRows = (items: readonly { readonly label: string; readonly hint: string }[], columns: number): readonly string[] => {
+    const labelWidth = Math.max(0, ...items.map((item) => displayWidth(item.label)));
+    return items.slice(0, 8).map((item) => {
+      const padded = item.label + " ".repeat(Math.max(0, labelWidth - displayWidth(item.label)));
+      const line = `  ${padded}  ${item.hint}`;
+      let out = "";
+      let used = 0;
+      for (const grapheme of graphemes(line)) {
+        const w = cellWidth(grapheme);
+        if (used + w >= columns) break;
+        out += grapheme;
+        used += w;
+      }
+      return out;
+    });
+  };
+
   const redraw = (): void => {
     if (prompt === null) return;
     const columns = terminalWidth();
+    const menu = menuRows(suggestions(), columns);
     write(`${RESTORE_CURSOR}${ERASE_DOWN}${rendered()}`);
-    const position = cursorPosition(draft, cursor, columns);
-    const up = position.rows - 1 - position.row;
+    // The menu is part of the region: drawn below the draft, erased with it, and counted when the
+    // cursor is moved back up into the draft.
+    if (menu.length > 0) write(`${NEWLINE}${menu.join(NEWLINE)}`);
+    const position = cursorPosition(draft, cursor, columns, displayWidth(prompt));
+    const up = position.rows - 1 - position.row + menu.length;
     if (up > 0) write(cursorUp(up));
     write(column(position.column + 1));
+  };
+
+  /** Tab: the draft becomes the first suggestion, and the cursor goes to its end. */
+  const complete = (): void => {
+    const [first] = suggestions();
+    if (first === undefined) return;
+    draft = first.insert;
+    cursor = draft.length;
+    redraw();
   };
 
   /** Inserts text at the cursor — typed or pasted — and repaints. */
@@ -611,6 +662,9 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
         case "text":
           insert(next.text);
           break;
+        case "tab":
+          complete();
+          break;
         case "ignore":
           break;
       }
@@ -618,7 +672,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   };
 
   type Token =
-    | { readonly kind: "text" | "submit" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "interrupt" | "eof" | "ignore"; readonly text: string; readonly length: number }
+    | { readonly kind: "text" | "submit" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "interrupt" | "eof" | "tab" | "ignore"; readonly text: string; readonly length: number }
     | { readonly kind: "paste-start"; readonly text: string; readonly length: number };
 
   /** The movement and editing keys this composer implements, by the sequence a terminal sends. */
@@ -665,6 +719,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     // Ctrl+A and Ctrl+E, which every shell user's fingers know.
     if (char === "\u0001") return { kind: "home", text: char, length: 1 };
     if (char === "\u0005") return { kind: "end", text: char, length: 1 };
+    if (char === "\t") return { kind: "tab", text: char, length: 1 };
     if (char < " ") {
       // Any other control byte is not part of a request, and is dropped rather than pasted in.
       return { kind: "ignore", text: char, length: 1 };

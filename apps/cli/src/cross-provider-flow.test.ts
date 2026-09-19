@@ -8,9 +8,10 @@ import { ProjectRegistry, TaskLedger, executionScopeFor } from "@braingate/core"
 import { GoalStore } from "@braingate/goals";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
-import type { ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
+import type { MeasuredCapabilities, ShadowInvocationPlan, ShadowProcessExecutor, ShadowProcessResult } from "@braingate/shadow";
 import type { WriteProviderExecutor, WriteProviderPlan, WriteProviderResult } from "@braingate/write";
 import { runRepl } from "./repl.js";
+import { ProjectMemory } from "@braingate/memory";
 
 /**
  * One goal, one workspace, four native workers — the multi-provider acceptance.
@@ -210,7 +211,7 @@ function continuedSession(providerId: string, args: readonly string[]): string |
   return conversation >= 0 ? args[conversation + 1] ?? null : null;
 }
 
-function sessionOf(repo: string, env: NodeJS.ProcessEnv, workers: FakeWorkers, answers: readonly string[]) {
+function sessionOf(repo: string, env: NodeJS.ProcessEnv, workers: FakeWorkers, answers: readonly string[], measured: Readonly<Record<string, MeasuredCapabilities>> = {}) {
   const remaining = [...answers];
   let out = "";
   let err = "";
@@ -240,7 +241,7 @@ function sessionOf(repo: string, env: NodeJS.ProcessEnv, workers: FakeWorkers, a
           sessionResume: { supported: true },
         },
       }),
-      measureCapabilities: async () => ({}),
+      measureCapabilities: async () => measured,
       verifyGrokIsolation: async (item: ProviderSnapshot) => ({
         providerId: "xai" as const, source: "sandbox-event-self-test" as const,
         version: item.version.value ?? "0.0.0", platform: "darwin" as const,
@@ -363,5 +364,73 @@ test("one goal, one workspace, four native workers: reads everywhere, DIRECT wri
       assert.equal(codexWrite.pinned, null, "and Codex pins nothing: it reported a second id");
       assert.equal(sessions.some((item) => item.providerId === "openai" && item.sessionId !== reported), true, "so a second Codex session exists for the write");
     } finally { ledger.close(); goals.close(); }
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("Antigravity joins the workspace when its own settings allow headless reads: a DIRECT read and a DIRECT write, with no bypass", async () => {
+  // The same fixture, with one difference: the capability probe reports that the operator's
+  // Antigravity settings allow headless reads. That is the whole gate, and it is read from their
+  // file rather than granted by a flag — so the argv the fake worker receives has to carry no
+  // permission bypass of any kind, and the write has to carry Antigravity's own edit posture.
+  const f = fixture("antigravity");
+  const workers = new FakeWorkers();
+  const session = sessionOf(f.repo, f.env, workers, [
+    "/use google/gemini-3.8-flash-medium",
+    "Read the test document in this workspace and summarize it.", "y",
+    "Append one inert marker comment to that file. Do not commit and do not create a branch.", "y",
+    "/exit",
+  ], { google: { toolDenial: "unknown", declaredSubagents: "unknown", sandbox: "unknown", sessionIdPinning: "unknown", headlessReads: true, headlessShell: true } });
+  try {
+    assert.equal(await session.run(), 0, session.text());
+    const text = session.text();
+    assert.doesNotMatch(text, /auto-denies every tool/, `no refusal: the settings opened the gate\n${text.slice(-600)}`);
+    const workspace = realpathSync.native(f.repo);
+
+    const reads = workers.readsFor("google");
+    assert.equal(reads.length, 1, `Antigravity ran the DIRECT read\n${text.slice(-600)}`);
+    assert.equal(reads[0]!.cwd, workspace, "in the workspace itself");
+    for (const forbidden of ["--dangerously-skip-permissions", "--sandbox", "--add-dir", "--mode"]) {
+      assert.equal(reads[0]!.args.includes(forbidden), false, `${forbidden} is not passed to a read`);
+    }
+
+    const writes = workers.writesFor("google");
+    assert.equal(writes.length, 1, `and the DIRECT write\n${text.slice(-600)}`);
+    assert.equal(writes[0]!.cwd, workspace, "in the workspace itself");
+    assert.deepEqual(writes[0]!.args.slice(writes[0]!.args.indexOf("--mode"), writes[0]!.args.indexOf("--mode") + 2), ["--mode", "accept-edits"], "edits approved in Antigravity's own vocabulary");
+    for (const forbidden of ["--dangerously-skip-permissions", "--sandbox", "--add-dir"]) {
+      assert.equal(writes[0]!.args.includes(forbidden), false, `${forbidden} is not passed to a write`);
+    }
+    assert.match(readFileSync(f.readme, "utf8"), /<!-- marker 1 by google -->/, "the change landed in the real file");
+    assert.equal(git(f.repo, ["log", "--oneline"]).split("\n").length, 1, "no commit was made");
+
+    const scope = executionScopeFor(new ProjectRegistry(f.home).loadFile(join(f.repo, ".brain", "project.json")), f.repo);
+    const goals = new GoalStore(scope.project);
+    try {
+      const goal = goals.activeGoal();
+      assert.notEqual(goal, null);
+      assert.equal(goals.recentTurns(goal!.conversationId, 50).length, 2, "both turns are on the timeline");
+      // Antigravity reports its conversation id; the record keeps it, bound to this goal.
+      const sessions = goals.listProviderSessions().filter((item) => item.providerId === "google");
+      assert.equal(sessions.length >= 1, true, "the reported conversation is on record");
+      assert.equal(sessions.every((item) => item.goalId === goal!.goalId), true, "and belongs to this goal");
+    } finally { goals.close(); }
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("/remember writes into the home this session was given, where /memory and memory promote read", async () => {
+  const f = fixture("remember");
+  const workers = new FakeWorkers();
+  const session = sessionOf(f.repo, f.env, workers, ["/remember the codename is blue falcon", "/memory", "/exit"]);
+  try {
+    assert.equal(await session.run(), 0, session.text());
+    const text = session.text();
+    const id = /Recorded proposal ([0-9a-f-]{36})/.exec(text)?.[1];
+    assert.notEqual(id, undefined, `a proposal was recorded\n${text.slice(-400)}`);
+    assert.match(text, /blue falcon/, "/memory lists it back in the same session");
+    // The proposal is in this session's home, not the process's default one.
+    const memory = new ProjectMemory(new ProjectRegistry(f.home).loadFile(join(f.repo, ".brain", "project.json")));
+    try {
+      assert.equal(memory.listProposals().some((proposal) => proposal.proposalId === id), true, "the proposal is readable from the session's own home");
+    } finally { memory.close(); }
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

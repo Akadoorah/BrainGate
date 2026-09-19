@@ -39,7 +39,10 @@ const SAFE_PROBE_COMMANDS = new Set([
   "grok\0version",
   "grok\0--help",
   "grok\0models",
-  "copilot\0version",
+  // `copilot version` is refused by copilot 0.0.358 ("Invalid command format"); `--version` is the
+  // form that answers. Found by the real Arabic dogfood run, which the allowlist stopped at the
+  // first probe: the discovery test's fake runner cannot see this list.
+  "copilot\0--version",
   "copilot\0help",
 ]);
 

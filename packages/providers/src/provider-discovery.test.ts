@@ -131,12 +131,12 @@ test("model metadata timeout stays unknown rather than guessing auth or models",
 
 test("providers without verified zero-prompt auth/status commands report unknown instead of making a model call", async () => {
   const runner = new FakeRunner([
-    ["copilot version", { stdout: "GitHub Copilot CLI 0.9.0\n" }],
+    ["copilot --version", { stdout: "GitHub Copilot CLI 0.9.0\n" }],
     ["copilot help", { stdout: "Options: -p --prompt --model --output-format json --stream; Commands: mcp\n" }],
   ]);
   const snapshot = await new ProviderDiscovery(runner).discover("github-copilot");
   assert.equal(snapshot.authMode.value, "unknown");
-  assert.deepEqual(runner.calls.map(formatProbeCommand), ["copilot version", "copilot help"]);
+  assert.deepEqual(runner.calls.map(formatProbeCommand), ["copilot --version", "copilot help"]);
 });
 
 test("discoverAll only issues commands from the explicit safe metadata probe set", async () => {

@@ -88,4 +88,17 @@ export interface WorkflowInput {
    * from it, and pinning them would defeat what they are for.
    */
   readonly pin?: { readonly providerId: string; readonly modelId: string } | undefined;
+  /**
+   * The policy this run executes under, and the providers whose installed build can execute it.
+   *
+   * Measured by the caller — a DIRECT read needs a CLI BrainGate can point at the workspace, a DIRECT
+   * write needs one with a scoped accept-edits posture — and passed as data so no provider name is
+   * ever hard-coded into routing policy.
+   */
+  readonly policy?: { readonly id: string; readonly supportedProviders: readonly string[] } | undefined;
+  /** The sessions this goal already holds, so continuing one can beat switching. Primary only. */
+  readonly continuity?: {
+    readonly warm: readonly { readonly providerId: string; readonly modelId: string }[];
+    readonly previous?: { readonly providerId: string; readonly modelId: string } | null;
+  } | undefined;
 }

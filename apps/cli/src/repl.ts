@@ -6,6 +6,7 @@ import { findManifest } from "./manifest-path.js";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
+import { SLASH_COMMANDS, slashSuggestions } from "./slash-commands.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
 import {
@@ -30,6 +31,7 @@ import {
   SESSION_ID_SOURCES,
   buildGoalContext,
   describeGoalDelta,
+  sessionEnvelopeFor,
   describeSessionDecision,
   inheritedComplexityFloor,
   renderHandoff,
@@ -404,6 +406,50 @@ interface WorkerLoopState {
   readonly versions: Map<string, string | null>;
 }
 
+/**
+ * The routing layer's view of what this goal already holds.
+ *
+ * Two facts, from two places, because they answer different questions. `warm` is which workers hold a
+ * session this request could resume — read through the same envelope rule the resolver uses, so the
+ * router can never be told a session is warm that the run would then refuse. `previous` is who
+ * actually produced the last turn, from the timeline's own attribution, which is what makes "continue
+ * with the worker that was already here" a fact rather than an assumption.
+ *
+ * Absent when the goal has neither, so a first turn routes exactly as it would with no continuity
+ * signal at all: this is a preference between close candidates, not a floor under them.
+ */
+export function routingContinuity(input: {
+  readonly goals: GoalStore;
+  readonly goalId: string;
+  readonly conversationId: string;
+  readonly intent: "read" | "write";
+  readonly policy: string;
+}): { readonly warm: readonly { readonly providerId: string; readonly modelId: string }[]; readonly previous?: { readonly providerId: string; readonly modelId: string } | null } | undefined {
+  const warm: { providerId: string; modelId: string }[] = [];
+  for (const record of input.goals.sessionsForGoal(input.goalId, (providerId) => sessionEnvelopeFor({ intent: input.intent, policy: input.policy, role: "primary", providerId }))) {
+    if (record.modelId === null) continue;
+    if (warm.some((item) => item.providerId === record.providerId && item.modelId === record.modelId)) continue;
+    warm.push({ providerId: record.providerId, modelId: record.modelId });
+  }
+  let previous: { providerId: string; modelId: string } | null = null;
+  // The newest turn that names a worker. A turn with no attribution is a turn whose worker is not
+  // known, and reading past it to an older one would describe a handoff that did not happen.
+  for (const turn of [...input.goals.recentTurns(input.conversationId, 8)].reverse()) {
+    // This goal's own turns. A conversation can hold several goals, and a turn that belongs to
+    // another one is not the previous worker *here* — counting it would report a handoff that never
+    // happened, on the strength of a conversation the two goals happen to share.
+    if (turn.goalId !== input.goalId) continue;
+    const last = turn.attributedTo[turn.attributedTo.length - 1];
+    if (last === undefined) continue;
+    const slash = last.indexOf("/");
+    if (slash <= 0 || slash === last.length - 1) continue;
+    previous = { providerId: last.slice(0, slash), modelId: last.slice(slash + 1) };
+    break;
+  }
+  if (warm.length === 0 && previous === null) return undefined;
+  return Object.freeze({ warm: Object.freeze(warm), ...(previous === null ? {} : { previous }) });
+}
+
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const spec = executionPolicyForIntent({ policy: worker.policy, intent: mode === "write" ? "write" : "read" });
@@ -450,6 +496,16 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     policy: () => worker.policy,
     onResolved: (summary) => { worker.lastRun = summary; },
   });
+  // Who this goal already has, which is the half of a routing decision the words cannot carry. A
+  // warm worker is one that worked this goal under this exact boundary; a request that changed
+  // intent or policy has no warm worker, because the session it would resume was told otherwise.
+  const continuity = goal === null || goals === null ? undefined : routingContinuity({
+    goals,
+    goalId: goal.goalId,
+    conversationId: goal.conversationId,
+    intent: requestIntent,
+    policy: worker.policy,
+  });
   const goalDeps = {
     ...(goal === null || goalLayers === null ? {} : {
       goalContext: goalLayers.context,
@@ -459,6 +515,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     }),
     ...(pin === undefined ? {} : { pin }),
     ...(nativeSession === undefined ? {} : { nativeSession }),
+    ...(continuity === undefined ? {} : { continuity }),
   };
 
   const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });
@@ -615,7 +672,10 @@ export function answerOf(data: unknown): string | null {
 
 async function runSlash(line: string, deps: ReplDeps, session: SessionContext, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState, workspaceScope: ExecutionScope | null): Promise<"continue" | "exit"> {
   const [command, ...rest] = line.slice(1).trim().split(/\s+/);
-  const io = { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr };
+  // The session's own environment, not the process's: `/remember` under a BRAINGATE_HOME the session
+  // was given wrote its proposal into the default home, where `memory promote` in that session
+  // could not find it — found by a real memory check whose proposal "did not exist".
+  const io = { cwd: deps.cwd, ...(deps.env === undefined ? {} : { env: deps.env }), stdout: deps.stdout, stderr: deps.stderr };
 
   switch (command) {
     case "exit": case "quit": case "q":
@@ -631,26 +691,13 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
         "  is given the goal's established findings, what has changed and what is unresolved, so",
         "  switching models continues the work instead of restarting it.",
         "",
-        "  /remember <text>  record something about this project, for later sessions",
-        "  /goal       the current goal, its established findings and its open questions",
-        "  /new        set the current goal aside and start a different one",
-        "",
         "  Which worker does the work. A switch keeps the goal: the next worker is handed the",
         "  established findings, and a worker whose own session can be resumed is given only what",
         "  changed while it was away.",
         "",
-        "  /use <provider>/<model> [--fresh]   send the next work to this worker",
-        "  /auto       let BrainGate choose again",
-        "  /worker     who is selected, what the goal is, and what the next run would resume",
-        "  /project    which checkout this session is bound to, and where it is registered",
-        "  /memory     what is remembered, and what is waiting for your evidence",
-        "  /status     recent tasks in this project",
-        "  /models     configured models and reviewer independence",
-        "  /providers  which CLIs are installed, and which role each may take here",
-        "  /doctor     validate project, models and reviewer isolation",
-        "  /forget     drop this session's thread (project memory is untouched)",
-        "  /feedback <task-id> <T0-T4> <success|partial|failure>",
-        "  /exit",
+        "  Type / to see these as you type; Tab completes.",
+        "",
+        ...SLASH_COMMANDS.map((command) => `  ${(`/${command.name}${command.args === undefined ? "" : ` ${command.args}`}`).padEnd(44)} ${command.hint}`),
         "",
       ].join("\n"));
       return "continue";
@@ -1060,6 +1107,8 @@ export async function runReplOnTerminal(cwd: string): Promise<number> {
     input: process.stdin,
     write: (text) => { process.stdout.write(text); },
     terminal: !dumb && process.stdin.isTTY === true,
+    // `/` opens the command list under the draft, and Tab completes it — from the same table /help prints.
+    suggest: slashSuggestions,
   });
   try {
     // A dumb terminal gets no escape sequences: no bracketed paste, no raw mode. Typing still works,

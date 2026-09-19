@@ -55,18 +55,29 @@ function worktree(): string {
 }
 
 test("the executing role is no longer one provider, and every one of them has to prove a boundary", () => {
-  // Antigravity is not on the list, and that is a measurement rather than an omission: agy 1.2.2
-  // auto-denies every tool it would need in headless mode, so it can neither read nor write the
-  // workspace it is pointed at. It is refused under both policies, in its own words.
+  // Antigravity is not on the worktree list, and that is a measurement rather than an omission: agy
+  // auto-denies every tool it would need in headless mode unless its own settings allow it, and it
+  // has no worktree profile at all. Under the worktree policy it is refused outright; under DIRECT
+  // it is refused until the operator's settings allow headless reads, and the refusal names the rule.
   assert.deepEqual([...WRITE_PROVIDERS], ["anthropic", "xai", "openai"]);
   assert.throws(
-    () => assertWriteEligible(snapshot("google" as ProviderId, "1.2.2"), model("google" as ProviderId, "gemini"), { now: NOW }),
+    () => assertWriteEligible(snapshot("google" as ProviderId, "1.2.7"), model("google" as ProviderId, "gemini"), { now: NOW }),
     (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_PROVIDER_BLOCKED",
   );
   assert.throws(
-    () => assertWriteEligible(snapshot("google" as ProviderId, "1.2.2"), model("google" as ProviderId, "gemini"), { nativeHarness: true, now: NOW }),
+    () => assertWriteEligible(snapshot("google" as ProviderId, "1.2.7"), model("google" as ProviderId, "gemini"), { nativeHarness: true, now: NOW }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_NATIVE_HARNESS_UNSUPPORTED" && /permissions\.allow/.test(error.message) && /read_file\(\*\)/.test(error.message),
+    "the DIRECT policy does not open it on an unconfigured machine, and the refusal says which rule would",
+  );
+  const measured = { toolDenial: "unknown" as const, declaredSubagents: "unknown" as const, sandbox: "unknown" as const, sessionIdPinning: "unknown" as const, headlessReads: true, headlessShell: true };
+  assert.doesNotThrow(
+    () => assertWriteEligible(snapshot("google" as ProviderId, "1.2.7"), model("google" as ProviderId, "gemini"), { nativeHarness: true, measured, now: NOW }),
+    "with headless reads allowed in its own settings, a DIRECT write is eligible",
+  );
+  assert.throws(
+    () => assertWriteEligible(snapshot("google" as ProviderId, "1.2.7"), model("google" as ProviderId, "gemini"), { measured, now: NOW }),
     (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_PROVIDER_BLOCKED",
-    "the DIRECT policy does not open it either: there is no invocation to open it with",
+    "and the same reading opens nothing under the worktree policy, which needs a profile it does not have",
   );
 });
 
@@ -239,4 +250,25 @@ test("a read snapshot never becomes a write workspace, however current the Codex
   // snapshot vocabulary lives on the shadow read path.
   assert.equal(plan.cwd, cwd, "a write is still confined to its own worktree");
   assert.equal(plan.grant.granted.includes("edit"), true, "and it is still a write, not a read");
+});
+
+test("a DIRECT write on a CLI that will not say how it is billed is covered by the operator's attestation, as the read is", () => {
+  // Antigravity's discovery reports auth unknown. The operator's acceptance carries a subscription
+  // self-attestation, and the read path already honours it; the write path refused the same provider
+  // for the same unknown until it did too.
+  const unknown = { ...snapshot("google" as ProviderId, "1.2.7"), authState: { value: "unknown" as const, evidence: "unknown" as const, sourceCommand: null, observedAt: NOW.toISOString() }, authMode: { value: "unknown" as const, evidence: "unknown" as const, sourceCommand: null, observedAt: NOW.toISOString() } } as ProviderSnapshot;
+  const measured = { toolDenial: "unknown" as const, declaredSubagents: "unknown" as const, sandbox: "unknown" as const, sessionIdPinning: "unknown" as const, headlessReads: true, headlessShell: true };
+  assert.throws(
+    () => assertWriteEligible(unknown, model("google" as ProviderId, "gemini"), { nativeHarness: true, measured, now: NOW }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_SUBSCRIPTION_REQUIRED",
+    "unknown billing with no attestation is refused",
+  );
+  const attestation = { providerId: "google" as const, mode: "subscription" as const, source: "user-confirmed-oauth" as const, observedAt: new Date(NOW.getTime() - 60_000).toISOString(), expiresAt: new Date(NOW.getTime() + 24 * 60 * 60_000).toISOString() };
+  assert.doesNotThrow(() => assertWriteEligible(unknown, model("google" as ProviderId, "gemini"), { nativeHarness: true, measured, attestations: [attestation], now: NOW }));
+  const stale = { ...attestation, expiresAt: new Date(NOW.getTime() - 1).toISOString() };
+  assert.throws(
+    () => assertWriteEligible(unknown, model("google" as ProviderId, "gemini"), { nativeHarness: true, measured, attestations: [stale], now: NOW }),
+    (error: unknown) => error instanceof BrainGateInvariantError && error.code === "WRITE_SUBSCRIPTION_REQUIRED",
+    "an expired attestation covers nothing",
+  );
 });

@@ -86,8 +86,9 @@ export class RoleFailover {
         this.#deps.emit("role.failover.failed", attempt.role, from, `failover-limit:${refusal.reason}:${refusal.quotaPool}`);
         throw error;
       }
-      // The failed attempt spent its reservation, so this is the honest place to look: a task with no
-      // calls left does not get a second one, however clearly the first was refused.
+      // A refused call gives its reservation back before this is reached (the engine releases it on a
+      // quota refusal), so what is counted here is work the task actually spent: a task with no
+      // calls left does not get a second one, however clearly the last was refused.
       if (this.#deps.tracker.remainingProviderCalls() <= 0) {
         this.#deps.emit("role.failover.failed", attempt.role, from, `budget-exhausted:${refusal.quotaPool}`);
         throw error;

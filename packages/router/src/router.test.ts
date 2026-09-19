@@ -147,9 +147,12 @@ test("a lookup goes to the fastest model that clears the floor, not the stronges
 
   assert.equal(route("T0"), "fast-model");
   assert.equal(route("T1"), "fast-model");
-  // Above the cheap tiers the preference inverts, because there the work is what costs, not the
-  // waiting: a T2 change and a T3 audit get the model that is actually better at them.
-  assert.equal(route("T2"), "deep-model");
+  // T2 is ordinary work — and every write starts here — so it keeps a value preference: the balanced
+  // model wins because the work does not need more. It used to go to the deep model, which meant a
+  // one-line append bought the strongest model in the catalogue while a *lookup* was carefully
+  // priced: the tier that most needed the preference was the only one without it.
+  assert.equal(route("T2"), "balanced-model");
+  // T3 and above invert it, because there the work is what costs, not the waiting.
   assert.equal(route("T3"), "deep-model");
 });
 

@@ -1,4 +1,4 @@
-import { BrainGateInvariantError, BudgetTracker } from "@braingate/core";
+import { BrainGateInvariantError, BudgetTracker , quotaRefusalOf } from "@braingate/core";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteCandidate } from "@braingate/router";
 import type { AgentInvoker, AgentRequest, AgentResponse, ReviewIndependence, WorkflowEvent, WorkflowInput, WorkflowOutcome, WorkflowReceipt } from "./types.js";
 import { RoleFailover, type FailoverAttempt } from "./role-failover.js";
@@ -113,12 +113,19 @@ export class WorkflowEngine {
     });
 
     const primaryExcluded = input.excludeProviders?.primary;
+    // Which providers can execute this run's policy, and which sessions the goal already holds. The
+    // engine does not know either; the caller measured the first and owns the second.
+    const routing = {
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
+      ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
+    };
     const routePrimary = (): RouteCandidate => this.#router.route({
       role: "coder",
       classification: input.classification,
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       writeRequired: input.writeRequired,
+      ...routing,
       ...(primaryExcluded === undefined ? {} : { excludeProviders: primaryExcluded }),
       // The operator's own choice, carried onto the run. Every gate still applies to it: a pin
       // narrows which model is considered and excuses it from nothing.
@@ -137,7 +144,8 @@ export class WorkflowEngine {
       reviewerLike: boolean,
     ): Promise<AgentResponse> => {
       const boundedCandidate = boundCandidateOutput(candidateOutput);
-      tracker.reserveProviderCall({ reviewer: reviewerLike, contextTokens: input.requiredContextTokens + candidateContextTokens(boundedCandidate) });
+      const reservation = { reviewer: reviewerLike, contextTokens: input.requiredContextTokens + candidateContextTokens(boundedCandidate) };
+      tracker.reserveProviderCall(reservation);
       const release = tracker.beginAgent();
       const ref = modelRef(candidate);
       emit("agent.started", role, ref, phase);
@@ -146,6 +154,12 @@ export class WorkflowEngine {
         assertResponse(role, response);
         emit("agent.completed", role, ref, phase);
         return response;
+      } catch (error) {
+        // A provider that refused on quota did no work and spent nothing, so the call it was
+        // reserved for is still available to whichever subscription the failover picks next. Any
+        // other failure keeps its reservation: the provider was asked and answered, however badly.
+        if (quotaRefusalOf(error) !== null) tracker.releaseProviderCall(reservation);
+        throw error;
       } finally {
         release();
       }
@@ -183,6 +197,7 @@ export class WorkflowEngine {
         budget: input.budget,
         requiredContextTokens: input.requiredContextTokens,
         writeRequired: false,
+        ...(input.policy === undefined ? {} : { policy: input.policy }),
         ...(independence === undefined ? {} : { independence }),
         ...(plannerExcluded === undefined ? {} : { excludeProviders: plannerExcluded }),
         ...failover.routeOptions(),
@@ -269,6 +284,11 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
       writeRequired: false,
       independence,
+      // The policy is a gate on the *run*, not on the executing role alone: under DIRECT every role
+      // keeps the runtime's own harness, so a provider that cannot run the policy cannot run any of
+      // them. Without this the router happily chose a staged-only provider for the reviewer and the
+      // invocation refused it afterwards — a plan that named a worker nobody could dispatch.
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
       ...(reviewerExcluded === undefined ? {} : { excludeProviders: reviewerExcluded }),
       ...failover.routeOptions(),
     }).selected;
@@ -368,6 +388,7 @@ export class WorkflowEngine {
       requiredContextTokens: input.requiredContextTokens + candidateContextTokens(finalOutput),
       writeRequired: false,
       independence: { mode: "preferred", level: "cross-provider", models: [modelRef(primary), modelRef(reviewer)] },
+      ...(input.policy === undefined ? {} : { policy: input.policy }),
       ...(judgeExcluded === undefined ? {} : { excludeProviders: judgeExcluded }),
       ...quotaExclusions(),
     }).selected;

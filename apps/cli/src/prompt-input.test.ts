@@ -4,7 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
-import { createPromptInput, displayWidth, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
+import { createPromptInput, type PromptInputOptions, displayWidth, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
 import { classifyRequestIntent } from "./request-intent.js";
 
 /**
@@ -28,8 +28,9 @@ class Terminal {
   rawModes: boolean[] = [];
   readonly input: PromptInput;
 
-  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number } = {}) {
+  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}) {
     this.input = createPromptInput({
+      ...(options.suggest === undefined ? {} : { suggest: options.suggest }),
       input: {
         on: (event: string, listener: never) => {
           if (event === "data") this.#data.push(listener);
@@ -190,14 +191,112 @@ class VirtualTerminal {
 
   /** The row the cursor is on, as text — for asserting where the operator is typing. */
   cursorRow(): string { return this.#rows[this.#row] ?? ""; }
+  /** The cell the cursor is in on that row, 0-based — for asserting it sits where the typing is. */
+  cursorColumn(): number { return this.#column; }
+  /** The rows below the cursor's row, for asserting what the composer drew under the draft. */
+  rowsBelowCursor(): readonly string[] { return this.#rows.slice(this.#row + 1); }
 }
 
 /** A terminal that both records bytes and displays them. */
-function displayTerminal(options: { readonly columns?: number } = {}): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
+function displayTerminal(options: { readonly columns?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
   const screen = new VirtualTerminal(options.columns ?? 0);
-  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); }, ...(options.columns === undefined ? {} : { columns: options.columns }) });
+  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); }, ...(options.columns === undefined ? {} : { columns: options.columns }), ...(options.suggest === undefined ? {} : { suggest: options.suggest }) });
   return { terminal, screen };
 }
+
+// ---------------------------------------------------------------- cursor placement and the slash menu
+
+test("the cursor is drawn after the prompt and the draft, not on top of the draft's tail", async () => {
+  // Seen on macOS Terminal: "> how ca" with the cursor on the "c". The composer placed the cursor at
+  // the draft's own width, forgetting the two cells the prompt occupies on the same row.
+  const { terminal, screen } = displayTerminal({ columns: 60 });
+  const pending = terminal.input.ask("> ");
+  terminal.type("how ca");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> how ca");
+  assert.equal(screen.cursorColumn(), "> how ca".length, "the cursor sits after the last typed character");
+
+  // Switching language in the same draft and back: Arabic in, deleted, English typed again.
+  terminal.type("سبسبسب");
+  terminal.chunk("\u007f".repeat(6));
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> how ca");
+  assert.equal(screen.cursorColumn(), "> how ca".length, "and is back where it was once the Arabic is deleted");
+  terminal.chunk("\u001b[D");
+  await terminal.input.idle();
+  assert.equal(screen.cursorColumn(), "> how ca".length - 1, "Left moves it one cell, still counting the prompt");
+
+  // A draft that wraps: the prompt's cells count towards the first row.
+  const long = "x".repeat(70);
+  terminal.chunk("\u001b[F");
+  terminal.type(long);
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow().length, (2 + 6 + 70) - 60, "the cursor is on the wrapped row, after the overflow that includes the prompt's width");
+  terminal.enter();
+  assert.equal(await pending, `how ca${long}`);
+});
+
+test("typing / lists the commands under the draft, narrows as more is typed, and Tab completes", async () => {
+  const table = [
+    { label: "/goal", hint: "the current goal", insert: "/goal" },
+    { label: "/use <provider>/<model>", hint: "send the next work to this worker", insert: "/use " },
+    { label: "/worker", hint: "who is selected", insert: "/worker" },
+  ];
+  const suggest = (draft: string) => (draft.startsWith("/") && !draft.includes(" ") && !draft.includes("\n")
+    ? table.filter((item) => item.label.slice(1).startsWith(draft.slice(1)))
+    : []);
+  const { terminal, screen } = displayTerminal({ columns: 80, suggest });
+  const pending = terminal.input.ask("> ");
+  terminal.type("/");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> /", "the draft row is the cursor's row");
+  assert.equal(screen.cursorColumn(), 3);
+  const below = screen.rowsBelowCursor().join("\n");
+  assert.match(below, /\/goal\s+the current goal/, "the menu names every command");
+  assert.match(below, /\/use <provider>\/<model>\s+send the next work/);
+  assert.match(below, /\/worker/);
+
+  terminal.type("wo");
+  await terminal.input.idle();
+  const narrowed = screen.rowsBelowCursor().join("\n");
+  assert.match(narrowed, /\/worker/, "only the matching command is left");
+  assert.doesNotMatch(narrowed, /\/goal|\/use/);
+
+  terminal.chunk("\t");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> /worker", "Tab completes the draft");
+  assert.equal(screen.cursorColumn(), "> /worker".length);
+
+  // A command with arguments completes to the command and a space, ready for them; the menu is gone.
+  terminal.chunk("\u007f".repeat(7));
+  terminal.type("/u");
+  terminal.chunk("\t");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> /use ");
+  assert.equal(screen.rowsBelowCursor().join("").trim(), "", "once the arguments start, nothing is offered");
+
+  terminal.chunk("\u007f".repeat(6));
+  terminal.type("/goal");
+  terminal.enter();
+  assert.equal(await pending, "/goal");
+  assert.equal(screen.rowsBelowCursor().join("").trim(), "", "the menu leaves nothing behind once the request is sent");
+});
+
+test("a paste or a multi-line draft never opens the menu, and a draft without a slash offers nothing", async () => {
+  const calls: string[] = [];
+  const suggest = (draft: string) => { calls.push(draft); return draft.startsWith("/") && !draft.includes("\n") ? [{ label: "/goal", hint: "g", insert: "/goal" }] : []; };
+  const { terminal, screen } = displayTerminal({ columns: 80, suggest });
+  const pending = terminal.input.ask("> ");
+  terminal.paste("/goal\nsecond line");
+  await terminal.input.idle();
+  assert.equal(screen.rowsBelowCursor().join("").trim(), "", "a multi-line draft is a request, not a command being typed");
+  terminal.chunk("\u0003");
+  terminal.type("hello");
+  await terminal.input.idle();
+  assert.equal(screen.rowsBelowCursor().join("").trim(), "");
+  terminal.enter();
+  assert.equal(await pending, "hello");
+});
 
 // ---------------------------------------------------------------- A. typed input
 
