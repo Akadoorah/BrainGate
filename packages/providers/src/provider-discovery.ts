@@ -86,7 +86,9 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     providerId: "github-copilot",
     displayName: "GitHub Copilot CLI",
     binary: "copilot",
-    versionArgs: ["version"],
+    // `copilot version` is "Invalid command format" on copilot 0.0.358; `--version` prints the
+    // version and commit on the first two lines (measured 2026-09-19).
+    versionArgs: ["--version"],
     helpArgs: ["help"],
     modelArgs: null,
     authArgs: null,
