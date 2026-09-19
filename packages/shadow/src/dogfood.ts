@@ -28,6 +28,7 @@ import type { RouteContinuity } from "@braingate/router";
 import type { QuotaReading } from "./quota-readings.js";
 import { planShadowInvocation, shadowProviderRoleStatus, snapshotPrimaryEligibility } from "./profiles.js";
 import type { TaskSnapshotProvider } from "./snapshot-provider.js";
+import type { MeasuredCapabilities } from "./tool-grants.js";
 import { assertShadowProjectCwd } from "./process-executor.js";
 import { assertWorkspaceUnchanged, snapshotWorkspace } from "./workspace-changes.js";
 import type { OperatorProviderAcceptance, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
@@ -72,6 +73,8 @@ function exclusionsFor(
    * subscription's worker and the run quietly spent the reference provider instead.
    */
   directProviders?: readonly string[],
+  /** The per-provider capability reading; Antigravity's DIRECT answer is in it, so the status has to see it. */
+  measured?: Readonly<Record<string, MeasuredCapabilities>>,
 ): readonly string[] {
   return Object.freeze(snapshots.filter((snapshot) => {
     const acceptance = (isolation.acceptances ?? []).find((item) => item.providerId === snapshot.providerId);
@@ -87,7 +90,7 @@ function exclusionsFor(
       ...(isolation.grokSnapshot === undefined ? {} : { grokSnapshotIsolation: isolation.grokSnapshot }),
     }).eligible;
     const directHere = isolation.direct === true && (directProviders ?? []).includes(snapshot.providerId);
-    if (!shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
+    if (!shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere, measured: measured?.[snapshot.providerId] ?? null }).enabled) return true;
     // A provider whose isolation is proven per run, not per install, is not routable until this
     // run has the proof. Excluding it here means the router never selects it and the operator
     // never sees a plan naming a model the invocation would then refuse.
@@ -179,6 +182,7 @@ export class ShadowDogfoodRunner {
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
+  readonly #measured: Readonly<Record<string, MeasuredCapabilities>> | undefined;
   readonly #executor: ShadowProcessExecutor | undefined;
   readonly #pin: RoutePin | undefined;
   /** The routing inputs the operator's policy and the goal's sessions contribute. */
@@ -209,6 +213,8 @@ export class ShadowDogfoodRunner {
      * profile, and no writable root. A run that has not earned it cannot route primary to Grok.
      */
     readonly grokSnapshotIsolation?: GrokIsolationAttestation;
+    /** What a capability probe found per provider; the run's invocations are gated on the same reading the plan used. */
+    readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
     readonly executor?: ShadowProcessExecutor;
     /**
      * The worker the operator named by hand, when there is one.
@@ -273,6 +279,7 @@ export class ShadowDogfoodRunner {
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
+    this.#measured = input.measured;
     this.#executor = input.executor;
     this.#pin = input.pin;
     this.#routing = Object.freeze({
@@ -341,10 +348,10 @@ export class ShadowDogfoodRunner {
     // own harness exactly as the primary does. Narrowing only the primary left the others judged by
     // staged proofs about a sandbox this run does not use, which is how a plan came to name a
     // staged-only provider for a role the invocation then refused.
-    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation, directProviders);
-    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation, directProviders);
-    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation, directProviders);
-    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation, directProviders);
+    const plannerExcluded = exclusionsFor(this.#snapshots, "planner", isolation, directProviders, this.#measured);
+    const primaryExcluded = exclusionsFor(this.#snapshots, "primary", isolation, directProviders, this.#measured);
+    const reviewerExcluded = exclusionsFor(this.#snapshots, "reviewer", isolation, directProviders, this.#measured);
+    const judgeExcluded = exclusionsFor(this.#snapshots, "judge", isolation, directProviders, this.#measured);
 
     // The state this task started from, measured before any provider is called.
     //
@@ -390,6 +397,7 @@ export class ShadowDogfoodRunner {
       ...(primarySnapshotEligible && this.#nativeHarness !== true ? { snapshotPrimary: true, preview: true } : {}),
       ...attestationFor(this.#attestations, primaryRef.providerId),
       ...acceptanceFor(this.#acceptances, primaryRef.providerId),
+      ...(this.#measured?.[primaryRef.providerId] === undefined ? {} : { measured: this.#measured[primaryRef.providerId]! }),
       // A provider whose isolation is proven per run is only constructible with its proof in hand,
       // and the primary route can now be one of those providers.
       ...(primaryRef.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
@@ -413,6 +421,7 @@ export class ShadowDogfoodRunner {
         payload: preflightPayload("reviewer", input.task, input.context),
         ...attestationFor(this.#attestations, reviewerRef.providerId),
         ...acceptanceFor(this.#acceptances, reviewerRef.providerId),
+        ...(this.#measured?.[reviewerRef.providerId] === undefined ? {} : { measured: this.#measured[reviewerRef.providerId]! }),
         ...(reviewerRef.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
         ...(reviewerRef.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
       });
@@ -540,7 +549,7 @@ export class ShadowDogfoodRunner {
     });
 
     try {
-      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }), ...(this.#nativeSession === undefined ? {} : { nativeSession: this.#nativeSession }), ...(this.#nativeHarness ? { nativeHarness: true } : {}) });
+      const invoker = new SubscriptionShadowAgentInvoker({ project: this.#project, cwd, snapshots: this.#snapshots, attestations: this.#attestations, acceptances: this.#acceptances, ...(this.#codexIsolation === undefined ? {} : { codexIsolation: this.#codexIsolation }), ...(this.#grokIsolation === undefined ? {} : { grokIsolation: this.#grokIsolation }), context: input.context, ...(this.#executor === undefined ? {} : { executor: this.#executor }), ledger: this.#ledger, taskId: task.taskId, ...(this.#snapshotStore === undefined ? {} : { snapshotStore: this.#snapshotStore }), ...(this.#grokSnapshotIsolation === undefined ? {} : { grokSnapshotIsolation: this.#grokSnapshotIsolation }), ...(this.#measured === undefined ? {} : { measured: this.#measured }), maxTurns: input.budget.maxInspectionTurns, timeoutMs: input.budget.maxInspectionMs, fanOut: input.budget.maxConcurrentAgents > 1, maxSubagents: input.budget.maxProviderSubagents, ...(this.#onRoleActivity === undefined ? {} : { onRoleActivity: this.#onRoleActivity }), ...(this.#onText === undefined ? {} : { onText: this.#onText }), ...(this.#onThinking === undefined ? {} : { onThinking: this.#onThinking }), ...(this.#onQuotaReading === undefined ? {} : { onQuotaReading: this.#onQuotaReading }), ...(this.#nativeSession === undefined ? {} : { nativeSession: this.#nativeSession }), ...(this.#nativeHarness ? { nativeHarness: true } : {}) });
       // The state the workspace was in before this run, for the verification below. Taken with or
       // without Git, because a workspace is a directory rather than a repository.
       const sourceBefore = snapshotWorkspace(cwd);

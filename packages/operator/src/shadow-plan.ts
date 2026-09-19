@@ -114,6 +114,8 @@ function excludedProviders(input: {
    * does not use. The staged roles still answer to the staged gates: they are not DIRECT runs.
    */
   readonly directProviders?: readonly string[];
+  /** The per-provider capability reading; Antigravity's DIRECT answer is in it, so the status has to see it. */
+  readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
 }): readonly string[] {
   const excludedList = Object.freeze(input.providers.filter((snapshot) => {
     const acceptance = (input.proof.acceptances ?? []).find((item) => item.providerId === snapshot.providerId && item.source === "operator-accepted-unscoped-provider");
@@ -129,7 +131,7 @@ function excludedProviders(input: {
     }).eligible;
     const directHere = (input.directProviders ?? []).includes(snapshot.providerId);
 
-    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere }).enabled) return true;
+    if (!shadowProviderRoleStatus(snapshot.providerId, input.role, { ...(acceptance === undefined ? {} : { acceptance }), snapshotPrimary: snapshotEligible, direct: directHere, measured: input.measured?.[snapshot.providerId] ?? null }).enabled) return true;
     // The proofs below are for a staged or snapshot posture: a sandbox profile BrainGate wrote, and
     // a copy it made. A DIRECT run has neither, so demanding them excluded exactly the worker the
     // operator named — the plan refusing the model the operator had just asked for.
@@ -202,7 +204,7 @@ export function buildShadowTaskPlan(input: {
     writeRequired: false,
     ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
     ...(input.continuity === undefined ? {} : { continuity: input.continuity }),
-    excludeProviders: excludedProviders({ providers: input.providers, role: "primary", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
+    excludeProviders: excludedProviders({ providers: input.providers, ...(input.measured === undefined ? {} : { measured: input.measured }), role: "primary", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
     ...(input.pin === undefined ? {} : { pin: input.pin }),
   });
   const primaryModel = modelRef(primaryRoute);
@@ -234,7 +236,7 @@ export function buildShadowTaskPlan(input: {
   // The planning pass, previewed before it is spent. A plan that showed only the executor would
   // hide the model the task actually leads with, which is the routing decision worth seeing.
   if (input.budget.separatePlanningPass && input.budget.maxPlanners > 0) {
-    const plannerExclusions = excludedProviders({ providers: input.providers, role: "planner", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) });
+    const plannerExclusions = excludedProviders({ providers: input.providers, ...(input.measured === undefined ? {} : { measured: input.measured }), role: "planner", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) });
     const routePlanner = (independence?: { readonly mode: "required"; readonly level: "cross-provider"; readonly models: readonly ModelRef[] }) => input.router.route({
       role: "planner",
       classification: input.classification,
@@ -299,7 +301,7 @@ export function buildShadowTaskPlan(input: {
       writeRequired: false,
       independence,
       ...(input.policyCapability === undefined ? {} : { policy: input.policyCapability }),
-      excludeProviders: excludedProviders({ providers: input.providers, role: "reviewer", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
+      excludeProviders: excludedProviders({ providers: input.providers, ...(input.measured === undefined ? {} : { measured: input.measured }), role: "reviewer", proof, ...(policyProviders.length === 0 ? {} : { directProviders: policyProviders }) }),
     });
     const reviewerModel = modelRef(reviewerRoute);
     const reviewerInvocation = planShadowInvocation({

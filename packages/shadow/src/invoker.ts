@@ -8,7 +8,7 @@ import { grokSandboxNotApplied, type GrokIsolationAttestation } from "./grok-iso
 import { planShadowInvocation, snapshotPrimaryEligibility } from "./profiles.js";
 import type { TaskSnapshotEvidence, TaskSnapshotProvider } from "./snapshot-provider.js";
 import { providerQuotaRefusal, quotaReadings, subagentUsage, type QuotaReading, type SubagentUsage } from "./quota-readings.js";
-import { grants } from "./tool-grants.js";
+import { grants, type MeasuredCapabilities } from "./tool-grants.js";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { OperatorProviderAcceptance, PlannedSessionKind, PlannedSessionReason, PlannedSessionResumeMode, ShadowInvocationPlan, ShadowProcessExecutor, ShadowRolePayload, SubscriptionAttestation } from "./types.js";
 
@@ -281,12 +281,36 @@ export function lastBalancedJsonObject(text: string): Record<string, unknown> | 
  * property of the run — whether the model filled the schema through a tool or wrote it out —
  * and not of the CLI's name.
  */
-function parseRoleResponseWithFallback(role: AgentRequest["role"], providerId: ProviderId, stdout: string, assembled: string | null): AgentResponse {
+function parseRoleResponseWithFallback(
+  role: AgentRequest["role"],
+  providerId: ProviderId,
+  stdout: string,
+  assembled: string | null,
+  /**
+   * Whether this run was asked for plain text rather than the contract's JSON.
+   *
+   * True for a Grok DIRECT read, where the enforced schema was measured to cost the inspection
+   * itself (grok 1.0.30, 2026-09-19). The prose the model streamed is then the `output`, and a JSON
+   * object it may still have written at the end is preferred when it parses.
+   */
+  options: { readonly prose?: boolean } = {},
+): AgentResponse {
   try {
     return parseRoleResponse(role, providerId, stdout);
   } catch (error) {
-    if (assembled === null || assembled.trim().length === 0) throw error;
-    return parseRoleResponse(role, providerId, assembled);
+    // The prose a streamed run assembled, or — for a run whose CLI answers in one envelope, like
+    // Antigravity — the envelope's own answer field. Unwrapping may itself refuse (a denied tool, an
+    // empty response), and that refusal is the better error, so it is allowed to propagate.
+    const text = assembled !== null && assembled.trim().length > 0
+      ? assembled
+      : options.prose === true ? unwrapProviderOutput(providerId, stdout) : null;
+    if (text === null || text.trim().length === 0) throw error;
+    try {
+      return parseRoleResponse(role, providerId, text);
+    } catch (inner) {
+      if (options.prose !== true || (role !== "primary" && role !== "planner")) throw inner;
+      return Object.freeze({ kind: "work", output: boundedText(text.trim()) });
+    }
   }
 }
 
@@ -460,6 +484,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
   // A list rather than a map, because one provider can carry two different decisions and a map
   // keyed by provider silently kept whichever was written last.
   readonly #acceptances: readonly OperatorProviderAcceptance[];
+  readonly #measured: Readonly<Record<string, MeasuredCapabilities>>;
   readonly #codexIsolation: CodexIsolationAttestation | undefined;
   readonly #grokIsolation: GrokIsolationAttestation | undefined;
   readonly #grokSnapshotIsolation: GrokIsolationAttestation | undefined;
@@ -494,6 +519,14 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     readonly snapshots: readonly ProviderSnapshot[];
     readonly attestations?: readonly SubscriptionAttestation[];
     readonly acceptances?: readonly OperatorProviderAcceptance[];
+    /**
+     * What a capability probe found per provider, when one has been run.
+     *
+     * The same reading the plan preview used, so the run's invocation is gated on the same facts:
+     * a DIRECT run refused in the plan is refused here for the same reason, and one the plan
+     * offered is not refused here for want of a measurement the plan had.
+     */
+    readonly measured?: Readonly<Record<string, MeasuredCapabilities>>;
     readonly codexIsolation?: CodexIsolationAttestation;
     readonly grokIsolation?: GrokIsolationAttestation;
     /** The snapshot-read proof, which is a different posture from the staged one. */
@@ -569,6 +602,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
     this.#snapshots = new Map(input.snapshots.map((snapshot) => [snapshot.providerId, snapshot]));
     this.#attestations = new Map((input.attestations ?? []).map((attestation) => [attestation.providerId, attestation]));
     this.#acceptances = Object.freeze([...(input.acceptances ?? [])]);
+    this.#measured = Object.freeze({ ...(input.measured ?? {}) });
     this.#codexIsolation = input.codexIsolation;
     this.#grokIsolation = input.grokIsolation;
     this.#grokSnapshotIsolation = input.grokSnapshotIsolation;
@@ -674,6 +708,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
       ...(attestation === undefined ? {} : { attestation }),
       ...(acceptance === undefined ? {} : { acceptance }),
       ...(networkAcceptance === undefined ? {} : { networkAcceptance }),
+      ...(this.#measured[request.model.providerId] === undefined ? {} : { measured: this.#measured[request.model.providerId]! }),
       ...(request.model.providerId === "openai" && this.#codexIsolation !== undefined ? { codexIsolation: this.#codexIsolation } : {}),
       ...(request.model.providerId === "xai" && this.#grokIsolation !== undefined ? { grokIsolation: this.#grokIsolation } : {}),
     });
@@ -806,7 +841,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           this.#event("shadow.provider.fanout_exceeded", { ...safeMeta, spawned: spawned.spawned, ceiling: this.#maxSubagents });
         }
       }
-      const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null);
+      const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null, { prose: plan.nativeHarness === true && (snapshot.providerId === "xai" || snapshot.providerId === "google") });
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
       this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
       this.#usage(

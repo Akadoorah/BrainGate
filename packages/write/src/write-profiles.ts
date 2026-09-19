@@ -1,6 +1,7 @@
 import { BrainGateInvariantError } from "@braingate/core";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import type { ModelRef } from "@braingate/router";
+import type { MeasuredCapabilities } from "@braingate/shadow";
 import {
   GROK_SANDBOX_PROFILE,
   GROK_WRITE_SANDBOX,
@@ -10,6 +11,7 @@ import {
   validGrokIsolationAttestation,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
+  type SubscriptionAttestation,
   type ToolGrant,
 } from "@braingate/shadow";
 import { assertClaudeWriteEligible, planClaudeWriteInvocation } from "./claude-write-profile.js";
@@ -49,10 +51,32 @@ const GROK_MINIMUM = "1.0.13";
  */
 export const DIRECT_WRITE_PROVIDERS: readonly ProviderId[] = Object.freeze(["xai", "openai"]);
 
-/** Whether this provider may write the workspace itself under the DIRECT policy. */
-export function directWriteCapable(providerId: ProviderId): boolean {
-  return providerId === "anthropic" || DIRECT_WRITE_PROVIDERS.includes(providerId);
+/**
+ * Every provider that could hold a DIRECT write, before the per-machine reading is applied.
+ *
+ * Antigravity is here and not in `WRITE_PROVIDERS` because it has a DIRECT write invocation and no
+ * worktree one: whether the DIRECT write may run is decided by `directWriteCapable`, from the
+ * operator's own Antigravity settings, rather than by membership.
+ */
+export const DIRECT_WRITE_CANDIDATES: readonly ProviderId[] = Object.freeze(["anthropic", "xai", "openai", "google"]);
+
+/**
+ * Whether this provider may write the workspace itself under the DIRECT policy.
+ *
+ * Claude, Grok and Codex by measured invocation. Antigravity by the same measurement its DIRECT
+ * read is gated on: its headless mode auto-denies every tool that would have prompted, and the
+ * only rules it honours are the operator's own `permissions.allow` — so a DIRECT write is offered
+ * exactly when those rules allow headless reads, and `--mode accept-edits` supplies the edit
+ * posture the same way `acceptEdits` does for Claude and Grok. A caller that measured nothing gets
+ * the answer for an unconfigured machine: no.
+ */
+export function directWriteCapable(providerId: ProviderId, measured: MeasuredCapabilities | null = null): boolean {
+  if (providerId === "anthropic" || DIRECT_WRITE_PROVIDERS.includes(providerId)) return true;
+  return providerId === "google" && measured?.headlessReads === true && measured?.headlessShell === true;
 }
+
+const ANTIGRAVITY_WRITE_REFUSAL =
+  "Antigravity auto-denies every tool it would need in headless mode unless its own settings allow it, so BrainGate has no DIRECT write for it until they do: allow headless tools under permissions.allow in ~/.gemini/antigravity-cli/settings.json with both rules read_file(*) and command(*) (measured 2026-09-19 on agy 1.2.7: with the read rule alone it still reached for the shell and was denied). BrainGate reads that file and never writes it. Its DIRECT read is gated on the same rules.";
 
 const WRITE_SCHEMA = Object.freeze({ kind: "work", summary: "string" });
 
@@ -75,11 +99,46 @@ function versionAtLeast(actual: string | null, minimum: string): boolean {
   return true;
 }
 
-function assertCommonEligibility(snapshot: ProviderSnapshot, model: ModelRef): void {
+/**
+ * Whether a local subscription attestation currently covers this provider.
+ *
+ * The same rule the read path applies (`assertAuth` in the shadow profiles): a CLI that will not say
+ * how it is billed is covered by the operator's own statement, which expires with the acceptance it
+ * came from.
+ */
+function validSubscriptionAttestation(attestations: readonly SubscriptionAttestation[], providerId: string, now: Date): boolean {
+  const value = attestations.find((entry) => entry.providerId === providerId && entry.mode === "subscription");
+  if (value === undefined) return false;
+  const observed = new Date(value.observedAt);
+  if (Number.isNaN(observed.getTime()) || observed.getTime() > now.getTime() + 60_000 || now.getTime() - observed.getTime() > 30 * 24 * 60 * 60 * 1000) return false;
+  if (value.expiresAt !== undefined && value.expiresAt !== null) {
+    const expires = new Date(value.expiresAt);
+    if (Number.isNaN(expires.getTime()) || expires.getTime() <= now.getTime()) return false;
+  }
+  return true;
+}
+
+function assertCommonEligibility(snapshot: ProviderSnapshot, model: ModelRef, options: { readonly nativeHarness?: boolean; readonly measured?: MeasuredCapabilities | null; readonly attestations?: readonly SubscriptionAttestation[]; readonly now?: Date } = {}): void {
   if (snapshot.providerId !== model.providerId) throw new BrainGateInvariantError("WRITE_PROVIDER_MISMATCH", "Provider snapshot and routed model do not match.");
-  if (!isWriteProvider(snapshot.providerId)) throw new BrainGateInvariantError("WRITE_PROVIDER_BLOCKED", `${snapshot.displayName} has no write profile: BrainGate cannot bound where a change it makes would land.`);
+  // A worktree write needs a worktree profile. A DIRECT write needs a DIRECT one, which is a
+  // different list: Antigravity has the second and not the first.
+  const hasProfile = options.nativeHarness === true
+    ? directWriteCapable(snapshot.providerId, options.measured ?? null) || DIRECT_WRITE_CANDIDATES.includes(snapshot.providerId)
+    : isWriteProvider(snapshot.providerId);
+  if (!hasProfile) throw new BrainGateInvariantError("WRITE_PROVIDER_BLOCKED", `${snapshot.displayName} has no write profile: BrainGate cannot bound where a change it makes would land.`);
   if (snapshot.available.value !== true) throw new BrainGateInvariantError("WRITE_PROVIDER_UNAVAILABLE", `${snapshot.displayName} CLI is unavailable.`);
-  if (snapshot.authState.value !== "authenticated" || snapshot.authMode.value !== "subscription") {
+  // The read path's rule, applied to the write: native proof first, the operator's own attestation
+  // when discovery reports unknown, and a refusal for API billing or a signed-out CLI either way.
+  // Antigravity is the case: its CLI never says how it is billed, the operator's acceptance says
+  // subscription, and the write path was refusing what the read path had already accepted.
+  if (snapshot.authMode.value === "api") {
+    throw new BrainGateInvariantError("WRITE_SUBSCRIPTION_REQUIRED", `${snapshot.displayName} is authenticated for API billing, not subscription write usage.`);
+  }
+  if (snapshot.authState.value === "unauthenticated") {
+    throw new BrainGateInvariantError("WRITE_SUBSCRIPTION_REQUIRED", `${snapshot.displayName} is not authenticated.`);
+  }
+  const natively = snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription";
+  if (!natively && !validSubscriptionAttestation(options.attestations ?? [], snapshot.providerId, options.now ?? new Date())) {
     throw new BrainGateInvariantError("WRITE_SUBSCRIPTION_REQUIRED", `${snapshot.displayName} write mode requires proven subscription authentication; API/unknown auth is refused.`);
   }
   if (snapshot.capabilities.value.headless !== true || snapshot.capabilities.value.modelPinning !== true) {
@@ -93,6 +152,8 @@ function assertCommonEligibility(snapshot: ProviderSnapshot, model: ModelRef): v
 export interface WriteEligibilityProof {
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
+  /** The operator's subscription attestations, for a CLI whose discovery reports unknown billing. */
+  readonly attestations?: readonly SubscriptionAttestation[];
   /**
    * Whether this write runs in the workspace itself under the DIRECT policy (ADR 0017).
    *
@@ -101,6 +162,13 @@ export interface WriteEligibilityProof {
    * silently running with a boundary they were not proven under.
    */
   readonly nativeHarness?: boolean;
+  /**
+   * What a capability probe found for this build, when one has been run.
+   *
+   * The write path's copy of the same reading the read path takes. It decides one thing here: whether
+   * Antigravity's own settings allow the headless reads a DIRECT write needs before it can edit.
+   */
+  readonly measured?: MeasuredCapabilities | null;
   /**
    * The native session this write runs in, when one was resolved.
    *
@@ -128,16 +196,20 @@ export interface WriteNativeSession {
  */
 export function assertWriteEligible(snapshot: ProviderSnapshot, model: ModelRef, proof: WriteEligibilityProof = {}): void {
   if (snapshot.providerId === "anthropic") { assertClaudeWriteEligible(snapshot, model); return; }
-  assertCommonEligibility(snapshot, model);
   const now = proof.now ?? new Date();
+  assertCommonEligibility(snapshot, model, { ...(proof.nativeHarness === true ? { nativeHarness: true } : {}), measured: proof.measured ?? null, attestations: proof.attestations ?? [], now });
   if (proof.nativeHarness === true) {
     // DIRECT. The boundary is the workspace the operator selected and the run they approved, and
     // the permission posture is the CLI's own: Codex's kernel sandbox at `workspace-write`, Grok's
-    // `acceptEdits`, Antigravity's `--mode accept-edits`. There is no BrainGate-written sandbox
-    // profile here, so there is no self-test about one to demand — asking for it would refuse the
-    // very invocation this path exists to make, for a boundary it does not use.
-    if (!DIRECT_WRITE_PROVIDERS.includes(snapshot.providerId)) {
-      throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${snapshot.displayName} has no measured DIRECT write invocation.`);
+    // `acceptEdits`, Antigravity's `--mode accept-edits` on top of the reads its own settings allow.
+    // There is no BrainGate-written sandbox profile here, so there is no self-test about one to
+    // demand — asking for it would refuse the very invocation this path exists to make, for a
+    // boundary it does not use.
+    if (!directWriteCapable(snapshot.providerId, proof.measured ?? null)) {
+      throw new BrainGateInvariantError(
+        "WRITE_NATIVE_HARNESS_UNSUPPORTED",
+        snapshot.providerId === "google" ? ANTIGRAVITY_WRITE_REFUSAL : `${snapshot.displayName} has no measured DIRECT write invocation.`,
+      );
     }
     return;
   }
@@ -218,6 +290,10 @@ export interface WriteInvocationInput {
   readonly schemaPath?: string;
   readonly codexIsolation?: CodexIsolationAttestation;
   readonly grokIsolation?: GrokIsolationAttestation;
+  /** What a capability probe found for this build; decides Antigravity's DIRECT write. */
+  readonly measured?: MeasuredCapabilities | null;
+  /** The operator's subscription attestations, for a CLI whose discovery reports unknown billing. */
+  readonly attestations?: readonly SubscriptionAttestation[];
   readonly now?: Date;
 }
 
@@ -345,7 +421,34 @@ function planDirectWrite(input: WriteInvocationInput): WriteProviderPlan {
   if (input.snapshot.providerId !== "google") {
     throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${input.snapshot.displayName} has no measured DIRECT write invocation.`);
   }
-  throw new BrainGateInvariantError("WRITE_NATIVE_HARNESS_UNSUPPORTED", `${input.snapshot.displayName} auto-denies every tool it would need in headless mode, so BrainGate has no DIRECT write for it. Its DIRECT read is blocked for the same reason.`);
+  // Antigravity. Eligibility above has already read the operator's settings: headless reads are
+  // allowed there, or this branch is never reached. `--mode accept-edits` is the edit posture in
+  // Antigravity's own vocabulary (measured 2026-09-14 on agy 1.2.2, flag unchanged on 1.2.7);
+  // anything else the run may do is decided by the same settings, and no bypass flag is passed.
+  // `-p` takes its value attached, the one form no option can land inside.
+  const args = Object.freeze([
+    "--output-format", "json",
+    "--model", input.model.modelId,
+    "--effort", "medium",
+    "--mode", "accept-edits",
+    ...(resumedId === null ? [] : ["--conversation", resumedId]),
+    `-p=${WRITE_INSTRUCTION}\n\n${body}`,
+  ]);
+  if (args.some((argument) => argument === "--dangerously-skip-permissions" || argument === "--sandbox" || argument === "--add-dir")) {
+    throw new BrainGateInvariantError("WRITE_PROFILE_UNSAFE", "Unsafe, sandboxed or workspace-widening Antigravity flags are forbidden for a DIRECT write.");
+  }
+  return Object.freeze({
+    providerId: "google",
+    executable: input.snapshot.binary,
+    args,
+    cwd: input.cwd,
+    modelId: input.model.modelId,
+    quotaPool: input.model.quotaPool,
+    stdin: "",
+    allowedEnvKeys: Object.freeze([]),
+    envOverrides: Object.freeze({}),
+    grant,
+  });
 }
 
 /**
@@ -361,6 +464,8 @@ export function planWriteInvocation(input: WriteInvocationInput): WriteProviderP
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
     ...(input.grokIsolation === undefined ? {} : { grokIsolation: input.grokIsolation }),
     ...(input.nativeHarness === true ? { nativeHarness: true } : {}),
+    ...(input.measured === undefined ? {} : { measured: input.measured }),
+    ...(input.attestations === undefined ? {} : { attestations: input.attestations }),
     now,
   });
 

@@ -1,6 +1,6 @@
 # ADR 0017 — DIRECT execution: role, policy, and the native harness
 
-Status: accepted (2026-09-20)
+Status: accepted (2026-09-20); amended by ADR [0020](0020-antigravity-direct-is-read-from-its-own-settings.md) (2026-09-19: Antigravity runs DIRECT when its own settings allow headless reads) and by M22 (the policy gates every role, and the route chooses the worker)
 
 ## Context
 
@@ -76,11 +76,12 @@ NATIVE CLI       = harness        (its tools, shell, subagents, MCP servers, per
 Reported rather than faked, because a preserved capability that is not preserved is worse than a
 missing one:
 
-- **Grok, Codex and Antigravity cannot run DIRECT.** Their invocations are built around a staged copy
-  (`--ignore-user-config`, `--ignore-rules`, a sandbox profile earned against it, `--sandbox` for
-  Antigravity), and re-deriving each one against the installed build is a measurement this slice did
-  not take. The plan refuses `nativeHarness` for them with that reason instead of quietly running
-  with a boundary they were not proven under. Their staged and snapshot postures are unchanged.
+- **Grok, Codex and Antigravity cannot run DIRECT.** *(Superseded.)* Grok and Codex gained measured
+  DIRECT invocations in M21. Antigravity's is gated on the operator's own settings allowing headless
+  reads — ADR [0020](0020-antigravity-direct-is-read-from-its-own-settings.md) — because its print
+  mode auto-denies every tool that would have prompted and takes no allow-list per invocation. On a
+  machine without that rule the plan still refuses `nativeHarness` for it, and the refusal names the
+  rule. Their staged and snapshot postures are unchanged.
 - **The headless prompt.** In print mode there is nobody to answer a permission prompt, so a tool the
   runtime would ask about is refused by the runtime. That is the CLI's own model applied faithfully —
   and it is why a DIRECT write edits files but does not run a test suite unless the operator's own
@@ -88,8 +89,10 @@ missing one:
 - **`--restricted` and `--safe-mode` are still passed.** They bound the run to the workspace without
   replacing the runtime's harness, and removing them is a separate question that needs a
   re-measurement rather than an opinion.
-- **A DIRECT write still routes to Claude only.** The other providers' write argv is worktree-shaped;
-  the router excludes them for that policy rather than failing later.
+- **A DIRECT write still routes to Claude only.** *(Superseded.)* Grok and Codex write DIRECT since
+  M21, Antigravity since ADR 0020 under the same settings gate, each with its own edit posture
+  (`workspace-write`, `acceptEdits`, `--mode accept-edits`). The router still excludes a provider
+  for the policy it cannot run rather than failing later.
 
 ## Consequences
 

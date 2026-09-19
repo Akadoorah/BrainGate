@@ -128,6 +128,18 @@ export interface MeasuredCapabilities {
    * instead of failing at the provider with a flag error.
    */
   readonly sessionIdPinning: boolean | "unknown";
+  /**
+   * Whether a headless run of this build may read workspace files without a prompt.
+   *
+   * Only meaningful for a CLI whose print mode auto-denies tools that would have prompted and takes
+   * no per-invocation allow-list — Antigravity today — where the answer lives in the operator's own
+   * settings file rather than in any flag. Read from there, never written there. A DIRECT run needs
+   * reads, so this is the fact its gate is opened on; absent, the gate stays closed and says which
+   * rule would open it.
+   */
+  readonly headlessReads?: boolean | "unknown";
+  /** The same reading for shell commands, which decide the `noShell` guarantee a DIRECT plan publishes. */
+  readonly headlessShell?: boolean | "unknown";
 }
 
 /**

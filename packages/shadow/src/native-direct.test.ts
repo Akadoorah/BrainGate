@@ -157,6 +157,11 @@ test("Grok DIRECT reads in the workspace with the runtime's own read posture", (
   for (const flag of SUBSTITUTED_HARNESS_FLAGS) assert.equal(args.includes(flag), false, `${flag} is BrainGate's harness, not Grok's`);
   assertNoForeignSandbox(args, "xai");
   assert.equal(plan.guarantees.noProjectWrites, true, "a headless Grok refuses what it would have prompted for");
+  // Measured 2026-09-19 on grok 1.0.30: under an enforced schema the model answers in one turn
+  // without a single tool call, promising to inspect and never doing so. A DIRECT read asks for
+  // prose instead, and the prose is the answer.
+  assert.equal(args.includes("--json-schema"), false, "no enforced schema on a DIRECT read: it costs the inspection");
+  assert.match(args[args.indexOf("-p") + 1] ?? "", /Answer in plain text/, "and the prompt asks for prose");
 });
 
 test("a resumed Grok session is continued by id, and a fresh one is pinned", () => {
@@ -168,34 +173,89 @@ test("a resumed Grok session is continued by id, and a fresh one is pinned", () 
   assert.equal(fresh.includes("--resume"), false);
 });
 
-test("Antigravity is refused a DIRECT run, with the measurement as the reason", () => {
+/** The reading of an Antigravity settings file, in the shape the plan receives it. */
+function antigravityMeasured(input: { readonly reads: boolean; readonly shell: boolean }) {
+  return Object.freeze({ toolDenial: "unknown" as const, declaredSubagents: "unknown" as const, sandbox: "unknown" as const, sessionIdPinning: "unknown" as const, headlessReads: input.reads, headlessShell: input.shell });
+}
+
+test("Antigravity is refused a DIRECT run until its own settings allow headless reads, and the refusal names the rule", () => {
   // Not "untried": agy 1.2.2 was measured on 2026-09-14 and auto-denied `read_file` under
-  // `--mode accept-edits`, under `--mode plan` and under `--sandbox`; once a project-local
-  // allow-rule permitted reads it denied `command` instead. What remains is a blanket bypass or a
-  // persistent change to the operator's own settings, and neither is BrainGate's to make quietly.
-  assert.throws(
-    () => planShadowInvocation({
-      snapshot: snapshot("google", ["google-model"]),
-      model: modelFor("google"),
-      cwd: WORKSPACE,
-      nativeHarness: true,
-      payload,
-      now: new Date("2026-09-14T01:00:00Z"),
-    }),
-    /auto-denies every tool|SHADOW_PROVIDER_BLOCKED/,
-  );
-  const status = shadowProviderRoleStatus("google", "primary", { direct: true });
-  assert.equal(status.enabled, false);
-  assert.match(String(status.reason), /auto-denies every tool/, "the reason carries the measurement, not a shrug");
-  assert.match(String(status.reason), /permissions\.allow|dangerously-skip-permissions/, "and says what would open it");
+  // `--mode accept-edits`, under `--mode plan` and under `--sandbox`; agy 1.2.7 on 2026-09-19 ended
+  // a run that needed the workspace with `denied_actions` and no answer. The CLI's own answer is a
+  // rule in the operator's settings.json, which BrainGate reads and never writes.
+  for (const measured of [undefined, antigravityMeasured({ reads: false, shell: true }), antigravityMeasured({ reads: true, shell: false })]) {
+    assert.throws(
+      () => planShadowInvocation({
+        snapshot: snapshot("google", ["google-model"]),
+        model: modelFor("google"),
+        cwd: WORKSPACE,
+        nativeHarness: true,
+        payload,
+        ...(measured === undefined ? {} : { measured }),
+        now: new Date("2026-09-14T01:00:00Z"),
+      }),
+      /auto-denies every tool|SHADOW_PROVIDER_BLOCKED/,
+      "one rule without the other does not open it: measured, the model reaches for the shell even to read",
+    );
+    const status = shadowProviderRoleStatus("google", "primary", { direct: true, ...(measured === undefined ? {} : { measured }) });
+    assert.equal(status.enabled, false);
+    assert.match(String(status.reason), /auto-denies every tool/, "the reason carries the measurement, not a shrug");
+    assert.match(String(status.reason), /permissions\.allow/, "and says where the rule goes");
+    assert.match(String(status.reason), /read_file\(\*\) and command\(\*\)/, "and which rules");
+    assert.doesNotMatch(String(status.reason), /dangerously-skip-permissions/, "a blanket bypass is not offered as the way in");
+    assert.equal(nativeDirectCapable("google", measured ?? null), false);
+  }
+});
+
+test("Antigravity runs DIRECT with its own settings when they allow headless reads, and the plan claims only what they allow", () => {
+  const readsOnly = antigravityMeasured({ reads: true, shell: true });
+  assert.equal(nativeDirectCapable("google", readsOnly), true, "the gate is the operator's settings, read per machine");
+  const status = shadowProviderRoleStatus("google", "primary", { direct: true, measured: readsOnly });
+  assert.equal(status.enabled, true);
+  assert.match(String(status.reason), /its own settings allow headless reads/);
+
+  const plan = planShadowInvocation({
+    snapshot: snapshot("google", ["google-model"]),
+    model: modelFor("google"),
+    cwd: WORKSPACE,
+    nativeHarness: true,
+    payload,
+    measured: readsOnly,
+    now: new Date("2026-09-19T01:00:00Z"),
+  });
+  assert.equal(plan.nativeHarness, true);
+  assert.equal(plan.workspaceMode, "project");
+  assert.equal(plan.cwd, WORKSPACE);
+  assert.equal(plan.executable, "agy");
+  // The runtime's own permission model is the whole tool policy: no bypass, no sandbox, no mode.
+  for (const forbidden of ["--dangerously-skip-permissions", "--sandbox", "--add-dir", "--mode"]) {
+    assert.equal(plan.args.includes(forbidden), false, `${forbidden} is not passed`);
+  }
+  assert.deepEqual(plan.args.slice(0, 6), ["--output-format", "json", "--model", "google-model", "--effort", "medium"]);
+  assert.match(plan.args.at(-1) ?? "", /^-p=/, "the prompt is attached to -p, the one form no option can land inside");
+  assert.equal(plan.guarantees.noShell, false, "the shell rule the gate needs means the plan cannot claim `noShell`");
+
+  const both = planShadowInvocation({
+    snapshot: snapshot("google", ["google-model"]),
+    model: modelFor("google"),
+    cwd: WORKSPACE,
+    nativeHarness: true,
+    payload,
+    measured: antigravityMeasured({ reads: true, shell: true }),
+    nativeSession: Object.freeze({ kind: "resumed", sessionId: "c0ffee00-1111-4222-8333-444455556666", persistent: true, resumeMode: "native", reason: "goal-continuity" }) as unknown as PlannedNativeSession,
+    now: new Date("2026-09-19T01:00:00Z"),
+  });
+  assert.equal(both.guarantees.noShell, false, "a shell rule in the operator's settings means the run may run commands, and the plan says so");
+  assert.deepEqual(both.args.slice(both.args.indexOf("--conversation"), both.args.indexOf("--conversation") + 2), ["--conversation", "c0ffee00-1111-4222-8333-444455556666"], "a goal's conversation is resumed by id");
 });
 
 test("a provider with no measured DIRECT invocation still refuses one", () => {
   assert.equal(nativeDirectCapable("anthropic"), true);
   assert.equal(nativeDirectCapable("openai"), true);
   assert.equal(nativeDirectCapable("xai"), true);
-  assert.equal(nativeDirectCapable("google"), false, "measured: headless Antigravity auto-denies the tools a DIRECT run needs");
+  assert.equal(nativeDirectCapable("google"), false, "measured per machine: nothing measured means Antigravity's settings allow nothing");
   assert.equal(nativeDirectCapable("github-copilot"), false, "copilot has not been measured for it");
+  assert.equal(nativeDirectCapable("github-copilot", antigravityMeasured({ reads: true, shell: true })), false, "and a settings reading is Antigravity's gate, not anyone else's");
   assert.throws(
     () => planShadowInvocation({
       snapshot: snapshot("github-copilot", ["copilot-model"]),
@@ -217,8 +277,8 @@ test("DIRECT reaches a provider the staged gates close, and does not pretend for
   assert.equal(direct.enabled, true, "and the DIRECT route opens it");
   assert.match(String(direct.reason), /DIRECT/, "with a reason that says which route it is");
 
-  // Antigravity is the case where both routes are closed, and the reason says which measurement
-  // closed the second one rather than implying nobody looked.
+  // Antigravity is the case where both routes are closed on an unconfigured machine, and the reason
+  // says which measurement closed the second one rather than implying nobody looked.
   const google = shadowProviderRoleStatus("google", "primary", { direct: true });
   assert.equal(google.enabled, false);
   assert.match(String(google.reason), /auto-denies every tool/);
@@ -228,48 +288,6 @@ test("DIRECT reaches a provider the staged gates close, and does not pretend for
   // And DIRECT is a statement about the primary worker, not a way to reach the staged roles.
   assert.equal(shadowProviderRoleStatus("google", "planner", { direct: true }).enabled, false);
 });
-
-test("Antigravity is refused a DIRECT run, with the measurement as the reason", () => {
-  // Not "untried": agy 1.2.2 was measured on 2026-09-14 and auto-denied `read_file` under
-  // `--mode accept-edits`, under `--mode plan` and under `--sandbox`; once a project-local
-  // allow-rule permitted reads it denied `command` instead. What remains is a blanket bypass or a
-  // persistent change to the operator's own settings, and neither is BrainGate's to make quietly.
-  assert.throws(
-    () => planShadowInvocation({
-      snapshot: snapshot("google", ["google-model"]),
-      model: modelFor("google"),
-      cwd: WORKSPACE,
-      nativeHarness: true,
-      payload,
-      now: new Date("2026-09-14T01:00:00Z"),
-    }),
-    /auto-denies every tool|SHADOW_PROVIDER_BLOCKED/,
-  );
-  const status = shadowProviderRoleStatus("google", "primary", { direct: true });
-  assert.equal(status.enabled, false);
-  assert.match(String(status.reason), /auto-denies every tool/, "the reason carries the measurement, not a shrug");
-  assert.match(String(status.reason), /permissions\.allow|dangerously-skip-permissions/, "and says what would open it");
-});
-
-test("a provider with no measured DIRECT invocation still refuses one", () => {
-  assert.equal(nativeDirectCapable("anthropic"), true);
-  assert.equal(nativeDirectCapable("openai"), true);
-  assert.equal(nativeDirectCapable("xai"), true);
-  assert.equal(nativeDirectCapable("google"), false, "measured: headless Antigravity auto-denies the tools a DIRECT run needs");
-  assert.equal(nativeDirectCapable("github-copilot"), false, "copilot has not been measured for it");
-  assert.throws(
-    () => planShadowInvocation({
-      snapshot: snapshot("github-copilot", ["copilot-model"]),
-      model: modelFor("github-copilot"),
-      cwd: WORKSPACE,
-      nativeHarness: true,
-      payload,
-    }),
-    /SHADOW_NATIVE_HARNESS_UNSUPPORTED|no measured DIRECT invocation/,
-  );
-});
-
-
 
 test("a DIRECT Codex run's schema is written outside the workspace, before the process starts", async () => {
   // Codex takes its response schema as a path, and a DIRECT run has no staged directory to put one

@@ -114,20 +114,58 @@ test("Grok DIRECT continues its session by id, and pins a new one when it has on
   assert.equal(fresh.includes("--resume"), false);
 });
 
-test("Antigravity is refused a DIRECT write for the same measured reason as its read", () => {
+test("Antigravity is refused a DIRECT write for the same measured reason as its read, and runs one when its settings allow reads", () => {
   assert.throws(
     () => planWriteInvocation({
-      snapshot: snapshot("google", "1.2.2"),
+      snapshot: snapshot("google", "1.2.7"),
       model: { providerId: "google", modelId: "google-model", quotaPool: "google-subscription" },
       cwd: WORKSPACE,
       nativeHarness: true,
       task: "Append one inert comment line.",
       context: Object.freeze({}),
       schemaPath: SCHEMA_PATH,
-      now: new Date("2026-09-14T01:00:00Z"),
+      now: new Date("2026-09-19T01:00:00Z"),
     }),
-    /no write profile|DIRECT write profile only|auto-denies every tool/,
+    /permissions\.allow|auto-denies every tool/,
   );
+  const measured = { toolDenial: "unknown" as const, declaredSubagents: "unknown" as const, sandbox: "unknown" as const, sessionIdPinning: "unknown" as const, headlessReads: true, headlessShell: true };
+  assert.equal(directWriteCapable("google"), false, "unmeasured, Antigravity has no DIRECT write");
+  assert.equal(directWriteCapable("google", measured), true, "measured with reads allowed, it has one");
+  const plan = planWriteInvocation({
+    snapshot: snapshot("google", "1.2.7"),
+    model: { providerId: "google", modelId: "google-model", quotaPool: "google-subscription" },
+    cwd: WORKSPACE,
+    nativeHarness: true,
+    measured,
+    task: "Append one inert comment line.",
+    context: Object.freeze({}),
+    schemaPath: SCHEMA_PATH,
+    now: new Date("2026-09-19T01:00:00Z"),
+  });
+  assert.equal(plan.providerId, "google");
+  assert.equal(plan.executable, "agy");
+  assert.equal(plan.cwd, WORKSPACE, "the write happens in the workspace, not a copy");
+  // Edits approved in Antigravity's own vocabulary; nothing broader, and no bypass of any kind.
+  assert.deepEqual(plan.args.slice(plan.args.indexOf("--mode"), plan.args.indexOf("--mode") + 2), ["--mode", "accept-edits"]);
+  for (const forbidden of ["--dangerously-skip-permissions", "--sandbox", "--add-dir"]) {
+    assert.equal(plan.args.includes(forbidden), false, `${forbidden} is not passed`);
+  }
+  assert.match(plan.args.at(-1) ?? "", /^-p=.*complete BrainGate task brief/s, "the brief travels attached to -p");
+  assert.equal(plan.stdin, "", "and not on stdin");
+  assert.equal(plan.args.includes("--conversation"), false, "a fresh run names no conversation");
+  const resumed = planWriteInvocation({
+    snapshot: snapshot("google", "1.2.7"),
+    model: { providerId: "google", modelId: "google-model", quotaPool: "google-subscription" },
+    cwd: WORKSPACE,
+    nativeHarness: true,
+    measured,
+    session: { kind: "resumed", sessionId: "c0ffee00-1111-4222-8333-444455556666", persistent: true },
+    task: "Append one inert comment line.",
+    context: Object.freeze({}),
+    schemaPath: SCHEMA_PATH,
+    now: new Date("2026-09-19T01:00:00Z"),
+  });
+  assert.deepEqual(resumed.args.slice(resumed.args.indexOf("--conversation"), resumed.args.indexOf("--conversation") + 2), ["--conversation", "c0ffee00-1111-4222-8333-444455556666"], "a goal's conversation is resumed by id");
 });
 
 test("a DIRECT write needs no sandbox self-test, because it does not use one BrainGate wrote", () => {

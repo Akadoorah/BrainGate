@@ -56,6 +56,26 @@ const DIRECT_PROMPT = [
 ].join(" ");
 
 /**
+ * The DIRECT instruction for a runtime that answers in prose rather than under an enforced schema.
+ *
+ * Measured 2026-09-19 on grok 1.0.30, in the workspace of a real Arabic dogfood run: with
+ * `--json-schema` the model produced the schema-shaped object in its first turn and stopped — no
+ * tool call, one turn, an `output` that *promised* to inspect the files ("سأفحص حالة المستودع…") and
+ * never did — in both `streaming-json` and `json` output. The same prompt without the schema ran
+ * `list_dir`, `grep` and the terminal, and answered correctly from the files. So a Grok DIRECT read
+ * asks for plain text and the invoker accepts the prose as the answer; the contract's `output` is
+ * the answer, and a schema that costs the inspection is not worth its shape.
+ */
+const DIRECT_PROSE_PROMPT = [
+  "You receive one JSON request object (appended below this instruction).",
+  "Use its `task` field as the request and its `context` field as supporting data.",
+  "You are running in the workspace itself: inspect the files it names with your own tools, and answer from what you actually find there.",
+  "Do not modify any file unless the task asks for a change.",
+  "Answer in plain text, in the language of the request, with the real values you found.",
+  "If you cannot complete the request, say why in plain text.",
+].join(" ");
+
+/**
  * The flags that name or continue a native session, from the decision that was made.
  *
  * It reads the decision rather than the runtime, so one place decides and one place acts: a decision
@@ -137,6 +157,15 @@ interface ProfileDefinition {
    */
   readonly nativeDirectBlockedBecause?: string;
   /**
+   * A DIRECT invocation that exists but is usable only when a capability probe says so.
+   *
+   * For Antigravity the probe reads the operator's own settings file: its print mode auto-denies
+   * every tool that would have prompted, takes no allow-list per invocation, and honours the
+   * `permissions.allow` rules the operator keeps there. `nativeDirect` stays false because the CLI
+   * alone cannot run DIRECT; this flag says the gate is a measurement rather than a constant.
+   */
+  readonly nativeDirectWhenMeasured?: boolean;
+  /**
    * What this CLI can be asked for, from the flags it actually exposes (ADR 0010).
    *
    * Not a judgement about the provider: a CLI with no way to deny a tool cannot be granted one,
@@ -157,6 +186,11 @@ const INVOCABLE: ReadonlySet<ProviderId> = new Set<ProviderId>(["anthropic", "op
 
 /** Where the staged request body is written for providers that read their prompt from a path. */
 export const STAGED_REQUEST_FILE = "braingate-request.txt";
+
+/** Where Antigravity keeps the rules its headless runs honour; named so a refusal can say where to look. */
+export const ANTIGRAVITY_SETTINGS_HINT = "~/.gemini/antigravity-cli/settings.json";
+const ANTIGRAVITY_DIRECT_REFUSAL =
+  `Antigravity auto-denies every tool it would need in headless mode unless its own settings allow it (measured 2026-09-19 on agy 1.2.7: a print-mode run that needed the workspace ended with denied_actions and no answer, and with read_file(*) alone it still reached for the shell and was denied; on agy 1.2.2 read_file was denied under --mode accept-edits, --mode plan and --sandbox), so a DIRECT run cannot inspect the workspace. Allow headless tools under permissions.allow in Antigravity's own settings (${ANTIGRAVITY_SETTINGS_HINT}) with both rules read_file(*) and command(*); then this opens. BrainGate reads that file and never writes it.`;
 
 const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze({
   anthropic: { providerId: "anthropic", enabled: true, nativeDirect: true, minimumVersion: CLAUDE_MINIMUM, blockedReason: null, surface: { isolatedPerInvocation: true, toolDenial: true, declaredSubagents: true, enforcedSandbox: false } },
@@ -182,16 +216,17 @@ const PROFILES: Readonly<Record<ProviderId, ProfileDefinition>> = Object.freeze(
   // one an isolated home the way it does for Codex and Grok. A staged run therefore keeps the
   // operator's real home, and what agy may reach elsewhere on the machine is unchecked — which
   // is the residual only the operator can accept (ADR 0008).
-  // Measured 2026-09-14 against agy 1.2.2, and the answer is no: headless Antigravity auto-denies
-  // every tool that would need a prompt, and a DIRECT run needs tools — it has to read the workspace
-  // it was pointed at. `--mode accept-edits` was denied for `read_file`, `--mode plan` was denied for
-  // `read_file`, `--sandbox` was denied for `read_file`, and with a project-local allow-rule for
-  // reads it was then denied for `command`. What is left is `--dangerously-skip-permissions`, which
-  // approves every tool with no scope BrainGate can see, or a persistent allow-rule set in the
-  // operator's own settings.json. BrainGate will not write the second on the operator's behalf and
-  // will not pass the first without their decision, so the capability is marked blocked rather than
-  // claimed — and the refusal says which two things would lift it.
-  google: { providerId: "google", enabled: false, nativeDirect: false, nativeDirectBlockedBecause: "Antigravity auto-denies every tool it would need in headless mode (measured 2026-09-14 on agy 1.2.2: read_file denied under --mode accept-edits, --mode plan and --sandbox; command denied once reads were allowed), so a DIRECT run cannot inspect the workspace. Add the allow-rules it needs under permissions.allow in its settings.json, or accept --dangerously-skip-permissions, and this opens.", stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
+  // Measured 2026-09-14 against agy 1.2.2 and again 2026-09-19 against agy 1.2.7: headless
+  // Antigravity auto-denies every tool that would need a prompt, and a DIRECT run needs tools — it
+  // has to read the workspace it was pointed at. `--mode accept-edits`, `--mode plan` and `--sandbox`
+  // were all denied for `read_file`; with a project-local allow-rule for reads it was then denied for
+  // `command`; on 1.2.7 a run that needed the workspace ended with `denied_actions` and an empty
+  // answer. The CLI's own answer is the `permissions.allow` rules in the operator's settings.json,
+  // which every `agy` run honours. So the DIRECT gate for this provider is a *reading* of that file
+  // (`nativeDirectWhenMeasured`): open when the operator has allowed headless reads there, closed
+  // otherwise, and BrainGate never writes the rules on their behalf. The blanket bypass flag is not
+  // used under any policy.
+  google: { providerId: "google", enabled: false, nativeDirect: false, nativeDirectWhenMeasured: true, nativeDirectBlockedBecause: ANTIGRAVITY_DIRECT_REFUSAL, stagedRoles: ["planner", "reviewer", "judge"], needsOperatorAcceptance: true, minimumVersion: null, blockedReason: "Antigravity has no per-invocation permission scope: settings and credentials share HOME, so BrainGate cannot prove what one call may reach outside the project.", surface: { isolatedPerInvocation: false, toolDenial: false, declaredSubagents: false, enforcedSandbox: false } },
 });
 
 /**
@@ -239,8 +274,17 @@ export function snapshotPrimaryCapable(providerId: ProviderId): boolean {
  * headlessly" and "BrainGate can point this CLI at the operator's own workspace" — three different
  * facts that a single `enabled` boolean was flattening into one.
  */
-export function nativeDirectCapable(providerId: ProviderId): boolean {
-  return PROFILES[providerId].nativeDirect === true;
+export function nativeDirectCapable(providerId: ProviderId, measured: MeasuredCapabilities | null = null): boolean {
+  const profile = PROFILES[providerId];
+  if (profile.nativeDirect === true) return true;
+  // Antigravity: not a constant about the CLI but a reading of the operator's own settings. Its
+  // print mode auto-denies every tool that would have prompted, and a DIRECT run has to read the
+  // workspace it was pointed at — so the run is possible exactly when the operator's settings allow
+  // headless reads, which is the runtime's own permission model doing what ADR 0017 says it does.
+  // Both rules, because the model reaches for the shell even to read: measured 2026-09-19 on agy
+  // 1.2.7 with `read_file(*)` alone, a DIRECT read still ended with `command` denied and no answer;
+  // with `command(*)` beside it, the same run read the file and answered.
+  return profile.nativeDirectWhenMeasured === true && measured?.headlessReads === true && measured?.headlessShell === true;
 }
 
 function versionTuple(value: string | null): readonly [number, number, number] | null {
@@ -293,12 +337,12 @@ function assertProfile(
   acceptance: OperatorProviderAcceptance | undefined,
   role: WorkflowRole,
   now: Date,
-  eligibility: { readonly snapshotPrimary?: boolean; readonly direct?: boolean } = {},
+  eligibility: { readonly snapshotPrimary?: boolean; readonly direct?: boolean; readonly measured?: MeasuredCapabilities | null } = {},
 ): ProfileDefinition {
   if (snapshot.providerId !== model.providerId) throw new BrainGateInvariantError("SHADOW_PROVIDER_MISMATCH", "Provider snapshot and routed model do not match.");
   const profile = PROFILES[snapshot.providerId];
   if (!profile.enabled) {
-    const status = shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now, snapshotPrimary: eligibility.snapshotPrimary === true, direct: eligibility.direct === true });
+    const status = shadowProviderRoleStatus(snapshot.providerId, role, { ...(acceptance === undefined ? {} : { acceptance }), now, snapshotPrimary: eligibility.snapshotPrimary === true, direct: eligibility.direct === true, measured: eligibility.measured ?? null });
     if (!status.enabled) throw new BrainGateInvariantError("SHADOW_PROVIDER_BLOCKED", status.reason ?? profile.blockedReason ?? "Provider shadow profile is blocked.");
   }
   if (snapshot.available.value !== true) throw new BrainGateInvariantError("SHADOW_PROVIDER_UNAVAILABLE", `${snapshot.displayName} CLI is unavailable.`);
@@ -401,11 +445,12 @@ export function planShadowInvocation(input: {
   const now = input.now ?? new Date();
   const snapshotPrimary = input.snapshotPrimary === true;
   const nativeHarness = input.nativeHarness === true;
-  if (nativeHarness && PROFILES[input.snapshot.providerId].nativeDirect !== true) {
+  if (nativeHarness && !nativeDirectCapable(input.snapshot.providerId, input.measured ?? null)) {
     // Not a capability judgement about the CLI: it is about BrainGate's own argv for it. A provider
     // without a DIRECT branch below is invoked with a staged-copy argv — `--ignore-user-config`,
     // `--ignore-rules`, a sandbox profile earned against a copy — and re-deriving each one needs a
-    // measurement this build has not taken. Reported, not silently downgraded.
+    // measurement this build has not taken. Reported, not silently downgraded. Antigravity is the
+    // one whose answer is measured per machine: its gate is the operator's own settings.
     const blocked = PROFILES[input.snapshot.providerId].nativeDirectBlockedBecause;
     throw new BrainGateInvariantError(
       "SHADOW_NATIVE_HARNESS_UNSUPPORTED",
@@ -421,7 +466,7 @@ export function planShadowInvocation(input: {
   if (snapshotPrimary && input.preview !== true && (input.workspaceRoot === undefined || input.workspaceRoot.length === 0)) {
     throw new BrainGateInvariantError("SHADOW_SNAPSHOT_ROOT_REQUIRED", "A snapshot-primary run requires the prepared workspace it must read.");
   }
-  const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now, { snapshotPrimary, direct: nativeHarness });
+  const profile = assertProfile(input.snapshot, input.model, input.attestation, input.acceptance, input.payload.role, now, { snapshotPrimary, direct: nativeHarness, measured: input.measured ?? null });
   const body = serializedPayload(input.payload);
   // The session decision, filled in with the real provider and model so the plan is
   // self-describing. Resolved once here rather than read from three places later.
@@ -649,13 +694,14 @@ export function planShadowInvocation(input: {
     }
 
     if (input.snapshot.providerId === "xai") {
+      // No `--json-schema`: measured on grok 1.0.30, the enforced schema ends the run in one turn
+      // with no tool call (see DIRECT_PROSE_PROMPT). The answer is the prose the model streams.
       const args = Object.freeze([
-        "-p", `${DIRECT_PROMPT}\n\n${body}`,
+        "-p", `${DIRECT_PROSE_PROMPT}\n\n${body}`,
         "--cwd", input.cwd,
         "--output-format", "streaming-json",
         "--model", input.model.modelId,
         "--max-turns", String(maxTurns),
-        "--json-schema", schema,
         "--verbatim",
         // The runtime's own read posture. Passed explicitly rather than left to config, because a
         // config that said `acceptEdits` would silently give a read run the write posture.
@@ -694,17 +740,24 @@ export function planShadowInvocation(input: {
     }
 
     // Antigravity. `-p` takes its value attached, which is also the only form that cannot be broken
-    // by an option landing between the flag and the prompt.
+    // by an option landing between the flag and the prompt. No permission flag of any kind: the
+    // run's tool policy is the operator's own settings file, which the gate above has already read.
     const args = Object.freeze([
       "--output-format", "json",
       "--model", input.model.modelId,
       "--effort", "medium",
       ...(session.kind === "resumed" && session.sessionId !== null ? ["--conversation", session.sessionId] : []),
-      `-p=${DIRECT_PROMPT}\n\n${body}`,
+      // Prose, like Grok: no schema flag is passed here either, and measured 2026-09-19 on agy 1.2.7
+      // the model answers a DIRECT read in markdown. The invoker accepts that prose as the answer.
+      `-p=${DIRECT_PROSE_PROMPT}\n\n${body}`,
     ]);
     if (args.some((argument) => argument === "--dangerously-skip-permissions" || argument === "--sandbox" || argument === "--add-dir" || argument === "--mode" || argument.startsWith("--mode="))) {
       throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe, sandboxed or workspace-widening Antigravity flags are forbidden for a DIRECT read.");
     }
+    // What the operator's rules allow is what the plan claims: a shell rule in their settings means
+    // this run may run commands, and the guarantee says so instead of promising a `noShell` the
+    // runtime would not keep.
+    const headlessShell = input.measured?.headlessShell === true;
     return Object.freeze({
       providerId: "google",
       executable: input.snapshot.binary,
@@ -722,7 +775,7 @@ export function planShadowInvocation(input: {
       grant: directGrant,
       nativeSession: session,
       streamDialect: null,
-      guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: true, noNetworkTools: false, noMcp: false })),
+      guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: !headlessShell, noNetworkTools: false, noMcp: false })),
       nativeHarness: true,
       minimumVersion: profile.minimumVersion,
     });
@@ -1014,7 +1067,7 @@ export function validOperatorAcceptance(
 export function shadowProviderRoleStatus(
   providerId: ProviderId,
   role: WorkflowRole,
-  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date; readonly snapshotPrimary?: boolean; readonly direct?: boolean } = {},
+  options: { readonly acceptance?: OperatorProviderAcceptance; readonly now?: Date; readonly snapshotPrimary?: boolean; readonly direct?: boolean; readonly measured?: MeasuredCapabilities | null } = {},
 ): Readonly<{ enabled: boolean; reason: string | null; acceptedByOperator: boolean }> {
   const profile = PROFILES[providerId];
 
@@ -1025,7 +1078,7 @@ export function shadowProviderRoleStatus(
   // since ADR 0017 — and the reason a staged-only or acceptance-gated provider is not thereby
   // excluded: what those gates withhold is BrainGate's staged harness, not the CLI itself.
   if (options.direct === true && role === "primary") {
-    if (profile.nativeDirect !== true) {
+    if (!nativeDirectCapable(providerId, options.measured ?? null)) {
       return Object.freeze({
         enabled: false,
         reason: profile.nativeDirectBlockedBecause ?? `${profile.blockedReason ?? "Provider has no DIRECT invocation."} BrainGate has no measured native invocation for it.`,
@@ -1034,7 +1087,9 @@ export function shadowProviderRoleStatus(
     }
     return Object.freeze({
       enabled: true,
-      reason: "Runs its own harness in the selected workspace under the DIRECT policy; the operator approves the run, and the runtime's own permission mode decides what it may do inside.",
+      reason: profile.nativeDirectWhenMeasured === true
+        ? "Runs its own harness in the selected workspace under the DIRECT policy; its own settings allow headless reads and shell commands, and they decide everything else it may do inside."
+        : "Runs its own harness in the selected workspace under the DIRECT policy; the operator approves the run, and the runtime's own permission mode decides what it may do inside.",
       acceptedByOperator: false,
     });
   }

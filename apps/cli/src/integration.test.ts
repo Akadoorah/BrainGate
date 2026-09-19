@@ -294,7 +294,15 @@ test("a T4 task spends more than one subscription, and names only workers that c
     const planners = [...plan.stdout.matchAll(/planner(-\d)?=([a-z-]+)\//g)].map((match) => match[2]!);
     assert.ok(planners.length >= 1 && planners.length <= 2, `unexpected planners in the plan: ${plan.stdout}`);
     if (planners.length === 2) assert.notEqual(planners[0], planners[1], "a second approach from the same provider is not a second approach");
-    assert.doesNotMatch(plan.stdout, /google\//, "a provider that cannot execute the policy is not named in the plan");
+    // Whether Antigravity can execute the policy is a fact about this machine — its own settings —
+    // so the expectation is read from the same listing the operator sees rather than assumed.
+    const listing = cli.run(["providers", "list", "--json"], 120_000);
+    assert.equal(listing.status, 0, `providers list failed: ${listing.stdout}${listing.stderr}`);
+    const rows = JSON.parse(listing.stdout) as readonly { readonly providerId: string; readonly direct: { readonly supported: boolean } }[];
+    const antigravityDirect = rows.find((row) => row.providerId === "google")?.direct.supported === true;
+    if (!antigravityDirect) {
+      assert.doesNotMatch(plan.stdout, /google\//, "a provider that cannot execute the policy is not named in the plan");
+    }
 
     // JSON, because the receipt is the evidence: which providers actually spent a call, taken
     // from the run itself rather than from a second command reading a shared history.

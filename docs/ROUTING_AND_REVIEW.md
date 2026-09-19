@@ -1,6 +1,26 @@
 # Capability routing and bounded review
 
-BrainGate never chooses a model merely because its marketing name is newer or larger. Provider-owned model IDs remain opaque strings. Routing uses stable role capabilities, task complexity/risk, context capacity, write support, runtime availability and quota pressure.
+BrainGate never chooses a model merely because its marketing name is newer or larger. Provider-owned model IDs remain opaque strings. Routing uses stable role capabilities, task complexity/risk, context capacity, write support, runtime availability, quota pressure, the execution policy the run executes under, and the goal's own sessions.
+
+## The policy gate and the continuity preference (M22)
+
+Two routing facts used to be decided elsewhere and dropped:
+
+- **The execution policy is a hard filter.** A provider whose installed build cannot run the requested
+  policy is excluded by name, for every role — planner, primary, reviewer and judge alike, because under
+  DIRECT every role keeps the runtime's own harness. `/use` on such a provider is refused with the reason
+  rather than silently satisfied by another model. Which providers can run DIRECT is measured per
+  machine, not assumed: Claude, Codex and Grok by their invocations, Antigravity by whether its own
+  settings allow headless reads and shell commands (ADR 0020).
+- **A warm session is a preference, not a rule.** A worker that already holds the goal — its files
+  and decisions loaded in a native session — is worth about thirteen capability points, enough to
+  keep the goal with it and not enough to keep a task with a worker that cannot do it. The preference
+  is produced where the goal lives (the store answers which sessions the request's envelope may
+  resume; the session says who answered the last turn) and travels through the plan to the route.
+
+The task brief records the winner's own reasons (`continuity:warm-session`,
+`continuity:previous-worker`, and the rest) beside every loser's, so "why this one?" is answered
+from the record rather than reconstructed from a score nobody kept.
 
 ## Quota ownership
 
@@ -72,5 +92,7 @@ This is a relative signal and is labelled as one. It claims to know no pool's li
 
 At T0 and T1 the capability floor has already answered "can this model do it". What remains is
 which qualifying model to spend, and the answer is the cheapest one — so speed is the deciding
-term there, not a tiebreak. Above those tiers the preference inverts: a T2 change and a T3 audit
-get the model that is actually better at them, because there the work is what costs.
+term there, not a tiebreak. T2 — ordinary work, and every write, since a write starts at T2 —
+keeps a little over half of the capability range in play, so a balanced model wins a simple append
+and a genuinely harder T2 still reaches the strong end. From T3 up the preference inverts fully: a
+T3 audit gets the model that is actually better at it, because there the work is what costs.
