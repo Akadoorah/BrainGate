@@ -440,7 +440,11 @@ test("B: a pin to a provider that is deliberately excluded refuses instead of ro
   assert.equal(await session.run(), 0);
   assert.equal(cli.calls.length, 0, "an excluded provider must not be invoked by a manual pin");
   assert.match(session.text(), /ROUTE_MANUAL_INELIGIBLE/);
-  assert.match(session.text(), /Nothing was routed elsewhere/);
+  // One line naming the reason and the next step (ADR 0021 Phase D); the full "nothing was routed
+  // elsewhere" reasoning stays in the error's own message — see
+  // packages/router/src/automatic-routing.test.ts.
+  assert.match(session.text(), /The worker you named cannot run this/);
+  assert.match(session.text(), /\/auto/);
 });
 
 // ---------------------------------------------------------------- C. returning provider
@@ -541,7 +545,10 @@ test("E: a manually chosen model that cannot run the work is refused, and nothin
   assert.equal(await session.run(), 0);
   assert.equal(cli.calls.length, 0, "a refused pin must not reach any provider");
   assert.match(session.text(), /ROUTE_MANUAL_INELIGIBLE/);
-  assert.match(session.text(), /Nothing was routed elsewhere/);
+  // One line naming the reason and the next step (ADR 0021 Phase D); the full "nothing was routed
+  // elsewhere" reasoning stays in the error's own message — see
+  // packages/router/src/automatic-routing.test.ts.
+  assert.match(session.text(), /The worker you named cannot run this/);
   assert.match(session.text(), /\/auto/);
 });
 

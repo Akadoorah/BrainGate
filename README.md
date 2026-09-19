@@ -213,7 +213,8 @@ braingate init --project-id my-service --name "My Service" --adopt-models --acce
 | `/use <provider>/<model>` | Send the next work to this worker. The goal is unchanged. |
 | `/use <provider>/<model> --fresh` | Same worker, new native session, same goal. |
 | `/auto` | Return to automatic selection. |
-| `/worker` | Who is selected, what the goal is, what the next run would resume. |
+| `/worker` | Who is selected, what the goal is, what the next run would resume, and any pool BrainGate is briefly resting after a refusal. |
+| `/why [task-id-prefix]` | The last plan's route, per role: who won and their own reasons, and every candidate that was set aside and why. With an id prefix, the same for a past task. |
 | `/goal` | The current goal: established findings, disputed claims, open questions. |
 | `/new` | Set the current goal aside and start a different one. |
 | `/remember`, `/memory` | Record something for later sessions; see what is remembered. |
@@ -281,7 +282,7 @@ has been spent; quota readings are recorded only when a provider states them, ma
 
 | | |
 |---|---|
-| **Working now** | Conversation and goal continuity; cross-provider handoff; returning-worker delta; manual switching (`/use`, `/auto`, `/worker`, `--fresh`); routing with eligibility, quota, budget and isolation gates, an execution-policy gate (a worker that cannot run the policy is excluded by name, for every role) and a continuity preference (a warm session keeps the goal with its worker unless another is clearly better); DIRECT reads and writes on Claude, Codex and Grok, and on Antigravity when its own settings allow headless reads and shell commands (ADR 0020); worktree writes; native session continuity and a reviewer only when policy or the operator asks; a task brief that records the winner's own reasons beside every loser's; task ledger, receipts and reconciliation; memory with a single validated write path; per-project isolation |
+| **Working now** | Conversation and goal continuity; cross-provider handoff; returning-worker delta; manual switching (`/use`, `/auto`, `/worker`, `--fresh`); routing with eligibility, quota, budget and isolation gates, an execution-policy gate (a worker that cannot run the policy is excluded by name, for every role) and a continuity preference (a warm session keeps the goal with its worker unless another is clearly better); DIRECT reads and writes on Claude, Codex and Grok, and on Antigravity when its own settings allow headless reads and shell commands (ADR 0020); worktree writes; native session continuity and a reviewer only when policy or the operator asks; a task brief that records the winner's own reasons beside every loser's, now visible via `/why` for the last plan, the last run, or a past task by id; an active refusal backoff shown in the plan line and `/worker` as BrainGate's own decision to wait, never a provider limit (ADR 0012); refusals in the session as one line naming the reason and the next step, with the full text still in `--json`; task ledger, receipts and reconciliation; memory with a single validated write path; per-project isolation |
 | **Native session resume** | Claude and Grok, where the installed build publishes a session-id flag (verified by a zero-cost capability probe) and the session belongs to the same workspace and build. Codex and Antigravity report the id of the session they create, and BrainGate resumes that id on the next compatible turn. Copilot has resume but reports no id, so each turn is a fresh invocation with the goal handoff — recorded as such, never faked |
 | **Planned** | Automated review and council execution beyond the current T4 disagreement path; a web dashboard; the broader native-capability overlays ADR 0014 classifies |
 

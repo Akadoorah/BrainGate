@@ -20,6 +20,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = Object.freeze([
   { name: "use", args: "<provider>/<model> [--fresh]", hint: "send the next work to this worker" },
   { name: "auto", hint: "let BrainGate choose again" },
   { name: "worker", hint: "who is selected, what the goal is, and what the next run would resume" },
+  { name: "why", args: "[task-id-prefix]", hint: "the last route: who won each role, and why the rest lost" },
   { name: "goal", hint: "the current goal, its established findings and its open questions" },
   { name: "new", hint: "set the current goal aside and start a different one" },
   { name: "remember", args: "<text>", hint: "record something about this project, for later sessions" },

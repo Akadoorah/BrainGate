@@ -66,6 +66,11 @@ row is written late still ends the wait and an earlier success persisted late do
 refusal. A served call clears the backoff. Expiry alone also ends it: the next task probes the pool
 again, which is the only thing that can discover the provider came back.
 
+**An active backoff is shown, not only stored.** `/worker` and the plan line the session prints both
+read `activeRefusalBackoffs` and say so in the operator's own terms — "BrainGate is resting
+claude-subscription until 14:52 after a refusal; it was not counted as a limit." — never as a
+provider limit, a quota reading, or a reset time (ADR 0012, M23 Phase D).
+
 **Backoff persistence is best-effort operational state, not canonical truth.** The task ledger is the
 record of what happened; the backoff is a convenience derived from it, written by a separate statement
 to a separate store, with no cross-store transaction (SQLite in WAL mode cannot commit across

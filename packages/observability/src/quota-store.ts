@@ -179,6 +179,21 @@ function mapBackoff(row: BackoffRow): RefusalBackoff {
   });
 }
 
+/**
+ * How an active backoff reads to the operator, in the one place every surface that shows one goes
+ * through: BrainGate's own decision to wait a little before trying a pool that just refused it,
+ * never a provider limit, a quota reading, or a reset time (ADR 0012).
+ *
+ * `policyBackoffUntil` is a local clock, not the provider's, and the wording says so: "resting"
+ * names what BrainGate is doing, "after a refusal" names the trigger, and "not counted as a limit"
+ * heads off the reading nobody here is allowed to imply.
+ */
+export function describeRefusalBackoff(backoff: RefusalBackoff): string {
+  const until = new Date(backoff.policyBackoffUntil);
+  const clock = Number.isNaN(until.getTime()) ? backoff.policyBackoffUntil : until.toTimeString().slice(0, 5);
+  return `BrainGate is resting ${backoff.quotaPool} until ${clock} after a refusal; it was not counted as a limit.`;
+}
+
 export class GlobalQuotaStore {
   readonly databasePath: string;
   readonly #db: Database.Database;

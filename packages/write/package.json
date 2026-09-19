@@ -11,6 +11,7 @@
   "dependencies": {
     "@braingate/core": "workspace:*",
     "@braingate/execution": "workspace:*",
+    "@braingate/observability": "workspace:*",
     "@braingate/providers": "workspace:*",
     "@braingate/router": "workspace:*",
     "@braingate/security": "workspace:*",

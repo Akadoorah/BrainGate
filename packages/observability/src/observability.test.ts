@@ -245,6 +245,35 @@ test("a task with no planned route reports the roles its own events show answeri
   } finally { ledger.close(); }
 });
 
+// ADR 0021 Phase D gives the write runner a brief too, so `dashboard-snapshot.ts`'s precedence
+// (`workflow.roles ?? brief.route ?? executed`) now reaches the brief for a write task rather than
+// falling through to the executed roles the test above covers. The router's own vocabulary for that
+// role is "coder", not "primary" — `routeRole` has to relabel it, or a write task's card would stop
+// finding the row `/status`'s attribution line looks for by name, silently, the moment a brief
+// existed where one never had before.
+test("a write task's own brief still reports the router's coder role as primary", () => {
+  const { project, ledger } = setupProject();
+  try {
+    const classification = classifyTask({ text: "Append one inert line to the README", mode: "write" });
+    const task = ledger.createTask({ title: "Direct write", complexity: classification.complexity, risk: classification.risk });
+    const budget = budgetFor(classification, { writeRequested: true });
+    ledger.transition(task.taskId, "planned", { write: true });
+    const brief = buildTaskBrief({
+      project, task: ledger.requireTask(task.taskId), classification, budget,
+      routes: [route("anthropic", "claude-sonnet-5", "claude-subscription")],
+      context: { memoryRecords: 0, explicitCandidates: 0, includedItems: 1, estimatedTokens: 100, truncatedItems: 0 },
+      permissions: { executionProfile: "write-direct", networkAllowed: false },
+    });
+    assert.equal(brief.route[0]?.role, "primary", "the brief itself already speaks the display vocabulary");
+    recordTaskBrief(ledger, brief);
+    ledger.appendEvent(task.taskId, "shadow.provider.started", { role: "primary", phase: "write", provider: "anthropic", model: "claude-sonnet-5", quotaPool: "claude-subscription" });
+    ledger.appendEvent(task.taskId, "shadow.provider.completed", { role: "primary", phase: "write", provider: "anthropic", model: "claude-sonnet-5", quotaPool: "claude-subscription", durationMs: 5 });
+
+    const card = buildTaskCard(project, normalizeTaskReceipt(ledger.receipt(task.taskId)));
+    assert.deepEqual(card.route.map((entry) => `${entry.role}=${entry.providerId}/${entry.modelId}`), ["primary=anthropic/claude-sonnet-5"]);
+  } finally { ledger.close(); }
+});
+
 test("a quota store that cannot be opened says which file and why, not CLI_UNEXPECTED", () => {
   // The operator state directory is not always writable, and a run used to die as CLI_UNEXPECTED
   // with the details suppressed: no cause, no path, nothing to act on. The failure is the same
