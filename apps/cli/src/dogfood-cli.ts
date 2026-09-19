@@ -1154,7 +1154,10 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       });
       const boundary = result.worktree === null ? `workspace=${result.providerCwd ?? repositoryPath}` : `branch=${result.worktree.branch}`;
       emit(json, data, [
-        `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${describeOutcome(recorded)} · ${boundary}`,
+        // A run that changed nothing is recorded as verification-failed, because no diff passed the
+        // guard — but on screen "FAILED" beside a worker that checked and found the change already
+        // there reads as a breakage. The record keeps its word; the line says what happened.
+        `Task ${result.taskId} · observed=${observationSequence ?? "none"} · outcome=${noChange ? "NO CHANGE (nothing to do, recorded as verification-failed)" : describeOutcome(recorded)} · ${boundary}`,
         noChange
           // The worker finished and the workspace did not change. Said plainly, with its own words,
           // rather than as a review outcome about a diff that never existed.
