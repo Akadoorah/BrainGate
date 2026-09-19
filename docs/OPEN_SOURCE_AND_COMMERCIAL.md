@@ -153,6 +153,13 @@ No license should be added solely because this document names a preference. Befo
 
 Until a repository license is deliberately selected and added, no document should imply that the source has already been released under Apache-2.0 or any other license.
 
+**Update, 2026-09-19 (M23 Phase F):** a root `LICENSE` file (Apache-2.0, copyright "BrainGate
+contributors") has been added, closing the first item of that decision — the repository is no
+longer unlicensed. This did **not** resolve the broader decision this document is about: whether
+Apache-2.0 remains the right choice once dependency/attribution audits, patent considerations and
+compatibility with a future commercial layer are weighed, which is still open (see
+`docs/PUBLIC_RELEASE_CHECKLIST.md`, "Legal and licensing").
+
 ## Source boundary between OSS and commercial code
 
 The architecture should preserve a clean dependency direction:

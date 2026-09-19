@@ -52,10 +52,16 @@ importers:
       '@braingate/write':
         specifier: workspace:*
         version: link:../../packages/write
+      better-sqlite3:
+        specifier: ^13.0.3
+        version: 13.0.3
     devDependencies:
       '@types/node':
         specifier: ^22.18.7
         version: 22.20.1
+      esbuild:
+        specifier: ^0.28.2
+        version: 0.28.2
       tsx:
         specifier: ^4.23.13
         version: 4.23.13

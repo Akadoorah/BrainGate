@@ -1,6 +1,7 @@
 node_modules/
 dist/
 coverage/
+package.json.prepack-backup
 *.log
 .DS_Store
 .env

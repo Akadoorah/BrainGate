@@ -1,16 +1,25 @@
 {
-  "name": "@braingate/cli",
-  "version": "0.0.0-private",
+  "name": "braingate",
+  "version": "0.1.0-preview",
   "private": true,
   "type": "module",
+  "description": "One local control plane for the AI coding subscriptions you already use.",
+  "license": "Apache-2.0",
   "bin": {
     "braingate": "./bin/braingate.mjs"
   },
+  "files": [
+    "bin",
+    "dist"
+  ],
   "scripts": {
     "start": "tsx src/main.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "tsx --test src/*.test.ts",
-    "test:integration": "BRAINGATE_INTEGRATION=1 tsx --test src/integration.test.ts"
+    "test:integration": "BRAINGATE_INTEGRATION=1 tsx --test src/integration.test.ts",
+    "build": "node scripts/build.mjs",
+    "prepack": "node scripts/prepack.mjs",
+    "postpack": "node scripts/postpack.mjs"
   },
   "dependencies": {
     "@braingate/context": "workspace:*",
@@ -26,10 +35,12 @@
     "@braingate/router": "workspace:*",
     "@braingate/security": "workspace:*",
     "@braingate/shadow": "workspace:*",
-    "@braingate/write": "workspace:*"
+    "@braingate/write": "workspace:*",
+    "better-sqlite3": "^13.0.3"
   },
   "devDependencies": {
     "@types/node": "^22.18.7",
+    "esbuild": "^0.28.2",
     "tsx": "^4.23.13",
     "typescript": "^5.9.3"
   }
