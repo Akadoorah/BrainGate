@@ -10,6 +10,14 @@ export interface ProviderModelProfile {
   readonly roles: Readonly<Record<ModelRole, number>>;
   readonly maxCoder: number;
   readonly maxReviewer: number;
+  /**
+   * The models still on BrainGate's starting scores, which the operator has not touched.
+   *
+   * Reported rather than inferred from the numbers, because a default and a deliberate choice can
+   * be the same number. The operator is the one who decides what a model is good at (ADR 0021),
+   * and this is the list of places where nobody has decided yet.
+   */
+  readonly defaultScored: readonly string[];
 }
 
 export interface ModelCoverageProfile {
@@ -31,6 +39,12 @@ function configured(entries: readonly ModelCatalogEntry[]): readonly ModelDefini
 
 export function analyzeModelCoverage(entries: readonly ModelCatalogEntry[]): ModelCoverageProfile {
   const definitions = configured(entries);
+  const defaultScored = new Set(
+    entries
+      .filter((entry): entry is Extract<ModelCatalogEntry, { configured: true }> => entry.configured)
+      .filter((entry) => entry.source !== undefined && entry.source !== "operator")
+      .map((entry) => `${entry.providerId}\u0000${entry.modelId}`),
+  );
   const byProvider = new Map<string, ModelDefinition[]>();
   for (const definition of definitions) {
     const current = byProvider.get(definition.providerId) ?? [];
@@ -48,6 +62,7 @@ export function analyzeModelCoverage(entries: readonly ModelCatalogEntry[]): Mod
       roles: Object.freeze(roles),
       maxCoder: Math.max(0, ...models.map((model) => model.capabilities.coder ?? 0)),
       maxReviewer: Math.max(0, ...models.map((model) => model.capabilities.reviewer ?? 0)),
+      defaultScored: Object.freeze(models.map((model) => model.modelId).filter((modelId) => defaultScored.has(`${providerId}\u0000${modelId}`)).sort()),
     } satisfies ProviderModelProfile);
   });
 
@@ -69,6 +84,10 @@ export function analyzeModelCoverage(entries: readonly ModelCatalogEntry[]): Mod
     if (provider.quotaPools.length > 1) warnings.push(`${provider.providerId} declares multiple quota pools; keep them separate only if provider telemetry proves they are independently limited.`);
   }
   if (!coverage.T4) warnings.push("No configured coding model reaches the T4 capability floor.");
+  const stillDefault = providers.flatMap((provider) => provider.defaultScored.map((modelId) => `${provider.providerId}/${modelId}`));
+  if (stillDefault.length > 0) {
+    warnings.push(`${stillDefault.length} model(s) still carry BrainGate's starting scores rather than yours: ${stillDefault.join(", ")}. Change any of them with \`braingate models add --definition <file>\`.`);
+  }
   if (reviewerIndependence === "unavailable") warnings.push("No reviewer-capable model is configured.");
 
   return Object.freeze({

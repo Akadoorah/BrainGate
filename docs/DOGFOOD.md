@@ -82,17 +82,52 @@ $BRAINGATE = "C:\absolute\path\to\BrainGate\apps\cli\bin\braingate.mjs"
 
 Run commands as `node "$BRAINGATE" ...` on macOS/Linux/WSL or `node $BRAINGATE ...` in PowerShell.
 
-## 2. Onboard one real project
+## 2. Onboard one real project — the wizard
 
-Change directory to the target Git repository, then create its local BrainGate identity. Example for Waslo:
+Change directory to the target repository and start BrainGate with no arguments:
 
 ```bash
-node "$BRAINGATE" init --project-id waslo --name "Waslo"
+cd /path/to/your/repo
+node "$BRAINGATE"
 ```
 
-This creates `.brain/project.json` and adds `.brain/` to the repository's local Git exclude file (`.git/info/exclude`). It does not modify the tracked `.gitignore`.
+On a terminal, in a directory with no `.brain/project.json`, this is the first-run wizard. It asks
+at most four questions and prints everything else it decided:
 
-Re-running the exact same `init` is safe. A conflicting existing project ID/name/repository mapping is refused rather than overwritten.
+1. **`Register <dir> as a BrainGate project? [Y/n]`** — creates `.brain/project.json` and adds
+   `.brain/` to the repository's local exclude file. It does not modify the tracked `.gitignore`.
+   The project id and display name are taken from the directory name; use
+   `braingate init --project-id <id> --name <name>` to choose something else. Where the directory is
+   not a repository, `init` offers to create one first, and registering a plain directory is a fine
+   answer — it is the worktree-isolated write modes that need a repository.
+2. **`Adopt these N models with these starting scores? [Y/n]`** — what sections 3 and 4 below used to
+   be, as one question. Each model is listed with the roles it would take, its speed, and where its
+   id came from (`from agy models`, or `assumed: claude lists no models`).
+3. **`Accept Antigravity as an unscoped provider for 30 days? [y/N]`** — only when `agy` is installed
+   and an acceptance would actually open a role (ADR 0008). The unscoped-provider risk is printed
+   first. Whatever you answer, if Antigravity's own settings lack the headless rules the wizard
+   prints them and the file path: BrainGate reads that file and never writes it (ADR 0020).
+4. **`Require a reviewer on every write in this session? [y/N]`** — `/review on|off` later. Big and
+   risky writes get a reviewer regardless of this answer.
+
+Everything else is printed as assumed: the `direct` execution policy, that quota is read from each
+CLI's own reporting, and whether a second provider exists for genuinely independent review.
+
+`/setup` runs it again at any time. It is idempotent: a registered project is left alone, newly
+listed models are offered, and anything you scored yourself is reported as `kept (your scores)` and
+never overwritten.
+
+Re-running the exact same `init` is safe. A conflicting existing project ID/name/repository mapping
+is refused rather than overwritten.
+
+Without a terminal — a pipe, CI, an editor task — there is no wizard, and the same work has flags:
+
+```bash
+node "$BRAINGATE" init --project-id waslo --name "Waslo" --adopt-models --accept google
+```
+
+`--adopt-models` and `--accept <provider>` do exactly what questions 2 and 3 do. `init` with any
+flag never prompts.
 
 Suggested distinct IDs for the planned dogfood projects:
 
@@ -111,15 +146,33 @@ Use lowercase alphanumeric/hyphen IDs only.
 node "$BRAINGATE" discover --json
 ```
 
-Check that the CLI you want to use is available and that subscription authentication is reported truthfully. BrainGate does not infer a subscription when discovery cannot prove it.
+Check that the CLI you want to use is available and that subscription authentication is reported
+truthfully. BrainGate does not infer a subscription when discovery cannot prove it. The wizard reads
+the same discovery, and names any CLI that is installed and signed out along with the command that
+fixes it.
 
 Do not continue with a provider showing API authentication if your intent is subscription-only execution.
 
-## 4. Configure the local model catalog
+## 4. Check the model catalog, and change what you disagree with
 
-BrainGate intentionally does not invent model capability scores, model IDs, context limits, or quota pools. First inspect discovery, then add a scored definition for each model you want the router to use.
+The wizard's answer to question 2 wrote a catalogue. Those scores are **BrainGate's starting point,
+not a measurement of your models** (ADR 0021), and the catalogue records which is which:
 
-Create a local JSON file outside the target repository or under its ignored `.brain/` directory. Example shape for a Claude coding model:
+```bash
+node "$BRAINGATE" models list --json
+node "$BRAINGATE" models validate --json
+node "$BRAINGATE" models profile
+```
+
+`models profile` names the models that still carry BrainGate's starting scores. Where a CLI
+publishes no zero-prompt model list — `claude` and `codex` today — the ids themselves are assumptions
+and are labelled `braingate-assumed`; a stale one fails at the provider with the provider's own
+error, and `models remove` takes it out. Ids that one provider *serves* for another — `agy models`
+lists `claude-sonnet-4-6` — are imported unscored rather than filed under the other subscription's
+quota pool.
+
+To replace a score with your own, write a definition and add it. An entry you add this way is yours:
+nothing in the wizard, and no later `/setup`, overwrites it.
 
 ```json
 {
@@ -139,22 +192,15 @@ Create a local JSON file outside the target repository or under its ignored `.br
 }
 ```
 
-Replace `modelId` and `contextCapacity` with values you have verified for the installed provider/model. The placeholder `0` is intentionally not usable as a real capacity.
-
-Then add it:
+Replace `modelId` and `contextCapacity` with values you have verified for the installed
+provider/model. The placeholder `0` is intentionally not usable as a real capacity.
 
 ```bash
 node "$BRAINGATE" models add --definition .brain/claude-model.json
 ```
 
-For Codex as an independent reviewer, add a separate OpenAI definition with `writeCapable: false` and a verified model ID/capacity. Codex remains reviewer-only and must pass the M10 isolation self-test before it can be selected.
-
-Inspect the catalog with:
-
-```bash
-node "$BRAINGATE" models list --json
-node "$BRAINGATE" models validate --json
-```
+Starting from an empty catalogue instead — no wizard, nothing adopted — is still supported: decline
+question 2, or run `models add` for each model you want the router to use.
 
 ## 5. Run zero-cost preflight
 

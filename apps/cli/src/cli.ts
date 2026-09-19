@@ -39,7 +39,7 @@ import {
   type ShadowProcessExecutor,
   type SubscriptionAttestation,
 } from "@braingate/shadow";
-import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
+import { acceptanceNeededFor, acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { reconciliationNotice } from "./tasks-cli.js";
 import { WriteDogfoodRunner, buildWriteTaskPlan, directWriteCapable, isWriteProvider, type VisualRequest, type WriteProviderExecutor } from "@braingate/write";
@@ -600,10 +600,9 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           return Object.freeze({ exitCode: 0, data });
         }
         // Accepting a provider BrainGate can already isolate would record a decision that
-        // changes nothing and implies a risk the operator is not actually taking.
-        const needsAcceptance = (["planner", "primary", "reviewer", "judge"] as const)
-          .some((role) => (shadowProviderRoleStatus(providerId, role).reason ?? "").includes("braingate providers accept"));
-        if (!needsAcceptance) {
+        // changes nothing and implies a risk the operator is not actually taking. The wizard asks
+        // the same question through the same function, so the two cannot drift apart.
+        if (!acceptanceNeededFor(providerId)) {
           throw new BrainGateInvariantError(
             "CLI_PROVIDER_ACCEPTANCE_UNNEEDED",
             `${providerId} does not run on operator acceptance: BrainGate either proves its isolation per run or has no invocation profile for it. Nothing to accept.`,

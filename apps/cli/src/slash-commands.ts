@@ -27,6 +27,8 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = Object.freeze([
   { name: "status", hint: "recent tasks in this project" },
   { name: "project", hint: "which checkout this session is bound to, and where it is registered" },
   { name: "policy", args: "[direct|worktree|...]", hint: "the execution policy the next run uses" },
+  { name: "review", args: "[on|off]", hint: "ask for a reviewer on every write, not only the risky ones" },
+  { name: "setup", hint: "run the first-run wizard again: models, acceptances, review" },
   { name: "models", hint: "configured models and reviewer independence" },
   { name: "providers", hint: "which CLIs are installed, and which role each may take here" },
   { name: "doctor", hint: "validate project, models and reviewer isolation" },

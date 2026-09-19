@@ -26,7 +26,10 @@ export async function runModelProfileCli(argv: readonly string[], deps: ModelPro
     if (args[0] !== "models" || args[1] !== "profile" || args.length !== 2) throw new BrainGateInvariantError("CLI_ARGUMENT_INVALID", "Use `braingate models profile [--json]`.");
     const state = resolveOperatorState(env);
     const profile = analyzeModelCoverage(new ModelCatalog(state.modelCatalogPath).load());
-    const providers = profile.providers.map((provider) => `${provider.providerId}: ${provider.models.length} model(s), speeds=${provider.speeds.join("/") || "none"}, reviewer=${provider.roles.reviewer}`).join("\n");
+    // Which of a provider's models the operator has actually decided about. A default and a
+    // considered score can be the same number, so the difference is reported rather than inferred
+    // (ADR 0021): "these are the ones nobody has looked at yet" is the useful sentence.
+    const providers = profile.providers.map((provider) => `${provider.providerId}: ${provider.models.length} model(s), speeds=${provider.speeds.join("/") || "none"}, reviewer=${provider.roles.reviewer}${provider.defaultScored.length === 0 ? "" : `, ${provider.defaultScored.length} on BrainGate's starting scores (${provider.defaultScored.join(", ")})`}`).join("\n");
     const human = [
       `Configured models: ${profile.configuredModels}`,
       `Single-provider mode: ${profile.singleProviderMode ? "yes" : "no"}`,

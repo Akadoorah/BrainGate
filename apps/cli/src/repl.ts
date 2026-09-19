@@ -1,14 +1,17 @@
 import { existsSync } from "node:fs";
 import { createPromptInput } from "./prompt-input.js";
 import { classifyRequestIntent } from "./request-intent.js";
-import { basename, join } from "node:path";
+import { join } from "node:path";
 import { findManifest } from "./manifest-path.js";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
+import { runModelProfileCli } from "./model-profile-cli.js";
 import { SLASH_COMMANDS, slashSuggestions } from "./slash-commands.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
+import { readSessionPreferences, sessionPreferencesPath, updateSessionPreferences } from "./session-preferences.js";
+import { runSetupWizard } from "./setup-wizard.js";
 import {
   DEFAULT_EXECUTION_POLICY,
   EXECUTION_POLICY_IDS,
@@ -395,8 +398,21 @@ interface WorkerLoopState {
    * Chosen by the operator with `/policy`, defaulting to DIRECT: the workspace itself, shared with
    * every worker and with them, which is what ordinary interactive work means. Nothing infers it
    * from the request — the classifier decides what is wanted, this decides where it may happen.
+   *
+   * Remembered across sessions once chosen (`session-preferences.ts`): a boundary is a decision
+   * about this workspace, not about this process.
    */
   policy: ExecutionPolicyId;
+  /**
+   * Whether every write asks for a reviewer, not only the ones whose budget requires it.
+   *
+   * Off by default, because a second subscription on a one-line documentation edit is one worker
+   * too many. `/review on` is for the sessions where it is not. Big and risky writes get a reviewer
+   * regardless of this, which is a property of the write rather than of the session.
+   */
+  reviewAlways: boolean;
+  /** Where this workspace's preferences are kept, or `null` when it has no storage. */
+  readonly preferencesPath: string | null;
   /** Mutated by `/use --fresh`: consumed by exactly one run. */
   freshRequested: boolean;
   /** What the last run did about a native session, for `/worker`. */
@@ -518,12 +534,17 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     ...(continuity === undefined ? {} : { continuity }),
   };
 
+  // `/review on` is the session saying that every write here gets a second reader, not only the
+  // ones whose budget demands it. Sent to the plan as well as to the run, so the reviewer the
+  // operator approved is the reviewer that runs.
+  const reviewArgs = mode === "write" && worker.reviewAlways ? ["--review"] : [];
+
   const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });
   // No `--json`: how a result is rendered is the surface's business, and this surface is a person.
   // The classification the plan *used* comes back as structure regardless, which is what the lines
   // below need — reading it back off the printed summary meant a tier was visible only when the
   // renderer happened to mention it.
-  const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input], {
+  const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input, ...reviewArgs], {
     cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns, discoverAll, ...runtimeDeps(deps), ...goalDeps,
   });
   planning.stop();
@@ -566,7 +587,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   let attributed: readonly string[] = Object.freeze([]);
   // The run's record — task id, outcome, usage, the answer — comes back as data without asking for
   // JSON, and the human-readable answer is what the operator sees.
-  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--policy", worker.policy, "--execute"], {
+  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--policy", worker.policy, ...reviewArgs, "--execute"], {
     cwd: deps.cwd,
     stdout: (text) => {
       working.stop();
@@ -844,6 +865,9 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       const availability = executionPolicyAvailability({ policy: requested, hasRepository: workspaceScope?.git !== null && workspaceScope !== null });
       if (!availability.available) { deps.stderr(`  ${availability.reason ?? "That policy is not available here."}\n`); return "continue"; }
       worker.policy = requested;
+      // Kept for the next session in this workspace. A boundary the operator chose once and had to
+      // re-choose every morning is a boundary they stop choosing.
+      if (worker.preferencesPath !== null) updateSessionPreferences(worker.preferencesPath, { policy: requested });
       // Changing the boundary spends nothing and reaches no provider: it is a local decision about
       // where the next run happens, which is why it can be made mid-conversation.
       deps.stdout(`  Execution policy: ${describeExecutionPolicy(requested)}\n`);
@@ -862,11 +886,48 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       deps.stdout("  Previous goal set aside. The next request starts a new one.\n");
       return "continue";
     }
+    case "review": {
+      const requested = rest[0]?.toLowerCase();
+      if (requested === undefined) {
+        deps.stdout(worker.reviewAlways
+          ? "  Reviewer on every write: on. Big or risky writes get one regardless.\n  /review off leaves it to the task's own budget.\n"
+          : "  Reviewer on every write: off — each write follows its own budget, and a big or risky\n  one still gets a reviewer. /review on asks for one every time.\n");
+        return "continue";
+      }
+      if (requested !== "on" && requested !== "off") {
+        deps.stderr("  Usage: /review [on|off]\n");
+        return "continue";
+      }
+      worker.reviewAlways = requested === "on";
+      if (worker.preferencesPath !== null) updateSessionPreferences(worker.preferencesPath, { reviewAlways: worker.reviewAlways });
+      deps.stdout(worker.reviewAlways
+        ? "  Reviewer on every write: on. A second worker — from another provider where one is\n  configured — reads every change before it is reported.\n"
+        : "  Reviewer on every write: off. Each write follows its own budget.\n");
+      return "continue";
+    }
+    case "setup": {
+      // The wizard again, on a workspace that is already registered: nothing about the project is
+      // changed, newly listed models are offered, and anything the operator has scored is kept.
+      const wizard = await runSetupWizard({
+        cwd: deps.cwd,
+        stdout: deps.stdout,
+        stderr: deps.stderr,
+        ask: deps.ask,
+        ...(deps.env === undefined ? {} : { env: deps.env }),
+        ...(deps.discoverAll === undefined ? {} : { discoverAll: deps.discoverAll }),
+      });
+      worker.reviewAlways = wizard.reviewAlways;
+      return "continue";
+    }
     case "status":
       await runCli(["status", "--project", ".brain/project.json"], io);
       return "continue";
     case "models":
-      await runCli(["models", "profile"], io);
+      // Through the profile surface, not the catalogue one: `runCli` has never understood
+      // `models profile` — the top-level dispatcher routes it to `runModelProfileCli` — so `/models`
+      // answered `CLI_SUBCOMMAND_INVALID` for every session that ever typed it. Found by the first
+      // real first-run, which is where this kind of thing is always found.
+      await runModelProfileCli(["models", "profile"], io);
       return "continue";
     case "providers":
       // Two halves of one question. Discovery says what is installed and how it is signed in;
@@ -936,24 +997,21 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   }
 
   // Arriving in an unregistered directory is the ordinary first run, not an error to be turned
-  // away at. The banner has already said what this is; now offer the one command that starts,
-  // rather than printing an instruction and exiting.
+  // away at. The banner has already said what this is; the wizard now does the whole of setting
+  // up — register, adopt models with starting scores, record what needs accepting — in at most
+  // four questions, and says what it assumed for everything else.
+  let wizardReviewAlways: boolean | null = null;
   if (attachment.kind === "unregistered") {
-    deps.stdout([
-      `  No BrainGate project in ${basename(deps.cwd)} yet.`,
-      "  The project id is the isolation boundary for memory, worktrees and telemetry,",
-      "  so it is registered explicitly rather than assumed.",
-      "",
-    ].join("\n"));
-    const answer = await deps.ask("  Register this repository now? [Y/n] ");
-    if (answer === null || /^n(o)?$/i.test(answer.trim())) {
-      deps.stdout("\n  Nothing registered. Run `braingate init` here when you are ready.\n\n");
-      return 1;
-    }
-    deps.stdout("\n");
-    const init = await runDogfoodCli(["init"], { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr, ask: deps.ask, quiet: true, ...runtimeDeps(deps) });
-    if (init.exitCode !== 0) return init.exitCode;
-    deps.stdout("\n");
+    const wizard = await runSetupWizard({
+      cwd: deps.cwd,
+      stdout: deps.stdout,
+      stderr: deps.stderr,
+      ask: deps.ask,
+      ...(deps.env === undefined ? {} : { env: deps.env }),
+      ...(deps.discoverAll === undefined ? {} : { discoverAll: deps.discoverAll }),
+    });
+    if (!wizard.registered) return wizard.exitCode === 0 ? 1 : wizard.exitCode;
+    wizardReviewAlways = wizard.reviewAlways;
   }
 
   /**
@@ -995,9 +1053,30 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     }
   }
 
-  const header: string[] = [];
-  await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t), ...runtimeDeps(deps) });
-  deps.stdout(`  ${firstLine(header.join(""))}\n  Type a request, or /help. Nothing is spent until you confirm.\n\n`);
+  // The wizard has just printed this exact line, so a session that ran it says the second half
+  // only. Printing readiness twice, two lines apart, reads as two different readings.
+  if (wizardReviewAlways === null) {
+    const header: string[] = [];
+    await runDogfoodCli(["dogfood", "preflight"], { cwd: deps.cwd, stdout: (t) => header.push(t), stderr: (t) => header.push(t), ...runtimeDeps(deps) });
+    deps.stdout(`  ${firstLine(header.join(""))}\n`);
+  }
+  /**
+   * What this workspace decided last time.
+   *
+   * Read here rather than at the loop, so the session says what boundary it is running under
+   * before the first prompt rather than after it. `/policy worktree` and `/review on` are
+   * workspace-scoped execution state (ADR 0016), kept beside the thread.
+   */
+  const preferencesPath = workspaceScope === null ? null : sessionPreferencesPath(workspaceScope.storageDir);
+  const preferences = preferencesPath === null ? {} : readSessionPreferences(preferencesPath);
+  const reviewAlways = wizardReviewAlways ?? preferences.reviewAlways ?? false;
+  if (preferences.policy !== undefined && preferences.policy !== DEFAULT_EXECUTION_POLICY) {
+    deps.stdout(`  Execution policy: ${describeExecutionPolicy(preferences.policy)} — remembered from your last session here. /policy changes it.\n`);
+  }
+  // Said only when it is on: a default nobody chose does not need announcing, and a preference
+  // that changes what every write costs does.
+  if (reviewAlways && wizardReviewAlways === null) deps.stdout("  Reviewer on every write: on. /review off changes it.\n");
+  deps.stdout("  Type a request, or /help. Nothing is spent until you confirm.\n\n");
 
   // The thread from earlier today, if there is one. It lives with this workspace's own state, so
   // another workspace in another terminal has its own and neither can see the other's.
@@ -1031,7 +1110,21 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   const probe = new SessionCapabilityProbe(deps.probeCapabilities, (providerId) => versions.get(providerId) ?? null);
   // DIRECT is the ordinary interactive boundary: the workspace itself, no worktree, no snapshot
   // (ADR 0017). The strict modes remain one command away and are never chosen for the operator.
-  const worker: WorkerLoopState = { selection: AUTO_WORKER, policy: DEFAULT_EXECUTION_POLICY, freshRequested: false, lastRun: null, probe, versions };
+  //
+  // What the operator chose last time is honoured over that default, because `/policy worktree`
+  // and `/review on` are decisions about this workspace rather than about this process. The
+  // wizard's answer wins over the file only in the session that just ran it, where the file was
+  // written a moment ago anyway.
+  const worker: WorkerLoopState = {
+    selection: AUTO_WORKER,
+    policy: preferences.policy ?? DEFAULT_EXECUTION_POLICY,
+    reviewAlways,
+    preferencesPath,
+    freshRequested: false,
+    lastRun: null,
+    probe,
+    versions,
+  };
   try {
     for (;;) {
       const line = await deps.ask("> ");
