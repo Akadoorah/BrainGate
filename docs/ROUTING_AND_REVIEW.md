@@ -22,6 +22,24 @@ The task brief records the winner's own reasons (`continuity:warm-session`,
 `continuity:previous-worker`, and the rest) beside every loser's, so "why this one?" is answered
 from the record rather than reconstructed from a score nobody kept.
 
+## The route explains itself (`/why`, M23 Phase D)
+
+The task brief's route is now visible in the session, not only in a task's stored receipt:
+
+- **`/why`** prints the last plan's route, per role — the selected model with its `selectedReasons`,
+  and every rejected candidate with its own `reasons` (the router's own vocabulary: `capability:72`,
+  `quota-pool-backoff:claude-subscription`, and the rest). It answers right after a plan is shown,
+  before the operator has confirmed anything, because the plan is where the routing decision was
+  made; after a run it answers from the ledger's own `task.brief` event instead, which is the record
+  of what actually executed rather than what was proposed. `/why <task-id-prefix>` answers for a past
+  task the same way.
+- **The write runner records a brief too.** Before this it recorded none — a write task's route lived
+  only in the plan JSON printed before the run, gone the moment the process exited — so `/why` after a
+  write now reads the same shape from the ledger that `/why` after a read always could.
+- **The plan JSON carries `route` and `backoffLines`** for both `dogfood ask plan` and
+  `dogfood write plan`, so a caller reading the plan back (the interactive session does) gets the
+  routing reasons and any active refusal backoff without a second call.
+
 ## Quota ownership
 
 Quota belongs to the provider path actually being used. A Claude-family model invoked through GitHub Copilot consumes the Copilot quota pool, not the user's direct Anthropic pool. `underlyingFamily` is advisory metadata only and never merges quota accounting.

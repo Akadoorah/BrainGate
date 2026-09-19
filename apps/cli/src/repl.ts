@@ -41,6 +41,7 @@ import {
   type GoalRecord,
   type NativeSessionDecision,
 } from "@braingate/goals";
+import { describeRefusalBackoff, normalizeTaskReceipt, openQuotaStore, type TaskBriefRouteRole } from "@braingate/observability";
 import { resolveOperatorState } from "@braingate/operator";
 import { NodeProbeRunner, probeCliCapabilities, type ProviderId, type ProviderSnapshot } from "@braingate/providers";
 import type {
@@ -171,6 +172,23 @@ const PROVIDER_CLI_NAMES: Readonly<Record<string, string>> = Object.freeze({
 
 export function providerCliName(providerId: string): string {
   return PROVIDER_CLI_NAMES[providerId] ?? providerId;
+}
+
+/**
+ * Active refusal backoffs, in the operator's own words — for `/worker`, which has no plan to read
+ * them from. Best-effort: a workspace with no global state yet, or a read that fails for any other
+ * reason, answers with nothing to show rather than an error, which is the correct fact for a
+ * session that has never recorded a refusal.
+ */
+function activeBackoffLines(env: NodeJS.ProcessEnv | undefined): readonly string[] {
+  try {
+    const state = resolveOperatorState(env ?? process.env);
+    const quota = openQuotaStore(state.globalDir);
+    try { return Object.freeze(quota.activeRefusalBackoffs().map(describeRefusalBackoff)); }
+    finally { quota.close(); }
+  } catch {
+    return Object.freeze([]);
+  }
 }
 
 /**
@@ -326,6 +344,48 @@ export interface ReadPlan {
   readonly roleSummary: string | null;
   /** Whether a worktree can be made here, when this plan needs one. */
   readonly worktreeReady: Readonly<{ ready: boolean; reason: string | null; changedFiles: number }> | null;
+  /**
+   * Who won each role and why, and who else was in the running and why they were not.
+   *
+   * Present on every plan, read or write: `/why` right after a plan is shown reads this rather than
+   * a task the plan has not created yet (ADR 0021 Phase D).
+   */
+  readonly route: readonly TaskBriefRouteRole[];
+  /**
+   * Pools BrainGate is briefly avoiding after a refusal, in the operator's own words — never a
+   * provider limit, a quota reading or a reset time (ADR 0012).
+   */
+  readonly backoffLines: readonly string[];
+}
+
+/** One item of `route`, read back defensively: a plan carries only what it actually computed. */
+function readRouteRole(value: unknown): TaskBriefRouteRole | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.role !== "string" || typeof record.providerId !== "string" || typeof record.modelId !== "string") return null;
+  const selectedReasons = Array.isArray(record.selectedReasons) ? record.selectedReasons.filter((item): item is string => typeof item === "string") : [];
+  const rejected = Array.isArray(record.rejected)
+    ? record.rejected.map((entry): TaskBriefRouteRole["rejected"][number] | null => {
+      if (typeof entry !== "object" || entry === null) return null;
+      const row = entry as Record<string, unknown>;
+      if (typeof row.providerId !== "string" || typeof row.modelId !== "string") return null;
+      const reasons = Array.isArray(row.reasons) ? row.reasons.filter((item): item is string => typeof item === "string") : [];
+      return Object.freeze({ providerId: row.providerId, modelId: row.modelId, reasons: Object.freeze(reasons) });
+    }).filter((entry): entry is TaskBriefRouteRole["rejected"][number] => entry !== null)
+    : [];
+  return Object.freeze({
+    role: record.role,
+    providerId: record.providerId,
+    modelId: record.modelId,
+    quotaPool: typeof record.quotaPool === "string" ? record.quotaPool : "",
+    quotaState: typeof record.quotaState === "string" ? record.quotaState : "unknown",
+    quotaHint: typeof record.quotaHint === "number" ? record.quotaHint : null,
+    quotaObservedAt: typeof record.quotaObservedAt === "string" ? record.quotaObservedAt : null,
+    rationale: Object.freeze([]),
+    selectedReasons: Object.freeze(selectedReasons),
+    fallbackCount: typeof record.fallbackCount === "number" ? record.fallbackCount : 0,
+    rejected: Object.freeze(rejected),
+  });
 }
 
 /**
@@ -346,6 +406,8 @@ export function readPlan(data: unknown): ReadPlan | null {
   // the session must still be able to run against a surface that has not been taught all of this.
   const escalation = typeof value.escalated === "object" && value.escalated !== null ? value.escalated as Record<string, unknown> : null;
   const readiness = typeof value.worktreeReady === "object" && value.worktreeReady !== null ? value.worktreeReady as Record<string, unknown> : null;
+  const route = Array.isArray(value.route) ? value.route.map(readRouteRole).filter((role): role is TaskBriefRouteRole => role !== null) : [];
+  const backoffLines = Array.isArray(value.backoffLines) ? value.backoffLines.filter((line): line is string => typeof line === "string") : [];
   return Object.freeze({
     summary: value.summary,
     complexity: value.complexity,
@@ -362,7 +424,57 @@ export function readPlan(data: unknown): ReadPlan | null {
     worktreeReady: readiness !== null && typeof readiness.ready === "boolean"
       ? Object.freeze({ ready: readiness.ready, reason: typeof readiness.reason === "string" ? readiness.reason : null, changedFiles: typeof readiness.changedFiles === "number" ? readiness.changedFiles : 0 })
       : null,
+    route: Object.freeze(route),
+    backoffLines: Object.freeze(backoffLines),
   });
+}
+
+/** One line per role: who won, in the router's own terms, and who else was rejected and why. */
+export function whyLines(route: readonly TaskBriefRouteRole[]): readonly string[] {
+  const lines: string[] = [];
+  for (const role of route) {
+    lines.push(`  ${role.role}: ${role.providerId}/${role.modelId} — ${role.selectedReasons.length === 0 ? "no reasons recorded" : role.selectedReasons.join(", ")}`);
+    for (const rejection of role.rejected) {
+      lines.push(`    rejected ${rejection.providerId}/${rejection.modelId}: ${rejection.reasons.length === 0 ? "no reasons recorded" : rejection.reasons.join(", ")}`);
+    }
+  }
+  return Object.freeze(lines);
+}
+
+/**
+ * Short names for the refusals whose full text is a measurement paragraph — what BrainGate found
+ * on the installed CLI, and why, in the detail a report needs — rather than a sentence a person
+ * mid-conversation can act on. The full text is never lost: it stays in the error object `--json`
+ * prints, and in `plan.data`/`result.data` for `/why` and anything else that reads structure.
+ *
+ * A code absent from this table falls back to its own message unshortened, which is what every
+ * refusal did before this table existed — so a code nobody has measured as "too long" yet is never
+ * silently truncated.
+ */
+const REFUSAL_ONE_LINERS: Readonly<Record<string, string>> = Object.freeze({
+  // The Antigravity DIRECT refusal: several sentences of what was measured on the installed build
+  // and the exact settings rule that would open it. A plan this fails on never reaches a route —
+  // there is nothing for `/why` to show — so the detail lives in `--json` alone.
+  SHADOW_PROVIDER_BLOCKED: "This worker is blocked for this role right now. Next: --json for what was measured.",
+  WRITE_REVIEWER_UNAVAILABLE: "No independent reviewer is available for this write. Next: sign in to a second CLI, or score one of its models for review with /models.",
+  ROUTE_NO_ELIGIBLE_MODEL: "No model is eligible for this work right now. Next: --json for the rejected reasons.",
+  ROUTE_MANUAL_INELIGIBLE: "The worker you named cannot run this. Next: /auto to return to automatic selection, or --json for the reasons.",
+});
+
+/**
+ * The refusal a failed plan or run carries, as one line naming the reason and the next step — or
+ * `null` when `data` is not the `{ error, recorded }` shape `dogfood-cli.ts` produces, in which
+ * case the caller falls back to whatever text it already captured.
+ */
+export function refusalLine(data: unknown): string | null {
+  if (typeof data !== "object" || data === null) return null;
+  const value = data as { readonly error?: { readonly code?: unknown; readonly message?: unknown }; readonly recorded?: unknown };
+  const code = typeof value.error?.code === "string" ? value.error.code : null;
+  const message = typeof value.error?.message === "string" ? value.error.message : null;
+  if (code === null || message === null) return null;
+  const line = REFUSAL_ONE_LINERS[code] ?? message;
+  const recorded = value.recorded === true;
+  return `BrainGate ${code}: ${line}${recorded ? "" : "\n\nNo task was created. Nothing was recorded for this attempt."}`;
 }
 
 /**
@@ -482,6 +594,12 @@ interface WorkerLoopState {
   freshRequested: boolean;
   /** What the last run did about a native session, for `/worker`. */
   lastRun: RunSessionSummary | null;
+  /**
+   * The route `/why` answers from: the last plan's, until a run exists whose ledger brief carries
+   * the route that actually executed. `taskId` is `null` for a plan that has not been run — `/why`
+   * still answers, because the plan is where the routing decision was actually made.
+   */
+  lastWhy: { readonly taskId: string | null; readonly route: readonly TaskBriefRouteRole[] } | null;
   readonly probe: SessionCapabilityProbe;
   /** The installed build per provider, filled by discovery as it runs. */
   readonly versions: Map<string, string | null>;
@@ -638,10 +756,15 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   planning.stop();
   const planText = captured.join("");
   // A plan that could not be built exits non-zero, and its output is the diagnosis rather than
-  // JSON; only a successful plan is parsed.
-  if (plan.exitCode !== 0) { deps.stderr(`${planText}\n`); return; }
+  // JSON; only a successful plan is parsed. The one-liner map keeps the terminal to a line naming
+  // the reason and the next step; the full measurement text — what `refusalLine` fell back from —
+  // stays in `plan.data` and reaches `--json` unshortened (ADR 0021 Phase D).
+  if (plan.exitCode !== 0) { deps.stderr(`${refusalLine(plan.data) ?? planText}\n`); return; }
   const planJson = readPlan(plan.data);
   const planSummary = planJson === null ? "the plan produced no readable output" : planJson.roleSummary ?? planJson.summary;
+  // `/why` right after this plan is shown, before anything has run: the routing decision was
+  // already made, and a plan the operator declines still answers what it would have done.
+  worker.lastWhy = { taskId: null, route: planJson?.route ?? [] };
   // The boundary the plan settled on, which the session now follows: a big write asked for DIRECT
   // has been planned as a worktree write with a mandatory reviewer, and everything below — the
   // line, the refusal, the prompt, the run and the session envelope — has to be about that.
@@ -651,6 +774,9 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // What the run will be, in the policy's own words. "write · isolated worktree" was the only
   // answer this line had, and it was wrong for every DIRECT run — which is now the ordinary one.
   deps.stdout(`\n  ${mode === "write" ? "write" : "read-only"} · ${planJson?.policySummary ?? planSpec.label} · ${isolationPhrase(planSpec)} · ${planSummary}\n`);
+  // Any pool BrainGate is briefly avoiding after a refusal, said here rather than discovered only
+  // when a role routed around it: it is BrainGate's own backoff, never a provider limit (ADR 0012).
+  for (const line of planJson?.backoffLines ?? []) deps.stdout(`  ${line}\n`);
   // The goal the request continues, said before anything is spent. This is the line that was
   // missing when a follow-up was silently treated as a brand-new task.
   if (goal !== null) {
@@ -704,6 +830,11 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // `provider/model`, in the order the run used them. Recorded on the turn so the timeline can say
   // who answered, which is what makes a later "switch back to Sonnet" a thing the record supports.
   let attributed: readonly string[] = Object.freeze([]);
+  // Buffered rather than forwarded live: the only thing `dogfood <mode> run` ever writes to
+  // `stderr` is its own final failure text, and that text is exactly what the one-liner map
+  // shortens. Kept as the fallback for a code the map does not know, or a shape `result.data`
+  // does not carry — so nothing this run says is ever lost, only shortened when it is understood.
+  let bufferedStderr = "";
   // The run's record — task id, outcome, usage, the answer — comes back as data without asking for
   // JSON, and the human-readable answer is what the operator sees.
   // The session's policy, not the plan's: the run re-derives the escalation from the same
@@ -718,7 +849,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
       // itself travels in `result.data`, so this decides display and nothing else.
       deps.stdout(streamed ? withoutStreamedAnswer(text) : text);
     },
-    stderr: (text) => { working.stop(); deps.stderr(text); },
+    stderr: (text) => { working.stop(); bufferedStderr += text; },
     // Who is working, while they work. A task spends several roles across several
     // subscriptions, and the indicator is the only place that is visible as it happens.
     onRoleActivity: (activity) => { if (activity.stage === "started") working.label(activityLabel(activity)); },
@@ -737,6 +868,24 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   });
   if (streamed) deps.stdout("\n");
   working.stop();
+  // The refusal, in one line naming the reason and the next step; the full measurement text is
+  // still in `result.data` and reaches `--json` unshortened (ADR 0021 Phase D).
+  if (result.exitCode !== 0) {
+    const line = refusalLine(result.data);
+    deps.stderr(line === null ? bufferedStderr : `${line}\n`);
+  }
+  // The route this run actually used, read back from the ledger's own brief rather than kept from
+  // the plan: a run can differ from what it was planned against (a pool that refused between the
+  // two, for one), and the ledger is the record of what happened rather than what was proposed.
+  if (result.exitCode === 0) {
+    const taskId = taskIdOf(result.data);
+    if (taskId !== null && ledger !== null) {
+      try {
+        const brief = normalizeTaskReceipt(ledger.receipt(taskId)).brief;
+        if (brief !== null) worker.lastWhy = { taskId, route: brief.route };
+      } catch { /* the plan's own route is still a true answer to "why" */ }
+    }
+  }
   // Only a clean result joins the thread. A failed or rejected task would otherwise become the
   // premise of the next follow-up.
   if (result.exitCode === 0) session.record(input, spoken.join("").replace(/\n*Task [0-9a-f-]{36}.*$/s, "").trim());
@@ -973,6 +1122,33 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       // other half: it is the boundary the next run happens inside.
       if (workspaceScope !== null) deps.stdout(`  workspace: ${workspaceScope.workspacePath} · ${workspaceScope.workspaceId}\n`);
       deps.stdout(`  policy:    ${describeExecutionPolicy(worker.policy)}\n`);
+      // Pools BrainGate is briefly avoiding after a refusal, in its own words — never a provider
+      // limit, a quota reading or a reset time (ADR 0012).
+      for (const line of activeBackoffLines(deps.env)) deps.stdout(`  ${line}\n`);
+      return "continue";
+    }
+    case "why": {
+      const prefix = rest[0];
+      if (prefix !== undefined) {
+        if (ledger === null) { deps.stderr("  No task ledger here.\n"); return "continue"; }
+        const match = ledger.listTasks().find((task) => task.taskId.startsWith(prefix));
+        if (match === undefined) { deps.stderr(`  No task starting with \`${prefix}\` in this workspace.\n`); return "continue"; }
+        let route: readonly TaskBriefRouteRole[] = [];
+        try { route = normalizeTaskReceipt(ledger.receipt(match.taskId)).brief?.route ?? []; }
+        catch { /* an unreadable receipt reports nothing recorded, below */ }
+        if (route.length === 0) { deps.stderr(`  Task ${match.taskId} has no recorded route.\n`); return "continue"; }
+        deps.stdout(`  Route for task ${match.taskId}:\n`);
+        for (const line of whyLines(route)) deps.stdout(`${line}\n`);
+        return "continue";
+      }
+      if (worker.lastWhy === null || worker.lastWhy.route.length === 0) {
+        deps.stderr("  Nothing planned yet in this session. Ask something first.\n");
+        return "continue";
+      }
+      deps.stdout(worker.lastWhy.taskId === null
+        ? "  Route for the last plan (not yet run):\n"
+        : `  Route for task ${worker.lastWhy.taskId}:\n`);
+      for (const line of whyLines(worker.lastWhy.route)) deps.stdout(`${line}\n`);
       return "continue";
     }
     case "policy": {
@@ -1246,6 +1422,7 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     preferencesPath,
     freshRequested: false,
     lastRun: null,
+    lastWhy: null,
     probe,
     versions,
   };

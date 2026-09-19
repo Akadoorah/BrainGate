@@ -150,11 +150,32 @@ function nonNegativeInteger(value: number, label: string): number {
   return value;
 }
 
-function routeRole(route: RouteResult): TaskBriefRouteRole {
+/**
+ * The router's own vocabulary ("coder") is not the one every other surface reading a route already
+ * uses ("primary"): `dashboard-snapshot.ts` builds `/status`'s attribution from whichever of
+ * `workflow.roles`, this brief's route, or the executed roles is present, and the first and third
+ * already say "primary" (`ObservationRole`'s own `coder → primary` mapping in
+ * `packages/shadow/src/dogfood.ts`). Before this phase a write task never had a brief, so its route
+ * fell through to the executed roles and nobody noticed the mismatch; the write runner recording one
+ * now would otherwise put a route with `role: "coder"` ahead of them and silently drop the row
+ * `/status` looks for by the name "primary".
+ */
+const ROUTE_ROLE_LABEL: Readonly<Record<string, string>> = Object.freeze({ coder: "primary" });
+
+/**
+ * Reduces one routed role to what an operator asks when a route is questioned: who won, why they
+ * won, and who else was in the running and why they were not.
+ *
+ * Exported — not merely used by `buildTaskBrief` — so a plan that has not run yet can carry the
+ * same shape the ledger's task brief carries once it has. `/why` reads either one through this
+ * function's output, which is what makes "before the run" and "after the run" describe the route
+ * the same way rather than two renderings that can drift apart.
+ */
+export function routeRole(route: RouteResult): TaskBriefRouteRole {
   const selected = route.selected.model.definition;
   const runtime = route.selected.model.runtime;
   return Object.freeze({
-    role: route.role,
+    role: ROUTE_ROLE_LABEL[route.role] ?? route.role,
     providerId: sanitizeText(selected.providerId, 120),
     modelId: sanitizeText(selected.modelId, 200),
     quotaPool: sanitizeText(selected.quotaPool, 160),

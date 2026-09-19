@@ -19,6 +19,7 @@ import {
   type WriteVerdict,
 } from "@braingate/core";
 import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
+import { buildTaskBrief, recordTaskBrief } from "@braingate/observability";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteContinuity, type RoutePin, type RouteResult } from "@braingate/router";
 import { readdirSync, type Dirent } from "node:fs";
@@ -48,6 +49,36 @@ function observationRolesFor(roles: readonly PlannedWriteRole[]): readonly Obser
     seen.push(Object.freeze({ role: role.role, providerId: role.model.providerId, modelId: role.model.modelId }));
   }
   return Object.freeze(seen);
+}
+
+/**
+ * What a write's own `context` says about itself, when the caller did not measure it.
+ *
+ * The write path's `context` has always been a free-form object built by the caller (dogfood-cli's
+ * project memory, session turns and goal handoff) rather than the counted structure the read path
+ * builds contemporaneously — so this reads what it can from the same shape dogfood-cli sends
+ * (`memory` as an array) rather than inventing a count. `requiredContextTokens` is a real number
+ * either way: it is what the budget was already sized against.
+ */
+function defaultWriteContextSummary(context: unknown, requiredContextTokens: number): {
+  readonly memoryRecords: number;
+  readonly explicitCandidates: number;
+  readonly includedItems: number;
+  readonly estimatedTokens: number;
+  readonly truncatedItems: number;
+  readonly sourceLabels: readonly string[];
+} {
+  const memory = typeof context === "object" && context !== null && Array.isArray((context as { readonly memory?: unknown }).memory)
+    ? (context as { readonly memory: readonly unknown[] }).memory.length
+    : 0;
+  return Object.freeze({
+    memoryRecords: memory,
+    explicitCandidates: 0,
+    includedItems: 1 + memory,
+    estimatedTokens: requiredContextTokens,
+    truncatedItems: 0,
+    sourceLabels: Object.freeze(memory === 0 ? ["write-minimal-context"] : ["write-minimal-context", "project-canonical-memory"]),
+  });
 }
 
 function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
@@ -543,6 +574,20 @@ export class WriteDogfoodRunner {
     readonly visual?: VisualRequest;
     readonly context: unknown;
     /**
+     * What went into `context`, for the task brief the read path has always recorded and the write
+     * path did not (ADR 0021's Phase D gap). Optional: a caller that does not supply it gets a
+     * summary derived from `context` and `requiredContextTokens` rather than a brief with nothing
+     * in this section, which is what happened before this field existed.
+     */
+    readonly contextSummary?: {
+      readonly memoryRecords: number;
+      readonly explicitCandidates: number;
+      readonly includedItems: number;
+      readonly estimatedTokens: number;
+      readonly truncatedItems: number;
+      readonly sourceLabels?: readonly string[];
+    };
+    /**
      * Classification and prior for the record. Required: an optional context is how a task ends up
      * in the ledger with nothing said about it, which is the defect this milestone removes.
      */
@@ -616,6 +661,20 @@ export class WriteDogfoodRunner {
     // looking for what happened, and "this ran in a worktree because it is a T3 change" is a thing
     // that happened rather than a property of the plan's metadata (ADR 0021 amending ADR 0019).
     if (plan.escalated !== null) this.#ledger.appendEvent(task.taskId, "write.escalated", { from: plan.escalated.from, to: plan.policy, reason: plan.escalated.reason, reviewRequired: plan.reviewRequired });
+    // The route this write picked, and everyone it did not pick, recorded on the task the same way
+    // the read path has always recorded it. Without this a write task's `/why` had nothing to read
+    // from the ledger — the plan JSON printed before the run was the only place the routing reasons
+    // ever existed, and it was gone the moment the process exited (ADR 0021 Phase D).
+    recordTaskBrief(this.#ledger, buildTaskBrief({
+      project: this.#project,
+      task: this.#ledger.requireTask(task.taskId),
+      classification: input.classification,
+      budget: input.budget,
+      routes: plan.roles.map((role) => role.route),
+      context: input.contextSummary ?? defaultWriteContextSummary(input.context, input.requiredContextTokens),
+      permissions: { executionProfile: direct ? "write-direct" : "write-worktree", networkAllowed: false },
+      worktree: { enabled: !direct, taskWorktreeLabel: null },
+    }));
 
     /**
      * The one place this run's outcome is composed.

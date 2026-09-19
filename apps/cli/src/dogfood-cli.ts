@@ -33,7 +33,7 @@ import {
   inspectGitRepository,
   repositoryReadiness,
 } from "@braingate/dogfood";
-import { WINDOW_UTILIZATION_METRIC, openQuotaStore, recordPoolLoad, recordPoolSpend } from "@braingate/observability";
+import { WINDOW_UTILIZATION_METRIC, describeRefusalBackoff, openQuotaStore, recordPoolLoad, recordPoolSpend, routeRole } from "@braingate/observability";
 import { ModelCatalog, buildShadowTaskPlan, hydrateModelRegistry, resolveOperatorState, type OperatorStatePaths } from "@braingate/operator";
 import { ModelListCache, NodeProbeRunner, PROVIDER_IDS, ProviderDiscovery, probeCliCapabilities, readAntigravityHeadlessPermissions, type ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type ModelDefinition } from "@braingate/router";
@@ -485,7 +485,7 @@ function recordSpendFromReceipt(state: OperatorStatePaths, usage: readonly { rea
   } finally { store.close(); }
 }
 
-function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnapshot[]): { readonly router: CapabilityRouter; readonly runtimes: readonly unknown[] } {
+function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnapshot[]): { readonly router: CapabilityRouter; readonly runtimes: readonly unknown[]; readonly backoffLines: readonly string[] } {
   const entries = new ModelCatalog(state.modelCatalogPath).load();
   if (!entries.some((entry) => entry.configured)) throw new BrainGateInvariantError("MODEL_CATALOG_EMPTY", "No configured models are available. Import/discover then add scored model definitions before dogfood execution.");
   const quota = openQuotaStore(state.globalDir);
@@ -493,8 +493,13 @@ function runtimeFor(state: OperatorStatePaths, snapshots: readonly ProviderSnaps
     // The refusal backoff is applied here, where a task is about to be routed: a pool a provider
     // refused minutes ago is avoided before the call rather than after it. It does not touch
     // availability — it is a local decision to wait, with its own expiry.
-    const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota: quota.latest(), backoff: quota.activeRefusalBackoffs() });
-    return Object.freeze({ router: new CapabilityRouter(hydrated.registry), runtimes: hydrated.runtimes });
+    const backoffs = quota.activeRefusalBackoffs();
+    const hydrated = hydrateModelRegistry({ entries, providers: snapshots, quota: quota.latest(), backoff: backoffs });
+    // Said in the plan and in `/worker`, so a pool BrainGate is briefly avoiding is visible before
+    // the operator wonders why a healthy-looking provider was routed around (ADR 0021 Phase D).
+    // Phrased through the one function every backoff surface uses, so it can never read as a
+    // provider limit or a quota reading (ADR 0012).
+    return Object.freeze({ router: new CapabilityRouter(hydrated.registry), runtimes: hydrated.runtimes, backoffLines: Object.freeze(backoffs.map(describeRefusalBackoff)) });
   } finally { quota.close(); }
 }
 
@@ -894,6 +899,13 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       })),
       budget,
       roles: plan.roles.map((role) => ({ role: role.role, model: role.model, invocation: role.invocation })),
+      // Who won each role and why, and who else was in the running and why they were not — the
+      // structure `/why` reads, before a run exists to write it into the ledger (ADR 0021 Phase D).
+      route: plan.roles.map((role) => routeRole(role.route)),
+      // Any pool BrainGate is briefly avoiding after a refusal, phrased as its own policy rather
+      // than a provider limit (ADR 0012), so the plan says so before the operator wonders why a
+      // healthy-looking provider was routed around.
+      backoffLines: runtime.backoffLines,
       providerCallsOnPlan: 0,
     });
 
@@ -1074,6 +1086,12 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       reviewRequired: plan.reviewRequired,
       worktreeReady,
       roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })),
+      // Who won each role and why, and who else was in the running and why they were not — the
+      // structure `/why` reads, before a run exists to write it into the ledger (ADR 0021 Phase D).
+      route: plan.roles.map((role) => routeRole(role.route)),
+      // Any pool BrainGate is briefly avoiding after a refusal, phrased as its own policy rather
+      // than a provider limit (ADR 0012).
+      backoffLines: runtime.backoffLines,
       providerCallsOnPlan: 0,
       createsWorktree: false,
       mergeAvailable: false,

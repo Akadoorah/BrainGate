@@ -401,6 +401,9 @@ importers:
       '@braingate/execution':
         specifier: workspace:*
         version: link:../execution
+      '@braingate/observability':
+        specifier: workspace:*
+        version: link:../observability
       '@braingate/providers':
         specifier: workspace:*
         version: link:../providers

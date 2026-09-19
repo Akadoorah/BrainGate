@@ -309,8 +309,13 @@ test("one goal, one workspace, four native workers: reads everywhere, DIRECT wri
       // Antigravity cannot run a DIRECT read at all — measured, not assumed — so the honest
       // outcome is a refusal that names the measurement rather than an invocation that half-works.
       assert.equal(workers.readsFor("google").length, 0, "Antigravity is not invoked for a DIRECT read");
-      assert.match(text, /auto-denies every tool/, "and the operator is told why, with the measurement");
-      assert.match(text, /permissions\.allow|dangerously-skip-permissions/, "and what would open it");
+      // The pin is refused by the router (ROUTE_MANUAL_INELIGIBLE), and the advice line dogfood-cli
+      // appends for a blocked pin carries the Antigravity measurement paragraph — exactly the
+      // paragraph ADR 0021 Phase D moves behind `--json` and the error object. The terminal gets
+      // one line naming the reason and the next step; `packages/shadow/src/native-direct.test.ts`
+      // and `packages/router/src/automatic-routing.test.ts` prove the full text still exists.
+      assert.match(text, /BrainGate ROUTE_MANUAL_INELIGIBLE: The worker you named cannot run this/, "and the operator is told the reason and where to read more");
+      assert.doesNotMatch(text, /auto-denies every tool/, "the measurement paragraph moved behind --json");
       assert.equal(workers.readsFor("xai").length, 1, `Grok verified the file: reads=${JSON.stringify(workers.reads.map((c) => c.providerId))}\nPLANS:\n${[...text.matchAll(/(read-only|write) · [^\n]*/g)].map((m) => m[0]).join("\n")}\nTAIL:\n${text.slice(-700)}`);
       assert.equal(workers.writesFor("xai").length, 1, "Grok performed a DIRECT write");
       assert.equal(workers.writesFor("openai").length, 1, "and so did Codex");
