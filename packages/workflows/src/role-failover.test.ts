@@ -168,22 +168,25 @@ test("one failover per role: a second refusal ends the role", async () => {
   assert.equal(invoker.calls.length, 2, "the failover ran once; the second refusal is terminal for that role");
 });
 
-test("a failover is not granted when the task has no provider call left to spend", async () => {
-  // One call, and the planner's refusal spends it. The refusal is terminal for the role, and the
-  // record says why no second attempt was made.
+test("a refused call gives its reservation back, and a failover that then answers is counted once", async () => {
+  // The old rule counted a refusal as a call made, so one call in the budget meant no second
+  // subscription — the real Arabic dogfood run failed a T1 read on a rate-limited Claude with three
+  // other subscriptions idle. A refusal at the door spends nothing; the failover limit, not the
+  // call budget, is what bounds re-routing.
   const classification = { ...classifyTask({ text: PLANNING_TASK, mode: "write" }), complexity: "T3" as const, risk: "high" as const };
-  const invoker = new ScriptedInvoker([refused()]);
+  const invoker = new ScriptedInvoker([refused(), { kind: "work", output: "approach" }, { kind: "work", output: "answer" }, { kind: "review", verdict: "approve", findings: [] }]);
   const engine = new WorkflowEngine(new CapabilityRouter(registry()), invoker);
-  const error = await engine.run({ task: PLANNING_TASK, classification, budget: { ...budgetFor(classification, { writeRequested: true }), maxProviderCalls: 1 }, requiredContextTokens: 10_000, writeRequired: true, optionalReview: false }).then(() => null, (caught: unknown) => caught);
-  assert.ok(error instanceof ProviderQuotaRefusalError, "the refusal itself is the failure the caller sees");
-  assert.equal(invoker.calls.length, 1);
+  const receipt = await engine.run({ task: PLANNING_TASK, classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 10_000, writeRequired: true, optionalReview: false });
+  assert.equal(invoker.calls.length, 4, "the refused planner, its failover, the primary and the review");
+  assert.equal(receipt.budget.providerCalls, 3, "three calls were made; the refusal was not one of them");
+  assert.equal(receipt.outcome, "approved");
 });
 
-test("the failover call is counted against the budget like any other", async () => {
+test("the failover call is counted against the budget like any other, and the refused one is not", async () => {
   const classification = classifyTask({ text: PLANNING_TASK, mode: "write" });
   const invoker = new ScriptedInvoker([refused(), { kind: "work", output: "approach" }, { kind: "work", output: "answer" }, { kind: "review", verdict: "approve", findings: [] }]);
   const receipt = await new WorkflowEngine(new CapabilityRouter(registry()), invoker).run({ task: PLANNING_TASK, classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 10_000, writeRequired: true, optionalReview: false });
-  assert.equal(receipt.budget.providerCalls, invoker.calls.length, "the extra attempt is spend, not a free retry");
+  assert.equal(receipt.budget.providerCalls, invoker.calls.length - 1, "the failover attempt is spend; the refusal that caused it is not");
   assert.ok(receipt.budget.providerCalls <= budgetFor(classification, { writeRequested: true }).maxProviderCalls);
 });
 
@@ -247,15 +250,18 @@ class RefusingInvoker implements AgentInvoker {
   }
 }
 
-test("a refusal the budget cannot retry stays the failure, and the record says why", async () => {
-  // T3/medium grants a single reviewer. When that reviewer's provider refuses, the failover would
-  // need a second reviewer reservation the budget does not grant, so the refusal is terminal — and
-  // the task's failure is the refusal, not a budget message the operator cannot act on.
-  const invoker = new RefusingInvoker({ refuseRole: "reviewer", responses: [{ kind: "work", output: "the approach" }, { kind: "work", output: "the answer" }] });
+test("a refused reviewer is re-routed, because its refusal returned the reviewer reservation", async () => {
+  // T3/medium grants a single reviewer. The refused reviewer reviewed nothing, so the one reviewer
+  // the budget grants is still available to the pool the failover picks — and the task's review is
+  // a real one rather than a refusal reported as the task's failure.
+  const invoker = new RefusingInvoker({ refuseRole: "reviewer", responses: [{ kind: "work", output: "the approach" }, { kind: "work", output: "the answer" }, { kind: "review", verdict: "approve", findings: [] }] });
   const engine = new WorkflowEngine(new CapabilityRouter(registry()), invoker);
-  const error = await engine.run(input(PLANNING_TASK)).then(() => null, (caught: unknown) => caught);
-  assert.ok(error instanceof ProviderQuotaRefusalError, "the root cause is what the caller sees");
-  assert.equal(invoker.calls.filter((call) => call.role === "reviewer").length, 1, "no second review was dispatched");
+  const receipt = await engine.run(input(PLANNING_TASK));
+  const reviews = invoker.calls.filter((call) => call.role === "reviewer");
+  assert.equal(reviews.length, 2, "the refused review and the one that ran");
+  assert.notEqual(reviews[1]!.model.quotaPool, invoker.refusedPool, "on a different pool");
+  assert.equal(receipt.outcome, "approved");
+  assert.equal(receipt.budget.reviewers, 1, "one reviewer reservation was spent, as the budget grants");
 });
 
 test("a run with no refusal is byte-for-byte the routing it always was", async () => {
@@ -269,4 +275,23 @@ test("a run with no refusal is byte-for-byte the routing it always was", async (
   // The selection is the same one the router makes with no exclusions at all.
   const expected = new CapabilityRouter(registry()).route({ role: "coder", classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 5_000, writeRequired: true }).selected;
   assert.equal(receipt.primary.model.definition.modelId, expected.model.definition.modelId);
+});
+
+test("a small task with one call in its budget still reaches a second subscription when the first refuses on quota", async () => {
+  // Found by the real Arabic dogfood run: Claude was rate-limited, the T1 budget allowed one provider
+  // call, the refusal was counted as that call, and the task failed with three other subscriptions
+  // idle. A refusal at the door spends nothing, so it must not spend the budget either.
+  const request = input("What is the build identifier recorded in SERVICE.md?", { mode: "ask" });
+  assert.equal(request.budget.maxProviderCalls, 1, "the premise: one call in the budget");
+  // Whichever pool the router picks first refuses; the answer comes from the next one.
+  const invoker = new RefusingInvoker({ refuseRole: "primary", responses: [{ kind: "work", output: "the answer" }] });
+  const engine = new WorkflowEngine(new CapabilityRouter(registry()), invoker);
+  const receipt = await engine.run(request);
+  assert.equal(invoker.calls.length, 2, "the refused call and the one that answered");
+  assert.equal(invoker.calls[0]!.model.quotaPool, invoker.refusedPool);
+  assert.notEqual(invoker.calls[1]!.model.quotaPool, invoker.refusedPool, "the second subscription was tried");
+  assert.equal(receipt.finalOutput, "the answer");
+  const kinds = receipt.events.map((event) => event.kind);
+  assert.deepEqual(kinds.filter((kind) => kind.startsWith("role.failover.")), ["role.failover.started", "role.failover.selected", "role.failover.completed"]);
+  assert.equal(receipt.budget.providerCalls, 1, "and the record counts the call that was made, not the one that was refused");
 });

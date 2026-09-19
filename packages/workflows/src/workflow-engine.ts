@@ -1,4 +1,4 @@
-import { BrainGateInvariantError, BudgetTracker } from "@braingate/core";
+import { BrainGateInvariantError, BudgetTracker , quotaRefusalOf } from "@braingate/core";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteCandidate } from "@braingate/router";
 import type { AgentInvoker, AgentRequest, AgentResponse, ReviewIndependence, WorkflowEvent, WorkflowInput, WorkflowOutcome, WorkflowReceipt } from "./types.js";
 import { RoleFailover, type FailoverAttempt } from "./role-failover.js";
@@ -144,7 +144,8 @@ export class WorkflowEngine {
       reviewerLike: boolean,
     ): Promise<AgentResponse> => {
       const boundedCandidate = boundCandidateOutput(candidateOutput);
-      tracker.reserveProviderCall({ reviewer: reviewerLike, contextTokens: input.requiredContextTokens + candidateContextTokens(boundedCandidate) });
+      const reservation = { reviewer: reviewerLike, contextTokens: input.requiredContextTokens + candidateContextTokens(boundedCandidate) };
+      tracker.reserveProviderCall(reservation);
       const release = tracker.beginAgent();
       const ref = modelRef(candidate);
       emit("agent.started", role, ref, phase);
@@ -153,6 +154,12 @@ export class WorkflowEngine {
         assertResponse(role, response);
         emit("agent.completed", role, ref, phase);
         return response;
+      } catch (error) {
+        // A provider that refused on quota did no work and spent nothing, so the call it was
+        // reserved for is still available to whichever subscription the failover picks next. Any
+        // other failure keeps its reservation: the provider was asked and answered, however badly.
+        if (quotaRefusalOf(error) !== null) tracker.releaseProviderCall(reservation);
+        throw error;
       } finally {
         release();
       }

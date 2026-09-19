@@ -174,6 +174,23 @@ export class BudgetTracker {
     this.#contextTokens += contextTokens;
   }
 
+  /**
+   * Gives back a reservation for a call the provider refused before doing any work.
+   *
+   * A quota refusal is the provider saying no at the door: nothing was inspected, nothing was
+   * generated, and the subscription was not spent. Counting it as a call made is how a T1 task with
+   * one call in its budget came to fail outright when Claude was rate-limited, instead of going to
+   * the next subscription — which is the one thing this product exists to do. Only the reservation
+   * this call took is returned; the refusal itself stays on the record, and the failover limit still
+   * bounds how many times a role may be re-routed.
+   */
+  releaseProviderCall(options: { reviewer?: boolean; contextTokens?: number } = {}): void {
+    const contextTokens = options.contextTokens ?? 0;
+    this.#providerCalls = Math.max(0, this.#providerCalls - 1);
+    if (options.reviewer) this.#reviewers = Math.max(0, this.#reviewers - 1);
+    this.#contextTokens = Math.max(0, this.#contextTokens - Math.max(0, contextTokens));
+  }
+
   beginAgent(): () => void {
     this.#assertBelow("BUDGET_CONCURRENCY_EXCEEDED", this.#activeAgents, this.#budget.maxConcurrentAgents, "concurrent agents");
     this.#activeAgents += 1;
