@@ -22,7 +22,8 @@ import { SafeCommandRunner, WorktreeGuard } from "@braingate/execution";
 import { buildTaskBrief, recordTaskBrief } from "@braingate/observability";
 import type { ProviderSnapshot } from "@braingate/providers";
 import { CapabilityRouter, type IndependenceConstraint, type ModelRef, type RouteContinuity, type RoutePin, type RouteResult } from "@braingate/router";
-import { readdirSync, type Dirent } from "node:fs";
+import { readFileSync, readdirSync, type Dirent } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join } from "node:path";
 import { taskTitleFor } from "@braingate/security";
 import { CODEX_GENERATED_IMAGES, assertSourceCheckoutUnchanged, providerQuotaRefusal, resolveCodexHome, NodeShadowProcessExecutor, extractCodexAgentMessage, planCodexVisualInvocation, SubscriptionShadowAgentInvoker, shadowProviderRoleStatus, sourceCheckoutFingerprint, type CodexIsolationAttestation, type GrokIsolationAttestation, type MeasuredCapabilities, type OperatorProviderAcceptance, type ShadowProcessExecutor, type SubscriptionAttestation } from "@braingate/shadow";
@@ -79,6 +80,34 @@ function defaultWriteContextSummary(context: unknown, requiredContextTokens: num
     truncatedItems: 0,
     sourceLabels: Object.freeze(memory === 0 ? ["write-minimal-context"] : ["write-minimal-context", "project-canonical-memory"]),
   });
+}
+
+/**
+ * The diff a DIRECT write made, for its reviewer.
+ *
+ * There is no base to diff against under DIRECT — the workspace may have carried the operator's own
+ * uncommitted work before the run — so this is `git diff HEAD` limited to the files the run was
+ * observed to change, which is the closest honest thing: it may include an earlier uncommitted edit
+ * to one of those files, and it says so. Without Git, or for a file Git does not track, the current
+ * content of the file is sent instead, bounded. Never empty for a changed file, which is what a
+ * reviewer that cannot open the workspace needs.
+ */
+function directChangeDiff(workspace: string, changedFiles: readonly string[]): string {
+  if (changedFiles.length === 0) return "";
+  const LIMIT = 200_000;
+  const runner = spawnSync("git", ["diff", "HEAD", "--", ...changedFiles], { cwd: workspace, encoding: "utf8", maxBuffer: 8 * 1024 * 1024 });
+  let diff = runner.status === 0 ? String(runner.stdout ?? "") : "";
+  const shown = new Set<string>();
+  for (const match of diff.matchAll(/^diff --git a\/(.+?) b\//gm)) shown.add(match[1]!);
+  const missing = changedFiles.filter((file) => !shown.has(file));
+  for (const file of missing) {
+    try {
+      const content = readFileSync(join(workspace, file), "utf8");
+      diff += `${diff.length === 0 ? "" : "\n"}=== ${file} (current content; not tracked by Git or Git unavailable) ===\n${content}\n`;
+    } catch { /* deleted or unreadable: the file name alone is the report */ }
+  }
+  const header = "Diff of the files this run changed, against the last commit. It may include an earlier uncommitted edit to the same files.\n\n";
+  return diff.length === 0 ? "" : (header + diff).slice(0, LIMIT);
 }
 
 function snapshotFor(snapshots: readonly ProviderSnapshot[], providerId: string): ProviderSnapshot {
@@ -904,7 +933,7 @@ export class WriteDogfoodRunner {
       const observed = workspaceChangesSince(workspaceBefore, snapshotWorkspace(handle.worktreePath));
       const observedFiles = observed === null ? Object.freeze([]) : changedPaths(observed);
       const guarded = direct
-        ? Object.freeze({ changedFiles: observedFiles, diff: "" })
+        ? Object.freeze({ changedFiles: observedFiles, diff: directChangeDiff(handle.worktreePath, observedFiles) })
         : collectGuardedDiff(handle.worktreePath, artifacts);
       if (sourceBefore !== null) assertSourceCheckoutUnchanged(handle.repositoryPath, sourceBefore);
       if (direct && guarded.changedFiles.length === 0) {
@@ -999,7 +1028,11 @@ export class WriteDogfoodRunner {
           ledger: this.#ledger,
           taskId: task.taskId,
         });
-        const response = await invoker.invoke({ role: "reviewer", model: reviewerRole.model, phase: "write-review", task: input.task, findings: Object.freeze([]), candidateOutput: direct ? null : guarded.diff });
+        // The diff travels with the review under both policies. A staged reviewer (Codex) has no way
+        // to open the workspace, and a DIRECT review that sent only the file names came back as
+        // "the content is not attached, no tool can read files here" — a request for changes about
+        // a change the reviewer never saw (seen in the operator's own session, 2026-09-20).
+        const response = await invoker.invoke({ role: "reviewer", model: reviewerRole.model, phase: "write-review", task: input.task, findings: Object.freeze([]), candidateOutput: guarded.diff.trim().length === 0 ? null : guarded.diff });
         if (response.kind !== "review") throw new BrainGateInvariantError("WRITE_REVIEW_INVALID", "Write reviewer did not return a review verdict.");
         review = Object.freeze({ providerId: reviewerRole.model.providerId, modelId: reviewerRole.model.modelId, verdict: response.verdict, findings: response.findings });
         this.#ledger.appendEvent(task.taskId, `write.review.${response.verdict}`, { provider: reviewerRole.model.providerId, model: reviewerRole.model.modelId, findingCount: response.findings.length });

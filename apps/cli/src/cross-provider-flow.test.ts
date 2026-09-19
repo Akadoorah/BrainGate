@@ -102,6 +102,8 @@ interface Call {
   readonly task: string;
   readonly resumed: string | null;
   readonly pinned: string | null;
+  /** The whole brief the worker was handed, for asserting what a role was actually shown. */
+  readonly brief: string;
 }
 
 /** The four CLIs, each answering in its own dialect, each able to edit the workspace it is given. */
@@ -167,6 +169,7 @@ class FakeWorkers {
       : (plan.attachmentContent ?? "") + " " + plan.args.join(" ");
     const task = /"task":"((?:[^"\\]|\\.)*)"/.exec(brief)?.[1]?.replace(/\\"/g, "\"") ?? "";
     const call: Call = {
+      brief,
       providerId: plan.providerId,
       modelId: plan.args[plan.args.indexOf("--model") + 1] ?? null,
       cwd: plan.cwd,
@@ -437,5 +440,27 @@ test("/remember writes into the home this session was given, where /memory and m
     try {
       assert.equal(memory.listProposals().some((proposal) => proposal.proposalId === id), true, "the proposal is readable from the session's own home");
     } finally { memory.close(); }
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("a DIRECT write's reviewer is handed the diff of what changed, not only the file names", async () => {
+  // Seen in the operator's own session: with `/review on`, Codex — a staged reviewer with no way
+  // to open the workspace — answered "the content is not attached, no tool can read files here"
+  // and asked for changes about a change it never saw.
+  const f = fixture("direct-review-diff");
+  const workers = new FakeWorkers();
+  const session = sessionOf(f.repo, f.env, workers, [
+    "/review on",
+    "/use xai/grok-4.6",
+    "Append one inert marker comment to that file. Do not commit and do not create a branch.", "y",
+    "/exit",
+  ]);
+  try {
+    assert.equal(await session.run(), 0, session.text());
+    assert.equal(workers.writesFor("xai").length, 1, "Grok wrote");
+    const review = workers.reads.find((call) => call.brief.includes('"role":"reviewer"'));
+    assert.notEqual(review, undefined, `a reviewer was called\n${session.text().slice(-500)}`);
+    assert.match(review!.brief, /candidateOutput":"[^"]*marker 1 by xai/, "and was shown the diff containing the change");
+    assert.match(review!.brief, /Diff of the files this run changed/, "with the note about how the diff was taken");
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });

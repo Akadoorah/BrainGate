@@ -942,7 +942,8 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // "BrainGate SHADOW_PROVIDER_BLOCKED" would tell the operator something refused them when what
   // actually happened is that they asked to stop.
   if (result.exitCode !== 0 && wasCancelled) {
-    const taskId = taskIdOf(result.data) ?? ledger?.listTasks()[0]?.taskId ?? null;
+    // `listTasks` is oldest-first; the run that was just cancelled is the newest.
+    const taskId = taskIdOf(result.data) ?? ledger?.listTasks().at(-1)?.taskId ?? null;
     deps.stdout(`  Cancelled.${taskId === null ? "" : ` Task ${taskId}`} recorded as interrupted; nothing was merged.\n\n`);
   } else if (result.exitCode !== 0) {
     const line = refusalLine(result.data);
