@@ -12,6 +12,7 @@ import {
   validCodexIsolationAttestation,
   validGrokIsolationAttestation,
   validGrokSnapshotReadAttestation,
+  shadowProviderRoleStatus,
   type CodexIsolationAttestation,
   type GrokIsolationAttestation,
   type GrokSandboxPolicy,
@@ -218,4 +219,25 @@ export function acceptedSubscriptions(state: OperatorStatePaths): readonly Subsc
 /** Whether a provider has any scored model in the catalogue, so a self-test is worth running. */
 export function configuredProvider(entries: readonly { readonly providerId: string; readonly configured: boolean }[], providerId: string): boolean {
   return entries.some((entry) => entry.configured && entry.providerId === providerId);
+}
+
+/**
+ * Whether an acceptance for this provider would change anything.
+ *
+ * Accepting a provider BrainGate can already isolate per run records a decision that grants
+ * nothing and implies a risk the operator is not taking. The test is the provider's own role
+ * policy: if some role is closed *and says so by naming `braingate providers accept`*, then an
+ * acceptance opens it and asking for one is honest. Otherwise there is nothing to accept.
+ *
+ * Factored out of `providers accept` so the wizard asks exactly the question the command would,
+ * rather than a second version of it that could drift — and so the wizard never puts the unscoped
+ * risk in front of an operator whose provider does not run on acceptance at all.
+ *
+ * Takes either the id or a snapshot, because the two callers hold different things.
+ */
+export function acceptanceNeededFor(provider: string | { readonly providerId: string }): boolean {
+  const providerId = typeof provider === "string" ? provider : provider.providerId;
+  if (!isProviderId(providerId)) return false;
+  return (["planner", "primary", "reviewer", "judge"] as const)
+    .some((role) => (shadowProviderRoleStatus(providerId, role).reason ?? "").includes("braingate providers accept"));
 }

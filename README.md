@@ -116,52 +116,96 @@ gets the goal.
 
 ## Using it
 
+The first run is a wizard. It asks at most four questions, prints everything it assumed, and every
+answer is changeable afterwards with a slash command.
+
 ```text
 $ braingate
 
-  ▌ B R A I N G A T E
-  ▌ one goal, many native CLIs — the worker is swappable
+  ▌  B R A I N G A T E
+  ▌  one goal, many native CLIs — the worker is swappable
 
-  Dogfood preflight demo: ask=ready · write=ready · configured=4 · model calls=0
+  No BrainGate project in my-service yet.
+  The project id is the isolation boundary for memory, worktrees and telemetry,
+  so it is registered explicitly rather than assumed.
+
+  Register /Users/you/code/my-service as a BrainGate project? [Y/n] y
+  assumed: project id `my-service`, name `my-service` — from this directory.
+  Registered my-service.
+
+  Found 8 model(s) on 3 subscription(s):
+
+    anthropic/claude-opus-5       planner, reviewer, judge · deep     · assumed: claude lists no models
+    anthropic/claude-sonnet-5     coder, reviewer          · balanced · assumed: claude lists no models
+    google/gemini-3.1-pro-high    planner, reviewer        · deep     · from agy models
+    google/gemini-3.8-flash-low   coder                    · fast     · from agy models
+    xai/grok-4.6                  coder, reviewer          · balanced · from grok models
+
+  These are BrainGate's starting scores, not measurements. They are labelled as such in
+  `models profile`, and anything you score yourself is never overwritten by them.
+
+  Adopt these 8 models with these starting scores? [Y/n] y
+  Accept Antigravity as an unscoped provider for 30 days? [y/N] y
+  Require a reviewer on every write in this session? [y/N] n
+
+  Assumed, and changeable:
+    policy `direct` — work happens in this workspace, where you can see it. /policy worktree changes it.
+    big writes (T3/T4 or high/critical risk) always run in an isolated worktree with a reviewer.
+    quota is read from each CLI's own reporting; BrainGate records no quota state of its own.
+    independent review: cross-provider — a reviewer can come from a different subscription than the writer.
+    reviewer on every write: off — /review on|off changes it.
+  Dogfood preflight my-service: ask=ready · write=ready · configured=8 · model calls=0
+  Editable any time: /setup, /models, /providers, /policy, /review.
+
   Type a request, or /help. Nothing is spent until you confirm.
 
 > Investigate why the mobile app logs the user out when it is idle
 
-  read-only · T2/medium · primary=anthropic/claude-sonnet
+  read-only · direct · in your workspace · T2/medium · primary=anthropic/claude-sonnet-5
   continues goal 4f2a91c3 · diagnosed
   primary: read, subagents
   Run it? [y/N] y
   … Claude Code reads the repository with its own tools and answers …
   session: new native session 9c1d4e77
 
-> /use xai/grok-fast
-  Next work will go to xai/grok-fast. Every availability, quota, capability and
+> /use xai/grok-4.6
+  Next work will go to xai/grok-4.6. Every availability, quota, capability and
   isolation check still applies; /auto returns to automatic selection.
 
 > Do you agree with that diagnosis?
 
-  read-only · T2/medium · primary=xai/grok-fast
+  read-only · direct · in your workspace · T2/medium · primary=xai/grok-4.6
   continues goal 4f2a91c3 · diagnosed · raised to T2 by this goal (the words alone were T1)
 
-> /use anthropic/claude-sonnet
+> /review on
+  Reviewer on every write: on. A second worker — from another provider where one is
+  configured — reads every change before it is reported.
+
+> /use anthropic/claude-sonnet-5
 
 > Now apply the fix you proposed
 
-  write · isolated worktree · T2/medium · primary=anthropic/claude-sonnet
+  write · direct · in your workspace · T2/medium · primary=anthropic/claude-sonnet-5 · reviewer=xai/grok-4.6
   continues goal 4f2a91c3 · diagnosed
   session: resuming native session 9c1d4e77 · delta: 2 turn(s) by another worker
 
-> /worker
-  Worker: manual — anthropic/claude-sonnet
-  Goal: 4f2a91c3 · why the app logs the user out when idle
-  Last run: anthropic/claude-sonnet
-  Native session: resuming native session 9c1d4e77
-  Sessions on record:
-    anthropic/claude-sonnet · 9c1d4e77 · available · last used 2026-09-13T…
-    xai/grok-fast · 3b7e0a12 · available · last used 2026-09-13T…
-
 > /auto
   Automatic selection restored. BrainGate routes each turn again.
+```
+
+The scores the wizard adopts are **a starting point, not a measurement** — BrainGate labels every
+one it wrote, `braingate models profile` says which ones you have never touched, and anything you
+score yourself with `braingate models add` is never overwritten, including by a later `/setup`
+(ADR [0021](docs/adr/0021-big-writes-and-default-profiles.md)).
+
+`/policy` and `/review` are remembered for the workspace you set them in, so a boundary you chose
+once is not a boundary you re-choose every morning. They are execution state, kept with the
+workspace's own storage rather than in the project manifest you share with everyone who clones it.
+
+Without a terminal there is no wizard, and the same work has flags:
+
+```bash
+braingate init --project-id my-service --name "My Service" --adopt-models --accept google
 ```
 
 | Command | What it does |
@@ -173,6 +217,9 @@ $ braingate
 | `/goal` | The current goal: established findings, disputed claims, open questions. |
 | `/new` | Set the current goal aside and start a different one. |
 | `/remember`, `/memory` | Record something for later sessions; see what is remembered. |
+| `/policy [direct\|worktree\|...]` | The execution boundary the next run uses. Remembered for this workspace. |
+| `/review [on\|off]` | Ask for a reviewer on every write, not only the risky ones. Remembered too. |
+| `/setup` | Run the first-run wizard again: newly listed models, acceptances, review. Your own scores are kept. |
 
 **Nothing is spent until you confirm.** Every request is planned first — which costs nothing — and
 the plan is shown with its classification, the worker that would run, and what that worker may do,

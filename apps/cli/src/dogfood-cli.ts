@@ -1112,7 +1112,62 @@ export async function runDogfoodCli(argv: readonly string[], deps: DogfoodCliDep
       // without it, a manifest that names another checkout is a conflict rather than something to
       // overwrite, because overwriting would silently point a project's memory at other work.
       const rebind = removeFlag(args, "--rebind");
+      // The wizard's work, available without the wizard. A script — or a terminal that is not one —
+      // asks for the same two things by name rather than being prompted for them.
+      const adoptModelsFlag = removeFlag(args, "--adopt-models");
+      const acceptFlags: string[] = [];
+      for (;;) {
+        const provider = takeOption(args, "--accept");
+        if (provider === undefined) break;
+        acceptFlags.push(provider);
+      }
       noExtraArgs(args);
+      /**
+       * Whether this is the bare first run, on a terminal, with nobody having said what they want.
+       *
+       * The wizard is for exactly that case. Any flag at all means the operator has stated their
+       * intent, and stating it must not then produce four questions about it. `quiet` is how every
+       * internal caller — the session, and the wizard's own `init` — says "I have already asked".
+       */
+      const bareInit = !adoptModelsFlag && acceptFlags.length === 0 && flagProjectId === null && flagName === null
+        && !gitInitFlag && !rebind && deps.quiet !== true && !json;
+      const interactive = deps.ask !== undefined || (process.stdin.isTTY === true && process.stdout.isTTY === true);
+      if (bareInit && interactive) {
+        // Imported here rather than at the top: the wizard calls back into `init`, and a static
+        // cycle between the two modules is a loading order nobody should have to reason about.
+        const { runSetupWizard } = await import("./setup-wizard.js");
+        const wizardAsk = deps.ask ?? terminalAsk();
+        const wizard = await runSetupWizard({
+          cwd, stdout, stderr,
+          ...(deps.env === undefined ? {} : { env: deps.env }),
+          ...(wizardAsk === undefined ? {} : { ask: wizardAsk }),
+          ...(deps.discoverAll === undefined ? {} : { discoverAll: deps.discoverAll }),
+        });
+        return Object.freeze({ exitCode: wizard.exitCode, data: wizard });
+      }
+      if (adoptModelsFlag || acceptFlags.length > 0) {
+        // The same flow with its questions already answered, so the scripted path and the
+        // interactive one cannot become two implementations of one first run.
+        const { runSetupWizard } = await import("./setup-wizard.js");
+        const captured: string[] = [];
+        const wizard = await runSetupWizard({
+          cwd,
+          stdout: json ? (text) => captured.push(text) : stdout,
+          stderr: json ? (text) => captured.push(text) : stderr,
+          ...(deps.env === undefined ? {} : { env: deps.env }),
+          ...(deps.discoverAll === undefined ? {} : { discoverAll: deps.discoverAll }),
+          ...(flagProjectId === null && flagName === null ? {} : { identity: { ...(flagProjectId === null ? {} : { projectId: flagProjectId }), ...(flagName === null ? {} : { name: flagName }) } }),
+          answers: {
+            register: true,
+            adoptModels: adoptModelsFlag,
+            accept: Object.freeze([...acceptFlags]),
+            reviewAlways: false,
+          },
+        });
+        data = wizard;
+        if (json) stdout(`${JSON.stringify(data, null, 2)}\n`);
+        return Object.freeze({ exitCode: wizard.exitCode, data });
+      }
       // Asked first, because it decides whether the identity questions are worth asking at all.
       // A new directory is where people start, and finding out it cannot be registered only
       // after answering two prompts — with git's own error, not BrainGate's — is the ordering

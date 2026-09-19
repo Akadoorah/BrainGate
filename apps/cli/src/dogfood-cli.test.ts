@@ -141,7 +141,7 @@ test("a project id is suggested from the directory name, or withheld when nothin
   assert.equal(suggestedProjectId(""), null);
 });
 
-test("init proposes an identity and uses the answers, rather than deciding silently", async () => {
+test("a bare init takes the identity from the directory rather than asking for it twice", async () => {
   const repo = freshRepo("my-cool-app");
   const out = io();
   const asked: string[] = [];
@@ -149,28 +149,34 @@ test("init proposes an identity and uses the answers, rather than deciding silen
     cwd: repo,
     env: { BRAINGATE_HOME: join(repo, "..", "brain-home") },
     stdout: out.stdout, stderr: out.stderr,
-    ask: async (question) => { asked.push(question); return ""; },
+    discoverAll: async () => [],
+    ask: async (question) => { asked.push(question); return /as a BrainGate project/.test(question) ? "y" : "n"; },
   });
-  assert.equal(result.exitCode, 0);
-  // Both answers were blank, so both suggestions stand.
-  assert.match(asked[0] ?? "", /\[my-cool-app\]/);
-  assert.match(asked[1] ?? "", /\[my-cool-app\]/);
+  assert.equal(result.exitCode, 0, out.err());
+  // The directory already names the project; the wizard prints the identity instead of asking,
+  // and `--project-id` / `--name` remain the way to choose something else.
+  assert.equal(asked.some((question) => /Project id|Display name/.test(question)), false, `asked: ${JSON.stringify(asked)}`);
+  assert.match(out.out(), /assumed: project id `my-cool-app`, name `my-cool-app`/);
   assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "my-cool-app");
-  // The identity is the isolation boundary, so say so, and say what to run next.
+  // The identity is the isolation boundary, so say so, and say what can still be changed.
   assert.match(out.out(), /isolation boundary/);
-  assert.match(out.out(), /braingate dogfood preflight/);
+  assert.match(out.out(), /Editable any time: \/setup, \/models, \/providers, \/policy, \/review\./);
 });
 
-test("an answer overrides the suggestion", async () => {
+test("a named identity skips the wizard, and the half that was not named is still asked for", async () => {
   const repo = freshRepo("my-cool-app");
   const out = io();
-  const answers = ["chosen-id", "Chosen Name"];
-  const result = await runDogfoodCli(["init"], {
+  const asked: string[] = [];
+  // Any flag means the operator has stated their intent, so `init` stays the plain command it was
+  // and asks only for what they left out.
+  const result = await runDogfoodCli(["init", "--project-id", "chosen-id"], {
     cwd: repo, env: { BRAINGATE_HOME: join(repo, "..", "brain-home") },
     stdout: out.stdout, stderr: out.stderr,
-    ask: async () => answers.shift() ?? "",
+    ask: async (question) => { asked.push(question); return "Chosen Name"; },
   });
-  assert.equal(result.exitCode, 0);
+  assert.equal(result.exitCode, 0, out.err());
+  assert.equal(asked.length, 1, `asked: ${JSON.stringify(asked)}`);
+  assert.match(asked[0] ?? "", /Display name \[my-cool-app\]/);
   const manifest = JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8"));
   assert.equal(manifest.project_id, "chosen-id");
   assert.equal(manifest.name, "Chosen Name");
@@ -301,8 +307,10 @@ test("a plan for complex work names the planner as well as the executor", async 
 
 // The first thing anyone does is open BrainGate in a new folder. It asked for a project id and
 // a display name, then failed with git's own error — so the answer arrived after the questions,
-// in a vocabulary that belongs to a different tool.
-test("a directory with no repository is offered one before the identity questions", async () => {
+// in a vocabulary that belongs to a different tool. A bare `init` on a terminal is now the
+// first-run wizard, and the ordering it inherits is the same one: register, then the repository
+// offer, and the identity is taken from the directory rather than asked for at all.
+test("a directory with no repository is offered one before anything else `init` does", async () => {
   const bare = mkdtempSync(join(tmpdir(), "braingate-cli-fresh-"));
   const asked: string[] = [];
   const output = io();
@@ -311,15 +319,19 @@ test("a directory with no repository is offered one before the identity question
     env: { BRAINGATE_HOME: join(bare, "brain-home") },
     stdout: output.stdout,
     stderr: output.stderr,
+    discoverAll: async () => [],
     ask: async (question: string) => {
       asked.push(question);
       if (/git init/.test(question)) return "y";
-      return /id/i.test(question) ? "fresh" : "Fresh";
+      if (/as a BrainGate project/.test(question)) return "y";
+      return "n";
     },
   });
 
-  assert.equal(result.exitCode, 0);
-  assert.match(asked[0] ?? "", /git init/, "the repository question must come first");
+  assert.equal(result.exitCode, 0, output.err());
+  assert.match(asked[0] ?? "", /as a BrainGate project/, "registration is the first question");
+  assert.match(asked[1] ?? "", /git init/, "the repository question comes before anything is created");
+  assert.equal(asked.some((question) => /^\s*(Project id|Display name)/.test(question)), false, "the identity is taken from the directory, not asked for");
   assert.match(output.out(), /not a Git repository/);
   assert.match(output.out(), /worktree-isolated write modes/, "and says what a missing repository actually costs");
   assert.equal(existsSync(join(bare, ".git")), true);
@@ -336,7 +348,8 @@ test("declining the repository registers the plain directory, and creates nothin
     env: { BRAINGATE_HOME: join(bare, "brain-home") },
     stdout: output.stdout,
     stderr: output.stderr,
-    ask: async (question: string) => (/git init/.test(question) ? "n" : /id/i.test(question) ? "fresh" : "Fresh"),
+    discoverAll: async () => [],
+    ask: async (question: string) => (/as a BrainGate project/.test(question) ? "y" : "n"),
   });
 
   assert.equal(result.exitCode, 0, output.err());

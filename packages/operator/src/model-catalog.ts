@@ -7,6 +7,21 @@ import { ModelRegistry, type ModelDefinition } from "@braingate/router";
 
 const SCHEMA_VERSION = 1;
 
+/**
+ * Who decided a configured entry's scores.
+ *
+ * Derived from a runtime list so the union and the check cannot drift. An entry with no `source`
+ * is the operator's: that is what every catalogue written before M23 is, and reading it as
+ * anything else would relabel their work as a guess. Only BrainGate's own starting scores are
+ * marked, because only those need to be distinguishable from a measurement (ADR 0021).
+ */
+export const MODEL_SCORE_SOURCES = ["operator", "braingate-default", "braingate-assumed"] as const;
+export type ModelScoreSource = (typeof MODEL_SCORE_SOURCES)[number];
+
+export function isModelScoreSource(value: string): value is ModelScoreSource {
+  return (MODEL_SCORE_SOURCES as readonly string[]).includes(value);
+}
+
 export type ModelCatalogEntry =
   | {
       readonly providerId: string;
@@ -18,6 +33,8 @@ export type ModelCatalogEntry =
       readonly modelId: string;
       readonly configured: true;
       readonly definition: ModelDefinition;
+      /** Absent means the operator's own. See `MODEL_SCORE_SOURCES`. */
+      readonly source?: ModelScoreSource;
     };
 
 interface CatalogDocument {
@@ -75,7 +92,15 @@ function parseEntry(value: unknown): ModelCatalogEntry {
   if (definition.providerId !== row.providerId || definition.modelId !== row.modelId) {
     throw new BrainGateInvariantError("MODEL_CATALOG_IDENTITY_MISMATCH", "Catalog entry identity must match its configured definition.");
   }
-  return Object.freeze({ providerId: row.providerId, modelId: row.modelId, configured: true, definition });
+  // Unrecognised is refused rather than dropped: a label that decides whether scores are presented
+  // as the operator's must not be able to disappear because it was spelled differently.
+  if (row.source !== undefined && (typeof row.source !== "string" || !isModelScoreSource(row.source))) {
+    throw new BrainGateInvariantError("MODEL_CATALOG_INVALID", `Model catalog entry source must be one of: ${MODEL_SCORE_SOURCES.join(", ")}.`);
+  }
+  const source = row.source === undefined ? "operator" : (row.source as ModelScoreSource);
+  // "operator" is the absence of a label, and it is written as an absence: a catalogue that has
+  // never met the wizard stays byte-comparable to the one it had before.
+  return Object.freeze({ providerId: row.providerId, modelId: row.modelId, configured: true, definition, ...(source === "operator" ? {} : { source }) });
 }
 
 function parseDocument(value: unknown): CatalogDocument {
@@ -124,10 +149,18 @@ export class ModelCatalog {
     return Object.freeze(this.load().filter((entry): entry is Extract<ModelCatalogEntry, { configured: true }> => entry.configured).map((entry) => entry.definition));
   }
 
-  upsert(definition: ModelDefinition): readonly ModelCatalogEntry[] {
+  /**
+   * Writes one scored model.
+   *
+   * `source` says who decided the scores, and defaults to the operator: everything that reaches
+   * this method from `models add` or from a hand-written definition is theirs. Only
+   * `adoptDiscoveredModels` passes anything else.
+   */
+  upsert(definition: ModelDefinition, options: { readonly source?: ModelScoreSource } = {}): readonly ModelCatalogEntry[] {
     const safe = validateDefinition(definition);
+    const source = options.source ?? "operator";
     const entries = this.load().filter((entry) => key(entry.providerId, entry.modelId) !== key(safe.providerId, safe.modelId));
-    entries.push(Object.freeze({ providerId: safe.providerId, modelId: safe.modelId, configured: true as const, definition: safe }));
+    entries.push(Object.freeze({ providerId: safe.providerId, modelId: safe.modelId, configured: true as const, definition: safe, ...(source === "operator" ? {} : { source }) }));
     return this.#save(entries);
   }
 

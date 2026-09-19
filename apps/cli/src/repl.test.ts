@@ -85,8 +85,14 @@ function snapshot(providerId: "anthropic" | "openai", models: readonly string[])
   } as unknown as ProviderSnapshot;
 }
 
-/** Drives a session from a fixed script of answers, capturing everything written. */
-function session(cwd: string, answers: readonly string[]) {
+/**
+ * Drives a session from a fixed script of answers, capturing everything written.
+ *
+ * The state directory is a parameter because some of these tests are about what survives a
+ * session: a helper that minted a fresh `BRAINGATE_HOME` per run could never see a preference
+ * outlive the process it was set in.
+ */
+function session(cwd: string, answers: readonly string[], env: NodeJS.ProcessEnv = operatorEnv()) {
   const remaining = [...answers];
   const asked: string[] = [];
   // How much had been printed when each question was put. The gate is an ordering, and a test that
@@ -99,7 +105,7 @@ function session(cwd: string, answers: readonly string[]) {
     text: () => `${out}${err}`,
     run: () => runRepl({
       cwd,
-      env: operatorEnv(),
+      env,
       animate: false,
       colour: false,
       stdout: (t) => { out += t; },
@@ -175,7 +181,7 @@ test("an unregistered directory is offered registration, not turned away", async
   // the ordinary first run, and the banner has already said what this is.
   const s = session(empty, ["n"]);
   assert.notEqual(await s.run(), 0);
-  assert.ok(s.asked.some((q) => /Register this repository now/.test(q)), "registration was never offered");
+  assert.ok(s.asked.some((q) => /as a BrainGate project\? \[Y\/n\]/.test(q)), "registration was never offered");
   assert.match(s.text(), /isolation boundary/);
   assert.match(s.text(), /braingate init/);
 });
@@ -189,12 +195,81 @@ test("accepting the offer registers the project and continues into the session",
   writeFileSync(join(repo, "x.txt"), "x\n");
   git(repo, ["add", "."]); git(repo, ["commit", "-m", "initial"]);
 
-  // Accept, then take both suggested identity answers, then leave.
-  const s = session(repo, ["y", "", "", "/exit"]);
+  // Accept, adopt the starting scores, decline a reviewer on every write, then leave. The id and
+  // the name are no longer questions: the directory names the project, and the wizard says so.
+  const s = session(repo, ["y", "y", "n", "/exit"]);
   assert.equal(await s.run(), 0);
   assert.equal(JSON.parse(readFileSync(join(repo, ".brain", "project.json"), "utf8")).project_id, "my-service");
+  assert.match(s.text(), /assumed: project id `my-service`/);
   // The session must actually start, not merely register and stop.
   assert.match(s.text(), /Type a request, or \/help/);
+});
+
+test("the wizard runs once: a second session in the same workspace starts straight into the prompt", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-repl-once-"));
+  const repo = join(root, "once"); mkdirSync(repo);
+  git(repo, ["init", "-b", "main"]);
+  git(repo, ["config", "user.email", "test@example.invalid"]);
+  git(repo, ["config", "user.name", "BrainGate Test"]);
+  writeFileSync(join(repo, "x.txt"), "x\n");
+  git(repo, ["add", "."]); git(repo, ["commit", "-m", "initial"]);
+
+  const env = operatorEnv();
+  const first = session(repo, ["y", "y", "n", "/exit"], env);
+  assert.equal(await first.run(), 0, first.text());
+  assert.ok(first.asked.some((q) => /Adopt these \d+ models/.test(q)), `asked: ${JSON.stringify(first.asked)}`);
+
+  const second = session(repo, ["/exit"], env);
+  assert.equal(await second.run(), 0, second.text());
+  assert.ok(!second.asked.some((q) => /as a BrainGate project/.test(q)), "the wizard re-registered a registered workspace");
+  assert.ok(!second.asked.some((q) => /Adopt these/.test(q)), "the wizard re-ran on a registered workspace");
+});
+
+test("/review on is remembered across sessions and sends a reviewer with the next write", async () => {
+  const repo = project();
+  const env = operatorEnv();
+  const first = session(repo, ["/review", "/review on", "/exit"], env);
+  assert.equal(await first.run(), 0, first.text());
+  assert.match(first.text(), /Reviewer on every write: off/);
+  assert.match(first.text(), /Reviewer on every write: on\./);
+
+  // A second process, same workspace: the preference is read back before the first prompt.
+  const second = session(repo, ["change the empty-state label to Nothing yet", "n", "/exit"], env);
+  assert.equal(await second.run(), 0, second.text());
+  assert.match(second.text(), /Reviewer on every write: on\. \/review off changes it\./);
+  // And it reached the plan rather than only the banner: a T1 DIRECT edit's budget permits a
+  // reviewer without requiring one, so a reviewer in the plan line is the flag having had effect.
+  assert.match(second.text(), /reviewer=/, "the session's reviewer preference never reached the write plan");
+
+  const third = session(repo, ["/review off", "/exit"], env);
+  assert.equal(await third.run(), 0, third.text());
+  const fourth = session(repo, ["/exit"], env);
+  assert.equal(await fourth.run(), 0, fourth.text());
+  assert.ok(!fourth.text().includes("Reviewer on every write: on"), "/review off did not persist");
+});
+
+test("/policy worktree persists into the next session", async () => {
+  const repo = project();
+  const env = operatorEnv();
+  const first = session(repo, ["/policy worktree", "/exit"], env);
+  assert.equal(await first.run(), 0, first.text());
+  assert.match(first.text(), /isolated worktree|worktree/);
+
+  const second = session(repo, ["/policy", "/exit"], env);
+  assert.equal(await second.run(), 0, second.text());
+  assert.match(second.text(), /remembered from your last session here/);
+  // And it is the boundary the next run would use, not only a line in the banner.
+  assert.match(second.text(), /Execution policy: [^\n]*worktree/i);
+});
+
+test("/setup reruns the wizard in a registered workspace without re-registering it", async () => {
+  const repo = project();
+  const env = operatorEnv();
+  const s = session(repo, ["/setup", "y", "n", "/exit"], env);
+  assert.equal(await s.run(), 0, s.text());
+  assert.match(s.text(), /is already registered here\. Nothing about it is changed\./);
+  assert.match(s.text(), /Editable any time: \/setup, \/models, \/providers, \/policy, \/review\./);
+  assert.ok(!s.asked.some((q) => /as a BrainGate project/.test(q)), "/setup offered to register an already-registered workspace");
 });
 
 test("a session turn never becomes project memory", async () => {
