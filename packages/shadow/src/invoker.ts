@@ -841,7 +841,7 @@ export class SubscriptionShadowAgentInvoker implements AgentInvoker {
           this.#event("shadow.provider.fanout_exceeded", { ...safeMeta, spawned: spawned.spawned, ceiling: this.#maxSubagents });
         }
       }
-      const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null, { prose: plan.nativeHarness === true && (snapshot.providerId === "xai" || snapshot.providerId === "google") });
+      const response = parseRoleResponseWithFallback(request.role, snapshot.providerId, result.stdout, result.assembled ?? null, { prose: plan.nativeHarness === true && (snapshot.providerId === "xai" || snapshot.providerId === "google" || (snapshot.providerId === "anthropic" && request.role === "primary")) });
       this.#event("shadow.provider.completed", { ...safeMeta, durationMs: result.durationMs });
       this.#activity({ ...safeMeta, stage: "completed", grant: Object.freeze([...plan.grant.granted]), durationMs: result.durationMs });
       this.#usage(

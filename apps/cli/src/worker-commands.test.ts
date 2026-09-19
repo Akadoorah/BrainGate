@@ -19,6 +19,7 @@ import {
   describeWorker,
   resolveProviderAlias,
   strongestConfiguredModelFor,
+  compareStrength,
 } from "./worker-commands.js";
 
 
@@ -294,4 +295,23 @@ test("strongestConfiguredModelFor gates on native DIRECT capability only for the
   );
   // Not "direct": the gate never applies, regardless of measured.
   assert.equal(strongestConfiguredModelFor({ providerId: "google", candidates: [flash], policy: "worktree", measured: null })?.modelId, "gemini-3.8-flash-medium");
+});
+
+test("a tie on coder score goes to the better reasoner, and a full tie to the newest version", () => {
+  // Seen in the operator's own session: every flash tier carried the same default coder score, so
+  // `/use antigravity` picked gemini-3.6-flash-high over 3.8, and `/use grok` picked grok-4.5 over
+  // 4.6 — whichever came first in the catalogue, which was the older model every time.
+  const flash = (id: string, reasoning = 50) => model({ providerId: "google", modelId: id, reasoning, capabilities: { coder: 64 } });
+  const chosen = strongestConfiguredModelFor({
+    providerId: "google",
+    candidates: [flash("gemini-3.6-flash-high"), flash("gemini-3.7-flash-medium"), flash("gemini-3.8-flash-high"), flash("gemini-3.8-flash-low")],
+    policy: "worktree",
+    measured: null,
+  });
+  assert.equal(chosen?.modelId, "gemini-3.8-flash-high", "the newest version wins a full tie");
+
+  const grok = (id: string, reasoning: number) => model({ providerId: "xai", modelId: id, reasoning, capabilities: { coder: 70 } });
+  assert.equal(strongestConfiguredModelFor({ providerId: "xai", candidates: [grok("grok-4.5", 80), grok("grok-4.6", 80)], policy: "worktree", measured: null })?.modelId, "grok-4.6");
+  assert.equal(strongestConfiguredModelFor({ providerId: "xai", candidates: [grok("grok-4.5", 90), grok("grok-4.6", 80)], policy: "worktree", measured: null })?.modelId, "grok-4.5", "reasoning breaks a coder tie before the version does");
+  assert.ok(compareStrength(flash("gemini-3.10-flash-high"), flash("gemini-3.9-flash-high")) > 0, "versions compare numerically, not as text");
 });

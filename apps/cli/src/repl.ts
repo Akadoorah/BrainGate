@@ -1019,7 +1019,14 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // Named as something to run *in a shell*, and paired with the command that does the same job here.
   // The bare `tasks list` this used to suggest was read by the session as a new request, so following
   // BrainGate's own advice spent a task on it — the guidance was the bug, not the operator.
-  if (result.exitCode !== 0 && !wasCancelled) deps.stdout("\n  Exit 1: this task did not finish successfully. Use /status here to see what was recorded, or run `braingate tasks list` in your shell.\n\n");
+  if (result.exitCode !== 0 && !wasCancelled) {
+    // A review that asked for changes is not a failed run: the work happened, the findings were
+    // printed just above, and the record says BLOCKED. The generic line was read as "it broke".
+    const reviewStatus = (result.data as { readonly reviewStatus?: unknown } | null)?.reviewStatus;
+    deps.stdout(reviewStatus === "CHANGES_REQUESTED"
+      ? "\n  The reviewer asked for changes (above). The task is recorded as BLOCKED and nothing was merged; address the findings and ask again, or /review off to skip the second opinion on small writes.\n\n"
+      : "\n  Exit 1: this task did not finish successfully. Use /status here to see what was recorded, or run `braingate tasks list` in your shell.\n\n");
+  }
 }
 
 /** The task id a finished run reported, or `null` when the run recorded nothing usable. */

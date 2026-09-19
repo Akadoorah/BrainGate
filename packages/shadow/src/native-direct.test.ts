@@ -379,6 +379,46 @@ async function replayedDirectRun(plan: ShadowInvocationPlan, workspace: string, 
   return { text: pieces.join(""), result };
 }
 
+/**
+ * A Claude DIRECT read as it streams now: prose deltas, then a `result` envelope whose `result` is
+ * the same prose. Under an enforced schema claude 2.1.278 narrated the answer and then filled the
+ * contract with a paraphrase through the StructuredOutput tool, and both reached the terminal.
+ */
+const CLAUDE_STREAM: readonly string[] = Object.freeze([
+  '{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}},"session_id":"2657a8de-0000-4000-8000-000000000001"}',
+  '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The distinctive ID is "}}}',
+  '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"BG-CANARY-7741-ZQ."}}}',
+  '{"type":"stream_event","event":{"type":"content_block_stop","index":0}}',
+  '{"type":"result","subtype":"success","result":"The distinctive ID is BG-CANARY-7741-ZQ.","session_id":"2657a8de-0000-4000-8000-000000000001","usage":{"input_tokens":10,"output_tokens":4}}',
+]);
+
+test("a Claude DIRECT read asks for prose, streams it once, and keeps the schema for the roles that need a verdict", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-direct-stream-claude-"));
+  const workspace = join(root, "repo");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const planned = planShadowInvocation({
+      snapshot: snapshot("anthropic", ["anthropic-model"]), model: modelFor("anthropic"), cwd: workspace,
+      nativeHarness: true, payload, now: new Date("2026-09-19T01:00:00Z"),
+    });
+    assert.equal(planned.streamDialect, "anthropic");
+    assert.equal(planned.args.includes("--json-schema"), false, "no enforced schema on a DIRECT primary read");
+    assert.match(planned.args[planned.args.indexOf("-p") + 1] ?? "", /Answer in plain text/);
+    const reviewer = planShadowInvocation({
+      snapshot: snapshot("anthropic", ["anthropic-model"]), model: modelFor("anthropic"), cwd: workspace,
+      nativeHarness: true, payload: { ...payload, role: "reviewer" }, now: new Date("2026-09-19T01:00:00Z"),
+    });
+    assert.equal(reviewer.args.includes("--json-schema"), true, "a reviewer's verdict keeps its shape");
+
+    const { text, result } = await replayedDirectRun(
+      { ...planned, executable: process.execPath, args: replayScript(CLAUDE_STREAM, 3), stdin: "" },
+      workspace, root,
+    );
+    assert.equal((text.match(/The distinctive ID is BG-CANARY-7741-ZQ\./g) ?? []).length, 1, "the answer reaches the terminal exactly once");
+    assert.match(result.stdout, /"type":"result"/, "and the envelope that names the session is retained");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
 test("a DIRECT Codex read streams its words and still yields its answer and session id", async () => {
   const root = mkdtempSync(join(tmpdir(), "braingate-direct-stream-"));
   const workspace = join(root, "repo");

@@ -173,7 +173,40 @@ export function strongestConfiguredModelFor(input: {
     && entry.capabilities.coder !== undefined
     && (input.policy !== "direct" || nativeDirectCapable(input.providerId as ProviderId, input.measured)));
   if (runnable.length === 0) return null;
-  return runnable.reduce((best, entry) => ((entry.capabilities.coder ?? 0) > (best.capabilities.coder ?? 0) ? entry : best));
+  // Ties are common: a default profile gives every flash tier the same coder score, and two Grok
+  // versions the same. A tie went to whichever came first in the catalogue — gemini-3.6 over 3.8,
+  // grok-4.5 over 4.6 — which is the older model every time. Reasoning breaks the tie, and the
+  // newest version breaks what reasoning cannot.
+  return runnable.reduce((best, entry) => (compareStrength(entry, best) > 0 ? entry : best));
+}
+
+/** Positive when `a` is the stronger worker: coder score, then reasoning, then the newer version id. */
+export function compareStrength(a: ModelDefinition, b: ModelDefinition): number {
+  const coder = (a.capabilities.coder ?? 0) - (b.capabilities.coder ?? 0);
+  if (coder !== 0) return coder;
+  const reasoning = (a.reasoning ?? 0) - (b.reasoning ?? 0);
+  if (reasoning !== 0) return reasoning;
+  return compareVersionIds(a.modelId, b.modelId);
+}
+
+/** Natural comparison of model ids, so `gemini-3.8-flash-high` sorts above `gemini-3.6-flash-high`. */
+function compareVersionIds(a: string, b: string): number {
+  const parts = (id: string): (string | number)[] => id.split(/(\d+(?:\.\d+)*)/).filter((part) => part.length > 0).map((part) => (/^\d/.test(part) ? Number(part.split(".").map((n) => n.padStart(4, "0")).join("")) : part));
+  const left = parts(a); const right = parts(b);
+  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
+    const l = left[index]; const r = right[index];
+    if (l === undefined) return -1;
+    if (r === undefined) return 1;
+    if (typeof l === "number" && typeof r === "number") { if (l !== r) return l - r; continue; }
+    // Antigravity names its effort tier in the id: `-high` outranks `-medium` outranks `-low`,
+    // which alphabetical order gets exactly backwards.
+    const tier = (part: string): number => ({ high: 3, medium: 2, low: 1 } as Record<string, number>)[part.split("-").filter((word) => word.length > 0).at(-1) ?? ""] ?? 0;
+    const tiers = tier(String(l)) - tier(String(r));
+    if (tiers !== 0) return tiers;
+    const c = String(l).localeCompare(String(r));
+    if (c !== 0) return c;
+  }
+  return 0;
 }
 
 /**

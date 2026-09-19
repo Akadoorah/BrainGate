@@ -86,7 +86,8 @@ export function analyzeModelCoverage(entries: readonly ModelCatalogEntry[]): Mod
   if (!coverage.T4) warnings.push("No configured coding model reaches the T4 capability floor.");
   const stillDefault = providers.flatMap((provider) => provider.defaultScored.map((modelId) => `${provider.providerId}/${modelId}`));
   if (stillDefault.length > 0) {
-    warnings.push(`${stillDefault.length} model(s) still carry BrainGate's starting scores rather than yours: ${stillDefault.join(", ")}. Change any of them with \`braingate models add --definition <file>\`.`);
+    const named = stillDefault.length <= 5 ? stillDefault.join(", ") : `${stillDefault.slice(0, 5).join(", ")} and ${String(stillDefault.length - 5)} more`;
+    warnings.push(`${stillDefault.length} model(s) still carry BrainGate's starting scores rather than yours (${named}). Change any of them with \`braingate models add --definition <file>\`; they route fine as they are.`);
   }
   if (reviewerIndependence === "unavailable") warnings.push("No reviewer-capable model is configured.");
 

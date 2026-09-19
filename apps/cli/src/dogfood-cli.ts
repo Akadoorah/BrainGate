@@ -1161,6 +1161,18 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
           ? `No change was made. The worker reported: ${result.report ?? "nothing"}`
           : `Changed: ${result.changedFiles.join(", ")}`,
         ...(noChange ? [] : [`Ready for human approval: ${result.readyForApproval ? "yes" : "no"}. No merge performed.`]),
+        // The reviewer's words, when it asked for changes. A run that printed BLOCKED and nothing
+        // else left the operator to guess what the other model objected to; the findings are the
+        // whole point of paying for a second opinion.
+        ...(result.review !== null && result.review.verdict !== "approve"
+          ? [
+            `Reviewer ${result.review.providerId}/${result.review.modelId} asked for changes:`,
+            ...(result.review.findings.length === 0 ? ["  (no specific finding was given)"] : result.review.findings.map((finding) => `  - ${finding}`)),
+            result.worktree === null
+              ? "The change is already in your workspace: keep it, fix it, or revert it with `git checkout -- <file>`."
+              : "The change is in the task worktree and nothing was merged; fix it there or discard the branch.",
+          ]
+          : []),
       ].join("\n"), stdout);
       // A no-change run is a completed observation, not a command failure: the record is written,
       // the operator is told the truth, and the follow-up ("try again, or say what blocked you")

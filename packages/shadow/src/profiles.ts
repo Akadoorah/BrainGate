@@ -533,7 +533,13 @@ export function planShadowInvocation(input: {
   if (input.snapshot.providerId === "anthropic") {
     const args = Object.freeze([
       "--restricted",
-      "-p", nativeHarness ? DIRECT_PROMPT : SCHEMA_PROMPT,
+      // A DIRECT primary read answers in prose. Under an enforced schema claude 2.1.278 narrates
+      // the whole answer as text and then fills the contract with a paraphrase of it through the
+      // StructuredOutput tool, and both reached the terminal — every answer read twice (seen in the
+      // operator's own session, 2026-09-19). The prose it streams is the answer of record, exactly
+      // as for Grok and Antigravity; the staged roles and the reviewer keep the schema, because a
+      // verdict has a shape and prose does not.
+      "-p", nativeHarness ? (input.payload.role === "primary" ? DIRECT_PROSE_PROMPT : DIRECT_PROMPT) : SCHEMA_PROMPT,
       // A token stream, so a waiting terminal sees the answer being written rather than a
       // spinner. `--verbose` is not optional here: this build refuses stream-json without it.
       // The executor keeps only the lines the parse reads, so the extra events cost no cap.
@@ -578,7 +584,7 @@ export function planShadowInvocation(input: {
         ]),
       "--max-turns", String(maxTurns),
       "--model", input.model.modelId,
-      "--json-schema", schema,
+      ...(nativeHarness && input.payload.role === "primary" ? [] : ["--json-schema", schema]),
     ]);
     if (args.includes("--bare") || args.includes("--dangerously-skip-permissions") || args.includes("--allow-dangerously-skip-permissions")) {
       throw new BrainGateInvariantError("SHADOW_PROFILE_UNSAFE", "Unsafe Claude permission/profile flags are forbidden.");
