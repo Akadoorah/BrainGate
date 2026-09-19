@@ -35,7 +35,8 @@
  *
  * The whole region is repainted from an anchor the **terminal** holds, not one this module counts:
  * `ESC 7` saves the cursor where the prompt ends, and every redraw is `ESC 8` (back to that exact
- * spot) + `ESC [ J` (erase from there down) + the buffer again. Two earlier designs moved the cursor
+ * spot), room made for the region by exact relative moves and the anchor saved again, then
+ * `ESC [ J` (erase from there down) + the buffer again. Two earlier designs moved the cursor
  * by a row count this module computed — first from the draft's logical line count, then from a
  * one-row window — and the first of them erased the operator's history, because the terminal decides
  * how many rows text occupies and a soft-wrapped line made the count wrong. Asking the terminal where
@@ -94,6 +95,8 @@ const ERASE_DOWN = "\u001b[J";
 const column = (value: number): string => `\u001b[${String(Math.max(1, value))}G`;
 /** Cursor up `rows`, for placing the cursor inside the region just reprinted. */
 const cursorUp = (rows: number): string => `\u001b[${String(rows)}A`;
+/** Cursor down `rows`, from the region's first row to the row the cursor belongs on. */
+const cursorDown = (rows: number): string => `\u001b[${String(rows)}B`;
 
 /**
  * Grapheme clusters. The unit a person means by "a character", and the unit Backspace deletes.
@@ -214,6 +217,8 @@ export interface PromptInputOptions {
    * would then have to count — the arithmetic that corrupted history.
    */
   readonly columns?: number;
+  /** How tall the terminal is, for keeping the region — draft plus menu — on the screen. */
+  readonly rows?: number;
   /**
    * What to offer under the draft as it is typed, when anything.
    *
@@ -402,6 +407,11 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     const value = options.columns ?? process.stdout.columns ?? 80;
     return Number.isFinite(value) && value > 8 ? Math.floor(value) : 80;
   };
+  /** How tall the terminal is now, for the same reason. */
+  const terminalHeight = (): number => {
+    const value = options.rows ?? process.stdout.rows ?? 24;
+    return Number.isFinite(value) && value > 2 ? Math.floor(value) : 24;
+  };
 
   const deliver = (answer: string): void => {
     if (waiter === null) { submitted.push(answer); return; }
@@ -456,14 +466,28 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   const redraw = (): void => {
     if (prompt === null) return;
     const columns = terminalWidth();
-    const menu = menuRows(suggestions(), columns);
-    write(`${RESTORE_CURSOR}${ERASE_DOWN}${rendered()}`);
-    // The menu is part of the region: drawn below the draft, erased with it, and counted when the
-    // cursor is moved back up into the draft.
+    const promptWidth = displayWidth(prompt);
+    const position = cursorPosition(draft, cursor, columns, promptWidth);
+    // The menu is part of the region: drawn below the draft, erased with it, and never allowed to
+    // push the prompt's row off the screen — a region taller than the screen is one whose first row
+    // cannot be returned to.
+    const room = Math.max(0, terminalHeight() - 1 - position.rows);
+    const menu = menuRows(suggestions(), columns).slice(0, room);
+    const total = position.rows + menu.length;
+    // Back to the anchor, then make room *before* painting: the rows the region needs are written
+    // as blank lines and walked back up by the same count. Both moves are exact — no width
+    // arithmetic is involved — so if the screen has to scroll it scrolls now, and the anchor is
+    // saved again on the prompt's row wherever that row ended up. A paint that ran past the bottom
+    // of the screen used to leave the saved anchor pointing above the prompt, after which every
+    // erase started in the wrong place and each keystroke added another copy of the menu (or of a
+    // wrapped draft) under the last one. Seen on a real terminal, eight command lists deep.
+    write(RESTORE_CURSOR);
+    if (total > 1) write(`${NEWLINE.repeat(total - 1)}${cursorUp(total - 1)}`);
+    write(`${column(promptWidth + 1)}${SAVE_CURSOR}${ERASE_DOWN}${rendered()}`);
     if (menu.length > 0) write(`${NEWLINE}${menu.join(NEWLINE)}`);
-    const position = cursorPosition(draft, cursor, columns, displayWidth(prompt));
-    const up = position.rows - 1 - position.row + menu.length;
-    if (up > 0) write(cursorUp(up));
+    // The cursor: from the anchor, down to its row and across to its cell.
+    write(RESTORE_CURSOR);
+    if (position.row > 0) write(cursorDown(position.row));
     write(column(position.column + 1));
   };
 

@@ -28,9 +28,10 @@ class Terminal {
   rawModes: boolean[] = [];
   readonly input: PromptInput;
 
-  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}) {
+  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number; readonly rows?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}) {
     this.input = createPromptInput({
       ...(options.suggest === undefined ? {} : { suggest: options.suggest }),
+      ...(options.rows === undefined ? {} : { rows: options.rows }),
       input: {
         on: (event: string, listener: never) => {
           if (event === "data") this.#data.push(listener);
@@ -97,10 +98,31 @@ class VirtualTerminal {
   #column = 0;
   /** How many cells a row holds before the terminal wraps, or 0 for a terminal that never wraps. */
   readonly #columns: number;
+  /** How many rows the screen shows before it scrolls, or 0 for a screen that never scrolls. */
+  readonly #height: number;
+  /** Rows that scrolled off the top: the scrollback a person would see above the screen. */
+  readonly #scrollback: string[] = [];
   /** Where each erase-to-end-of-display started, which is the invariant under test. */
   readonly #eraseStarts: { readonly row: number; readonly column: number }[] = [];
 
-  constructor(columns = 0) { this.#columns = columns; }
+  constructor(columns = 0, height = 0) { this.#columns = columns; this.#height = height; }
+
+  /**
+   * The cursor moved down a row: when the screen is full, everything scrolls up by one, and — as
+   * on a real terminal — the saved cursor keeps its absolute row, which now points one row too high.
+   */
+  #advanceRow(): void {
+    this.#row += 1;
+    while (this.#height > 0 && this.#row >= this.#height) {
+      this.#scrollback.push(this.#rows.shift() ?? "");
+      this.#row -= 1;
+      if (this.#saved !== null) this.#saved.row = Math.max(0, this.#saved.row - 1);
+    }
+    while (this.#rows.length <= this.#row) this.#rows.push("");
+  }
+
+  /** What scrolled off the top, joined by newlines. */
+  scrollback(): string { return this.#scrollback.join("\n"); }
 
   /** The rows each erase began on: the composer may only ever start one inside its own region. */
   eraseStarts(): readonly { readonly row: number; readonly column: number }[] { return this.#eraseStarts; }
@@ -120,10 +142,10 @@ class VirtualTerminal {
         index += up[0].length;
         continue;
       }
-      if (rest.startsWith("\u001b[1B")) {
-        this.#row += 1;
-        this.#column = 0;
-        index += 4;
+      const down = /^\u001b\[(\d*)B/.exec(rest);
+      if (down !== null) {
+        for (let n = Number(down[1] === "" ? "1" : down[1]); n > 0; n -= 1) this.#advanceRow();
+        index += down[0].length;
         continue;
       }
       if (rest.startsWith("\u001b7")) {
@@ -169,12 +191,12 @@ class VirtualTerminal {
         continue;
       }
       if (char === "\r") { this.#column = 0; index += 1; continue; }
-      if (char === "\n") { this.#row += 1; this.#column = 0; index += 1; continue; }
+      if (char === "\n") { this.#advanceRow(); this.#column = 0; index += 1; continue; }
       const point = String.fromCodePoint(text.codePointAt(index)!);
       // A real terminal wraps when the next cell would leave the row. Wrapping is modelled here
       // because the composer's cursor arithmetic depends on it: if this fixture did not wrap, it
       // would agree with a composer that counted rows wrongly.
-      if (this.#columns > 0 && this.#column >= this.#columns) { this.#row += 1; this.#column = 0; }
+      if (this.#columns > 0 && this.#column >= this.#columns) { this.#advanceRow(); this.#column = 0; }
       const row = this.#rows[this.#row] ?? "";
       this.#rows[this.#row] = row.slice(0, this.#column) + point + row.slice(this.#column + point.length);
       this.#column += point.length;
@@ -198,11 +220,83 @@ class VirtualTerminal {
 }
 
 /** A terminal that both records bytes and displays them. */
-function displayTerminal(options: { readonly columns?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
-  const screen = new VirtualTerminal(options.columns ?? 0);
-  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); }, ...(options.columns === undefined ? {} : { columns: options.columns }), ...(options.suggest === undefined ? {} : { suggest: options.suggest }) });
+function displayTerminal(options: { readonly columns?: number; readonly height?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}): { readonly terminal: Terminal; readonly screen: VirtualTerminal } {
+  const screen = new VirtualTerminal(options.columns ?? 0, options.height ?? 0);
+  const terminal = new Terminal({ onWrite: (text) => { screen.write(text); }, ...(options.columns === undefined ? {} : { columns: options.columns }), ...(options.height === undefined ? {} : { rows: options.height }), ...(options.suggest === undefined ? {} : { suggest: options.suggest }) });
   return { terminal, screen };
 }
+
+// ---------------------------------------------------------------- the region at the bottom of the screen
+
+const MENU = [
+  { label: "/use <provider>/<model>", hint: "send the next work to this worker", insert: "/use " },
+  { label: "/auto", hint: "let BrainGate choose again", insert: "/auto" },
+  { label: "/worker", hint: "who is selected", insert: "/worker" },
+  { label: "/goal", hint: "the current goal", insert: "/goal" },
+  { label: "/new", hint: "set the current goal aside", insert: "/new" },
+  { label: "/remember <text>", hint: "record something", insert: "/remember " },
+  { label: "/memory", hint: "what is remembered", insert: "/memory" },
+  { label: "/status", hint: "recent tasks", insert: "/status" },
+];
+const suggestFrom = (draft: string) => (draft.startsWith("/") && !draft.includes(" ") && !draft.includes("\n")
+  ? MENU.filter((item) => item.label.slice(1).startsWith(draft.slice(1)))
+  : []);
+
+test("a menu that scrolls the screen is erased on the next keystroke, not duplicated", async () => {
+  // Reported from a real terminal: with the prompt on the last row, typing `/` scrolled the screen to
+  // make room for the list, the saved anchor then pointed above the prompt, and every further
+  // keystroke painted another copy of the list under the previous one.
+  const { terminal, screen } = displayTerminal({ columns: 80, height: 6, suggest: suggestFrom });
+  screen.write("history 1\r\nhistory 2\r\nhistory 3\r\nhistory 4\r\nhistory 5\r\n");
+  const pending = terminal.input.ask("> ");
+  terminal.type("/");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> /");
+  assert.equal(screen.cursorColumn(), 3);
+  assert.equal((screen.screen().match(/\/use/g) ?? []).length, 1, "one copy of the list");
+  // Six rows on screen: the prompt's row and at most five below it, so the list is cut to fit
+  // rather than pushing the prompt off the top.
+  assert.equal(screen.rowsBelowCursor().filter((row) => row.trim().length > 0).length, 4, "the list is cut to the rows the screen has under the prompt");
+  assert.doesNotMatch(screen.screen(), /\/memory/, "the eighth command did not fit and is not shown");
+
+  terminal.type("m");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> /m", "the draft row is still the cursor's row after the scroll");
+  assert.equal(screen.cursorColumn(), 4);
+  assert.equal((screen.screen().match(/\/memory/g) ?? []).length, 1, "the list was erased and painted once, not added under the old one");
+  assert.doesNotMatch(screen.screen(), /\/use|\/auto|\/goal/, "and it is the narrowed list");
+  assert.doesNotMatch(screen.scrollback(), /\/use|\/memory/, "no copy of the list was pushed into the scrollback");
+  assert.match(screen.scrollback(), /history 1/, "what scrolled off is the operator's own history, in order");
+
+  terminal.chunk("\u007f".repeat(2));
+  terminal.type("hello");
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> hello");
+  assert.doesNotMatch(screen.screen(), /\/memory|what is remembered/, "no residue of the menu once the draft is no longer a command");
+  terminal.enter();
+  assert.equal(await pending, "hello");
+  assert.doesNotMatch(screen.screen(), /\/memory|what is remembered/, "and none after the request is sent");
+  assert.match(screen.screen(), /> hello/, "the request stays on screen as history");
+});
+
+test("a long draft at the bottom of the screen wraps, scrolls, and shrinks back without residue", async () => {
+  const { terminal, screen } = displayTerminal({ columns: 40, height: 4 });
+  screen.write("earlier output\r\nmore output\r\nlast line before the prompt\r\n");
+  const pending = terminal.input.ask("> ");
+  const long = "w".repeat(100);
+  terminal.type(long);
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "w".repeat((2 + 100) % 40), "the cursor is on the last wrapped row");
+  assert.equal(screen.cursorColumn(), (2 + 100) % 40);
+  terminal.chunk("\u007f".repeat(100));
+  await terminal.input.idle();
+  assert.equal(screen.cursorRow(), "> ", "deleting the whole draft leaves the prompt alone");
+  assert.equal(screen.cursorColumn(), 2);
+  assert.equal(screen.screen().split("\n").filter((row) => row.includes("wwww")).length, 0, "no wrapped row of the old draft survives");
+  terminal.type("ok");
+  terminal.enter();
+  assert.equal(await pending, "ok");
+});
 
 // ---------------------------------------------------------------- cursor placement and the slash menu
 
@@ -764,8 +858,10 @@ test("J: every edit repaints from the terminal's anchor, and never erases above 
   // The mechanism now: restore the anchor, erase downwards, reprint the buffer, place the cursor.
   // One anchor-save per prompt, one restore per edit, and every erase starting exactly at the anchor
   // — which is where the prompt ended, so nothing above it can be touched.
-  assert.equal(bytes.split("\u001b7").length - 1, 1, "the anchor is saved once, when the prompt is written");
-  assert.equal(bytes.split("\u001b8").length - 1, 15, "and restored by each of the fifteen edits");
+  // One save when the prompt is written, and one more per edit — on the same row and column, after
+  // room for the region has been made by exact relative moves, so a scroll cannot leave it stale.
+  assert.equal(bytes.split("\u001b7").length - 1, 1 + 15, "the anchor is saved with the prompt and re-saved by each of the fifteen edits");
+  assert.equal(bytes.split("\u001b8").length - 1, 30, "and restored twice per edit: once to make room, once to place the cursor");
   assert.equal(screen.eraseStarts().length, 15, "each restore is followed by one erase");
   for (const start of screen.eraseStarts()) {
     assert.equal(start.row, 0, "every erase starts on the prompt's own row");
