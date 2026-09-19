@@ -1,4 +1,7 @@
 import test from "node:test";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import assert from "node:assert/strict";
 import type { ProbeCommand, ProbeResult, ProbeRunner } from "./types.js";
 import { ProviderDiscovery, formatProbeCommand } from "./index.js";
@@ -74,7 +77,7 @@ test("Codex login status proves ChatGPT subscription auth without a model call",
     ["codex --help", { stdout: "Commands: exec login; Options: --model --json mcp\n" }],
     ["codex login status", { stderr: "Logged in using ChatGPT\n" }],
   ]);
-  const snapshot = await new ProviderDiscovery(runner).discover("openai");
+  const snapshot = await new ProviderDiscovery(runner, { env: {} }).discover("openai");
   assert.equal(snapshot.authState.value, "authenticated");
   assert.equal(snapshot.authMode.value, "subscription");
   assert.equal(snapshot.authMode.evidence, "native");
@@ -88,7 +91,7 @@ test("Codex API/access-token auth is never treated as subscription", async () =>
       ["codex --help", { stdout: "Commands: exec login; Options: --model --json\n" }],
       ["codex login status", { stderr: `${status}\n` }],
     ]);
-    const snapshot = await new ProviderDiscovery(runner).discover("openai");
+    const snapshot = await new ProviderDiscovery(runner, { env: {} }).discover("openai");
     assert.equal(snapshot.authState.value, "authenticated");
     assert.equal(snapshot.authMode.value, "api");
   }
@@ -100,7 +103,7 @@ test("Codex unauthenticated state fails closed as native unauthenticated evidenc
     ["codex --help", { stdout: "Commands: exec login; Options: --model --json\n" }],
     ["codex login status", { exitCode: 1, stderr: "Not logged in\n" }],
   ]);
-  const snapshot = await new ProviderDiscovery(runner).discover("openai");
+  const snapshot = await new ProviderDiscovery(runner, { env: {} }).discover("openai");
   assert.equal(snapshot.authState.value, "unauthenticated");
   assert.equal(snapshot.authMode.value, "unknown");
   assert.equal(snapshot.authState.evidence, "native");
@@ -186,4 +189,23 @@ test("a command that answers two questions is run once, not raced against itself
   };
   await new ProviderDiscovery(runner).discover("xai");
   assert.equal(seen.filter((entry) => entry === "grok models").length, 1, `grok models ran ${String(seen.filter((e) => e === "grok models").length)} times`);
+});
+
+test("Codex's model list is read from the cache the CLI keeps, as native evidence naming the file", async () => {
+  const home = mkdtempSync(join(tmpdir(), "braingate-codex-discovery-"));
+  try {
+    mkdirSync(join(home, ".codex"), { recursive: true });
+    writeFileSync(join(home, ".codex", "models_cache.json"), JSON.stringify({ models: [{ slug: "gpt-6-astra" }, { slug: "gpt-5.6-sol" }, { slug: "codex-auto-review" }] }));
+    const runner = new FakeRunner([
+      ["codex --version", { stdout: "codex-cli 0.153.4\n" }],
+      ["codex --help", { stdout: "Commands: exec login; Options: --model --json\n" }],
+      ["codex login status", { stderr: "Logged in using ChatGPT\n" }],
+    ]);
+    const snapshot = await new ProviderDiscovery(runner, { env: { HOME: home } }).discover("openai");
+    assert.deepEqual([...(snapshot.models.value ?? [])], ["gpt-6-astra", "gpt-5.6-sol", "codex-auto-review"]);
+    assert.equal(snapshot.models.evidence, "native", "the CLI's own list, read back rather than asked again");
+    assert.equal(snapshot.models.sourceCommand, join(home, ".codex", "models_cache.json"));
+    assert.equal(snapshot.warnings.some((w) => /model-list command/.test(w)), false, "no warning about a listing command when the file answered");
+    assert.deepEqual(runner.calls.map(formatProbeCommand), ["codex --version", "codex --help", "codex login status"], "and no extra process was spawned for it");
+  } finally { rmSync(home, { recursive: true, force: true }); }
 });

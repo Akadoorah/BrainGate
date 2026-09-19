@@ -244,7 +244,7 @@ function resolveWriteRepository(project: RegisteredProject, cwd: string, request
 async function discovery(deps: CliDependencies, state: OperatorStatePaths): Promise<readonly ProviderSnapshot[]> {
   if (deps.discoverAll !== undefined) return await deps.discoverAll();
   const modelCache = new ModelListCache({ path: resolve(state.globalDir, "model-lists.json") });
-  return await new ProviderDiscovery(undefined, { modelCache }).discoverAll();
+  return await new ProviderDiscovery(undefined, { modelCache, env: deps.env ?? process.env }).discoverAll();
 }
 
 /**

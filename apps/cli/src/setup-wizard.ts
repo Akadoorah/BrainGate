@@ -115,7 +115,7 @@ async function confirm(
 async function discover(deps: SetupWizardDependencies, globalDir: string): Promise<readonly ProviderSnapshot[]> {
   if (deps.discoverAll !== undefined) return await deps.discoverAll();
   const modelCache = new ModelListCache({ path: resolve(globalDir, "model-lists.json") });
-  return await new ProviderDiscovery(new NodeProbeRunner(), { modelCache }).discoverAll();
+  return await new ProviderDiscovery(new NodeProbeRunner(), { modelCache, env: deps.env ?? process.env }).discoverAll();
 }
 
 /** The first line of a captured command's output, which is the line worth repeating. */

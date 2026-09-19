@@ -184,3 +184,17 @@ test("a CLI that is not installed offers nothing, and a listing CLI never falls 
   assert.deepEqual(listed.map((row) => row.modelId), ["claude-sonnet-5"]);
   assert.match(listed[0]!.origin, /from claude models/);
 });
+
+test("Codex's cached list adopts the gpt ids, leaves its own review model unscored, and names the file", () => {
+  const catalog = new ModelCatalog(catalogPath("codex-cache"));
+  const base = snapshot("openai", "codex", ["gpt-6-astra", "gpt-5.6-sol", "gpt-reserve", "codex-auto-review"]);
+  const codex = { ...base, models: { ...base.models, sourceCommand: "/Users/someone/.codex/models_cache.json" } } as ProviderSnapshot;
+  const rows = planModelAdoption(catalog.load(), [codex]);
+  const byId = Object.fromEntries(rows.map((row) => [row.modelId, row]));
+  assert.equal(byId["gpt-6-astra"]?.disposition, "adopt");
+  assert.equal(byId["gpt-5.6-sol"]?.disposition, "adopt");
+  assert.equal(byId["gpt-reserve"]?.disposition, "adopt");
+  assert.equal(byId["codex-auto-review"]?.disposition, "unscored", "Codex's approval-review model is not a worker anyone routes to");
+  assert.equal(byId["gpt-6-astra"]?.origin, "from ~/.codex/models_cache.json", "the wizard says where the list came from, with the home elided");
+  assert.equal(rows.some((row) => row.disposition === "assume"), false, "nothing is assumed once the CLI's own list is there");
+});

@@ -105,7 +105,9 @@ export const DEFAULT_MODEL_PROFILES: readonly DefaultModelProfileRow[] = Object.
   },
   {
     providerId: "openai",
-    match: /^(gpt-|codex)/i,
+    // `gpt-*` only: Codex's cached list also carries `codex-auto-review`, its own approval-review
+    // model, which is not a worker anyone routes to.
+    match: /^gpt-/i,
     family: "OpenAI GPT/Codex",
     profile: {
       quotaPool: "chatgpt-subscription",
@@ -183,6 +185,13 @@ export function defaultProfileFor(providerId: string, modelId: string): DefaultM
   return row?.profile ?? null;
 }
 
+/** Where a listing came from, as the wizard says it: a command, or the file a CLI keeps its own list in. */
+function listingSource(snapshot: ProviderSnapshot): string {
+  const source = snapshot.models.sourceCommand;
+  if (source === null || source === undefined) return `${snapshot.binary} models`;
+  return source.startsWith("/") ? source.replace(/^\/Users\/[^/]+|^\/home\/[^/]+/, "~") : source;
+}
+
 /** The family name, for a sentence that has to say which row matched. */
 export function defaultFamilyFor(providerId: string, modelId: string): string | null {
   const row = DEFAULT_MODEL_PROFILES.find((candidate) => candidate.providerId === providerId && candidate.match.test(modelId));
@@ -247,10 +256,10 @@ export function planModelAdoption(entries: readonly ModelCatalogEntry[], snapsho
         continue;
       }
       if (profile === null) {
-        push({ providerId: snapshot.providerId, modelId, disposition: "unscored", profile: null, roles: Object.freeze([]), origin: `from ${snapshot.binary} models, matched by no default` });
+        push({ providerId: snapshot.providerId, modelId, disposition: "unscored", profile: null, roles: Object.freeze([]), origin: `from ${listingSource(snapshot)}, matched by no default` });
         continue;
       }
-      push({ providerId: snapshot.providerId, modelId, disposition: "adopt", profile, roles: profileRoles(profile), origin: `from ${snapshot.binary} models` });
+      push({ providerId: snapshot.providerId, modelId, disposition: "adopt", profile, roles: profileRoles(profile), origin: `from ${listingSource(snapshot)}` });
     }
     if (listed.length > 0) continue;
     // Nothing listed: the known ids for this runtime, if there are any, as assumptions.

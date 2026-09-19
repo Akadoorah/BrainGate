@@ -314,4 +314,6 @@ test("a tie on coder score goes to the better reasoner, and a full tie to the ne
   assert.equal(strongestConfiguredModelFor({ providerId: "xai", candidates: [grok("grok-4.5", 80), grok("grok-4.6", 80)], policy: "worktree", measured: null })?.modelId, "grok-4.6");
   assert.equal(strongestConfiguredModelFor({ providerId: "xai", candidates: [grok("grok-4.5", 90), grok("grok-4.6", 80)], policy: "worktree", measured: null })?.modelId, "grok-4.5", "reasoning breaks a coder tie before the version does");
   assert.ok(compareStrength(flash("gemini-3.10-flash-high"), flash("gemini-3.9-flash-high")) > 0, "versions compare numerically, not as text");
+  const gpt = (id: string) => model({ providerId: "openai", modelId: id, reasoning: 92, capabilities: { coder: 72 } });
+  assert.equal(strongestConfiguredModelFor({ providerId: "openai", candidates: [gpt("gpt-reserve"), gpt("gpt-5.6-sol"), gpt("gpt-6-astra")], policy: "worktree", measured: null })?.modelId, "gpt-6-astra", "a versioned id outranks an unversioned one, and 6 outranks 5.6");
 });

@@ -189,24 +189,32 @@ export function compareStrength(a: ModelDefinition, b: ModelDefinition): number 
   return compareVersionIds(a.modelId, b.modelId);
 }
 
-/** Natural comparison of model ids, so `gemini-3.8-flash-high` sorts above `gemini-3.6-flash-high`. */
+/**
+ * Natural comparison of model ids, so `gemini-3.8-flash-high` sorts above `gemini-3.6-flash-high`.
+ *
+ * The first version number in the id decides (`6` over `5.6`, numerically); an id with a version
+ * outranks one without (`gpt-6-astra` over `gpt-reserve`); Antigravity's effort tier decides next
+ * (`-high` over `-medium` over `-low`, which alphabetical order gets backwards); and only then the
+ * text.
+ */
 function compareVersionIds(a: string, b: string): number {
-  const parts = (id: string): (string | number)[] => id.split(/(\d+(?:\.\d+)*)/).filter((part) => part.length > 0).map((part) => (/^\d/.test(part) ? Number(part.split(".").map((n) => n.padStart(4, "0")).join("")) : part));
-  const left = parts(a); const right = parts(b);
-  for (let index = 0; index < Math.max(left.length, right.length); index += 1) {
-    const l = left[index]; const r = right[index];
-    if (l === undefined) return -1;
-    if (r === undefined) return 1;
-    if (typeof l === "number" && typeof r === "number") { if (l !== r) return l - r; continue; }
-    // Antigravity names its effort tier in the id: `-high` outranks `-medium` outranks `-low`,
-    // which alphabetical order gets exactly backwards.
-    const tier = (part: string): number => ({ high: 3, medium: 2, low: 1 } as Record<string, number>)[part.split("-").filter((word) => word.length > 0).at(-1) ?? ""] ?? 0;
-    const tiers = tier(String(l)) - tier(String(r));
-    if (tiers !== 0) return tiers;
-    const c = String(l).localeCompare(String(r));
-    if (c !== 0) return c;
+  const version = (id: string): number[] | null => {
+    const match = /\d+(?:\.\d+)*/.exec(id);
+    return match === null ? null : match[0].split(".").map(Number);
+  };
+  const va = version(a); const vb = version(b);
+  if (va !== null && vb === null) return 1;
+  if (va === null && vb !== null) return -1;
+  if (va !== null && vb !== null) {
+    for (let index = 0; index < Math.max(va.length, vb.length); index += 1) {
+      const d = (va[index] ?? 0) - (vb[index] ?? 0);
+      if (d !== 0) return d;
+    }
   }
-  return 0;
+  const tier = (id: string): number => ({ high: 3, medium: 2, low: 1 } as Record<string, number>)[id.split("-").at(-1) ?? ""] ?? 0;
+  const tiers = tier(a) - tier(b);
+  if (tiers !== 0) return tiers;
+  return a.localeCompare(b);
 }
 
 /**

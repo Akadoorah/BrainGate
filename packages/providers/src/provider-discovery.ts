@@ -11,6 +11,7 @@ import type {
   ProviderSnapshot,
 } from "./types.js";
 import { NodeProbeRunner, formatProbeCommand } from "./probe-runner.js";
+import { readCodexModelCache, type CodexModelCache } from "./codex-models.js";
 
 interface ProviderSpec {
   readonly providerId: ProviderId;
@@ -19,6 +20,12 @@ interface ProviderSpec {
   readonly versionArgs: readonly string[];
   readonly helpArgs: readonly string[];
   readonly modelArgs: readonly string[] | null;
+  /**
+   * A model list the CLI keeps on disk when it has no zero-prompt listing command.
+   *
+   * Read, never written, from the environment discovery was given: the CLI's own answer, read back.
+   */
+  readonly modelFile?: (env: NodeJS.ProcessEnv) => CodexModelCache;
   readonly authArgs: readonly string[] | null;
   readonly headlessPatterns: readonly RegExp[];
   readonly structuredPatterns: readonly RegExp[];
@@ -46,7 +53,10 @@ const PROVIDERS: readonly ProviderSpec[] = Object.freeze([
     binary: "codex",
     versionArgs: ["--version"],
     helpArgs: ["--help"],
+    // `codex models` exits "stdin is not a terminal" (codex-cli 0.153.4); the list the CLI fetched
+    // for its own picker sits in `models_cache.json` under its home, and that is what is read.
     modelArgs: null,
+    modelFile: (env) => readCodexModelCache({ env }),
     authArgs: ["login", "status"],
     headlessPatterns: [/\bexec\b/i, /non[- ]interactive/i],
     structuredPatterns: [/json/i],
@@ -210,9 +220,12 @@ export class ProviderDiscovery {
   readonly #runner: ProbeRunner;
   readonly #modelCache: ModelListCache | null;
 
-  constructor(runner: ProbeRunner = new NodeProbeRunner(), options: { readonly modelCache?: ModelListCache } = {}) {
+  readonly #env: NodeJS.ProcessEnv;
+
+  constructor(runner: ProbeRunner = new NodeProbeRunner(), options: { readonly modelCache?: ModelListCache; readonly env?: NodeJS.ProcessEnv } = {}) {
     this.#runner = runner;
     this.#modelCache = options.modelCache ?? null;
+    this.#env = options.env ?? process.env;
   }
 
   /**
@@ -318,6 +331,10 @@ export class ProviderDiscovery {
         models = observation(null, "unknown", source, modelResult.observedAt);
         warnings.push("Model metadata probe did not complete successfully; availability was left unknown.");
       }
+    } else if (spec.modelFile !== undefined && spec.modelFile(this.#env).present) {
+      // The CLI's own cached list: native evidence, with the file as the source for the record.
+      const cached = spec.modelFile(this.#env);
+      models = observation(cached.models, "native", cached.path, new Date().toISOString());
     } else {
       models = observation(null, "unknown", null, helpResult.observedAt);
       warnings.push("No verified zero-prompt model-list command is configured for this provider.");
