@@ -25,6 +25,7 @@ export const SLASH_COMMANDS: readonly SlashCommand[] = Object.freeze([
   { name: "new", hint: "set the current goal aside and start a different one" },
   { name: "remember", args: "<text>", hint: "record something about this project, for later sessions" },
   { name: "memory", hint: "what is remembered, and what is waiting for your evidence" },
+  { name: "promote", args: "<n> --evidence <file-or-url> [--confidence 0.9]", hint: "promote a proposal numbered by /memory to canonical memory" },
   { name: "status", hint: "recent tasks in this project" },
   { name: "project", hint: "which checkout this session is bound to, and where it is registered" },
   { name: "policy", args: "[direct|worktree|...]", hint: "the execution policy the next run uses" },
@@ -64,4 +65,46 @@ export function slashSuggestions(draft: string): readonly SlashSuggestion[] {
       hint: command.hint,
       insert: `/${command.name}${command.args === undefined ? "" : " "}`,
     })));
+}
+
+/**
+ * The number of single-character edits (insert, delete, substitute) between two strings.
+ *
+ * Plain Levenshtein, with a rolling pair of rows rather than a full matrix: nothing here needs to
+ * reconstruct the edit, only count it, and a typo is a handful of characters — the table is never
+ * more than a slash command's own length wide.
+ */
+export function editDistance(a: string, b: string): number {
+  let previous = Array.from({ length: b.length + 1 }, (_, index) => index);
+  for (let i = 1; i <= a.length; i += 1) {
+    const current = [i];
+    for (let j = 1; j <= b.length; j += 1) {
+      current.push(a[i - 1] === b[j - 1]
+        ? previous[j - 1]!
+        : 1 + Math.min(previous[j - 1]!, previous[j]!, current[j - 1]!));
+    }
+    previous = current;
+  }
+  return previous[b.length]!;
+}
+
+/**
+ * The closest known slash command to one that was not recognised, or `null` when nothing is close.
+ *
+ * "Close" is an edit distance of 2 or less against a command's own name or any of its aliases —
+ * `/us` and `/uze` both reach `/use` in one edit, and a genuinely different command (`/promote` from
+ * `/policy`) stays far enough apart that this says nothing rather than guessing. The exact match a
+ * caller would never reach this for is not special-cased: it simply wins with distance 0.
+ */
+export function suggestSlashCommand(typed: string): string | null {
+  const name = typed.trim().toLowerCase();
+  if (name.length === 0) return null;
+  let best: { readonly name: string; readonly distance: number } | null = null;
+  for (const command of SLASH_COMMANDS) {
+    for (const candidate of [command.name, ...(command.aliases ?? [])]) {
+      const distance = editDistance(name, candidate.toLowerCase());
+      if (distance <= 2 && (best === null || distance < best.distance)) best = { name: command.name, distance };
+    }
+  }
+  return best?.name ?? null;
 }

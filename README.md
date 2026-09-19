@@ -212,15 +212,26 @@ braingate init --project-id my-service --name "My Service" --adopt-models --acce
 |---|---|
 | `/use <provider>/<model>` | Send the next work to this worker. The goal is unchanged. |
 | `/use <provider>/<model> --fresh` | Same worker, new native session, same goal. |
+| `/use grok\|claude\|codex\|antigravity` | Send the next work to the strongest configured model of that provider that can run your current policy, and say which one and why. `xai`, `anthropic`, `openai`, `google` work the same way. |
 | `/auto` | Return to automatic selection. |
 | `/worker` | Who is selected, what the goal is, what the next run would resume, and any pool BrainGate is briefly resting after a refusal. |
 | `/why [task-id-prefix]` | The last plan's route, per role: who won and their own reasons, and every candidate that was set aside and why. With an id prefix, the same for a past task. |
 | `/goal` | The current goal: established findings, disputed claims, open questions. |
 | `/new` | Set the current goal aside and start a different one. |
-| `/remember`, `/memory` | Record something for later sessions; see what is remembered. |
+| `/remember`, `/memory` | Record something for later sessions; see what is remembered. `/memory` numbers the proposals waiting on your evidence. |
+| `/promote <n> --evidence <file-or-url> [--confidence 0.9]` | Promote proposal `n` — the number `/memory` (or `/remember`'s own hint) just listed it under — to canonical memory. Evidence is always required. |
 | `/policy [direct\|worktree\|...]` | The execution boundary the next run uses. Remembered for this workspace. |
 | `/review [on\|off]` | Ask for a reviewer on every write, not only the risky ones. Remembered too. |
 | `/setup` | Run the first-run wizard again: newly listed models, acceptances, review. Your own scores are kept. |
+
+A few more keystrokes saved, in the composer itself: **Up/Down on an empty line recall this
+session's own earlier requests, newest first** — keep pressing Up (with Escape or Ctrl+C in
+between to clear what was recalled) to walk further back. Inside a draft that already has text, Up
+and Down go back to moving between its lines. Escape or Ctrl+C clears a recalled draft. An unknown
+slash command that is close to a real one — `/hepl`, `/us grok/x` — is met with "did you mean
+`/help`?" rather than a bare refusal. **Ctrl+C while a provider is working cancels that task** —
+it is recorded as `interrupted`, nothing is merged, and the session returns to the prompt instead
+of exiting; Ctrl+C at an empty prompt still ends the session, as it always did.
 
 **Nothing is spent until you confirm.** Every request is planned first — which costs nothing — and
 the plan is shown with its classification, the worker that would run, and what that worker may do,
