@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import { initializeDogfoodProject } from "@braingate/dogfood";
-import { ProjectRegistry } from "@braingate/core";
+import { ProjectRegistry, TaskLedger, executionScopeFor } from "@braingate/core";
 import { ProjectMemory } from "@braingate/memory";
 import { ModelCatalog, resolveOperatorState } from "@braingate/operator";
 import type { ProviderSnapshot } from "@braingate/providers";
@@ -64,13 +64,20 @@ function operatorEnv(): NodeJS.ProcessEnv {
  * logged out and two of them failed, and with the real HOME they were passing by accident. A
  * planning test is about planning, so the discovery it needs is supplied.
  */
-function snapshot(providerId: "anthropic" | "openai", models: readonly string[]): ProviderSnapshot {
+const PROVIDER_DISPLAY: Readonly<Record<string, { readonly name: string; readonly binary: string }>> = Object.freeze({
+  anthropic: { name: "Claude Code", binary: "claude" },
+  openai: { name: "Codex CLI", binary: "codex" },
+  xai: { name: "Grok CLI", binary: "grok" },
+  google: { name: "Antigravity", binary: "agy" },
+});
+
+function snapshot(providerId: "anthropic" | "openai" | "xai" | "google", models: readonly string[]): ProviderSnapshot {
   const observedAt = "2026-09-13T00:00:00.000Z";
   const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
   return {
     providerId,
-    displayName: providerId === "anthropic" ? "Claude Code" : "Codex CLI",
-    binary: providerId === "anthropic" ? "claude" : "codex",
+    displayName: PROVIDER_DISPLAY[providerId]!.name,
+    binary: PROVIDER_DISPLAY[providerId]!.binary,
     available: obs(true),
     version: obs("2.1.269"),
     authState: obs("authenticated"),
@@ -92,7 +99,13 @@ function snapshot(providerId: "anthropic" | "openai", models: readonly string[])
  * session: a helper that minted a fresh `BRAINGATE_HOME` per run could never see a preference
  * outlive the process it was set in.
  */
-function session(cwd: string, answers: readonly string[], env: NodeJS.ProcessEnv = operatorEnv()) {
+/**
+ * @param overrides Additional (or replacement) `runRepl` dependencies — a fake `executor` to let a
+ * run actually execute, `registerCancel` to reach into the session's own cancellation hook, a wider
+ * `discoverAll` for a provider the default two do not cover. Merged in last, so a test that needs a
+ * real executor or a third provider is not copying this whole fixture to get one.
+ */
+function session(cwd: string, answers: readonly string[], env: NodeJS.ProcessEnv = operatorEnv(), overrides: Record<string, unknown> = {}) {
   const remaining = [...answers];
   const asked: string[] = [];
   // How much had been printed when each question was put. The gate is an ordering, and a test that
@@ -129,6 +142,7 @@ function session(cwd: string, answers: readonly string[], env: NodeJS.ProcessEnv
         observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
         readableRoots: [], networkRestricted: true, configSurfaces: [],
       }),
+      ...overrides,
     }),
   };
 }
@@ -377,4 +391,147 @@ test("S: text a provider repeated itself is stored and printed once, not duplica
   const kept = withoutStreamedAnswer(block);
   assert.equal(kept.match(/The flag is unused\./g), null, "the answer stays out of the receipt block");
   assert.equal(providerText.match(/The flag is unused\./g)?.length, 2, "and the provider's text is preserved as it was");
+});
+
+// ---------------------------------------------------------------- Phase E: fewer keystrokes
+
+/** `operatorEnv` plus two xai models with different `reasoning` scores, for `/use grok`. */
+function operatorEnvWithXai(): NodeJS.ProcessEnv {
+  const env = operatorEnv();
+  const catalog = new ModelCatalog(resolveOperatorState(env).modelCatalogPath);
+  for (const [modelId, reasoning] of [["grok-4.5", 80], ["grok-4.6", 88]] as const) {
+    catalog.upsert({
+      providerId: "xai", modelId, quotaPool: "grok-subscription",
+      capabilities: { coder: reasoning, reviewer: 70 }, speed: "balanced",
+      contextCapacity: 200_000, writeCapable: true, reasoning, underlyingFamily: null,
+    });
+  }
+  return env;
+}
+
+test("/use grok resolves the CLI name to the provider and picks the strongest configured model", async () => {
+  const repo = project();
+  const env = operatorEnvWithXai();
+  const s = session(repo, ["/use grok", "/exit"], env, {
+    discoverAll: async () => [
+      snapshot("anthropic", ["claude-sonnet-5"]),
+      snapshot("openai", ["gpt-6-astra"]),
+      snapshot("xai", ["grok-4.5", "grok-4.6"]),
+    ],
+  });
+  assert.equal(await s.run(), 0, s.text());
+  // xai has `nativeDirect: true` unconditionally, so both configured models pass the `direct`
+  // policy filter and the higher `reasoning` score (grok-4.6, 88) must win over grok-4.5 (80).
+  assert.match(s.text(), /Next work will go to xai\/grok-4\.6 — the strongest configured model for xai that can run `direct` \(coder 88 of 2 configured\)/);
+});
+
+test("/use <alias> reports an unknown provider by name, and a provider with nothing configured", async () => {
+  const repo = project();
+  const s = session(repo, ["/use mistral", "/use codex", "/exit"]);
+  assert.equal(await s.run(), 0, s.text());
+  assert.match(s.text(), /Unknown provider `mistral`\. Known: grok, claude, codex, antigravity/);
+  // `operatorEnv` (the default fixture) only configures anthropic models.
+  assert.match(s.text(), /No models are configured for openai yet\. Run `braingate discover`/);
+});
+
+test("an unrecognised slash command is offered the closest one within an edit distance of 2", async () => {
+  const repo = project();
+  const s = session(repo, ["/hepl", "/qwertyzargh", "/exit"]);
+  assert.equal(await s.run(), 0, s.text());
+  assert.match(s.text(), /Unknown command \/hepl\. Did you mean \/help\? Try \/help for the full list\./);
+  // Genuinely unrelated: no suggestion is offered rather than a guess.
+  assert.match(s.text(), /Unknown command \/qwertyzargh\. Try \/help\.\n/);
+});
+
+test("/remember hints at /promote, and /promote <n> --evidence promotes the numbered proposal", async () => {
+  const repo = project();
+  const env = operatorEnv();
+  const s = session(repo, [
+    "/remember the service reads its theme from config.yml",
+    "/promote 1 --evidence config.yml",
+    "/remember the service caches responses for 60 seconds",
+    "/remember the cache is invalidated on every deploy",
+    "/memory",
+    // Two proposals created moments apart can share a millisecond, and the store then breaks the
+    // tie on its own id rather than on creation order — so which of the two `/memory` prints as
+    // "1" and which as "2" is read back from its own output below, rather than assumed.
+    "/promote 2 --evidence deploy-notes.md",
+    "/exit",
+  ], env);
+  assert.equal(await s.run(), 0, s.text());
+  assert.match(s.text(), /promote it with\n {2}\/promote 1 --evidence <file>/, "/remember ends with the exact hint");
+  assert.match(s.text(), /Promoted proposal \S+ to canonical memory record/);
+  const listed = [...s.text().matchAll(/^ {2}(\d)\. \S+ · verified_fact · operator · (.+)$/gm)]
+    .map((match) => ({ number: Number(match[1]), body: match[2]! }));
+  assert.equal(listed.length, 2, `/memory numbered exactly the two pending proposals: ${JSON.stringify(listed)}`);
+  const second = listed.find((entry) => entry.number === 2);
+  const first = listed.find((entry) => entry.number === 1);
+  assert.notEqual(second, undefined);
+  assert.notEqual(first, undefined);
+
+  // The same operator home the session itself resolved `~/.braingate` from — a fresh, unrelated
+  // registry root reads a different, empty storage directory and would pass this check vacuously.
+  const registry = new ProjectRegistry(resolveOperatorState(env).home);
+  const registered = registry.loadFile(join(repo, ".brain", "project.json"));
+  const memory = new ProjectMemory(registered);
+  try {
+    const records = memory.listEffective(10);
+    assert.equal(records.length, 2, "exactly the two /promote calls became canonical records");
+    assert.ok(records.some((record) => record.body.includes("config.yml")), "the first /promote (its own number 1) went through");
+    assert.ok(records.some((record) => record.body === second!.body), "/promote 2 targeted whichever proposal /memory actually numbered 2");
+    assert.ok(!records.some((record) => record.body === first!.body), "the proposal /memory numbered 1 (but /promote never named) stayed a proposal");
+  } finally { memory.close(); }
+});
+
+test("/promote without evidence is refused, and a number nothing lists is refused by name", async () => {
+  const repo = project();
+  const s = session(repo, ["/remember the export path is configurable", "/promote 1", "/promote 9 --evidence x", "/exit"]);
+  assert.equal(await s.run(), 0, s.text());
+  assert.match(s.text(), /MEMORY_EVIDENCE_REQUIRED/, "evidence stays mandatory even through /promote");
+  assert.match(s.text(), /No proposal numbered 9\. \/memory listed 1\./);
+});
+
+test("cancellation: Ctrl+C mid-run finalizes the task as interrupted, prints one line, and the session keeps working", async () => {
+  const repo = project();
+  const env = operatorEnv();
+  let cancelNow: (() => void) | null = null;
+  let calls = 0;
+  const executor = {
+    run: async () => {
+      calls += 1;
+      // Simulates the operator's Ctrl+C arriving while this exact provider call is in flight — the
+      // same moment `abortActiveRuns`/`abortTrackedChildren` would run for a real signal.
+      if (calls === 1) cancelNow?.();
+      return {
+        spawned: true, exitCode: 0, timedOut: false, durationMs: 1, stderr: "", removedEnvironmentKeys: [],
+        stdout: JSON.stringify({ result: JSON.stringify({ kind: "work", output: "the theme lives in config.yml" }) }),
+      };
+    },
+  };
+  const REQUEST = "where is the theme configuration defined?";
+  const s = session(repo, [REQUEST, "y", REQUEST, "y", "/exit"], env, {
+    executor,
+    registerCancel: (cancel: () => void) => { cancelNow = cancel; },
+  });
+  assert.equal(await s.run(), 0, s.text());
+  assert.equal(calls, 2, "the run that was cancelled, and the next one that was not");
+  assert.match(s.text(), /Cancelled\. Task [0-9a-f-]{8}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{4}-[0-9a-f-]{12} recorded as interrupted; nothing was merged\./);
+  // The generic failure text is exactly what the cancellation line replaces.
+  assert.doesNotMatch(s.text(), /Exit 1: this task did not finish successfully/);
+  // The second, uncancelled request still ran and answered.
+  assert.match(s.text(), /the theme lives in config\.yml/);
+
+  const registry = new ProjectRegistry(resolveOperatorState(env).home);
+  const registered = registry.loadFile(join(repo, ".brain", "project.json"));
+  const scope = executionScopeFor(registered, repo);
+  const ledger = new TaskLedger(scope.project);
+  try {
+    const tasks = ledger.listTasks();
+    assert.equal(tasks.length, 2, "both the cancelled run and the completed one left a task");
+    const cancelledTask = tasks[0]!; // listTasks is oldest first, and the cancelled run happened first
+    const receipt = ledger.receipt(cancelledTask.taskId);
+    const marker = receipt.events.find((event) => event.kind === "task.finalized");
+    assert.equal((marker?.payload as { readonly snapshot?: { readonly outcome?: string; readonly failureKind?: string } } | undefined)?.snapshot?.outcome, "INTERRUPTED");
+    assert.equal((marker?.payload as { readonly snapshot?: { readonly outcome?: string; readonly failureKind?: string } } | undefined)?.snapshot?.failureKind, "interrupted");
+  } finally { ledger.close(); }
 });

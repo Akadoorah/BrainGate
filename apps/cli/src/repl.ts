@@ -7,7 +7,7 @@ import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
 import { runModelProfileCli } from "./model-profile-cli.js";
-import { SLASH_COMMANDS, slashSuggestions } from "./slash-commands.js";
+import { SLASH_COMMANDS, slashSuggestions, suggestSlashCommand } from "./slash-commands.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
 import { readSessionPreferences, sessionPreferencesPath, updateSessionPreferences } from "./session-preferences.js";
@@ -17,6 +17,8 @@ import {
   EXECUTION_POLICY_IDS,
   ProjectRegistry,
   TaskLedger,
+  abortActiveRuns,
+  activeRunCount,
   describeExecutionPolicy,
   executionPolicyAvailability,
   executionPolicyForIntent,
@@ -43,13 +45,14 @@ import {
 } from "@braingate/goals";
 import { describeRefusalBackoff, normalizeTaskReceipt, openQuotaStore, type TaskBriefRouteRole } from "@braingate/observability";
 import { resolveOperatorState } from "@braingate/operator";
-import { NodeProbeRunner, probeCliCapabilities, type ProviderId, type ProviderSnapshot } from "@braingate/providers";
-import type {
-  CodexIsolationAttestation,
-  GrokIsolationAttestation,
-  MeasuredCapabilities,
-  ShadowProcessExecutor,
-  TaskSnapshotProvider,
+import { NodeProbeRunner, probeCliCapabilities, readAntigravityHeadlessPermissions, type ProviderId, type ProviderSnapshot } from "@braingate/providers";
+import {
+  abortTrackedChildren,
+  type CodexIsolationAttestation,
+  type GrokIsolationAttestation,
+  type MeasuredCapabilities,
+  type ShadowProcessExecutor,
+  type TaskSnapshotProvider,
 } from "@braingate/shadow";
 import type { WriteProviderExecutor } from "@braingate/write";
 import {
@@ -58,7 +61,9 @@ import {
   describeWorker,
   pinFor,
   recordSessionUse,
+  resolveAliasWorker,
   resolveManualWorker,
+  resolveProviderAlias,
   type RunSessionSummary,
   type WorkerSelection,
 } from "./worker-commands.js";
@@ -112,6 +117,50 @@ interface ReplDeps {
   readonly animate?: boolean;
   /** False under NO_COLOR or a dumb terminal. */
   readonly colour?: boolean;
+  /**
+   * Called once this session's own `SessionContext` exists.
+   *
+   * `runReplOnTerminal` uses it to wire the real terminal composer's request-history recall
+   * (`prompt-input.ts`'s `history` option) to this session's thread: the composer is created before
+   * the session is, so this is how the one gets a reference to the other. A test that supplies its
+   * own `ask` never needs this — it already controls the draft directly.
+   */
+  readonly onSession?: (session: SessionContext) => void;
+  /**
+   * Registered once, so the composer's Ctrl+C can reach "cancel the run in flight" without a signal.
+   *
+   * This is the exact mechanism `main.ts`'s process-level SIGINT handler already uses —
+   * `abortActiveRuns` finalizes the task through the same handlers a real signal would run
+   * (`registerActiveRun` in `write-runner.ts` and `dogfood.ts`), and `abortTrackedChildren` kills
+   * the provider's child process — called from inside the process instead of from a signal, because
+   * this path must return to the prompt rather than exit it. An `AbortSignal` threaded through
+   * `runDogfoodCli` into the runners was the other option considered; it would mean two ways to stop
+   * a run instead of one, and the ledger consequence has to be identical either way, so reusing the
+   * mechanism that already keeps the ledger consistent is the one with nothing new to get wrong.
+   */
+  readonly registerCancel?: (cancel: () => void) => void;
+}
+
+/**
+ * The measured reading a provider's DIRECT capability needs, for the one provider it is ever
+ * anything but `null` for.
+ *
+ * Antigravity's DIRECT answer lives in its own settings file rather than in a constant (ADR 0020),
+ * which is what `providers list`'s own `measuredFor` in `cli.ts` reads for the same reason: whether
+ * `/use antigravity` can pick a model that runs DIRECT depends on permissions this process never
+ * writes, only describes.
+ */
+function measuredCapabilitiesFor(providerId: string, deps: ReplDeps): MeasuredCapabilities | null {
+  if (providerId !== "google") return null;
+  try {
+    const antigravity = readAntigravityHeadlessPermissions({ env: deps.env ?? process.env, workspace: deps.cwd });
+    return Object.freeze({
+      toolDenial: "unknown", declaredSubagents: "unknown", sandbox: "unknown", sessionIdPinning: "unknown",
+      headlessReads: antigravity.reads, headlessShell: antigravity.shell,
+    });
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -603,6 +652,21 @@ interface WorkerLoopState {
   readonly probe: SessionCapabilityProbe;
   /** The installed build per provider, filled by discovery as it runs. */
   readonly versions: Map<string, string | null>;
+  /**
+   * The proposals the last `/memory` (or `/remember`) listed, in the numbers it printed them under.
+   *
+   * `/promote <n>` reads this rather than asking the memory store for "proposal number n" — the
+   * store has no such notion, and inventing an ordinal there would make the numbering a second
+   * source of truth. `/remember` seeds this with the one proposal it just created, at position 1, so
+   * "promote it with /promote 1 --evidence <file>" is true the moment it is printed.
+   */
+  lastProposals: readonly { readonly proposalId: string }[];
+  /**
+   * Set by the registered Ctrl+C handler when it actually aborted a run, read once the awaited
+   * `runDogfoodCli` call settles and reset immediately after. `runPlanned` uses it to print the one
+   * cancellation line instead of the ordinary refusal text for the failure a killed run produces.
+   */
+  cancelled: boolean;
 }
 
 /**
@@ -868,9 +932,19 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   });
   if (streamed) deps.stdout("\n");
   working.stop();
+  // Read once and reset immediately: the *next* run must start believing nothing was cancelled,
+  // whatever this one ended up doing.
+  const wasCancelled = worker.cancelled;
+  worker.cancelled = false;
   // The refusal, in one line naming the reason and the next step; the full measurement text is
-  // still in `result.data` and reaches `--json` unshortened (ADR 0021 Phase D).
-  if (result.exitCode !== 0) {
+  // still in `result.data` and reaches `--json` unshortened (ADR 0021 Phase D). A run this session
+  // itself cancelled gets its own line instead: the failure the killed run produced is real, but
+  // "BrainGate SHADOW_PROVIDER_BLOCKED" would tell the operator something refused them when what
+  // actually happened is that they asked to stop.
+  if (result.exitCode !== 0 && wasCancelled) {
+    const taskId = taskIdOf(result.data) ?? ledger?.listTasks()[0]?.taskId ?? null;
+    deps.stdout(`  Cancelled.${taskId === null ? "" : ` Task ${taskId}`} recorded as interrupted; nothing was merged.\n\n`);
+  } else if (result.exitCode !== 0) {
     const line = refusalLine(result.data);
     deps.stderr(line === null ? bufferedStderr : `${line}\n`);
   }
@@ -945,7 +1019,7 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // Named as something to run *in a shell*, and paired with the command that does the same job here.
   // The bare `tasks list` this used to suggest was read by the session as a new request, so following
   // BrainGate's own advice spent a task on it — the guidance was the bug, not the operator.
-  if (result.exitCode !== 0) deps.stdout("\n  Exit 1: this task did not finish successfully. Use /status here to see what was recorded, or run `braingate tasks list` in your shell.\n\n");
+  if (result.exitCode !== 0 && !wasCancelled) deps.stdout("\n  Exit 1: this task did not finish successfully. Use /status here to see what was recorded, or run `braingate tasks list` in your shell.\n\n");
 }
 
 /** The task id a finished run reported, or `null` when the run recorded nothing usable. */
@@ -1004,13 +1078,58 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       // The session thread ends with this process; this does not. It is recorded as a proposal
       // rather than as fact, because what was typed is a claim about the project and the
       // evidence gate is what tells the two apart.
-      await runMemoryCli(["memory", "note", "--text", text], io);
+      const captured: string[] = [];
+      const noted = await runMemoryCli(["memory", "note", "--text", text], { ...io, stdout: (t) => captured.push(t) });
+      if (noted.exitCode !== 0) { deps.stderr(captured.join("") || "  Could not record that.\n"); return "continue"; }
+      const proposal = noted.data as { readonly proposalId: string; readonly kind: string };
+      // The one proposal this just created is numbered 1, so the hint below is true the moment it
+      // is printed rather than after a separate `/memory` to discover the number.
+      worker.lastProposals = Object.freeze([{ proposalId: proposal.proposalId }]);
+      deps.stdout([
+        `  Recorded proposal ${proposal.proposalId} (${proposal.kind}).`,
+        "",
+        "  It is a proposal, not memory: tasks read canonical records only. promote it with",
+        "  /promote 1 --evidence <file>",
+        "",
+      ].join("\n"));
       return "continue";
     }
-    case "memory":
+    case "memory": {
       await runMemoryCli(["memory", "list"], io);
-      await runMemoryCli(["memory", "proposals"], io);
+      const captured: string[] = [];
+      const listed = await runMemoryCli(["memory", "proposals", "--json"], { ...io, stdout: (t) => captured.push(t) });
+      const proposals = Array.isArray(listed.data)
+        ? (listed.data as readonly { readonly proposalId: string; readonly kind: string; readonly proposedBy: string; readonly body: string }[])
+        : [];
+      // Numbered here, and remembered in this order, so `/promote <n>` names a proposal by the same
+      // number this just printed — the store itself has no ordinal, only an id nobody types by hand.
+      worker.lastProposals = Object.freeze(proposals.map((proposal) => Object.freeze({ proposalId: proposal.proposalId })));
+      deps.stdout(proposals.length === 0
+        ? "No proposals waiting. `/remember <text>` records one.\n"
+        : `\n${proposals.map((proposal, index) => `  ${index + 1}. ${proposal.proposalId} · ${proposal.kind} · ${proposal.proposedBy} · ${proposal.body.slice(0, 90)}`).join("\n")}\n\n  Promote one with /promote <n> --evidence <file-or-url> [--confidence 0.9]\n`);
       return "continue";
+    }
+    case "promote": {
+      const [numberRaw, ...flags] = rest;
+      const number = Number(numberRaw);
+      if (numberRaw === undefined || !Number.isInteger(number) || number < 1) {
+        deps.stderr("  Usage: /promote <n> --evidence <file-or-url> [--confidence 0.9] — n is a number from /memory.\n");
+        return "continue";
+      }
+      const proposal = worker.lastProposals[number - 1];
+      if (proposal === undefined) {
+        deps.stderr(worker.lastProposals.length === 0
+          ? "  No proposals listed yet in this session. Run /memory first, or /remember to create one.\n"
+          : `  No proposal numbered ${numberRaw}. /memory listed ${worker.lastProposals.length}.\n`);
+        return "continue";
+      }
+      // Evidence stays mandatory: `runMemoryCli`'s own promote path refuses without it. A default
+      // confidence is supplied only when the operator did not type one, matching the hint's own
+      // example (`--confidence 0.9`) rather than inventing a different number here.
+      const withConfidence = flags.includes("--confidence") ? flags : [...flags, "--confidence", "0.9"];
+      await runMemoryCli(["memory", "promote", "--proposal", proposal.proposalId, ...withConfidence], io);
+      return "continue";
+    }
     case "forget":
       session.clear();
       deps.stdout("  Session thread cleared, here and on disk. Project memory is untouched.\n");
@@ -1041,7 +1160,23 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       // Only the first token is the target: `/use anthropic/claude-sonnet --fresh` must pass the
       // flag as a flag rather than folding it into the model id, where it would be reported as a
       // model nobody configured.
-      const result = resolveManualWorker({ target: rest[0] ?? "", ...(deps.env === undefined ? {} : { env: deps.env }) });
+      const target = rest[0] ?? "";
+      // `/use grok` names the CLI, not a `<provider>/<model>` pair: an alias never contains a
+      // slash, so that is the whole test for which resolver gets it — including a name nobody
+      // recognises, so `/use mistral` is told which providers exist rather than shown the usage
+      // line for a target that was never meant to have a slash in it. The alias path picks the
+      // strongest configured model of that provider that can run this session's own policy and
+      // says why; `<provider>/<model>` stays exactly the explicit choice it always was. Empty
+      // input (`/use` alone) falls to the explicit resolver for its usage message.
+      const aliasAttempt = target.length > 0 && !target.includes("/");
+      const result = aliasAttempt
+        ? resolveAliasWorker({
+          alias: target,
+          policy: worker.policy,
+          ...(deps.env === undefined ? {} : { env: deps.env }),
+          measured: measuredCapabilitiesFor(resolveProviderAlias(target) ?? "", deps),
+        })
+        : resolveManualWorker({ target, ...(deps.env === undefined ? {} : { env: deps.env }) });
       if (!result.ok) { deps.stderr(`  ${result.message}\n`); return "continue"; }
       worker.selection = result.selection;
       // `--fresh` is consumed by the next run, so it is armed here and cleared when that run
@@ -1250,7 +1385,12 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       return "continue";
     }
     default:
-      deps.stderr(`  Unknown command /${String(command)}. Try /help.\n`);
+      {
+        const suggestion = suggestSlashCommand(String(command));
+        deps.stderr(suggestion === null
+          ? `  Unknown command /${String(command)}. Try /help.\n`
+          : `  Unknown command /${String(command)}. Did you mean /${suggestion}? Try /help for the full list.\n`);
+      }
       return "continue";
   }
 }
@@ -1384,6 +1524,10 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
   if (session.resumed > 0) {
     deps.stdout(`  Continuing a thread of ${String(session.resumed)} earlier ${session.resumed === 1 ? "turn" : "turns"}. /forget starts fresh.\n\n`);
   }
+  // Wires the real terminal composer's Up/Down history to this session's own thread — see the doc
+  // on `ReplDeps.onSession`. A test supplying its own `ask` has no composer to wire and never sets
+  // this, which is why it is optional rather than a required dependency.
+  deps.onSession?.(session);
   const providers = new ProviderSnapshotCache();
   // The goal this session continues. One conversation per workspace, opened on the first run and
   // resumed by every run after it, which is what makes closing the terminal not the same as
@@ -1425,7 +1569,19 @@ export async function runRepl(deps: ReplDeps): Promise<number> {
     lastWhy: null,
     probe,
     versions,
+    lastProposals: Object.freeze([]),
+    cancelled: false,
   };
+  // Ctrl+C with a provider working and no question pending reaches here — see the doc on
+  // `ReplDeps.registerCancel`. Guarded on `activeRunCount()` so a stray keypress with nothing
+  // running is a no-op rather than a cancellation message for a run that never existed, and so the
+  // *next* request never inherits a `worker.cancelled` flag this one had no reason to set.
+  deps.registerCancel?.(() => {
+    if (activeRunCount() === 0) return;
+    worker.cancelled = true;
+    abortActiveRuns("SIGINT");
+    abortTrackedChildren();
+  });
   try {
     for (;;) {
       const line = await deps.ask("> ");
@@ -1497,12 +1653,20 @@ export async function runReplOnTerminal(cwd: string): Promise<number> {
    * this was written; see `prompt-input.ts`. The composer below reads the raw stream, where the
    * markers still exist, so the paste boundary is a fact rather than a guess.
    */
+  // Filled once `runRepl` has a `SessionContext` to read, and once it has registered a cancel
+  // handler for the run in flight. Both are set after the composer exists — the composer has to be
+  // ready before `deps.ask` is handed to `runRepl` — so each is a mutable indirection rather than a
+  // value: the composer always calls "whatever is current", and `runRepl` is what makes it current.
+  let historySource: (() => readonly string[]) | null = null;
+  let cancelCurrentRun: (() => void) | null = null;
   const promptInput = createPromptInput({
     input: process.stdin,
     write: (text) => { process.stdout.write(text); },
     terminal: !dumb && process.stdin.isTTY === true,
     // `/` opens the command list under the draft, and Tab completes it — from the same table /help prints.
     suggest: slashSuggestions,
+    history: () => historySource?.() ?? [],
+    onCancel: () => { cancelCurrentRun?.(); },
   });
   try {
     // A dumb terminal gets no escape sequences: no bracketed paste, no raw mode. Typing still works,
@@ -1515,6 +1679,8 @@ export async function runReplOnTerminal(cwd: string): Promise<number> {
       stderr: (text) => process.stderr.write(text),
       ask: (question) => promptInput.ask(question),
       probeCapabilities: probeCapabilitiesFor,
+      onSession: (session) => { historySource = () => session.requests(); },
+      registerCancel: (cancel) => { cancelCurrentRun = cancel; },
     });
   } finally {
     promptInput.close();

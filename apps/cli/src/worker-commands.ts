@@ -16,8 +16,9 @@ import {
   sessionEnvelopeReason,
   type SessionExecutionEnvelope,
 } from "@braingate/goals";
-import type { NativeSessionResolver } from "@braingate/shadow";
+import { nativeDirectCapable, type MeasuredCapabilities, type NativeSessionResolver } from "@braingate/shadow";
 import type { ProviderId } from "@braingate/providers";
+import type { ModelDefinition } from "@braingate/router";
 
 /**
  * Who is doing the work, and whether they are continuing a native session.
@@ -116,6 +117,126 @@ export function resolveManualWorker(input: {
     selection: Object.freeze({ mode: "manual" as const, providerId: parsed.providerId, modelId: parsed.modelId, fresh: parsed.fresh }),
     ok: true,
     message: `Next work will go to ${parsed.providerId}/${parsed.modelId}${parsed.fresh ? " with a fresh native session" : ""}. ${continuity}. Every availability, quota, capability and isolation check still applies; /auto returns to automatic selection.`,
+  });
+}
+
+/**
+ * The CLI names `/use` accepts as a provider alias, mapped to the provider id the catalogue and
+ * router use — the same mapping `providerCliName` in `repl.ts` prints in reverse. The provider ids
+ * themselves (`xai`, `anthropic`, `openai`, `google`) are also accepted, for a session that thinks
+ * in those terms instead.
+ */
+const PROVIDER_CLI_ALIASES: Readonly<Record<string, string>> = Object.freeze({
+  grok: "xai",
+  claude: "anthropic",
+  codex: "openai",
+  antigravity: "google",
+});
+
+const KNOWN_PROVIDER_IDS: readonly string[] = Object.freeze(["xai", "anthropic", "openai", "google"]);
+
+/** `/use grok` → `xai`; `/use xai` → `xai`; anything else → `null`. Never a model id. */
+export function resolveProviderAlias(token: string): string | null {
+  const normalized = token.trim().toLowerCase();
+  if (normalized.length === 0) return null;
+  const aliased = PROVIDER_CLI_ALIASES[normalized];
+  if (aliased !== undefined) return aliased;
+  return KNOWN_PROVIDER_IDS.includes(normalized) ? normalized : null;
+}
+
+/**
+ * The strongest configured model of one provider that can actually be sent work and run under the
+ * session's current policy.
+ *
+ * "Strongest" is the model's own `capabilities.coder` score — not `reasoning` — because `coder` is
+ * the capability `CapabilityRouter` scores a `role: "coder"` request by (`packages/shadow/src/
+ * dogfood.ts`, `packages/write/src/write-runner.ts`: both name the primary role `"coder"` when they
+ * route it), and `/use <alias>` exists so the *next request*, read or write, goes to this worker.
+ * A model scored only for `planner`/`reviewer`/`judge` — real dogfood found `gemini-3.1-pro-high`,
+ * which reasons the best of any configured Google model but carries no `coder` score at all — would
+ * be picked by `reasoning` and then refused by the router with `ROUTE_MANUAL_INELIGIBLE` the moment
+ * a request actually ran, which is a worse outcome than never offering it. A tie keeps the
+ * catalogue's own order (`reduce` never replaces the current best on an equal score).
+ *
+ * The policy filter only bites for `direct`: a worktree, snapshot or unattended run does not need
+ * this provider's own native harness, so every worker-capable model of the provider is a candidate
+ * for those; DIRECT is the one policy `nativeDirectCapable` actually gates.
+ */
+export function strongestConfiguredModelFor(input: {
+  readonly providerId: string;
+  readonly candidates: readonly ModelDefinition[];
+  readonly policy: string;
+  readonly measured: MeasuredCapabilities | null;
+}): ModelDefinition | null {
+  const runnable = input.candidates.filter((entry) =>
+    entry.providerId === input.providerId
+    && entry.capabilities.coder !== undefined
+    && (input.policy !== "direct" || nativeDirectCapable(input.providerId as ProviderId, input.measured)));
+  if (runnable.length === 0) return null;
+  return runnable.reduce((best, entry) => ((entry.capabilities.coder ?? 0) > (best.capabilities.coder ?? 0) ? entry : best));
+}
+
+/**
+ * Resolves `/use grok|claude|codex|antigravity` (or a bare provider id) to the strongest configured
+ * model of that provider that can run the session's current policy.
+ *
+ * Kept separate from `resolveManualWorker`, which resolves an explicit `<provider>/<model>`: an
+ * alias is a request for BrainGate to pick, and picking needs the catalogue and the policy: neither
+ * is a fact `parseUseTarget` has.
+ */
+export function resolveAliasWorker(input: {
+  readonly alias: string;
+  readonly policy: string;
+  readonly state?: OperatorStatePaths;
+  readonly env?: NodeJS.ProcessEnv;
+  readonly measured?: MeasuredCapabilities | null;
+}): WorkerCommandResult {
+  const providerId = resolveProviderAlias(input.alias);
+  if (providerId === null) {
+    return Object.freeze({
+      selection: AUTO_WORKER,
+      ok: false,
+      message: `Unknown provider \`${input.alias}\`. Known: grok, claude, codex, antigravity (or xai, anthropic, openai, google), or /use <provider>/<model>.`,
+    });
+  }
+  let configured: readonly ModelDefinition[];
+  try {
+    const paths = input.state ?? resolveOperatorState(input.env ?? process.env);
+    configured = new ModelCatalog(paths.modelCatalogPath).configured();
+  } catch {
+    return Object.freeze({ selection: AUTO_WORKER, ok: false, message: "The model catalogue could not be read, so a strongest model cannot be chosen. Fix that first, or stay on /auto." });
+  }
+  const forProvider = configured.filter((entry) => entry.providerId === providerId);
+  if (forProvider.length === 0) {
+    return Object.freeze({
+      selection: AUTO_WORKER,
+      ok: false,
+      message: `No models are configured for ${providerId} yet. Run \`braingate discover\`, then \`braingate models add\` (or /setup).`,
+    });
+  }
+  // A model with no `coder` score is configured for review, planning or judging only — a real one
+  // routes here (M23 Phase E's own real run found `gemini-3.1-pro-high` this way) and is worth
+  // naming separately from "nothing configured at all".
+  const workerCapable = forProvider.filter((entry) => entry.capabilities.coder !== undefined);
+  if (workerCapable.length === 0) {
+    return Object.freeze({
+      selection: AUTO_WORKER,
+      ok: false,
+      message: `${forProvider.length === 1 ? "The only model" : `All ${String(forProvider.length)} models`} configured for ${providerId} (${forProvider.map((entry) => entry.modelId).join(", ")}) ${forProvider.length === 1 ? "is" : "are"} scored for review, planning or judging only — none has a \`coder\` score, so none can be sent work directly. Score one with \`braingate models add\`, or /setup.`,
+    });
+  }
+  const chosen = strongestConfiguredModelFor({ providerId, candidates: workerCapable, policy: input.policy, measured: input.measured ?? null });
+  if (chosen === null) {
+    return Object.freeze({
+      selection: AUTO_WORKER,
+      ok: false,
+      message: `None of the configured worker model(s) for ${providerId} (${workerCapable.map((entry) => entry.modelId).join(", ")}) can run under the \`${input.policy}\` policy right now.`,
+    });
+  }
+  return Object.freeze({
+    selection: Object.freeze({ mode: "manual" as const, providerId, modelId: chosen.modelId, fresh: false }),
+    ok: true,
+    message: `Next work will go to ${providerId}/${chosen.modelId} — the strongest configured model for ${providerId} that can run \`${input.policy}\` (coder ${String(chosen.capabilities.coder)} of ${workerCapable.length} configured). /auto returns to automatic selection.`,
   });
 }
 

@@ -407,6 +407,56 @@ the same model or immediately on a different one. A worker whose own native sess
 given only what changed while it was away. None of this reaches canonical memory: an answer is a
 worker's claim until the operator or the evidence makes it a finding, exactly as before.
 
+The same thread is what Up/Down in the composer read from, on an empty line: your own earlier
+requests this session, newest first, one further back each press (with Escape or Ctrl+C to clear a
+recalled draft in between). It is retrieval, not memory — nothing about it is promoted, and closing
+the terminal or `/forget` drops it exactly as it always did.
+
+### Cancelling a run in progress
+
+Ctrl+C while a provider is working — the composer shows no draft to clear because there is nothing
+to type, a task is running — kills the provider's child process and finalizes the task as
+`cancelled` (`failureKind: interrupted`) through the same handlers a real `SIGINT` to the whole
+process already used (`registerActiveRun` / `abortActiveRuns` in `packages/core`,
+`abortTrackedChildren` in `packages/shadow`). The session prints one line and returns to the
+prompt instead of exiting:
+
+```text
+> اقرأ نظام المصادقة بالكامل واشرح كل خطوة
+  read · direct · in your workspace · ...
+  Run it? [y/N] y
+
+^CCancelled. Task 1b6f2a90-... recorded as interrupted; nothing was merged.
+> /status
+  ... 1b6f2a90 · interrupted · ...
+```
+
+`/status` afterwards shows the task as interrupted, exactly like a run that lost the process to a
+real signal — this is the same finalization, run from inside the process instead of by one, so the
+ledger is never left with a task stuck `running`. Ctrl+C at an empty prompt with nothing running
+still ends the session, as it always did.
+
+### Turning a proposal into canonical memory in fewer steps
+
+`/remember <text>` still only ever creates a *proposal*: a claim the operator stated, waiting on
+evidence before a task can read it as fact. What changed is the distance to promoting one. `/memory`
+now numbers the proposals still waiting, newest first, and `/remember`'s own reply ends with the
+exact next step:
+
+```text
+> /remember the export path is set by BRAINGATE_EXPORT_DIR, not a flag
+  Recorded proposal 3f9c2b7e... (verified_fact).
+
+  It is a proposal, not memory: tasks read canonical records only. promote it with
+  /promote 1 --evidence <file>
+```
+
+`/promote <n> --evidence <file-or-url> [--confidence 0.9]` promotes proposal `n` from the numbering
+the last `/memory` (or `/remember`) printed — it is the same `memory promote` path underneath, so
+evidence is exactly as mandatory as it has always been (memory needs evidence). Numbers are a
+session convenience over the proposal's own id; they are not stable across a restart, so a numbered
+`/promote` follows a `/memory` (or a `/remember`) in the same session.
+
 ## Trying DIRECT execution on a disposable copy
 
 The ordinary loop is: run BrainGate in a directory, ask for something, and see it in your files. Use a

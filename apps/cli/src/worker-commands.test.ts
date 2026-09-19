@@ -9,7 +9,17 @@ import {
   executionScopeFor,
 } from "@braingate/core";
 import { GoalStore, computeGoalDelta, renderGoalDelta, resolveSessionDecision } from "@braingate/goals";
-import { createNativeSessionResolver, recordSessionUse, parseUseTarget, pinFor, AUTO_WORKER, describeWorker } from "./worker-commands.js";
+import type { ModelDefinition } from "@braingate/router";
+import {
+  createNativeSessionResolver,
+  recordSessionUse,
+  parseUseTarget,
+  pinFor,
+  AUTO_WORKER,
+  describeWorker,
+  resolveProviderAlias,
+  strongestConfiguredModelFor,
+} from "./worker-commands.js";
 
 
 
@@ -222,4 +232,66 @@ test("auto selection implies no pin, and /worker describes both modes", () => {
   const lines = describeWorker({ selection: AUTO_WORKER, goal: null, lastRun: null, knownSessions: [] });
   assert.match(lines.join("\n"), /Worker: auto/);
   assert.match(lines.join("\n"), /Goal: none yet/);
+});
+
+test("/use <alias> resolves grok, claude, codex, antigravity to their provider ids, and rejects anything else", () => {
+  assert.equal(resolveProviderAlias("grok"), "xai");
+  assert.equal(resolveProviderAlias("Claude"), "anthropic");
+  assert.equal(resolveProviderAlias("codex"), "openai");
+  assert.equal(resolveProviderAlias("antigravity"), "google");
+  // The provider ids themselves, for a session that thinks in those terms.
+  assert.equal(resolveProviderAlias("xai"), "xai");
+  assert.equal(resolveProviderAlias("google"), "google");
+  assert.equal(resolveProviderAlias("mistral"), null);
+  assert.equal(resolveProviderAlias(""), null);
+});
+
+/** A minimal, valid `ModelDefinition` for the strongest-model tests below. */
+function model(overrides: Partial<ModelDefinition> & { readonly providerId: string; readonly modelId: string }): ModelDefinition {
+  return {
+    quotaPool: `${overrides.providerId}-subscription`,
+    capabilities: {},
+    speed: "balanced",
+    contextCapacity: 200_000,
+    writeCapable: false,
+    reasoning: 0,
+    underlyingFamily: null,
+    ...overrides,
+  };
+}
+
+test("strongestConfiguredModelFor picks the highest `coder` score, never `reasoning` alone", () => {
+  // The exact shape M23 Phase E's own real run found: the model that reasons best (used for
+  // planner/reviewer/judge) has no `coder` score at all, and must never be offered as a worker —
+  // it would be picked, pinned, and then refused by the router with ROUTE_MANUAL_INELIGIBLE the
+  // moment a request actually tried to run on it.
+  const bestReasoner = model({ providerId: "google", modelId: "gemini-3.1-pro-high", reasoning: 95, capabilities: { planner: 88, reviewer: 82, judge: 80 } });
+  const weakerButAWorker = model({ providerId: "google", modelId: "gemini-3.8-flash-low", reasoning: 40, capabilities: { coder: 58 } });
+  const strongerWorker = model({ providerId: "google", modelId: "gemini-3.8-flash-medium", reasoning: 50, capabilities: { coder: 64 } });
+  const chosen = strongestConfiguredModelFor({
+    providerId: "google",
+    candidates: [bestReasoner, weakerButAWorker, strongerWorker],
+    policy: "worktree", // not "direct": the native-harness gate does not apply here
+    measured: null,
+  });
+  assert.equal(chosen?.modelId, "gemini-3.8-flash-medium", "the highest coder score among models that can actually be a worker");
+
+  // A provider with nothing but planner/reviewer/judge scores has no worker candidate at all.
+  assert.equal(strongestConfiguredModelFor({ providerId: "google", candidates: [bestReasoner], policy: "worktree", measured: null }), null);
+});
+
+test("strongestConfiguredModelFor gates on native DIRECT capability only for the direct policy", () => {
+  // xai has `nativeDirect: true` unconditionally, so it passes the direct-policy gate regardless
+  // of `measured`; google needs `measured.headlessReads`/`headlessShell`, both true here.
+  const grok = model({ providerId: "xai", modelId: "grok-4.6", capabilities: { coder: 80 } });
+  assert.equal(strongestConfiguredModelFor({ providerId: "xai", candidates: [grok], policy: "direct", measured: null })?.modelId, "grok-4.6");
+
+  const flash = model({ providerId: "google", modelId: "gemini-3.8-flash-medium", capabilities: { coder: 64 } });
+  assert.equal(strongestConfiguredModelFor({ providerId: "google", candidates: [flash], policy: "direct", measured: null }), null, "no measured headless permission means no DIRECT for google");
+  assert.equal(
+    strongestConfiguredModelFor({ providerId: "google", candidates: [flash], policy: "direct", measured: { toolDenial: "unknown", declaredSubagents: "unknown", sandbox: "unknown", sessionIdPinning: "unknown", headlessReads: true, headlessShell: true } })?.modelId,
+    "gemini-3.8-flash-medium",
+  );
+  // Not "direct": the gate never applies, regardless of measured.
+  assert.equal(strongestConfiguredModelFor({ providerId: "google", candidates: [flash], policy: "worktree", measured: null })?.modelId, "gemini-3.8-flash-medium");
 });

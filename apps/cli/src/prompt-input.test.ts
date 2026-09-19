@@ -28,10 +28,12 @@ class Terminal {
   rawModes: boolean[] = [];
   readonly input: PromptInput;
 
-  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number; readonly rows?: number; readonly suggest?: PromptInputOptions["suggest"] } = {}) {
+  constructor(options: { readonly terminal?: boolean; readonly onWrite?: (text: string) => void; readonly columns?: number; readonly rows?: number; readonly suggest?: PromptInputOptions["suggest"]; readonly history?: PromptInputOptions["history"]; readonly onCancel?: PromptInputOptions["onCancel"] } = {}) {
     this.input = createPromptInput({
       ...(options.suggest === undefined ? {} : { suggest: options.suggest }),
       ...(options.rows === undefined ? {} : { rows: options.rows }),
+      ...(options.history === undefined ? {} : { history: options.history }),
+      ...(options.onCancel === undefined ? {} : { onCancel: options.onCancel }),
       input: {
         on: (event: string, listener: never) => {
           if (event === "data") this.#data.push(listener);
@@ -1394,4 +1396,125 @@ test("W2: the classifier receives exactly the visible buffer, after paste, navig
   assert.equal(secondSubmitted, secondVisible, "what was submitted is what was on screen");
   assert.equal(secondSubmitted.trim(), "Delete the temporary file.", "the instruction is what remains");
   assert.equal(classifyRequestIntent(secondSubmitted), "write", "and it is a write");
+});
+
+// ---------------------------------------------------------------- Phase E: history, escape, cancel
+
+test("history: Up on an empty draft recalls the session's requests, newest first", async () => {
+  const requests = ["most recent request", "older request"];
+  const terminal = new Terminal({ history: () => requests });
+  const pending = terminal.input.ask("> ");
+  terminal.chunk("\u001b[A");
+  await terminal.input.idle();
+  terminal.enter();
+  assert.equal(await pending, "most recent request", "the first Up recalls the newest request");
+});
+
+test("history: repeated Up, with a clear in between, walks further back each time", async () => {
+  const requests = ["newest", "middle", "oldest"];
+  const terminal = new Terminal({ history: () => requests });
+  const pending = terminal.input.ask("> ");
+  terminal.chunk("\u001b[A");
+  await terminal.input.idle();
+  // A second Up over a non-empty (single-line) draft is ordinary line movement, not a further
+  // recall — the composer cannot tell "still browsing history" from "editing this line" except by
+  // whether the draft is empty, and a single line has nowhere for that movement to go.
+  terminal.chunk("\u001b[A");
+  await terminal.input.idle();
+  assert.equal(terminal.written().includes("middle"), false, "a second Up did not skip ahead in history");
+  // Ctrl+C clears the recalled draft back to empty, and Up from there resumes one entry further
+  // back — this is how the composer's own history is walked, entry by entry.
+  terminal.chunk("\u0003");
+  await terminal.input.idle();
+  terminal.chunk("\u001b[A");
+  await terminal.input.idle();
+  terminal.chunk("\u0003");
+  await terminal.input.idle();
+  terminal.chunk("\u001b[A");
+  await terminal.input.idle();
+  terminal.enter();
+  assert.equal(await pending, "oldest", "three Up presses, each after a clear, reach the third entry");
+});
+
+test("history: typing after a recall resets the walk back to the newest entry", async () => {
+  const requests = ["newest", "oldest"];
+  const terminal = new Terminal({ history: () => requests });
+  const pending = terminal.input.ask("> ");
+  terminal.chunk("\u001b[A"); // recall "newest"
+  await terminal.input.idle();
+  terminal.chunk("\u0003"); // clear it
+  await terminal.input.idle();
+  terminal.type("x");
+  terminal.chunk("\u007f"); // typed and then removed: draft is empty again, but history is not
+  await terminal.input.idle();
+  terminal.chunk("\u001b[A");
+  await terminal.input.idle();
+  terminal.enter();
+  assert.equal(await pending, "newest", "editing invalidated the walk, so Up starts over from the newest");
+});
+
+test("history: Down with nothing recalled is a no-op on an empty draft, and ordinary movement in one", async () => {
+  const terminal = new Terminal({ history: () => ["only request"] });
+  const pending = terminal.input.ask("> ");
+  terminal.chunk("\u001b[B"); // Down before any Up: nothing to recall
+  await terminal.input.idle();
+  terminal.paste("line one\nline two"); // a paste, not typed Enters, is how a multi-line draft is built
+  await terminal.input.idle();
+  terminal.chunk("\u001b[B"); // already on the last line: ordinary moveDown no-ops
+  await terminal.input.idle();
+  terminal.enter();
+  assert.equal(await pending, "line one\nline two", "Down never recalled anything, and the pasted draft is unchanged");
+});
+
+test("history: inside a non-empty draft, Up and Down still move between lines", async () => {
+  const terminal = new Terminal({ history: () => ["should not appear"] });
+  const pending = terminal.input.ask("> ");
+  terminal.paste("first line\nsecond line");
+  await terminal.input.idle();
+  terminal.chunk("\u001b[H"); // Home: to the start of the second line, where the paste left the cursor
+  terminal.chunk("\u001b[A"); // Up, at column 0: to the start of the first line — a line move, not a history recall
+  terminal.type("X");
+  await terminal.input.idle();
+  terminal.enter();
+  const submitted = await pending;
+  assert.notEqual(submitted, null);
+  assert.equal(submitted?.includes("should not appear"), false, "history was never consulted for a non-empty draft");
+  assert.equal(submitted, "Xfirst line\nsecond line", "Up moved to the first line's start, where X was inserted");
+});
+
+test("Escape clears a recalled draft, and otherwise does nothing", async () => {
+  const terminal = new Terminal({ history: () => ["recalled text"] });
+  const pending = terminal.input.ask("> ");
+  // Escape at an empty prompt: no draft to clear, no session-ending side effect either.
+  terminal.chunk("\u001b");
+  await terminal.input.idle();
+  terminal.chunk("\u001b[A"); // recall "recalled text"
+  await terminal.input.idle();
+  terminal.chunk("\u001b"); // Escape clears it
+  await terminal.input.idle();
+  terminal.type("fresh request");
+  terminal.enter();
+  assert.equal(await pending, "fresh request", "the recalled draft is gone and typing works normally");
+});
+
+test("Ctrl+C with no question pending calls onCancel instead of ending the session", async () => {
+  let cancelled = 0;
+  const terminal = new Terminal({ onCancel: () => { cancelled += 1; } });
+  // Nothing is asking anything right now — the state a provider call leaves the composer in.
+  terminal.chunk("\u0003");
+  await terminal.input.idle();
+  assert.equal(cancelled, 1, "onCancel ran exactly once");
+
+  // The session itself is still open: the next `ask` gets a real answer, not `null`.
+  const pending = terminal.input.ask("> ");
+  terminal.type("still here");
+  terminal.enter();
+  assert.equal(await pending, "still here");
+});
+
+test("Ctrl+C at an empty prompt still ends the session when nothing is running", async () => {
+  const terminal = new Terminal({ onCancel: () => { throw new Error("must not be called with a question pending"); } });
+  const pending = terminal.input.ask("> ");
+  terminal.chunk("\u0003");
+  assert.equal(await pending, null, "Ctrl+C at an idle prompt keeps its old meaning: it ends the session");
 });

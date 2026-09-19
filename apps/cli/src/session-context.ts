@@ -130,6 +130,17 @@ export class SessionContext {
   }
 
   /**
+   * This session's own requests, newest first — for the composer's Up/Down history recall.
+   *
+   * Never memory: these are the same turns `/forget` drops and the thread's own lifetime expires,
+   * not a canonical record. `record` already redacts and bounds them, so recalling one into the
+   * draft hands back exactly what a later renderer would have shown, nothing more.
+   */
+  requests(): readonly string[] {
+    return Object.freeze([...this.#turns].reverse().map((turn) => turn.request));
+  }
+
+  /**
    * The turns that fit within a token ceiling, most recent first in priority.
    *
    * The ceiling is a share of the task's own context budget, matching how project memory is

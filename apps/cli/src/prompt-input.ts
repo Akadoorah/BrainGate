@@ -227,6 +227,24 @@ export interface PromptInputOptions {
    * commands: the session does, and a test can pass any table it likes.
    */
   readonly suggest?: (draft: string) => readonly { readonly label: string; readonly hint: string; readonly insert: string }[];
+  /**
+   * This session's earlier requests, newest first, for Up/Down recall on an empty draft.
+   *
+   * Read lazily — called again on every Up/Down rather than snapshotted once — because the session
+   * behind it keeps growing while the composer is open, and a request submitted a minute ago should
+   * be one keystroke away without restarting the composer.
+   */
+  readonly history?: () => readonly string[];
+  /**
+   * Ctrl+C with no question pending: a provider is working and there is nothing to answer.
+   *
+   * The composer cannot itself tell "waiting for a request" from "a request is running" — both look
+   * like no draft and no prompt from here — so it defers to this hook when one is supplied, and
+   * keeps its old meaning (end the session) when it is not. Given, this is *not* also called for a
+   * non-empty draft: Ctrl+C over a draft — typed or recalled — always clears it first, on the theory
+   * that a person who has started typing wants their typing gone before anything else happens.
+   */
+  readonly onCancel?: () => void;
 }
 
 export interface PromptInput {
@@ -390,6 +408,16 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   let draft = "";
   /** Where editing happens, as a UTF-16 index into `draft`, always on a grapheme boundary. */
   let cursor = 0;
+  /**
+   * How far back Up/Down have walked into `options.history()`, or `null` before the first recall.
+   *
+   * Survives a clear (Ctrl+C or Escape) on purpose: "Up, clear, Up" is how this walks further back
+   * through history, one entry per press, the way a shell's own history does. It is reset by actually
+   * typing or editing something, because at that point the draft is the operator's own words again
+   * and the next Up should start over from the newest request, not continue where a different draft
+   * left off.
+   */
+  let historyIndex: number | null = null;
   /** The question of the ask currently waiting, or `null` between asks. */
   let prompt: string | null = null;
   let waiter: ((answer: string | null) => void) | null = null;
@@ -503,12 +531,15 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   /** Inserts text at the cursor — typed or pasted — and repaints. */
   const insert = (text: string): void => {
     if (text.length === 0) return;
+    // Typing is the operator overriding whatever Up/Down last recalled; the next Up starts fresh.
+    historyIndex = null;
     draft = draft.slice(0, cursor) + text + draft.slice(cursor);
     cursor += text.length;
     redraw();
   };
 
   const submit = (): void => {
+    historyIndex = null;
     // Every grapheme of the buffer, exactly as composed, and exactly once.
     const answer = draft;
     draft = "";
@@ -545,6 +576,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     // At the beginning this is a no-op — and a no-op that writes nothing, so the terminal is not
     // repainted for a keystroke that changed nothing.
     if (removed.length === 0) return;
+    historyIndex = null;
     draft = draft.slice(0, cursor - removed.length) + draft.slice(cursor);
     cursor -= removed.length;
     redraw();
@@ -553,6 +585,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   const deleteForward = (): void => {
     const removed = atCursor();
     if (removed.length === 0) return;
+    historyIndex = null;
     draft = draft.slice(0, cursor) + draft.slice(cursor + removed.length);
     redraw();
   };
@@ -601,6 +634,36 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     const { line, offset } = lineAndColumn();
     if (line >= draft.split(LF).length - 1) return;
     placeCursor(line + 1, offset);
+  };
+
+  /** Replaces the whole draft with recalled text, cursor at the end — never through `insert`, which would reset the very index this is walking. */
+  const recallHistory = (text: string): void => {
+    draft = text;
+    cursor = draft.length;
+    redraw();
+  };
+
+  /**
+   * Up: on an empty draft, the session's own requests, newest first, one further back each press
+   * (surviving a clear in between, per `historyIndex`'s own doc); on anything already typed or
+   * recalled, the ordinary line movement `moveUp` always did.
+   */
+  const historyUp = (): void => {
+    if (draft.length > 0) { moveUp(); return; }
+    const entries = options.history?.() ?? [];
+    if (entries.length === 0) return;
+    historyIndex = historyIndex === null ? 0 : Math.min(historyIndex + 1, entries.length - 1);
+    recallHistory(entries[historyIndex] ?? "");
+  };
+
+  /** Down: the mirror of `historyUp` — one entry newer, or back to empty at the newest. */
+  const historyDown = (): void => {
+    if (draft.length > 0) { moveDown(); return; }
+    if (historyIndex === null) return;
+    if (historyIndex === 0) { historyIndex = null; recallHistory(""); return; }
+    historyIndex -= 1;
+    const entries = options.history?.() ?? [];
+    recallHistory(entries[historyIndex] ?? "");
   };
 
   const moveHome = (): void => {
@@ -666,10 +729,10 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
           moveRight();
           break;
         case "up":
-          moveUp();
+          historyUp();
           break;
         case "down":
-          moveDown();
+          historyDown();
           break;
         case "home":
           moveHome();
@@ -677,8 +740,16 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
         case "end":
           moveEnd();
           break;
+        case "escape":
+          // Escape only ever clears; at an empty prompt or mid-run it does nothing, unlike Ctrl+C.
+          if (draft.length > 0) clearDraft();
+          break;
         case "interrupt":
-          if (draft.length > 0) clearDraft(); else endSession();
+          if (draft.length > 0) { clearDraft(); break; }
+          // No draft to clear. A pending question still ends the session, exactly as it always did;
+          // a provider working with nothing pending is the one case `onCancel` exists for.
+          if (waiter === null && options.onCancel !== undefined) options.onCancel();
+          else endSession();
           break;
         case "eof":
           if (draft.length === 0) endSession();
@@ -696,7 +767,7 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   };
 
   type Token =
-    | { readonly kind: "text" | "submit" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "interrupt" | "eof" | "tab" | "ignore"; readonly text: string; readonly length: number }
+    | { readonly kind: "text" | "submit" | "backspace" | "delete" | "left" | "right" | "up" | "down" | "home" | "end" | "interrupt" | "eof" | "tab" | "escape" | "ignore"; readonly text: string; readonly length: number }
     | { readonly kind: "paste-start"; readonly text: string; readonly length: number };
 
   /** The movement and editing keys this composer implements, by the sequence a terminal sends. */
@@ -721,6 +792,16 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   function nextToken(text: string): Token | null {
     if (text.length === 0) return null;
     if (text.startsWith(PASTE_START)) return { kind: "paste-start", text: PASTE_START, length: PASTE_START.length };
+    // A bare Escape keypress, checked before the paste-marker "still arriving" hold below — a lone
+    // ESC byte is also a one-byte prefix of `PASTE_START`, and without this it would be held forever
+    // waiting for a `[200~` that a real Escape key never sends. Measured on this stack: every
+    // sequence this composer recognises — arrow keys, Home/End, Delete, a bracketed paste's markers
+    // — arrives whole in one `data` event, never as a lone ESC first and the rest in a later one. So
+    // an ESC with nothing queued behind it in the *current* buffer is the key on its own, and it is
+    // turned into a token immediately rather than held for a byte that is not coming. (A stack where
+    // that measurement no longer holds would need this reconsidered — see the module comment on why
+    // nothing here uses a timer instead.)
+    if (text === "\u001b") return { kind: "escape", text, length: 1 };
     const held = partialMarkerPrefix(text, PASTE_START);
     if (held.length > 0 && held.length === text.length) return null;
     for (const [sequences, kind] of KEYS) {
