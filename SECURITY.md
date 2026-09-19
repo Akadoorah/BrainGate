@@ -11,10 +11,7 @@ measured against.
 **Report privately, not through a public GitHub issue.** A public issue on a project that drives
 other people's AI coding CLIs and touches their source code is itself a disclosure.
 
-<!-- TODO(operator): replace this placeholder before the technical preview is announced publicly.
-     A GitHub private security advisory ("Report a vulnerability" under the repository's Security
-     tab) or a dedicated security-contact mailbox both work; pick one and remove this comment. -->
-- **Contact:** *(operator to fill in — no disclosure contact is published yet)*
+- **Contact:** sales@tec-ads.com
 
 Please include:
 
