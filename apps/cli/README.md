@@ -14,7 +14,7 @@ From the monorepo:
 
 ```bash
 pnpm install
-pnpm --filter @braingate/cli start -- help
+pnpm --filter braingate start -- help
 ```
 
 After linking/installing the workspace binary you can use `braingate ...` directly.

@@ -147,6 +147,76 @@ Two milestones that exist because dogfooding found them, not because a plan pred
     unmeasured boundary. ADR [0017](adr/0017-direct-execution.md). Next: re-measuring those three
     invocations against the installed builds, and an explicit commit workflow.
 
+## Milestone 21 — Native multi-provider DIRECT control plane ✅
+
+Re-measured the DIRECT invocation for Codex, Grok and Antigravity against the installed builds and
+opened DIRECT writes for all three, not only Claude. Native session continuity now covers every
+runtime that reports its own session id, and one goal is reachable across all four providers rather
+than three. Codex's DIRECT read gained the external schema it needs; Antigravity's DIRECT path was
+found blocked by its own headless tool denial and marked so rather than assumed open — the
+measurement M22 later acted on.
+
+## Milestone 22 — Every installed CLI runs DIRECT ✅
+
+Closed what M21 found blocked: Antigravity DIRECT now reads its own settings
+(`~/.gemini/antigravity-cli/settings.json`) to decide whether headless reads and shell commands are
+allowed, rather than being closed by default (ADR
+[0020](adr/0020-antigravity-direct-is-read-from-its-own-settings.md)) — BrainGate reads that file
+and never writes it. The execution-policy gate now applies to every role a task plans, not only the
+primary, and routing considers the task, the chosen policy, and the goal's own native sessions
+together rather than the task alone. The Arabic real-run harness that has found every real defect so
+far found and fixed the ones the fakes hid here too (`memory/fakes-prove-intent-not-outcome`).
+
+## Milestone 23 — First run in ten minutes, and every weakness closed
+
+The operator's own list of what still made BrainGate a demo rather than a daily tool, after M22 —
+executed as one phase per PR, Opus for the hard phases and Sonnet for CLI/UX/docs, a real Arabic
+session gating each one. Full plan: `docs/adr/0021-big-writes-and-default-profiles.md` and the
+milestone's own plan document.
+
+- **M23-A — First run in ten minutes.** ✅ (merged) Default model capability profiles per known
+  model family, adopted only on the operator's say-so and never overwriting a score the operator
+  set; a four-question setup wizard (register, adopt, accept Antigravity where relevant, reviewer
+  policy) that replaces hand-authoring a model-catalog JSON entry before BrainGate can do anything;
+  workspace-scoped session preferences (`policy`, `reviewAlways`) kept beside the thread rather than
+  in the identity manifest.
+- **M23-B — Big writes escalate, never refused, never DIRECT.** ✅ (merged) A T3/T4 or
+  high/critical-risk write no longer fails outright: asked for DIRECT it escalates to an isolated
+  worktree with a cross-provider-only reviewer, and it is refused by name only when no second
+  provider is signed in — never run unreviewed, never in the operator's checkout. ADR
+  [0021](adr/0021-big-writes-and-default-profiles.md).
+- **M23-C — Nothing is silent while a provider works.** ✅ (merged) Codex and Antigravity streaming
+  dialects, measured against real runs and dated; the REPL's working indicator names the provider
+  and elapsed time.
+- **M23-D — The route explains itself, quota state is visible.** Complete, pushed
+  (`feat/m23-d-why-and-quota`), not yet merged to `main`. `/why` shows the last plan's route per
+  role — the winner's own reasons and every rejected candidate's; active refusal backoffs are shown
+  as BrainGate's own decision, never a provider limit (ADR
+  [0012](adr/0012-quota-state-is-native-only.md)); refusals in the session collapse to one line
+  with the full text still behind `--json`.
+- **M23-E — Fewer keystrokes.** Complete, pushed (`feat/m23-e-fewer-keystrokes`), not yet merged.
+  `/use grok|claude|codex|antigravity` provider aliases; Up/Down request history on an empty
+  composer line; "did you mean" for a near-miss slash command; `/promote <n> --evidence <file>`;
+  Ctrl+C cancels the running task instead of exiting the session.
+- **M23-F — Ship a technical preview.** Complete, pushed (`feat/m23-f-technical-preview`), not yet
+  merged, dated 2026-09-19. `apps/cli` gained a `build` script (esbuild, `better-sqlite3` kept
+  external) and a `pnpm pack` tarball proven with a real `npm install -g` smoke test under a
+  throwaway `HOME`; the README was rewritten around the ten-minute path with a new "Responsible
+  use" section and a current Arabic translation; `docs/PROVIDER_POLICY_AUDIT.md` states exactly how
+  BrainGate invokes each of Claude Code, Codex, Grok and Antigravity; `LICENSE` (Apache-2.0),
+  `SECURITY.md`, and `CONTRIBUTING.md` were added; a dependency license scan and a Git-history scan
+  for secrets and personal data were run and recorded in
+  [`docs/PUBLIC_RELEASE_CHECKLIST.md`](PUBLIC_RELEASE_CHECKLIST.md) (the latter surfaced the
+  operator's real email in existing pushed commit history, which needs the operator's decision —
+  history was not rewritten). This closes the code/docs items in that checklist that did not need a
+  legal or business decision; it does not itself make BrainGate publicly released — see that
+  document for what remains and why.
+
+Once D, E and F are merged, what M23 leaves open for the next milestone: automated review/council
+execution beyond the T4 disagreement path, a web dashboard, and the broader native-capability
+overlays ADR 0014 classifies — plus everything `docs/PUBLIC_RELEASE_CHECKLIST.md` still lists as
+unchecked.
+
 ## Immediate technical hardening
 
 - Grow the labeled regression corpus across Waslo, SaudiGPT, Viral-X, and Tabaq AI.

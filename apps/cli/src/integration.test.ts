@@ -21,7 +21,7 @@ import { ProjectRegistry, executionScopeFor } from "@braingate/core";
  *
  * These tests spend real subscription quota, so they are opt-in and never run in CI:
  *
- *   BRAINGATE_INTEGRATION=1 pnpm --filter @braingate/cli test
+ *   BRAINGATE_INTEGRATION=1 pnpm --filter braingate test
  *
  * They assert outcomes, not arguments: an answer that could only come from reading this
  * repository, and a file whose bytes actually changed.

@@ -17,9 +17,10 @@ BrainGate is a private pre-alpha project for coordinating official AI coding CLI
 [한국어](docs/i18n/README.ko.md) ·
 [हिन्दी](docs/i18n/README.hi.md)
 
-English is the source of truth. Translations cover installation and first use; the rest of
-this document and everything under `docs/` is English only. They predate the current product
-position and are being brought up to date one at a time.
+English is the source of truth. Translations cover installation, the ten-minute path, the command
+table and responsible use; the rest of this document and everything under `docs/` is English only.
+[العربية](docs/i18n/README.ar.md) is current as of this release; the others predate the current
+product position and are being brought up to date one at a time.
 
 ---
 
@@ -114,7 +115,29 @@ sessions where Claude keeps them, Grok where Grok does. BrainGate records a refe
 continues whether or not a session can be resumed — a runtime with no way to name a session still
 gets the goal.
 
-## Using it
+## The ten-minute path
+
+Six steps, start to finish, all of them inside the same session:
+
+1. **Install** (below) and sign in to at least one provider CLI with your own subscription.
+2. **Run `braingate` in a project directory.** The first run is a wizard: it registers the
+   directory, discovers what your subscriptions expose, offers starting model scores, and asks
+   about Antigravity and reviewers where it needs to. At most four questions; everything else is
+   printed as assumed.
+3. **Ask something.** A plain question is a read-only task. The plan is shown — classification,
+   which worker would run it — before anything is spent, and `y` confirms it.
+4. **Ask for a small change.** A write is planned the same way; a small one runs `write · direct`
+   in your workspace, and you keep, amend or discard it in your own shell.
+5. **Run `/why`.** It shows the plan that just ran: which worker won the role and its own reasons,
+   and every candidate that was set aside and why — the router's reasoning made inspectable rather
+   than trusted blind.
+6. **Run `/promote <n> --evidence <file>`** on something `/memory` or `/remember` listed, once you
+   have evidence for it. That is the one gate a claim crosses to become project memory instead of a
+   conversation nobody can find again next week.
+
+That is the whole loop this tool is for: plan, confirm, inspect, and only then remember. What
+follows is the same walk in more detail, and the reference sections below it cover everything the
+wizard assumed on your behalf.
 
 The first run is a wizard. It asks at most four questions, prints everything it assumed, and every
 answer is changeable afterwards with a slash command.
@@ -280,6 +303,35 @@ separate decisions:
 
 ADR [0014](docs/adr/0014-native-runtime-preservation.md) states the principle and classifies every
 restriction that exists today, including the ones BrainGate intends to lift and why.
+
+## Responsible use
+
+BrainGate spends subscriptions, not tokens it resells, and that only holds if it is run the way it
+was designed:
+
+- **Your own accounts, on your own machine.** Sign the provider CLIs in with subscriptions you are
+  independently authorized to use. BrainGate has no mechanism to pool, share, or proxy an account
+  across people or machines, and is not built to be used that way.
+- **No sharing or pooling.** Presenting one subscription as several independent quota authorities,
+  or running BrainGate against an account that is not yours, is outside what this tool does and
+  outside most providers' terms.
+- **A refusal is a stop, not a puzzle to route around.** When a provider CLI refuses, rate-limits, or
+  reports a quota exhausted, BrainGate backs off and reports that as its own decision
+  (ADR [0012](docs/adr/0012-quota-state-is-native-only.md)) — it never retries past the refusal,
+  never rotates credentials to get around it, and never treats a provider's limit as an obstacle to
+  engineer past.
+- **Each provider's terms are yours to keep.** BrainGate runs the official CLI you already signed
+  into, the way that CLI is documented to run non-interactively, and nothing else. It does not
+  interpret, relax, or override any provider's terms of service; whether a particular use is allowed
+  under your subscription is between you and that provider.
+- **No API keys, ever.** BrainGate does not ask for, accept, or store a provider API key. It strips
+  known API-key and base-URL environment variables from the subprocesses it starts, so a stray key
+  left in your shell cannot silently move a run onto per-token billing.
+
+This is spelled out here because a technical preview is the point where people other than the
+author run the software, and these assumptions are load-bearing, not incidental. See
+[`docs/PROVIDER_POLICY_AUDIT.md`](docs/PROVIDER_POLICY_AUDIT.md) for exactly how each supported CLI
+is invoked today.
 
 ## Cost
 
@@ -501,6 +553,12 @@ changes behaviour. The flag interface below is unchanged and remains the scripti
 
 ## Quickstart
 
+This is the same ten-minute path as flags instead of the wizard — useful in a script, in CI, or
+on a non-TTY shell where the interactive session does not start one. `braingate init` on a real
+terminal runs the wizard shown above, adopts discovered models with starting scores, and skips
+step 2 below entirely; reach for step 2 only when you are scripting the setup or adding a model
+the wizard did not discover.
+
 **1. Check what BrainGate can see.** Sign in with each provider's own CLI first (`claude`,
 `codex login`, and so on), then:
 
@@ -510,34 +568,7 @@ braingate discover
 
 Authentication that cannot be proven is reported as `unknown` rather than assumed.
 
-**2. Configure the model catalog.** BrainGate does not invent model ids, context capacities, or
-capability scores, so you declare the models you want it to route to. The catalog is global:
-configure it once and every project uses it.
-
-```bash
-cat > claude-model.json <<'JSON'
-{
-  "providerId": "anthropic",
-  "modelId": "<MODEL_ID_YOU_HAVE_VERIFIED>",
-  "quotaPool": "claude-subscription",
-  "capabilities": { "coder": 88, "reviewer": 84, "judge": 82 },
-  "speed": "balanced",
-  "contextCapacity": 200000,
-  "writeCapable": true,
-  "reasoning": 85,
-  "underlyingFamily": null
-}
-JSON
-
-braingate models add --definition claude-model.json
-braingate models profile
-```
-
-Add one entry per model you want available. `speed` is `fast`, `balanced`, or `deep`, and it is
-the cheap-first lever: `fast` is favoured on simple tasks, `deep` on hard ones. The scores are
-your routing policy — see [`docs/ROUTING_AND_REVIEW.md`](docs/ROUTING_AND_REVIEW.md).
-
-**3. Register a workspace.**
+**2. Register a workspace.**
 
 ```bash
 cd /path/to/your/project
@@ -625,13 +656,13 @@ run in, and where the state lives — so you can verify where BrainGate is opera
 your files directly. BrainGate tells you which files changed, by whom, and under which policy, and
 makes no commit. Committing stays your decision, in your own shell.
 
-**4. Check readiness. This spends nothing.**
+**3. Check readiness. This spends nothing.**
 
 ```bash
 braingate dogfood preflight
 ```
 
-**5. Ask a question.** Always plan first: a plan makes no provider call and shows you the
+**4. Ask a question.** Always plan first: a plan makes no provider call and shows you the
 classification, which model would run, and whether a reviewer is required.
 
 ```bash
@@ -641,13 +672,13 @@ braingate dogfood ask run  --task "Where is the theme configuration defined?" --
 
 `--execute` is the only gate that reaches a model. Nothing before it costs quota.
 
-**6. Record what the task actually turned out to be.** This is how routing improves.
+**5. Record what the task actually turned out to be.** This is how routing improves.
 
 ```bash
 braingate dogfood feedback --task-id <TASK_UUID> --actual-complexity T1 --outcome success
 ```
 
-**7. Make a small change.** Writes need a clean checkout, and they land in a task worktree —
+**6. Make a small change.** Writes need a clean checkout, and they land in a task worktree —
 never in your working tree.
 
 ```bash
@@ -657,6 +688,38 @@ braingate dogfood write run  --task "Change the empty-state label from X to Y" -
 
 Review the branch it reports and merge it yourself if you want it. BrainGate performs no merge,
 push, or deploy.
+
+### Manual model catalog entries (advanced)
+
+The wizard adopts what it discovers automatically (ADR
+[0021](docs/adr/0021-big-writes-and-default-profiles.md)); reach for this only in a script, in
+CI, or to add a model the wizard did not find or to score one yourself. BrainGate does not invent
+model ids, context capacities, or capability scores — you declare each one. The catalog is
+global: configure it once and every project uses it.
+
+```bash
+cat > claude-model.json <<'JSON'
+{
+  "providerId": "anthropic",
+  "modelId": "<MODEL_ID_YOU_HAVE_VERIFIED>",
+  "quotaPool": "claude-subscription",
+  "capabilities": { "coder": 88, "reviewer": 84, "judge": 82 },
+  "speed": "balanced",
+  "contextCapacity": 200000,
+  "writeCapable": true,
+  "reasoning": 85,
+  "underlyingFamily": null
+}
+JSON
+
+braingate models add --definition claude-model.json
+braingate models profile
+```
+
+`speed` is `fast`, `balanced`, or `deep`, and it is the cheap-first lever: `fast` is favoured on
+simple tasks, `deep` on hard ones. An entry you score yourself is never overwritten by a later
+`/setup` or `braingate init --adopt-models` — see
+[`docs/ROUTING_AND_REVIEW.md`](docs/ROUTING_AND_REVIEW.md).
 
 ## What it will and will not do
 
