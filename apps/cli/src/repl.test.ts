@@ -330,14 +330,20 @@ test("the confirmation shows what each role may do, not only which model was cho
   assert.deepEqual([...grantLines("T0/low · primary=anthropic/claude-haiku-4-5")], []);
 });
 
-test("the indicator names the role, the model and the pool being spent", () => {
+test("the indicator names the role, the CLI, the model and the pool being spent", () => {
   assert.equal(
-    activityLabel({ role: "planner", model: "grok-4.6", quotaPool: "grok-subscription" }),
-    "planning · grok-4.6 · grok-subscription",
+    activityLabel({ role: "planner", provider: "xai", model: "grok-4.6", quotaPool: "grok-subscription" }),
+    "planning · grok · grok-4.6",
   );
+  // Codex spends a ChatGPT subscription, which its own name does not say, so the pool stays.
   assert.equal(
-    activityLabel({ role: "reviewer", model: "gpt-6-astra", quotaPool: "chatgpt-subscription" }),
-    "reviewing · gpt-6-astra · chatgpt-subscription",
+    activityLabel({ role: "reviewer", provider: "openai", model: "gpt-6-astra", quotaPool: "chatgpt-subscription" }),
+    "reviewing · codex · gpt-6-astra · chatgpt-subscription",
+  );
+  // The CLI the operator signed into, not the vendor behind it: nobody waits on "google".
+  assert.equal(
+    activityLabel({ role: "primary", provider: "google", model: "gemini-3.8-flash-medium", quotaPool: "antigravity-subscription" }),
+    "working · antigravity · gemini-3.8-flash-medium",
   );
   // A role with no better verb still says which model is spending the time.
   assert.match(activityLabel({ role: "primary", model: "claude-sonnet-5", quotaPool: "claude-subscription" }), /^working · claude-sonnet-5/);

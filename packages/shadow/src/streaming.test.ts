@@ -15,12 +15,92 @@ const GROK_THOUGHT = '{"type":"thought","data":"The user"}';
 const GROK_TOOLS = '{"type":"available_commands","tools":["read_file","grep"]}';
 const GROK_END = '{"type":"end","stopReason":"end_turn","usage":{"input_tokens":22448,"output_tokens":37}}';
 
+/**
+ * Lines copied from a real `codex exec --json -C <dir> --sandbox read-only --model gpt-6-astra -`
+ * run, codex-cli 0.153.4, 2026-09-19, on a throwaway repository holding one canary file.
+ *
+ * There are no deltas in this stream and no flag that produces any: `--json` prints whole events,
+ * so the finest granularity this build offers is one completed item at a time.
+ */
+const CODEX_THREAD = '{"type":"thread.started","thread_id":"01a0ba7c-5dce-7fd2-a002-953a9aa9d711"}';
+const CODEX_TURN_STARTED = '{"type":"turn.started"}';
+const CODEX_NARRATION = '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I\'ll read canary.txt for the ID.\\n"}}';
+const CODEX_COMMAND_STARTED = '{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \'cat canary.txt\'","aggregated_output":"","exit_code":null,"status":"in_progress"}}';
+const CODEX_COMMAND_DONE = '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \'cat canary.txt\'","aggregated_output":"The distinctive id is BG-CANARY-7741-ZQ.\\nSecond line: the project name is Rehla.\\n","exit_code":0,"status":"completed"}}';
+const CODEX_ANSWER = '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"The distinctive ID is BG-CANARY-7741-ZQ."}}';
+const CODEX_TURN_COMPLETED = '{"type":"turn.completed","usage":{"input_tokens":45225,"cached_input_tokens":29440,"cache_write_input_tokens":0,"output_tokens":65,"reasoning_output_tokens":0}}';
+
+/**
+ * Lines copied from a real
+ * `agy --output-format stream-json --model gemini-3.8-flash-medium --effort medium -p='…'` run,
+ * agy 1.2.7, 2026-09-19, same repository. Truncated only where a field held a whole file.
+ */
+const AGY_INIT = '{"event":"init","conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","init":{"model":"gemini-3.8-flash-medium","cwd":"/tmp/repo","tools":["ask_permission","run_command","view_file"]}}';
+const AGY_TOOL_ACTIVE = '{"event":"step_update","step_update":{"conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","step_index":2,"state":"ACTIVE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"ls -la"}}}}';
+const AGY_TOOL_DONE = '{"event":"step_update","step_update":{"conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","duration_seconds":0.162732,"tool_info":{"name":"run_command","parameters":{"CommandLine":"ls -la"},"output":"total 0\\r\\ndrwxr-xr-x  …"}}}';
+const AGY_DELTA = (index: number, text: string) => `{"event":"step_update","step_update":{"conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","step_index":${String(index)},"state":"ACTIVE","step_type":"agent_response","text_delta":${JSON.stringify(text)}}}`;
+const AGY_STEP_DONE = '{"event":"step_update","step_update":{"conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","step_index":1,"state":"DONE","step_type":"agent_response","duration_seconds":2.759107,"usage":{"input_tokens":11891,"output_tokens":493,"thinking_tokens":392,"cache_read_tokens":0,"total_tokens":12384}}}';
+const AGY_RESULT = '{"event":"result","result":{"conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","status":"SUCCESS","response":"The distinctive ID is `BG-CANARY-7741-ZQ`.\\n","duration_seconds":18.739201,"num_turns":1,"usage":{"input_tokens":79004,"output_tokens":1501,"thinking_tokens":876,"cache_read_tokens":0,"total_tokens":80505}}}';
+
 test("a provider whose stream shape nobody has watched has no dialect", () => {
   assert.equal(streamDialectFor("anthropic"), "anthropic");
   assert.equal(streamDialectFor("xai"), "xai");
-  assert.equal(streamDialectFor("google"), null);
-  assert.equal(streamDialectFor("openai"), null);
+  // Watched on 2026-09-19, one real read each; the fixtures above are those runs.
+  assert.equal(streamDialectFor("google"), "google");
+  assert.equal(streamDialectFor("openai"), "openai");
   assert.equal(streamDialectFor("github-copilot"), null);
+});
+
+test("Codex streams whole messages, and the answer of record survives the thinning", () => {
+  const reader = new ProviderStreamReader("openai");
+  // The session id and the accounting are read from the retained output after the run.
+  assert.equal(reader.read(CODEX_THREAD).retain, true);
+  assert.equal(reader.read(CODEX_TURN_STARTED).retain, false);
+
+  const narration = reader.read(CODEX_NARRATION);
+  assert.equal(narration.answer, "I'll read canary.txt for the ID.\n", "the narration reaches the terminal while the run is still working");
+  assert.equal(narration.retain, true, "every agent_message is retained: the parse reads the last one");
+
+  // A `cat` of the workspace is not an answer and nothing reads it back, so it costs no cap.
+  assert.equal(reader.read(CODEX_COMMAND_STARTED).retain, false);
+  const commandDone = reader.read(CODEX_COMMAND_DONE);
+  assert.equal(commandDone.retain, false);
+  assert.equal(commandDone.answer, null);
+
+  const answer = reader.read(CODEX_ANSWER);
+  assert.equal(answer.answer, "The distinctive ID is BG-CANARY-7741-ZQ.");
+  // Without this the answer of record would be the narration with the answer glued to it.
+  assert.equal(answer.restart, true);
+  assert.equal(reader.read(CODEX_TURN_COMPLETED).retain, true);
+});
+
+test("a Codex reasoning item is activity, never an answer", () => {
+  const verdict = readStreamLine("openai", '{"type":"item.completed","item":{"id":"item_3","type":"reasoning","text":"considering the file"}}');
+  assert.equal(verdict.thinking, true);
+  assert.equal(verdict.answer, null);
+  assert.equal(verdict.retain, false, "the invoker's parser refuses a reasoning item as an answer, so retaining it buys nothing");
+});
+
+test("Antigravity's text deltas are the answer; its tool steps are not", () => {
+  const reader = new ProviderStreamReader("google");
+  assert.equal(reader.read(AGY_INIT).retain, true, "the conversation id is what a goal resumes on");
+  assert.equal(reader.read(AGY_TOOL_ACTIVE).retain, false);
+  // `tool_info.output` is whatever the tool read — a whole file, in the measured run.
+  assert.equal(reader.read(AGY_TOOL_DONE).retain, false);
+  assert.equal(reader.read(AGY_DELTA(12, "The distinctive ID in [c")).answer, "The distinctive ID in [c");
+  assert.equal(reader.read(AGY_DELTA(12, "anary.txt]")).answer, "anary.txt]");
+  // A step that reports only its usage carries no text.
+  assert.equal(reader.read(AGY_STEP_DONE).answer, null);
+  assert.equal(reader.read(AGY_RESULT).retain, true, "the answer of record, its conversation id and its usage are all in this line");
+});
+
+test("a new Antigravity step is a new answer, so narration is not glued to the reply", () => {
+  const reader = new ProviderStreamReader("google");
+  assert.equal(reader.read(AGY_DELTA(3, "Let me look at the file.")).restart, undefined, "the first text step starts nothing over");
+  const second = reader.read(AGY_DELTA(12, "The distinctive ID is"));
+  assert.equal(second.restart, true);
+  assert.equal(second.answer, "The distinctive ID is");
+  assert.equal(reader.read(AGY_DELTA(12, " BG-CANARY-7741-ZQ.")).restart, undefined, "the same step continues the same answer");
 });
 
 test("Claude's text deltas are the answer, and nothing else is retained from them", () => {

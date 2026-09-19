@@ -6,11 +6,13 @@ import type { ProviderId } from "@braingate/providers";
  * Not every CLI is here, and that is deliberate: a dialect is added when someone has watched
  * this build produce it, never because a format with the same name exists elsewhere.
  */
-export type StreamDialect = "anthropic" | "xai";
+export type StreamDialect = "anthropic" | "xai" | "openai" | "google";
 
 export function streamDialectFor(providerId: ProviderId): StreamDialect | null {
   if (providerId === "anthropic") return "anthropic";
   if (providerId === "xai") return "xai";
+  if (providerId === "openai") return "openai";
+  if (providerId === "google") return "google";
   return null;
 }
 
@@ -41,9 +43,15 @@ export interface StreamLineVerdict {
 
 const NOTHING: StreamLineVerdict = Object.freeze({ retain: false, answer: null, thinking: false });
 const KEEP: StreamLineVerdict = Object.freeze({ retain: true, answer: null, thinking: false });
+const THINKING: StreamLineVerdict = Object.freeze({ retain: false, answer: null, thinking: true });
 
 function answerPiece(text: string): StreamLineVerdict {
   return Object.freeze({ retain: false, answer: text, thinking: false });
+}
+
+/** The value as an object, or null: a field whose shape the CLI decides, not BrainGate. */
+function objectOf(value: unknown): Record<string, unknown> | null {
+  return typeof value === "object" && value !== null ? value as Record<string, unknown> : null;
 }
 
 /**
@@ -56,6 +64,23 @@ function answerPiece(text: string): StreamLineVerdict {
  *   final result envelope carrying `result` and `usage`.
  * - Grok emits `{"type":"text","data":"…"}` per piece, `{"type":"thought","data":"…"}` while
  *   reasoning, and `{"type":"end",…,"usage":{…}}` last.
+ *
+ * Measured 2026-09-19 against codex-cli 0.153.4 and agy 1.2.7, one read each in a throwaway git
+ * repository:
+ *
+ * - Codex `exec --json` emits no token deltas at all — `--json` is documented as "print events to
+ *   stdout as JSONL" and the events are whole items: `thread.started` (the thread id),
+ *   `turn.started`, `item.started`/`item.completed` for each `agent_message` and
+ *   `command_execution`, then `turn.completed` with `usage`. So this build streams at message
+ *   granularity: the narration item ("I'll read canary.txt for the ID.") arrives while the run is
+ *   still working, and the final `agent_message` is the answer. That is the finest granularity this
+ *   CLI offers; there is no flag for deltas (`codex exec --help`, same day).
+ * - Antigravity `--output-format stream-json` does emit token deltas:
+ *   `{"event":"step_update","step_update":{…,"step_type":"agent_response","text_delta":"…"}}`, one
+ *   per piece, with `step_index` naming which turn-step they belong to. Tool work arrives as
+ *   `step_type":"tool"` steps whose `tool_info.output` can be a whole file, and the run ends with
+ *   `{"event":"result","result":{"conversation_id":…,"response":…,"usage":{…}}}`. No thought text
+ *   is streamed: reasoning is only ever *counted*, in `usage.thinking_tokens`.
  */
 export function readStreamLine(dialect: StreamDialect, line: string): StreamLineVerdict {
   const trimmed = line.trim();
@@ -88,6 +113,44 @@ export function readStreamLine(dialect: StreamDialect, line: string): StreamLine
     // Whole messages repeat what the deltas already carried, and the signatures attached to them
     // are large. The final envelope is what the parse and the usage accounting read.
     if (event.type === "assistant" || event.type === "user") return NOTHING;
+    return KEEP;
+  }
+
+  if (dialect === "openai") {
+    // Only the events the final parse reads are retained: `thread.started` carries the session id
+    // (`reportedSessionIdOf`), the completed `agent_message` items carry the answer
+    // (`extractCodexAgentMessage`), `turn.completed` carries the accounting. A
+    // `command_execution` item carries its whole `aggregated_output` — a file the run `cat`-ed —
+    // and nothing reads it, so it would be the output cap spent on a copy of the workspace.
+    if (event.type === "item.started" || event.type === "item.updated" || event.type === "item.completed") {
+      const item = objectOf(event.item);
+      if (item === null) return NOTHING;
+      if (item.type === "agent_message") {
+        // A whole message, not a fragment: each one starts the answer again, so a run that narrates
+        // before it answers is not parsed as narration-plus-answer concatenated.
+        if (event.type !== "item.completed" || typeof item.text !== "string") return NOTHING;
+        return Object.freeze({ retain: true, answer: item.text, thinking: false, restart: true });
+      }
+      // Reasoning items are how this CLI reports thinking when the model produces any; the run
+      // measured on 2026-09-19 produced none (`reasoning_output_tokens: 0`), and the shape is the
+      // one the invoker's parser already refuses to read as an answer.
+      if (item.type === "reasoning") return THINKING;
+      return NOTHING;
+    }
+    if (event.type === "turn.started") return NOTHING;
+    return KEEP;
+  }
+
+  if (dialect === "google") {
+    if (event.event === "step_update") {
+      const step = objectOf(event.step_update);
+      if (step === null) return NOTHING;
+      if (step.step_type !== "agent_response") return NOTHING;
+      const delta = step.text_delta;
+      return typeof delta === "string" && delta.length > 0 ? answerPiece(delta) : NOTHING;
+    }
+    // `init` (the conversation id, before any answer exists) and `result` (the answer of record,
+    // its conversation id and its usage). Both are read after the run; everything else is a step.
     return KEEP;
   }
 
@@ -209,10 +272,13 @@ export const STRUCTURED_OUTPUT_TOOL = "StructuredOutput";
  */
 export class ProviderStreamReader {
   #block: "text" | "structured" | "other" | null = null;
+  /** Which Antigravity turn-step the text seen so far belongs to. */
+  #step: number | null = null;
 
   constructor(private readonly dialect: StreamDialect) {}
 
   read(line: string): StreamLineVerdict {
+    if (this.dialect === "google") return this.#readAntigravity(line);
     if (this.dialect !== "anthropic") return readStreamLine(this.dialect, line);
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) return readStreamLine("anthropic", line);
@@ -248,16 +314,37 @@ export class ProviderStreamReader {
       const delta = record.delta;
       if (typeof delta !== "object" || delta === null) return NOTHING;
       const deltaRecord = delta as Record<string, unknown>;
-      if (deltaRecord.type === "thinking_delta") return Object.freeze({ retain: false, answer: null, thinking: true });
+      if (deltaRecord.type === "thinking_delta") return THINKING;
       if (this.#block === "text" && deltaRecord.type === "text_delta" && typeof deltaRecord.text === "string") {
-        return Object.freeze({ retain: false, answer: deltaRecord.text, thinking: false });
+        return answerPiece(deltaRecord.text);
       }
       if (this.#block === "structured" && deltaRecord.type === "input_json_delta" && typeof deltaRecord.partial_json === "string") {
-        return Object.freeze({ retain: false, answer: deltaRecord.partial_json, thinking: false });
+        return answerPiece(deltaRecord.partial_json);
       }
       return NOTHING;
     }
 
     return NOTHING;
+  }
+
+  /**
+   * Antigravity's deltas, with the one thing a line cannot say: which step they belong to.
+   *
+   * A turn is a sequence of numbered steps, and a model that speaks before it uses a tool speaks
+   * again afterwards. Both arrive as `agent_response` text deltas, so concatenating every step's
+   * text would make the answer of record the narration plus the answer. A new step index is a new
+   * answer, exactly as a new content block is for Claude.
+   */
+  #readAntigravity(line: string): StreamLineVerdict {
+    const verdict = readStreamLine("google", line);
+    if (verdict.answer === null) return verdict;
+    let index: number | null = null;
+    try {
+      const step = (JSON.parse(line.trim()) as { step_update?: { step_index?: unknown } }).step_update;
+      if (typeof step?.step_index === "number") index = step.step_index;
+    } catch { /* the verdict above already parsed it; an unreadable index is simply unknown */ }
+    const restart = index !== null && this.#step !== null && index !== this.#step;
+    if (index !== null) this.#step = index;
+    return restart ? Object.freeze({ ...verdict, restart: true }) : verdict;
   }
 }
