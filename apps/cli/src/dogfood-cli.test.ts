@@ -503,3 +503,109 @@ test("a quota store that cannot be opened is named with its path, not turned int
   assert.match(out.err(), /BRAINGATE_HOME/, "and the way out");
   assert.doesNotMatch(out.err(), /CLI_UNEXPECTED/, "a suppressed failure would say nothing");
 });
+
+// ---------------------------------------------------------------- big writes (ADR 0021)
+
+/**
+ * A second signed-in provider, so "reviewed by someone else" is a thing this machine can do.
+ *
+ * A big write is planned with a reviewer from another provider or not at all, so a fixture with one
+ * subscription can only ever prove the refusal. Codex earns its place the way it does in a real
+ * run: a snapshot, a scored model, and the sandbox self-test the reviewer role is gated on.
+ */
+function codexSnapshot(): ProviderSnapshot {
+  const observedAt = "2026-09-19T00:00:00.000Z";
+  const obs = <T>(value: T) => ({ value, evidence: "native" as const, sourceCommand: null, observedAt });
+  return {
+    providerId: "openai",
+    displayName: "Codex CLI",
+    binary: "codex",
+    available: obs(true),
+    version: obs("0.153.4"),
+    authState: obs("authenticated"),
+    authMode: obs("subscription"),
+    models: { value: null, evidence: "unknown", sourceCommand: null, observedAt },
+    capabilities: obs({ headless: true, structuredOutput: true, modelPinning: true, mcp: true }),
+    usage: { value: null, evidence: "unknown", sourceCommand: null, observedAt },
+    removedBillingOverrides: [],
+    warnings: [],
+  } as unknown as ProviderSnapshot;
+}
+
+function twoProviderFixture(projectId: string) {
+  const f = fixture(projectId);
+  new ModelCatalog(resolveOperatorState(f.env, f.repo).modelCatalogPath).upsert({
+    providerId: "openai", modelId: "codex-test", quotaPool: "chatgpt-subscription",
+    capabilities: { coder: 60, reviewer: 92, judge: 88 }, speed: "balanced",
+    contextCapacity: 200_000, writeCapable: false, reasoning: 88, underlyingFamily: null,
+  });
+  return f;
+}
+
+function bigWriteDeps(f: ReturnType<typeof fixture>, out: ReturnType<typeof io>) {
+  return {
+    cwd: f.repo, env: f.env,
+    discoverAll: async () => [snapshot(), codexSnapshot()],
+    verifyCodexIsolation: async (item: ProviderSnapshot) => ({
+      providerId: "openai" as const, source: "sandbox-self-test" as const,
+      version: item.version.value ?? "0.0.0", platform: "darwin" as const,
+      profileHash: "test-profile", policyHash: "test-policy",
+      observedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 3_600_000).toISOString(),
+      unrecognisedKeys: [], droppedKeys: [], droppedFeatureKeys: [],
+    }),
+    stdout: out.stdout, stderr: out.stderr,
+  };
+}
+
+const MIGRATION_TASK = "Apply this to migrations/001_add_users.sql: ALTER TABLE users ADD COLUMN email TEXT;";
+
+test("a migration write asked for --policy direct exits non-zero with the remedy, not a DIRECT run", async () => {
+  const f = twoProviderFixture("big-direct"); const out = io();
+  const result = await runDogfoodCli(["dogfood", "write", "plan", "--task", MIGRATION_TASK, "--policy", "direct"], bigWriteDeps(f, out));
+  assert.equal(result.exitCode, 1);
+  assert.match(out.err(), /WRITE_SCOPE_BLOCKED/, "the refusal has a name");
+  assert.match(out.err(), /does not run DIRECT/);
+  assert.match(out.err(), /--policy worktree/, "and the remedy the flag interface can use");
+  assert.match(out.err(), /Nothing was spent/);
+  assert.equal(git(f.repo, ["status", "--porcelain"]), "", "and the checkout is untouched");
+});
+
+test("the same write with --auto-escalate is planned as a worktree write with a reviewer from another provider", async () => {
+  const f = twoProviderFixture("big-escalated"); const out = io();
+  const result = await runDogfoodCli(["dogfood", "write", "plan", "--task", MIGRATION_TASK, "--policy", "direct", "--auto-escalate", "--json"], bigWriteDeps(f, out));
+  assert.equal(result.exitCode, 0, out.err());
+  const data = result.data as {
+    executionPolicy: string;
+    escalated: { from: string; reason: string } | null;
+    reviewRequired: boolean;
+    summary: string;
+    repositoryPath: string;
+    worktreeReady: { ready: boolean };
+    roles: readonly { role: string; model: { providerId: string } }[];
+  };
+  assert.equal(data.executionPolicy, "worktree");
+  assert.deepEqual(data.escalated, { from: "direct", reason: "T4" });
+  assert.equal(data.reviewRequired, true);
+  assert.match(data.summary, /worktree \(escalated: T4\) · reviewer required/);
+  // The registered repository, not the workspace path a DIRECT write would have used: a worktree
+  // is prepared from a repository, and choosing the path before classifying got this wrong.
+  assert.equal(data.repositoryPath, realpathSync.native(f.repo));
+  assert.equal(data.worktreeReady.ready, true, "the fixture is clean and committed");
+  const reviewer = data.roles.find((role) => role.role === "reviewer");
+  assert.notEqual(reviewer, undefined);
+  assert.equal(reviewer!.model.providerId, "openai");
+  assert.equal(data.roles.find((role) => role.role === "primary")!.model.providerId, "anthropic");
+});
+
+test("a dirty checkout is reported on the plan, before anything is confirmed or spent", async () => {
+  const f = twoProviderFixture("big-dirty"); const out = io();
+  writeFileSync(join(f.repo, "app.txt"), "uncommitted work\n");
+  writeFileSync(join(f.repo, "notes.md"), "and something untracked\n");
+  const result = await runDogfoodCli(["dogfood", "write", "plan", "--task", MIGRATION_TASK, "--policy", "direct", "--auto-escalate", "--json"], bigWriteDeps(f, out));
+  assert.equal(result.exitCode, 0, out.err());
+  const readiness = (result.data as { worktreeReady: { ready: boolean; reason: string | null; changedFiles: number } }).worktreeReady;
+  assert.equal(readiness.ready, false);
+  assert.equal(readiness.changedFiles, 2, "the count is what tells the operator how much is in the way");
+  assert.match(String(readiness.reason), /clean/);
+  assert.equal(readFileSync(join(f.repo, "app.txt"), "utf8"), "uncommitted work\n", "and their work is exactly where they left it");
+});

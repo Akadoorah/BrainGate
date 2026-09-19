@@ -165,6 +165,14 @@ function writeManifest(
 export interface GitRepositoryState {
   readonly repositoryPath: string;
   readonly clean: boolean;
+  /**
+   * How many paths the status reports, so a refusal can say how much is in the way.
+   *
+   * "Your checkout has uncommitted changes" is a fact the operator already suspects; "3 changed
+   * files" is the one that tells them whether this is one commit or an afternoon. The status was
+   * being read here anyway and the count thrown away.
+   */
+  readonly changedFiles: number;
   readonly branch: string | null;
   /** Null on an unborn branch: a repository exists, and nothing has been committed to it. */
   readonly head: string | null;
@@ -180,5 +188,6 @@ export function inspectGitRepository(repositoryPath: string): GitRepositoryState
   // is standing.
   const resolved = spawnSync("git", ["rev-parse", "--verify", "HEAD"], { cwd: repo, encoding: "utf8", shell: false, timeout: 15_000 });
   const head = resolved.error || resolved.status !== 0 ? null : String(resolved.stdout ?? "").trim();
-  return Object.freeze({ repositoryPath: repo, clean: status.length === 0, branch: branch.length === 0 ? null : branch, head: head === null || head.length === 0 ? null : head });
+  const changed = status.split(/\r?\n/).filter((line) => line.trim().length > 0);
+  return Object.freeze({ repositoryPath: repo, clean: status.length === 0, changedFiles: changed.length, branch: branch.length === 0 ? null : branch, head: head === null || head.length === 0 ? null : head });
 }

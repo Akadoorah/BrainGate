@@ -55,7 +55,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
-import { WriteDogfoodRunner, assertWriteEligible, buildWriteTaskPlan, directWriteCapable, type WriteProviderExecutor } from "@braingate/write";
+import { WriteDogfoodRunner, assertWriteEligible, bigWrite, buildWriteTaskPlan, directWriteCapable, type WriteProviderExecutor } from "@braingate/write";
 import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
 
@@ -528,6 +528,24 @@ function describeOutcome(recorded: RecordedOutcome | null): string {
 }
 
 /**
+ * Whether an isolated worktree can be made from this repository right now, and what is in the way.
+ *
+ * Read before a big write is confirmed rather than discovered inside `WorktreeGuard.prepare`, which
+ * is right to refuse a dirty source — a worktree branches from a commit, and a checkout with
+ * uncommitted work has no single state to branch from — but refuses at a moment when the operator
+ * has already said yes. The answer is a sentence and a count, because "commit or stash three files"
+ * is actionable and a guard's error code is not.
+ */
+function worktreeReadiness(repositoryPath: string): Readonly<{ ready: boolean; reason: string | null; changedFiles: number }> {
+  let repository;
+  try { repository = inspectGitRepository(repositoryPath); }
+  catch { return Object.freeze({ ready: false, reason: "this directory is not the top level of a Git repository, and a worktree branches from one", changedFiles: 0 }); }
+  if (repository.head === null) return Object.freeze({ ready: false, reason: "nothing has been committed here yet, and a worktree branches from a commit", changedFiles: repository.changedFiles });
+  if (!repository.clean) return Object.freeze({ ready: false, reason: `your checkout has ${String(repository.changedFiles)} changed file(s), and a worktree branches from a clean one`, changedFiles: repository.changedFiles });
+  return Object.freeze({ ready: true, reason: null, changedFiles: 0 });
+}
+
+/**
  * The routed roles, as one line.
  *
  * A role that appears twice is numbered rather than printed twice under the same name: a task
@@ -759,8 +777,8 @@ async function runPreflight(args: string[], deps: DogfoodCliDependencies, cwd: s
   if (!writeCandidate) blockers.push("No authenticated configured model is eligible for a DIRECT write.");
   // Not blockers for the default policy: they are what the worktree policy needs, and a DIRECT write
   // is unaffected by either. Kept visible so an operator choosing `worktree` knows what it requires.
-  if (!cleanForWrite) notes.push("At least one registered repository has uncommitted or untracked files; worktree writes require a clean source checkout, DIRECT writes do not.");
-  if (uncommitted.length > 0) notes.push("No commit yet in this repository; worktree writes branch from one. DIRECT writes and questions work now.");
+  if (!cleanForWrite) notes.push("At least one registered repository has uncommitted or untracked files. A worktree write needs a clean source checkout to branch from — and every big write (T3/T4 or high/critical risk) is a worktree write, so one cannot start here until you commit or stash. Small DIRECT writes and questions are unaffected.");
+  if (uncommitted.length > 0) notes.push("No commit yet in this repository; a worktree branches from one, so big writes cannot start here yet. Small DIRECT writes and questions work now.");
 
   const data = Object.freeze({
     project: { projectId: project.projectId, name: project.name, manifest: resolve(cwd, manifest) },
@@ -954,6 +972,16 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
   const declinesReview = removeFlag(args, "--no-review");
   const reviewPreference: boolean | null = wantsReview ? true : declinesReview ? false : null;
   const copilotOauth = removeFlag(args, "--attest-copilot-oauth");
+  /**
+   * Whether a big write asked for DIRECT may run in a worktree instead of being refused.
+   *
+   * The interactive session passes it, because there the operator is standing in front of the
+   * escalation, is shown it in the plan, and confirms the run. A flag interface that typed
+   * `--policy direct` gets the refusal and the remedy instead: replacing a policy someone typed
+   * with a different one, in a non-interactive command, is exactly the silent decision ADR 0017
+   * exists to prevent (ADR 0021).
+   */
+  const autoEscalate = removeFlag(args, "--auto-escalate");
   // Read before the leftover-argument check: a flag the command accepts is not an extra argument.
   const policy = policyOption(args);
   noExtraArgs(args);
@@ -962,11 +990,6 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
   const state = resolveOperatorState(env);
   const oauth = attestations(copilotOauth, state);
   const { project, scope } = attachFromManifest(state, manifest, cwd);
-  // Under DIRECT the write happens in the workspace itself, so the path it runs in is the workspace
-  // the operator selected rather than a registered repository picked for a worktree of it.
-  const repositoryPath = policy === "direct" || policy === "unattended"
-    ? scope.workspacePath
-    : resolveWriteRepository(project, cwd, requestedRepo);
   const snapshots = await discovery(deps, state);
   const runtime = runtimeFor(state, snapshots);
   const store = new DogfoodStore(scope.project);
@@ -981,6 +1004,21 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     // The decision, after the budget: required reviews always run, and a reviewer the budget only
     // permits runs when the operator asked for one.
     const review = reviewPreference ?? budget.reviewerPolicy === "required";
+    /**
+     * Where this write will actually run, decided before the path it runs in is chosen.
+     *
+     * The order matters and it used to be the other way round. A worktree is prepared by
+     * `WorktreeGuard` from a *registered repository*, while a DIRECT write runs in the workspace
+     * directory the operator attached — which may be a subdirectory of one, or not a Git top level
+     * at all. Choosing the path first and classifying second meant an escalated plan carried the
+     * DIRECT path into a policy that cannot use it, and the run failed on the guard instead of on
+     * nothing (ADR 0021).
+     */
+    const escalationReason = bigWrite(effective);
+    const escalating = escalationReason !== null && autoEscalate && (policy === "direct" || policy === "unattended");
+    const repositoryPath = !escalating && (policy === "direct" || policy === "unattended")
+      ? scope.workspacePath
+      : resolveWriteRepository(project, cwd, requestedRepo);
     const requiredContextTokens = contextTokens(task);
     const isolation = await codexIsolationStatus(snapshots, deps, env, review && configuredOpenAi(state), state, CODEX_PROBE_VERSION);
     const codexIsolation = isolation.attestation ?? undefined;
@@ -994,10 +1032,19 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const measured = await measuredCapabilities(deps, env, repositoryPath);
     // A DIRECT write needs a measured write posture, which is a different set from a DIRECT read: a
     // CLI can be able to inspect the workspace and unable to change it.
-    const policyCapability = policy === "direct"
+    const policyCapability = policy === "direct" && !escalating
       ? Object.freeze({ id: "direct" as const, supportedProviders: Object.freeze(snapshots.filter((item) => directWriteCapable(item.providerId, measured[item.providerId] ?? null)).map((item) => item.providerId)) })
       : undefined;
-    const plan = buildWriteTaskPlan({ policy, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, measured, ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    const plan = buildWriteTaskPlan({ policy, allowEscalation: autoEscalate, router: runtime.router, providers: snapshots, attestations: oauth, acceptances, measured, ...(policyCapability === undefined ? {} : { policyCapability }), ...(deps.continuity === undefined ? {} : { continuity: deps.continuity }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), classification: effective, budget, requiredContextTokens, repositoryPath, baseRef, review });
+    /**
+     * Whether a worktree could be made here at all, read before anything is spent.
+     *
+     * Every big write is a worktree write, and a worktree branches from a clean checkout with at
+     * least one commit. Asking now — it costs a `git status` — is what lets the session say "commit
+     * or stash first" as a sentence instead of letting the run die on `WORKTREE_REPOSITORY_DIRTY`
+     * after the operator has already confirmed it.
+     */
+    const worktreeReady = plan.policy === "worktree" ? worktreeReadiness(repositoryPath) : Object.freeze({ ready: true, reason: null, changedFiles: 0 });
     const view = classificationView(predicted, effective, prior, adaptive.applied);
     // The same structural fields the read plan carries, so a caller that continues a goal reads one
     // shape whichever mode the request took. `summary` is what the terminal prints; the tiers are
@@ -1007,12 +1054,25 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
       complexity: effective.complexity,
       risk: effective.risk,
       promptComplexity: predicted.complexity,
-      summary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
+      // The boundary, its escalation and its reviewer, as one phrase. A surface that composes its
+      // own line — the session does — takes this rather than re-deriving it, so the terminal and
+      // the flag interface cannot describe the same plan differently.
+      policySummary: `${plan.policy}${plan.escalated === null ? "" : ` (escalated: ${plan.escalated.reason})`}${plan.reviewRequired ? " · reviewer required" : ""}`,
+      summary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${plan.policy}${plan.escalated === null ? "" : ` (escalated: ${plan.escalated.reason})`}${plan.reviewRequired ? " · reviewer required" : ""} · ${roleLine(plan.roles)}`,
+      // The same line without the boundary, for a surface that prints the boundary itself.
+      roleSummary: `${effective.complexity}/${effective.risk}${adaptive.applied ? " · project prior applied" : ""} · ${roleLine(plan.roles)}`,
       // No grants here: a write role carries a workspace rather than a tool grant, and inventing an
       // empty list would let a reader conclude the roles were granted nothing.
       budget,
       repositoryPath,
       baseRef,
+      // What the plan decided about the boundary, as structure rather than as prose: the policy it
+      // will run under, whether it was moved there, whether a reviewer is mandatory, and whether a
+      // worktree can be made here at all (ADR 0021).
+      executionPolicy: plan.policy,
+      escalated: plan.escalated,
+      reviewRequired: plan.reviewRequired,
+      worktreeReady,
       roles: plan.roles.map((role) => ({ role: role.role, model: role.model, workspace: role.workspace })),
       providerCallsOnPlan: 0,
       createsWorktree: false,
@@ -1026,6 +1086,9 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
         // Which workspace each write role runs in, which is this mode's equivalent of a grant: it
         // says where a change would land, and that the operator's checkout is not on the list.
         ...plan.roles.map((role) => `  ${role.role}: ${role.workspace} · ${role.model.providerId}/${role.model.modelId}`),
+        // A boundary this repository cannot provide, said in the plan rather than at the run: the
+        // remedy is the operator's to apply, and they should read it before they confirm anything.
+        ...(worktreeReady.ready ? [] : [`  This write needs an isolated worktree, and one cannot be made here: ${String(worktreeReady.reason)}. Commit or stash your work, then ask again. BrainGate never stashes for you.`]),
         "Zero provider model calls. Zero worktrees. Merge unavailable.",
       ].join("\n"), stdout);
       return Object.freeze({ exitCode: 0, data });
@@ -1035,7 +1098,7 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
     const beforeTaskId = ledger.listTasks()[0]?.taskId ?? null;
     try {
       const runner = new WriteDogfoodRunner({ project: scope.project, ledger, finalizer: projectFinalizer({ project: scope.project, ledger, store }), router: runtime.router, ...(deps.nativeSession === undefined ? {} : { nativeSession: deps.nativeSession }), ...(deps.pin === undefined ? {} : { pin: deps.pin }), providers: snapshots, attestations: oauth, acceptances, measured, ...(codexIsolation === undefined ? {} : { codexIsolation }), ...(grokIsolation === undefined ? {} : { grokIsolation }), ...(grokWriteIsolation === undefined ? {} : { grokWriteIsolation }), ...(deps.writeExecutor === undefined ? {} : { writer: deps.writeExecutor }), ...(deps.executor === undefined ? {} : { reviewExecutor: deps.executor }) });
-      const result = await runner.run({ task, repositoryPath, baseRef, policy, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
+      const result = await runner.run({ task, repositoryPath, baseRef, policy, allowEscalation: autoEscalate, classification: effective, budget, requiredContextTokens, observation: { predicted, effective, prior }, ...(deps.goalId === undefined ? {} : { goalId: deps.goalId }), ...(deps.conversationId === undefined ? {} : { conversationId: deps.conversationId }), context: Object.freeze({ projectId: project.projectId, scope: "dogfood-task-worktree", access: "small-write", merge: "human-only", memory: collectTaskMemory(project, task, budget.maxContextTokens).records, session: deps.sessionTurns?.(budget.maxContextTokens) ?? [], ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }) }), review, dryRun: false, env });
       if (result.taskReceipt === null || result.taskId === null) throw new BrainGateInvariantError("DOGFOOD_WRITE_RECEIPT_MISSING", "Executed dogfood write did not produce a task receipt.");
       // A write turn is a turn like any other, and the goal history has to name the worker that made
       // the change: a later worker reading the delta must be able to tell who wrote what.
@@ -1054,7 +1117,8 @@ async function runWrite(args: string[], deps: DogfoodCliDependencies, cwd: strin
         reviewStatus: recorded?.reviewStatus ?? null,
         failureKind: recorded?.failureKind ?? null,
         worktree: result.worktree,
-        executionPolicy: result.executionPolicy ?? policy,
+        executionPolicy: result.executionPolicy ?? plan.policy,
+        escalated: result.escalated ?? plan.escalated,
         providerCwd: result.providerCwd ?? repositoryPath,
         changedFiles: result.changedFiles,
         diff: result.diff,

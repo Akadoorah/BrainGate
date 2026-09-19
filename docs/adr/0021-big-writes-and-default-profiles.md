@@ -1,7 +1,7 @@
 # ADR 0021 — Big writes are worktree + reviewer; default model profiles are a starting point the operator owns
 
-Status: accepted (2026-09-19) — the default-profiles half. The big-writes half is drafted below and
-is **not accepted yet**; it is decided and recorded when M23 Phase B lands.
+Status: accepted (2026-09-19). Both halves: default model profiles (M23 Phase A) and big writes
+(M23 Phase B).
 
 ## Context
 
@@ -74,19 +74,73 @@ an entry the operator scored.**
   non-interactive command it always was, and `--adopt-models` / `--accept <provider>` do the
   wizard's work without asking.
 
-## Decision — big writes (Phase B; **not yet accepted**)
+## Decision — big writes (accepted)
 
-*This section is a placeholder with the intended shape, so that the part already implemented can be
-read against what it is going to amend. Nothing here is in force, and no code implements it yet.*
+**A T3/T4 or high/critical-risk write is never refused for its size, never runs in the operator's
+checkout, and never runs without a reviewer from another provider. Asked for DIRECT it escalates to
+an isolated worktree, or — where the operator typed the policy themselves — it is refused for that
+policy with both ways forward.**
 
-The intent recorded in the M23 plan is that a T3/T4 or high/critical-risk write is no longer refused
-outright but **escalated**: it runs in an isolated worktree with a mandatory reviewer from another
-provider, and never DIRECT. `assertM11Scope` becomes `bigWrite(classification)`, the plan gains
-`allowEscalation`, `escalated: { from, reason }` and `reviewRequired`, the reviewer route for a big
-write is cross-provider or the task does not run, and a `--policy direct` big write exits non-zero
-with the remedy rather than silently running in the workspace.
+- `assertM11Scope` is replaced by `bigWrite(classification): string | null`
+  (`packages/write/src/write-runner.ts`), which answers *what this write needs* rather than *whether
+  it may run*. The reason is the tier when the tier is what makes it big (`T3`, `T4`) and the risk
+  word otherwise (`risk high`, `risk critical`), because a T2 change to auth or payments is a big
+  write for a reason its tier does not carry.
+- `buildWriteTaskPlan` gains `allowEscalation` and returns `escalated: { from, reason } | null` and
+  `reviewRequired`. With a big write and a DIRECT (or `unattended`) policy: `allowEscalation` moves
+  it to `worktree` and records the move; without it the plan throws `WRITE_SCOPE_BLOCKED` naming
+  both remedies — `--policy worktree`, or let the session escalate it. A big write *asked for* a
+  worktree simply runs there; escalation is only ever about DIRECT.
+- **The session escalates; a flag interface does not.** `--auto-escalate` is passed by the
+  interactive session (`apps/cli/src/repl.ts`), where the operator is shown the escalation in the
+  plan and confirms the run. `braingate dogfood write plan|run --policy direct` on a big task exits
+  non-zero. Replacing a policy someone typed, in a non-interactive command, is exactly the silent
+  decision ADR [0017](0017-direct-execution.md) exists to prevent.
+- **The reviewer is cross-provider or the task does not run.** For a big write, `routeWriteReviewer`
+  tries `cross-provider` independence only; where no eligible model exists it throws
+  `WRITE_REVIEWER_UNAVAILABLE`, naming the signed-in providers and the two fixes (sign in to a
+  second CLI, or score one of its models for the reviewer role). Small writes keep the cascade —
+  a same-provider reviewer is better than none for an ordinary edit, and is not the independent
+  check a migration is being promised. `--no-review` cannot switch a big write's reviewer off.
+- **Classification comes before the repository path.** A worktree is prepared by `WorktreeGuard`
+  from a *registered repository*; a DIRECT write runs in the attached workspace directory, which may
+  be neither. `apps/cli/src/dogfood-cli.ts` therefore classifies, decides escalation, and only then
+  chooses the path.
+- **A boundary that cannot be built is said before anything is confirmed.** The plan carries
+  `worktreeReady { ready, reason, changedFiles }` from `inspectGitRepository`. A dirty or
+  commitless checkout gets one message in the session — what kind of change this is, why it needs a
+  worktree, how many files are in the way, and that BrainGate will not stash them — and no
+  confirmation prompt, because there is nothing to confirm. Nothing is spent.
+- The escalation is on the task's own record: a `write.escalated` event and the `planned`
+  transition's `executionPolicy` / `escalatedFrom` / `escalationReason`, beside the plan JSON the
+  session printed.
 
-When that lands, this ADR will also record how it amends ADR 0017 (DIRECT stays the ordinary policy
-for T0–T2 low/medium), ADR [0019](0019-a-write-is-a-first-class-task.md) (escalation is recorded on
-the write task's plan and receipt) and ADR 0005 (a big write's reviewer is cross-provider or the
-task does not run).
+### What this amends
+
+- **ADR [0017](0017-direct-execution.md)** — DIRECT remains the ordinary policy for T0–T2
+  low/medium work, and is now explicitly *not available* above that line. The invariant that an
+  agent never writes the primary checkout except under an attended DIRECT run is unchanged; this
+  narrows which work may be attended that way.
+- **ADR [0019](0019-a-write-is-a-first-class-task.md)** — a write task's plan and receipt now carry
+  the boundary it ran under *and* the boundary it was asked for.
+- **ADR [0005](0005-budget-governor.md)** — the budget's `reviewerPolicy: "required"` was already
+  the rule for T3/T4 and high/critical risk. This adds the independence requirement: for those
+  tasks the reviewer must come from another provider, and an unavailable reviewer is a refusal
+  rather than a downgrade.
+- **ADR [0008](0008-operator-accepted-providers.md) / [0020](0020-antigravity-direct-is-read-from-its-own-settings.md)** —
+  unchanged, and now load-bearing in a second place: the reviewer a big write needs may be a
+  provider the operator accepted, and nothing here writes another CLI's settings.
+- **ADR [0012](0012-quota-state-is-native-only.md)** — unchanged. An escalation is a routing
+  decision; it records no quota state.
+
+### Consequences
+
+- The work BrainGate most obviously exists for — a migration, an auth rewrite — stops being the
+  work it refuses. It costs two subscriptions and a merge the operator performs.
+- A big write needs two signed-in providers. On a one-subscription machine it is refused by name,
+  which is a worse outcome than running unreviewed only if an unreviewed migration was ever an
+  outcome worth having.
+- Every big write needs a clean checkout with a commit, because every big write is a worktree
+  write. The operator is told that before they confirm rather than by a guard afterwards.
+- `--no-review` and `--policy direct` no longer mean what they used to for these tasks. Both are
+  refused loudly rather than honoured quietly.

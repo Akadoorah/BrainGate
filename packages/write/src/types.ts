@@ -59,6 +59,17 @@ export interface WriteTaskPlan {
   readonly baseRef: string;
   /** The boundary this plan runs inside: the workspace itself, or an isolated worktree (ADR 0017). */
   readonly policy: ExecutionPolicyId;
+  /**
+   * The policy this plan was asked for and why it moved, or `null` when it did not.
+   *
+   * A big write (T3/T4, or high/critical risk) asked for DIRECT runs in an isolated worktree
+   * instead. The move is recorded rather than silent: the operator asked for one boundary and got
+   * another, and a plan that did not say so would be deciding on their behalf without telling them
+   * (ADR 0021).
+   */
+  readonly escalated: Readonly<{ from: ExecutionPolicyId; reason: string }> | null;
+  /** True when this write may not proceed without a reviewer: a big write, or a budget that says so. */
+  readonly reviewRequired: boolean;
   readonly roles: readonly PlannedWriteRole[];
   readonly providerCallsOnPlan: 0;
   readonly createsWorktree: false;
@@ -78,6 +89,8 @@ export interface WriteRunResult {
   /** `null` under the DIRECT policy: the run happened in the workspace, so there is no second directory. */
   readonly worktree: Readonly<{ path: string; branch: string | null; baseRef: string }> | null;
   readonly executionPolicy?: ExecutionPolicyId;
+  /** Set when a big write asked for DIRECT ran in a worktree instead, with the reason it did. */
+  readonly escalated?: Readonly<{ from: ExecutionPolicyId; reason: string }> | null;
   /** The directory the worker ran in, recorded so the cwd a run actually used can be audited. */
   readonly providerCwd?: string;
   /**

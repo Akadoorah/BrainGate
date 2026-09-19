@@ -194,8 +194,15 @@ Risk is now decided by the requested effect and by the **artifact** the request 
 - domain cues match at word starts, so `flutter_migration` is not `migration` and `subscription` is
   not `auth`.
 
-The gate itself is unchanged, and the tests run through it: real migration, auth and payment writes
-are refused with `WRITE_SCOPE_BLOCKED`, and an inert documentation edit is admitted at T2/low.
+What the gate does with that classification changed in M23 (ADR
+[0021](adr/0021-big-writes-and-default-profiles.md)): a T3/T4 or high/critical-risk write is no
+longer refused outright, but it is never DIRECT and never unreviewed. Asked for DIRECT it escalates
+to an isolated worktree with a mandatory reviewer from *another provider* — or, where the operator
+typed `--policy direct` themselves, it is refused with `WRITE_SCOPE_BLOCKED` and both ways forward.
+Where no cross-provider reviewer is eligible the task is refused with `WRITE_REVIEWER_UNAVAILABLE`
+rather than reviewed by the subscription that wrote it. The tests run through the gate: real
+migration, auth and payment writes never reach a DIRECT run, and an inert documentation edit is
+admitted at T2/low.
 
 ## DIRECT execution and the security model
 

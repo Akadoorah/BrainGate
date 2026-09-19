@@ -314,6 +314,9 @@ export function failureKindFromCode(code: string): FailureKind {
       return "isolation-unavailable";
     case "ROUTE_NO_ELIGIBLE_MODEL":
     case "MODEL_CATALOG_EMPTY":
+    // A big write whose reviewer must come from another provider, where none is eligible: the
+    // route could not be made, which is the same fact as no eligible model (ADR 0021).
+    case "WRITE_REVIEWER_UNAVAILABLE":
       return "routing-unavailable";
     case "WRITE_SCOPE_BLOCKED":
     case "WRITE_DIFF_TOO_LARGE":
