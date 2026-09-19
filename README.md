@@ -225,6 +225,21 @@ braingate init --project-id my-service --name "My Service" --adopt-models --acce
 the plan is shown with its classification, the worker that would run, and what that worker may do,
 before any provider is called.
 
+**A big change moves itself out of your checkout.** Ask for a migration or an auth rewrite and the
+plan says where it will happen instead:
+
+```
+> أعد كتابة نظام المصادقة وأضف ترحيل قاعدة البيانات
+
+  write · worktree (escalated: T4) · reviewer required · isolated worktree · T4/high · primary=anthropic/claude-sonnet-5 · reviewer=openai/gpt-6-astra
+  Run it? This changes a task worktree, never your checkout; merging is yours. [y/N]
+```
+
+It is never refused for being big and never runs in your workspace, the reviewer comes from another
+subscription than the writer, and nothing is merged for you. A worktree branches from a clean
+checkout, so if yours has uncommitted work you are told once — what is in the way and how much of
+it — and nothing is spent.
+
 ## Safety
 
 Preserving a runtime's capabilities is not the same as having no boundaries, and the two are
@@ -236,6 +251,16 @@ separate decisions:
   A write happens under the execution policy you selected: `direct` edits your workspace in place and
   leaves the change uncommitted for you to keep, amend or discard; `worktree` stages it in an
   isolated worktree you review and never merges for you.
+- **A big change is not refused, and does not run in your checkout.** A T3/T4 or high/critical-risk
+  write — a migration, an auth rewrite, anything the classifier reads as large or dangerous — always
+  runs in an isolated worktree with a reviewer from a *different* provider than the one writing, and
+  the merge is yours. In a session it is escalated there and the plan says so
+  (`write · worktree (escalated: T4) · reviewer required`); from the flag interface, `--policy direct`
+  on such a task exits non-zero with both ways forward rather than quietly editing your files. If no
+  second provider is signed in, the task is refused by name — an unreviewed migration is not a
+  fallback. A worktree branches from a clean checkout, so a big write asks you to commit or stash
+  first; BrainGate never stashes your work for you
+  (ADR [0021](docs/adr/0021-big-writes-and-default-profiles.md)).
 - **Autonomous and unattended execution is constrained more, not less.** When nobody is there to
   approve a runtime action, BrainGate's own policy is what stands in for that approval.
 - **Strict modes remain available**: project snapshots, isolated worktrees, and the Codex and Grok
@@ -626,11 +651,11 @@ push, or deploy.
 | It does | It never does |
 |---|---|
 | Route each task to the cheapest capable model | Read or copy provider auth-token files |
-| Add an independent reviewer for risky work | Write to your checkout — changes go to a task worktree |
+| Add an independent reviewer for risky work | Make a big change (T3/T4, high/critical risk) in your checkout, or without a reviewer from another provider |
 | Verify afterwards that your checkout is untouched | Merge, push, or deploy anything |
 | Label usage `native`, `measured`, `estimated`, or `unknown` | Present an estimate as a measurement |
 | Keep memory, worktrees, and telemetry per project | Carry context across project boundaries by default |
-| Block high-risk and T3/T4 writes outright | Store credentials, `.env` contents, or secrets in memory |
+| Run a big write in an isolated worktree you merge yourself | Store credentials, `.env` contents, or secrets in memory |
 
 ## Verifying it actually works
 
@@ -851,12 +876,12 @@ Codex review runs from a fresh staged workspace rather than the real repository.
 Current writes are intentionally narrow:
 
 - Claude Code is the reference write provider: it is the one whose write profile is proven end to end, and `braingate doctor` reports whether it is currently eligible on this machine. Grok and Codex also route writes once you score them for the role and their sandbox self-test is current.;
-- writes occur only inside task-specific BrainGate worktrees;
+- a small write runs under the policy you chose, which by default is your workspace (ADR 0017); every big write — T3/T4 or high/critical risk — runs only inside a task-specific BrainGate worktree (ADR 0021);
 - source checkout mutation is treated as an invariant failure;
 - sensitive paths and BrainGate/agent control files are rejected;
 - `git diff --check` is required;
 - reviewer rejection makes the task not ready for approval;
-- high/critical-risk and T3/T4 writes remain blocked;
+- high/critical-risk and T3/T4 writes are never DIRECT and never unreviewed: they are escalated to a worktree with a reviewer from another provider, and refused by name when no such reviewer is signed in;
 - no automatic merge, push, deploy, or production-secret access exists.
 
 ## Privacy and billing boundaries

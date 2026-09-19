@@ -9,7 +9,12 @@ This guide is for trying BrainGate locally against one real Git repository befor
 - Read-only execution requires an explicit `--execute` on `dogfood ask run`.
 - Write execution requires an explicit `--execute` on `dogfood write run` and writes only to a BrainGate task worktree.
 - M12 has no automatic merge, push, deploy, or production-secret access.
-- High/critical-risk and T3/T4 write tasks remain blocked by the M11 write boundary.
+- High/critical-risk and T3/T4 write tasks are **not** blocked, and are **never** DIRECT: they run in
+  an isolated worktree with a mandatory reviewer from another provider, and you merge
+  (ADR [0021](adr/0021-big-writes-and-default-profiles.md)). The interactive session escalates such a
+  task and shows the escalation in the plan; `dogfood write plan|run --policy direct` on one exits
+  non-zero with the remedy. With only one signed-in provider there is no independent reviewer, and
+  the task is refused rather than reviewed by the subscription that wrote it.
 - Dogfood telemetry is project-local and does not persist raw task text, model answers, candidate diffs, provider reasoning, or secrets.
 - Adaptive routing in M12 can only raise project-local complexity/risk floors. It never silently lowers them or changes model scores.
 
@@ -272,7 +277,7 @@ M12 activates a project/mode prior only after at least three labeled samples and
 
 ## 8. First small write trial
 
-Start with a harmless T0-T2 change such as copy, a small isolated UI string, or a narrow test-only change. Avoid auth, payments, migrations, security controls, production operations, or destructive changes.
+Start with a harmless T0-T2 change such as copy, a small isolated UI string, or a narrow test-only change — not because a bigger one is refused, but because it is the cheapest way to see the loop work end to end. Auth, payments, migrations, security controls, production operations and destructive changes take the big-write path in section 8a: a worktree, a reviewer from another provider, and a merge you perform.
 
 Plan with review disabled for the smallest initial writer smoke test:
 
@@ -296,6 +301,47 @@ BrainGate returns the task worktree path and branch. The source checkout remains
 Once Codex reviewer isolation is ready on Linux/macOS/WSL, omit `--no-review` to use the configured review path. Native Windows Codex review remains fail-closed in this milestone; WSL follows the Linux path and still has to pass the self-test.
 
 BrainGate does not merge the worktree branch for you in M12.
+
+## 8a. A big write
+
+A T3/T4 or high/critical-risk task — a migration, an auth rewrite — has exactly one shape
+(ADR [0021](adr/0021-big-writes-and-default-profiles.md)): an isolated worktree, a mandatory reviewer
+from a different provider than the one writing, and a merge you perform.
+
+Asked for DIRECT from the flag interface it is refused, because replacing a policy you typed is not
+something a non-interactive command does:
+
+```bash
+node "$BRAINGATE" dogfood write plan \
+  --task "Add the users-email migration and update the auth acceptance path" \
+  --policy direct
+# BrainGate WRITE_SCOPE_BLOCKED: This is a T3 change, and a change that size does not run DIRECT …
+```
+
+The two ways forward are in that message. Either name the boundary yourself:
+
+```bash
+node "$BRAINGATE" dogfood write run \
+  --task "Add the users-email migration and update the auth acceptance path" \
+  --policy worktree --execute
+```
+
+…or run it in the interactive session (`braingate` with no arguments), which escalates it for you
+and shows the escalation before anything is spent:
+
+```
+  write · worktree (escalated: T3) · reviewer required · isolated worktree · T3/high · primary=… · reviewer=…
+  Run it? This changes a task worktree, never your checkout; merging is yours. [y/N]
+```
+
+Two things stop a big write before it starts, and both are said in one message with nothing spent:
+
+- **No second provider.** `WRITE_REVIEWER_UNAVAILABLE` names who is signed in and the two fixes —
+  sign in to another CLI, or score one of its models for the reviewer role. A big write is never
+  reviewed by the subscription that wrote it.
+- **A dirty checkout.** A worktree branches from a clean checkout with at least one commit, so the
+  session tells you how many files are in the way. Commit or stash them yourself; BrainGate never
+  stashes your work.
 
 ## 9. Inspect dogfood learning
 

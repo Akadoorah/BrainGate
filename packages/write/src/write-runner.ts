@@ -87,10 +87,31 @@ function reviewerExclusions(
   }).map((snapshot) => snapshot.providerId));
 }
 
-function assertM11Scope(classification: TaskClassification): void {
-  if (classification.risk === "high" || classification.risk === "critical" || classification.complexity === "T3" || classification.complexity === "T4") {
-    throw new BrainGateInvariantError("WRITE_SCOPE_BLOCKED", "M11 permits only T0-T2 low/medium-risk code changes. Auth, payment, security, migration and other high-risk writes remain blocked.");
-  }
+/**
+ * Whether this is a *big* write, and in what words to say so.
+ *
+ * This used to be `assertM11Scope`, which threw: a T3/T4 or high/critical-risk change was refused
+ * outright, whatever policy it was asked for. The refusal was right while a worktree write had no
+ * reviewer guarantee, and it became the wrong answer once one existed — a refusal here means "do it
+ * by hand in the CLI you already have", which is the outcome BrainGate exists to improve on
+ * (ADR 0021).
+ *
+ * So the question is no longer "may this run" but "what does this run need": a non-null reason means
+ * an isolated worktree and a reviewer from another provider, and never the operator's own checkout.
+ * The tier is preferred over the risk word when both apply, because the tier is what the budget, the
+ * plan and the receipt all already speak in; `risk high` is the answer for a T2 change whose subject
+ * is auth or payments, which is a big write for a reason the tier alone does not carry.
+ */
+export function bigWrite(classification: TaskClassification): string | null {
+  if (classification.complexity === "T4" || classification.complexity === "T3") return classification.complexity;
+  if (classification.risk === "critical" || classification.risk === "high") return `risk ${classification.risk}`;
+  return null;
+}
+
+/** What an escalated plan says about itself: the policy it was asked for, and why it moved. */
+export interface WriteEscalation {
+  readonly from: ExecutionPolicyId;
+  readonly reason: string;
 }
 
 /**
@@ -177,6 +198,19 @@ function routeWriteReviewer(input: {
   readonly excludeProviders: readonly string[];
   /** The policy this review runs under, when the caller measured which providers can execute it. */
   readonly policy?: { readonly id: string; readonly supportedProviders: readonly string[] };
+  /**
+   * A big write's reason, when this is one.
+   *
+   * Present means the cascade below does not apply: a change this size is reviewed by a model from
+   * *another provider* or it does not run at all. A second opinion from the same subscription that
+   * wrote the change is a weaker check than the operator is being told they are getting, and for a
+   * migration or an auth rewrite that difference is the whole point of the reviewer (ADR 0021
+   * amending ADR 0005). Small writes keep the cascade, where a same-provider reviewer is better
+   * than none.
+   */
+  readonly strictIndependence?: string | null;
+  /** Who is signed in here, for the refusal's own text. Names, not a judgement about them. */
+  readonly signedInProviders?: readonly string[];
 }): RouteResult {
   const route = (independence: IndependenceConstraint): RouteResult => input.router.route({
     role: "reviewer",
@@ -192,6 +226,19 @@ function routeWriteReviewer(input: {
     return route({ mode: "required", level: "cross-provider", models: [input.primaryModel] });
   } catch (error) {
     if (!isNoEligibleModel(error)) throw error;
+    if (input.strictIndependence !== undefined && input.strictIndependence !== null) {
+      const signedIn = (input.signedInProviders ?? []).filter((providerId) => providerId !== input.primaryModel.providerId);
+      throw new BrainGateInvariantError(
+        "WRITE_REVIEWER_UNAVAILABLE",
+        [
+          `This is a ${input.strictIndependence} change, so it is reviewed by a model from a provider other than ${input.primaryModel.providerId} — and none is eligible here.`,
+          signedIn.length === 0
+            ? `${input.primaryModel.providerId} is the only signed-in provider on this machine.`
+            : `Signed in besides ${input.primaryModel.providerId}: ${signedIn.join(", ")} — but no scored, eligible model of theirs can review this write.`,
+          "Sign in to a second CLI, or score one of its models for the reviewer role with `/models` (`braingate models add`). Nothing was spent.",
+        ].join(" "),
+      );
+    }
     try {
       return route({ mode: "required", level: "different-model", models: [input.primaryModel] });
     } catch (differentModelError) {
@@ -253,6 +300,15 @@ export function buildWriteTaskPlan(input: {
    * `createsWorktree` is false and no merge is ever offered for it.
    */
   readonly policy?: ExecutionPolicyId;
+  /**
+   * Whether a big write asked for DIRECT may be moved to the worktree policy instead of refused.
+   *
+   * The session sets it, because the session is where the operator is standing to be told what
+   * happened and to confirm the run. A flag interface that asked for `--policy direct` on a T3
+   * change gets the refusal with the remedy instead: a policy the operator typed is not something
+   * to quietly replace with a different one (ADR 0021).
+   */
+  readonly allowEscalation?: boolean;
   readonly review?: boolean;
   /**
    * The worker the operator named by hand, when there is one.
@@ -271,12 +327,32 @@ export function buildWriteTaskPlan(input: {
   readonly policyCapability?: { readonly id: string; readonly supportedProviders: readonly string[] };
   readonly continuity?: RouteContinuity;
 }): WriteTaskPlan {
-  assertM11Scope(input.classification);
   if (input.requiredContextTokens > input.budget.maxContextTokens) throw new BrainGateInvariantError("WRITE_CONTEXT_BUDGET", "Required context exceeds the task Budget Governor limit.");
+  /**
+   * The size of this change, and what it therefore costs to do safely.
+   *
+   * A big write is never refused any more and never runs in the operator's checkout. Asked for
+   * DIRECT it either escalates — the same task, in an isolated worktree, with a mandatory
+   * cross-provider reviewer, merged by the operator — or it is refused *for that policy* with the
+   * two ways forward. Asked for a worktree already, it simply runs: the boundary it needs is the
+   * one it was given (ADR 0021).
+   */
+  const escalationReason = bigWrite(input.classification);
+  const requestedDirect = input.policy === "direct" || input.policy === "unattended";
+  let escalated: WriteEscalation | null = null;
+  if (escalationReason !== null && requestedDirect) {
+    if (input.allowEscalation !== true) {
+      throw new BrainGateInvariantError(
+        "WRITE_SCOPE_BLOCKED",
+        `This is a ${escalationReason} change, and a change that size does not run DIRECT: it would edit the checkout you are working in, unreviewed. Re-run with \`--policy worktree\` to do it in an isolated worktree with a reviewer from another provider, which you then merge — or let the session escalate it for you. Nothing was spent.`,
+      );
+    }
+    escalated = Object.freeze({ from: input.policy!, reason: escalationReason });
+  }
   // Every provider that cannot prove a bounded place to work is excluded here, rather than one
   // provider being named as the only one allowed to. The router then picks on capability among
   // whoever is left, which is what makes the executing role something more than one subscription.
-  const direct = input.policy === "direct" || input.policy === "unattended";
+  const direct = requestedDirect && escalated === null;
   const writeProofFor = (providerId: string) => ({
     ...(input.codexIsolation === undefined ? {} : { codexIsolation: input.codexIsolation }),
     ...(input.grokWriteIsolation === undefined ? {} : { grokIsolation: input.grokWriteIsolation }),
@@ -328,7 +404,12 @@ export function buildWriteTaskPlan(input: {
   assertWriteEligible(snapshotFor(input.providers, primaryModel.providerId), primaryModel, writeProofFor(primaryModel.providerId));
   const roles: PlannedWriteRole[] = [Object.freeze({ role: "primary", model: primaryModel, route: primaryRoute, workspace: direct ? "workspace" : "task-worktree" })];
 
-  const wantsReview = input.review ?? true;
+  // A reviewer this write may not go without: a big write's second reader is part of what makes
+  // the change safe to make at all, and a budget that says `required` has already decided. Either
+  // overrides `--no-review`, which is an economy on an ordinary edit and not a choice available
+  // here (ADR 0021 amending ADR 0005).
+  const reviewRequired = escalationReason !== null || input.budget.reviewerPolicy === "required";
+  const wantsReview = reviewRequired || (input.review ?? true);
   if (wantsReview) {
     // A DIRECT review keeps the runtime's own harness, like the write it reviews, so the staged
     // proofs this list is built from do not apply to it: a provider the caller measured as able to
@@ -343,6 +424,8 @@ export function buildWriteTaskPlan(input: {
       budget: input.budget,
       requiredContextTokens: input.requiredContextTokens,
       primaryModel,
+      strictIndependence: escalationReason,
+      signedInProviders: input.providers.filter((snapshot) => snapshot.authState.value === "authenticated" && snapshot.authMode.value === "subscription").map((snapshot) => snapshot.providerId),
       ...(direct && input.policyCapability !== undefined ? { policy: input.policyCapability } : {}),
       excludeProviders: direct && input.policyCapability?.id === "direct"
         ? stagedReviewerExclusions.filter((providerId) => !capable.includes(providerId))
@@ -359,6 +442,10 @@ export function buildWriteTaskPlan(input: {
     repositoryPath: input.repositoryPath,
     baseRef: input.baseRef,
     policy: direct ? "direct" : "worktree",
+    // The plan carries its own escalation, so the receipt, the terminal and a later reader all
+    // learn it from the same place rather than each re-deriving it (ADR 0021 amending ADR 0019).
+    escalated,
+    reviewRequired,
     roles: Object.freeze(roles),
     providerCallsOnPlan: 0,
     createsWorktree: false,
@@ -441,6 +528,14 @@ export class WriteDogfoodRunner {
     readonly baseRef?: string;
     /** Defaults to `worktree`: the strict mode, and the one this path shipped with. */
     readonly policy?: ExecutionPolicyId;
+    /**
+     * Whether a big write asked for DIRECT may run in a worktree instead of being refused.
+     *
+     * The caller must pass the *same* repository path a worktree needs — a registered repository,
+     * not merely the workspace directory — because that is what `WorktreeGuard` accepts. The
+     * surfaces decide escalation before they choose the path for exactly this reason.
+     */
+    readonly allowEscalation?: boolean;
     readonly classification: TaskClassification;
     readonly budget: ExecutionBudget;
     readonly requiredContextTokens: number;
@@ -493,6 +588,7 @@ export class WriteDogfoodRunner {
       repositoryPath: input.repositoryPath,
       baseRef: input.baseRef ?? "HEAD",
       ...(input.policy === undefined ? {} : { policy: input.policy }),
+      ...(input.allowEscalation === undefined ? {} : { allowEscalation: input.allowEscalation }),
       review: input.review ?? input.budget.reviewerPolicy === "required",
     });
     // The DIRECT policy: the worker runs in the workspace itself. No worktree is prepared, nothing
@@ -515,7 +611,11 @@ export class WriteDogfoodRunner {
       }),
     });
     // `worktreeOnly` was hard-coded true here, so a DIRECT plan described itself as a worktree write.
-    this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: !direct, mergeAvailable: false, executionPolicy: plan.policy });
+    this.#ledger.transition(task.taskId, "planned", { write: true, worktreeOnly: !direct, mergeAvailable: false, executionPolicy: plan.policy, reviewRequired: plan.reviewRequired, ...(plan.escalated === null ? {} : { escalatedFrom: plan.escalated.from, escalationReason: plan.escalated.reason }) });
+    // The escalation as its own event, beside the transition that carries it: a receipt is read by
+    // looking for what happened, and "this ran in a worktree because it is a T3 change" is a thing
+    // that happened rather than a property of the plan's metadata (ADR 0021 amending ADR 0019).
+    if (plan.escalated !== null) this.#ledger.appendEvent(task.taskId, "write.escalated", { from: plan.escalated.from, to: plan.policy, reason: plan.escalated.reason, reviewRequired: plan.reviewRequired });
 
     /**
      * The one place this run's outcome is composed.
@@ -766,6 +866,7 @@ export class WriteDogfoodRunner {
           taskId: task.taskId,
           worktree: null,
           executionPolicy: plan.policy,
+        escalated: plan.escalated,
           providerCwd: handle.worktreePath,
           changedFiles: Object.freeze([]),
           diff: "",
@@ -867,6 +968,7 @@ export class WriteDogfoodRunner {
         // because there is no second directory and pretending there is one would be the lie.
         worktree: direct ? null : Object.freeze({ path: handle.worktreePath, branch: handle.branch, baseRef: handle.baseRef }),
         executionPolicy: plan.policy,
+        escalated: plan.escalated,
         providerCwd: handle.worktreePath,
         changedFiles: guarded.changedFiles,
         diff: guarded.diff,

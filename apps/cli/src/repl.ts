@@ -307,6 +307,25 @@ export interface ReadPlan {
   readonly complexity: string;
   readonly promptComplexity: string;
   readonly grantLines: readonly string[];
+  /** The risk the plan used, so a prompt can say what a critical change owes before it is confirmed. */
+  readonly risk: string | null;
+  /**
+   * The boundary the plan decided, which is not always the one the session asked for.
+   *
+   * A big write asked for DIRECT is planned as a worktree write with a mandatory reviewer
+   * (ADR 0021). Everything the operator is shown — the line, the prompt, the session's own
+   * envelope — follows the plan rather than the session's setting, because the plan is what will
+   * run.
+   */
+  readonly executionPolicy: ExecutionPolicyId | null;
+  readonly escalated: Readonly<{ from: string; reason: string }> | null;
+  readonly reviewRequired: boolean;
+  /** `worktree (escalated: T3) · reviewer required`, composed where the decision was made. */
+  readonly policySummary: string | null;
+  /** The classification and the routed roles, without the boundary, for a surface that prints it. */
+  readonly roleSummary: string | null;
+  /** Whether a worktree can be made here, when this plan needs one. */
+  readonly worktreeReady: Readonly<{ ready: boolean; reason: string | null; changedFiles: number }> | null;
 }
 
 /**
@@ -319,10 +338,31 @@ export interface ReadPlan {
  */
 export function readPlan(data: unknown): ReadPlan | null {
   if (typeof data !== "object" || data === null) return null;
-  const value = data as { readonly summary?: unknown; readonly complexity?: unknown; readonly promptComplexity?: unknown; readonly grantLines?: unknown };
+  const value = data as Record<string, unknown>;
   if (typeof value.summary !== "string" || typeof value.complexity !== "string" || typeof value.promptComplexity !== "string") return null;
   const grants = Array.isArray(value.grantLines) ? value.grantLines.filter((line): line is string => typeof line === "string") : [];
-  return Object.freeze({ summary: value.summary, complexity: value.complexity, promptComplexity: value.promptComplexity, grantLines: Object.freeze(grants) });
+  // The write plan's fields, absent on a read plan and on anything older. Each is read on its own
+  // terms rather than as a block, so a plan that carries some of them is not discarded for the rest:
+  // the session must still be able to run against a surface that has not been taught all of this.
+  const escalation = typeof value.escalated === "object" && value.escalated !== null ? value.escalated as Record<string, unknown> : null;
+  const readiness = typeof value.worktreeReady === "object" && value.worktreeReady !== null ? value.worktreeReady as Record<string, unknown> : null;
+  return Object.freeze({
+    summary: value.summary,
+    complexity: value.complexity,
+    promptComplexity: value.promptComplexity,
+    grantLines: Object.freeze(grants),
+    risk: typeof value.risk === "string" ? value.risk : null,
+    executionPolicy: typeof value.executionPolicy === "string" && isExecutionPolicyId(value.executionPolicy) ? value.executionPolicy : null,
+    escalated: escalation !== null && typeof escalation.from === "string" && typeof escalation.reason === "string"
+      ? Object.freeze({ from: escalation.from, reason: escalation.reason })
+      : null,
+    reviewRequired: value.reviewRequired === true,
+    policySummary: typeof value.policySummary === "string" ? value.policySummary : null,
+    roleSummary: typeof value.roleSummary === "string" ? value.roleSummary : null,
+    worktreeReady: readiness !== null && typeof readiness.ready === "boolean"
+      ? Object.freeze({ ready: readiness.ready, reason: typeof readiness.reason === "string" ? readiness.reason : null, changedFiles: typeof readiness.changedFiles === "number" ? readiness.changedFiles : 0 })
+      : null,
+  });
 }
 
 /**
@@ -491,9 +531,26 @@ export function routingContinuity(input: {
   return Object.freeze({ warm: Object.freeze(warm), ...(previous === null ? {} : { previous }) });
 }
 
+/** Where a run under this policy happens, in the operator's words rather than the policy's id. */
+function isolationPhrase(spec: { readonly isolation: string }): string {
+  return spec.isolation === "none" ? "in your workspace"
+    : spec.isolation === "worktree" ? "isolated worktree"
+      : spec.isolation === "snapshot" ? "reading a copy"
+        : "no writes";
+}
+
 async function runPlanned(input: string, deps: ReplDeps, session: SessionContext, providers: ProviderSnapshotCache, goal: GoalRecord | null, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState): Promise<void> {
   const mode = looksLikeWriteRequest(input) ? "write" : "ask";
   const spec = executionPolicyForIntent({ policy: worker.policy, intent: mode === "write" ? "write" : "read" });
+  /**
+   * The boundary this request will actually run under.
+   *
+   * It starts as the session's own policy and is replaced by the plan's once the plan exists: a big
+   * write asked for DIRECT is planned as a worktree write, and the session that resumes a native
+   * session for it must ask about *that* boundary, not the one it set (ADR 0018, ADR 0021). Read
+   * lazily by the resolver below, which runs during the run rather than now.
+   */
+  let effectivePolicy: ExecutionPolicyId = worker.policy;
   // The requested effect, in the vocabulary the session registry uses. Policy and intent are
   // separate: DIRECT with a write is a valid pair, and so is DIRECT with a read.
   const requestIntent: "read" | "write" = mode === "write" ? "write" : "read";
@@ -534,7 +591,9 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
     // What the run about to happen is for. Read at resolution time, because the envelope decides
     // whether a stored session may be resumed at all: a read-only session is not a write session.
     intent: () => requestIntent,
-    policy: () => worker.policy,
+    // The boundary the *plan* settled on. An escalated write runs in a worktree, and a session
+    // recorded against DIRECT is not the session that run may resume.
+    policy: () => effectivePolicy,
     onResolved: (summary) => { worker.lastRun = summary; },
   });
   // Who this goal already has, which is the half of a routing decision the words cannot carry. A
@@ -563,13 +622,17 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // ones whose budget demands it. Sent to the plan as well as to the run, so the reviewer the
   // operator approved is the reviewer that runs.
   const reviewArgs = mode === "write" && worker.reviewAlways ? ["--review"] : [];
+  // The session is where a big write is allowed to become a worktree write instead of a refusal:
+  // the operator is here, the escalation is printed in the plan, and nothing runs until they say
+  // yes. The flag interface deliberately does not pass this (ADR 0021).
+  const escalationArgs = mode === "write" ? ["--auto-escalate"] : [];
 
   const planning = startProgress({ write: deps.stdout, label: "planning", ...progressStyle(deps) });
   // No `--json`: how a result is rendered is the surface's business, and this surface is a person.
   // The classification the plan *used* comes back as structure regardless, which is what the lines
   // below need — reading it back off the printed summary meant a tier was visible only when the
   // renderer happened to mention it.
-  const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input, ...reviewArgs], {
+  const plan = await runDogfoodCli(["dogfood", mode, "plan", "--task", input, ...reviewArgs, ...escalationArgs], {
     cwd: deps.cwd, stdout: capture, stderr: capture, sessionTurns, discoverAll, ...runtimeDeps(deps), ...goalDeps,
   });
   planning.stop();
@@ -578,11 +641,16 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // JSON; only a successful plan is parsed.
   if (plan.exitCode !== 0) { deps.stderr(`${planText}\n`); return; }
   const planJson = readPlan(plan.data);
-  const planSummary = planJson === null ? "the plan produced no readable output" : planJson.summary;
+  const planSummary = planJson === null ? "the plan produced no readable output" : planJson.roleSummary ?? planJson.summary;
+  // The boundary the plan settled on, which the session now follows: a big write asked for DIRECT
+  // has been planned as a worktree write with a mandatory reviewer, and everything below — the
+  // line, the refusal, the prompt, the run and the session envelope — has to be about that.
+  if (planJson?.executionPolicy !== null && planJson?.executionPolicy !== undefined) effectivePolicy = planJson.executionPolicy;
+  const planSpec = effectivePolicy === worker.policy ? spec : executionPolicyForIntent({ policy: effectivePolicy, intent: requestIntent });
 
   // What the run will be, in the policy's own words. "write · isolated worktree" was the only
   // answer this line had, and it was wrong for every DIRECT run — which is now the ordinary one.
-  deps.stdout(`\n  ${mode === "write" ? "write" : "read-only"} · ${spec.label} · ${spec.isolation === "none" ? "in your workspace" : spec.isolation === "worktree" ? "isolated worktree" : spec.isolation === "snapshot" ? "reading a copy" : "no writes"} · ${planSummary}\n`);
+  deps.stdout(`\n  ${mode === "write" ? "write" : "read-only"} · ${planJson?.policySummary ?? planSpec.label} · ${isolationPhrase(planSpec)} · ${planSummary}\n`);
   // The goal the request continues, said before anything is spent. This is the line that was
   // missing when a follow-up was silently treated as a brand-new task.
   if (goal !== null) {
@@ -593,9 +661,35 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   // that used to be dropped, and it is the half that answers "why is this reading less than I
   // expected" before the run rather than after it.
   for (const line of planJson?.grantLines ?? []) deps.stdout(`  ${line}\n`);
-  const answer = await deps.ask(mode === "write" && spec.isolation === "worktree"
-    ? "  Run it? This changes a task worktree, never your checkout. [y/N] "
-    : mode === "write" && spec.allowWrites
+  /**
+   * A worktree write with nowhere to put the worktree: said once, and nothing is spent.
+   *
+   * This is the shape a big write takes in an ordinary working directory — the operator has
+   * uncommitted work, which is the normal state of someone mid-task, and the change they just asked
+   * for is one that may not touch that work. It used to become a confirmation prompt followed by a
+   * guard failure after they said yes. One message, with the reason and the remedy, and no question
+   * at all: there is nothing to confirm when the answer cannot be carried out.
+   *
+   * BrainGate does not stash. Moving someone's uncommitted work is not a step a tool takes on their
+   * behalf, and saying so is part of the message rather than a footnote.
+   */
+  if (mode === "write" && planJson?.worktreeReady != null && !planJson.worktreeReady.ready) {
+    const why = planJson.escalated?.reason ?? `${planJson.complexity}/${planJson.risk ?? "unknown"}`;
+    deps.stdout([
+      `  This is a ${why} change, so it runs in an isolated worktree with a reviewer from another provider — never in your checkout.`,
+      `  It cannot start yet: ${planJson.worktreeReady.reason ?? "a worktree cannot be created from this repository"}.`,
+      "  Commit or stash your work, then ask again. Nothing was spent, and BrainGate never stashes for you.",
+      "",
+      "",
+    ].join("\n"));
+    return;
+  }
+  // The prompt says what the run will do to the operator's own files, which for an escalated write
+  // is "nothing": the change lands in a task worktree and the merge is theirs. A critical change
+  // owes human approval before that merge, and the prompt is where that belongs (ADR 0005).
+  const answer = await deps.ask(mode === "write" && planSpec.isolation === "worktree"
+    ? `  Run it? This changes a task worktree, never your checkout; merging is yours.${planJson?.risk === "critical" ? " Human approval is required before any merge." : ""} [y/N] `
+    : mode === "write" && planSpec.allowWrites
       ? "  Run it? This changes files in your workspace, and nothing is committed. [y/N] "
       : "  Run it? [y/N] ");
   if (answer === null || !/^y(es)?$/i.test(answer.trim())) { deps.stdout("  Skipped. Nothing was spent.\n\n"); return; }
@@ -612,7 +706,10 @@ async function runPlanned(input: string, deps: ReplDeps, session: SessionContext
   let attributed: readonly string[] = Object.freeze([]);
   // The run's record — task id, outcome, usage, the answer — comes back as data without asking for
   // JSON, and the human-readable answer is what the operator sees.
-  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--policy", worker.policy, ...reviewArgs, "--execute"], {
+  // The session's policy, not the plan's: the run re-derives the escalation from the same
+  // classification under `--auto-escalate`, so the task's own record carries the move it made
+  // rather than arriving at a worktree with no memory of having been asked for a workspace.
+  const result = await runDogfoodCli(["dogfood", mode, "run", "--task", input, "--policy", worker.policy, ...reviewArgs, ...escalationArgs, "--execute"], {
     cwd: deps.cwd,
     stdout: (text) => {
       working.stop();
@@ -730,8 +827,10 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
       deps.stdout([
         "",
         "  Type a request in plain words. A question is answered; an instruction to change",
-        "  something is planned as a write into an isolated worktree. Either way you see the",
-        "  plan and confirm before anything is spent.",
+        "  something is planned as a write in this workspace — or, when it is a big change",
+        "  (T3/T4, or high/critical risk), in an isolated worktree with a reviewer from another",
+        "  provider, which you merge. Either way you see the plan and confirm before anything",
+        "  is spent.",
         "",
         "  Follow-ups continue the same goal. Every worker — whichever provider it is routed to —",
         "  is given the goal's established findings, what has changed and what is unresolved, so",

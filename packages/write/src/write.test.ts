@@ -161,11 +161,15 @@ test("sensitive writes fail closed while preserving a clean source checkout", as
   } finally { ledger.close(); }
 });
 
-test("high-risk writes fail before task/worktree/provider creation", async () => {
+// A high-risk write is no longer refused for being high-risk: it escalates to a worktree with a
+// mandatory cross-provider reviewer (ADR 0021). What is unchanged, and what this test now pins, is
+// the half of the old guard that still holds — such a write never runs DIRECT, and the refusal that
+// says so arrives before a task, a worktree or a provider call exists.
+test("a high-risk write asked for DIRECT is refused before task/worktree/provider creation", async () => {
   const { project, repo } = fixture(); const ledger = new TaskLedger(project); const writer = new FakeWriter(() => { throw new Error("must not run"); });
   const classification = classifyTask({ text: "fix auth login and session security", mode: "write" }); const budget = budgetFor(classification, { writeRequested: true });
   try {
-    await assert.rejects(() => new WriteDogfoodRunner({ project, ledger, router: router(true), providers: [snapshot("anthropic"), snapshot("openai")], writer , finalizer: finalizerFor(project, ledger)}).run({ task: "fix auth login and session security", repositoryPath: repo, classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {} }), /M11 permits only T0-T2/);
+    await assert.rejects(() => new WriteDogfoodRunner({ project, ledger, router: router(true), providers: [snapshot("anthropic"), snapshot("openai")], writer , finalizer: finalizerFor(project, ledger)}).run({ task: "fix auth login and session security", repositoryPath: repo, policy: "direct", classification, budget, requiredContextTokens: 500, observation: observationFor(classification), context: {} }), /does not run DIRECT/);
     assert.equal(writer.calls.length, 0); assert.equal(ledger.listTasks().length, 0); assert.equal(existsSync(join(project.storageDir, "worktrees")), false);
   } finally { ledger.close(); }
 });
@@ -219,11 +223,12 @@ test("a write task compares the checkout against a fingerprint, not against bein
 // ---------------------------------------------------------------- the write-scope gate, both ways
 
 /**
- * The M11 guard is unchanged: it still refuses T3+, high and critical risk. What changed is the
- * classification that feeds it, so the tests here run *through the guard* — a request that reaches
- * the runner and is refused, or reaches it and is planned.
+ * The gate no longer refuses big work outright — it decides where big work may happen (ADR 0021).
+ * These tests still run *through* it, on real migration, auth and payment requests: one asks for
+ * DIRECT and is refused with the remedy, the other is an inert documentation edit and is planned.
+ * What a big write does when it is given a worktree is `big-write-escalation.test.ts`.
  */
-test("H: the write-scope gate still refuses real migration, auth and payment work", async () => {
+test("H: real migration, auth and payment work is never admitted to a DIRECT write", async () => {
   const highRisk = [
     "Apply this to migrations/001_add_users.sql: ALTER TABLE users ADD COLUMN email TEXT;",
     "Change the authentication acceptance logic in auth/login.ts.",
@@ -235,7 +240,7 @@ test("H: the write-scope gate still refuses real migration, auth and payment wor
     try {
       await assert.rejects(
         () => new WriteDogfoodRunner({ project: f.project, ledger: new TaskLedger(f.project), router: router(), providers: [snapshot("anthropic")], writer, finalizer: finalizerFor(f.project, new TaskLedger(f.project)) })
-          .run({ task, repositoryPath: f.repo, classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500, context: {}, observation: observationFor(classification), review: false }),
+          .run({ task, repositoryPath: f.repo, policy: "direct", classification, budget: budgetFor(classification, { writeRequested: true }), requiredContextTokens: 500, context: {}, observation: observationFor(classification), review: false }),
         // The code, not the prose: the message is the operator's explanation and may be reworded.
         (error: unknown) => (error as { readonly code?: string }).code === "WRITE_SCOPE_BLOCKED",
         task,

@@ -366,7 +366,11 @@ test("write run --execute changes an isolated worktree and never the source chec
   assert.match(output.out(), /app\.txt/);
 });
 
-test("write high-risk task fails before provider execution", async () => {
+// A high-risk write is not refused for its size any more: under the worktree policy this path uses,
+// it is admitted with a mandatory reviewer from another provider (ADR 0021). On a machine with one
+// signed-in provider there is no such reviewer, so it still fails — before any provider call, with
+// a clean checkout, and now naming what is missing and how to supply it.
+test("write high-risk task fails before provider execution when no independent reviewer exists", async () => {
   const f = fixture();
   const writer = new FakeWriteExecutor();
   const output = io();
@@ -375,7 +379,8 @@ test("write high-risk task fails before provider execution", async () => {
   });
   assert.equal(result.exitCode, 1);
   assert.equal(writer.calls.length, 0);
-  assert.match(output.err(), /WRITE_SCOPE_BLOCKED/);
+  assert.match(output.err(), /WRITE_REVIEWER_UNAVAILABLE/);
+  assert.match(output.err(), /Sign in to a second CLI/);
   assert.equal(git(f.repo, ["status", "--porcelain"]), "");
 });
 
