@@ -23,7 +23,19 @@ export interface ProgressStyle {
 export const PLAIN_PROGRESS: ProgressStyle = Object.freeze({ dim: "", accent: "", reset: "" });
 export const COLOURED_PROGRESS: ProgressStyle = Object.freeze({ dim: "[2m", accent: "[36m", reset: "[0m" });
 
-/** One frame: the mark at `tick`, the label, and whole seconds elapsed. */
+/**
+ * Elapsed time, in the unit a person reads it in.
+ *
+ * Past a minute, seconds stop being a duration and become a number: "112s" is read digit by digit,
+ * "1m52s" is read as a length of time. A DIRECT read on a subscription routinely runs past that,
+ * so this is the common case rather than the edge one.
+ */
+export function elapsedLabel(elapsedMs: number): string {
+  const seconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  return seconds < 60 ? `${String(seconds)}s` : `${String(Math.floor(seconds / 60))}m${String(seconds % 60).padStart(2, "0")}s`;
+}
+
+/** One frame: the mark at `tick`, the label, and the time elapsed. */
 export function progressFrame(label: string, tick: number, elapsedMs: number, style: ProgressStyle = PLAIN_PROGRESS): string {
   const middle = Math.floor(TRACK_WIDTH / 2);
   const position = tick % TRACK_WIDTH;
@@ -32,8 +44,7 @@ export function progressFrame(label: string, tick: number, elapsedMs: number, st
     if (index === middle) cells.push(GATE);
     else cells.push(index === position ? "▸" : "·");
   }
-  const seconds = Math.floor(elapsedMs / 1000);
-  return `  ${style.accent}${RAIL}${style.reset}  ${style.dim}${cells.join(" ")}  ${label} · ${String(seconds)}s${style.reset}`;
+  return `  ${style.accent}${RAIL}${style.reset}  ${style.dim}${cells.join(" ")}  ${label} · ${elapsedLabel(elapsedMs)}${style.reset}`;
 }
 
 export interface ProgressOptions {

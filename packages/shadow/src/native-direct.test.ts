@@ -6,8 +6,9 @@ import { join } from "node:path";
 import type { ProviderId, ProviderSnapshot } from "@braingate/providers";
 import { NodeShadowProcessExecutor } from "./process-executor.js";
 import type { ModelRef } from "@braingate/router";
+import { extractAntigravityResult, extractCodexAgentMessage, providerTokenUsage, reportedSessionIdOf } from "./invoker.js";
 import { nativeDirectCapable, planShadowInvocation, shadowProviderRoleStatus } from "./profiles.js";
-import { STAGE_PATH_TOKEN, type PlannedNativeSession, type ShadowRolePayload } from "./types.js";
+import { STAGE_PATH_TOKEN, type PlannedNativeSession, type ShadowInvocationPlan, type ShadowProcessResult, type ShadowRolePayload } from "./types.js";
 
 /**
  * The DIRECT invocation for the providers whose native harness BrainGate has measured.
@@ -231,7 +232,13 @@ test("Antigravity runs DIRECT with its own settings when they allow headless rea
   for (const forbidden of ["--dangerously-skip-permissions", "--sandbox", "--add-dir", "--mode"]) {
     assert.equal(plan.args.includes(forbidden), false, `${forbidden} is not passed`);
   }
-  assert.deepEqual(plan.args.slice(0, 6), ["--output-format", "json", "--model", "google-model", "--effort", "medium"]);
+  // Measured 2026-09-19 on agy 1.2.7: NDJSON with token-level `text_delta` events, and a `result`
+  // envelope that still carries `conversation_id`, which is the condition for reading it this way.
+  assert.deepEqual(plan.args.slice(0, 4), ["--output-format", "stream-json", "--model", "google-model"]);
+  assert.equal(plan.streamDialect, "google");
+  // The effort tier belongs to the model id on this build, and a contradicting `--effort` aborts
+  // the run before a token is spent. `google-model` names no tier, so none is claimed for it.
+  assert.equal(plan.args.includes("--effort"), false, "an id with no tier gets the CLI's own default, not a guess");
   assert.match(plan.args.at(-1) ?? "", /^-p=/, "the prompt is attached to -p, the one form no option can land inside");
   assert.equal(plan.guarantees.noShell, false, "the shell rule the gate needs means the plan cannot claim `noShell`");
 
@@ -318,5 +325,103 @@ test("a DIRECT Codex run's schema is written outside the workspace, before the p
     });
     assert.equal(result.spawned, true);
     assert.equal(JSON.parse(readFileSync(schemaPath, "utf8")).type, "object", "the schema is on disk where the plan said");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+/**
+ * The two DIRECT streams, replayed exactly as their CLIs produced them.
+ *
+ * Every line below was copied from a real run on 2026-09-19 (codex-cli 0.153.4, agy 1.2.7) in a
+ * throwaway git repository holding one canary file. Replaying them through the real executor rather
+ * than asserting on `readStreamLine` alone is what pins the property the operator actually cares
+ * about: prose reaches the terminal *while the provider is still working*, and the answer of record
+ * still parses out of what was retained.
+ */
+const CODEX_STREAM: readonly string[] = Object.freeze([
+  '{"type":"thread.started","thread_id":"01a0ba7c-5dce-7fd2-a002-953a9aa9d711"}',
+  '{"type":"turn.started"}',
+  '{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I will read canary.txt for the ID."}}',
+  '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/zsh -lc \'cat canary.txt\'","aggregated_output":"The distinctive id is BG-CANARY-7741-ZQ.\\nSecond line: the project name is Rehla.\\n","exit_code":0,"status":"completed"}}',
+  '{"type":"item.completed","item":{"id":"item_2","type":"agent_message","text":"{\\"kind\\":\\"work\\",\\"output\\":\\"The distinctive ID is BG-CANARY-7741-ZQ.\\"}"}}',
+  '{"type":"turn.completed","usage":{"input_tokens":45225,"output_tokens":65,"reasoning_output_tokens":0}}',
+]);
+
+const AGY_STREAM: readonly string[] = Object.freeze([
+  '{"event":"init","conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","init":{"model":"gemini-3.8-flash-medium","cwd":"/tmp/repo"}}',
+  '{"event":"step_update","step_update":{"step_index":2,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"output":"Second line: the project name is Rehla."}}}',
+  '{"event":"step_update","step_update":{"step_index":12,"state":"ACTIVE","step_type":"agent_response","text_delta":"The distinctive ID is "}}',
+  '{"event":"step_update","step_update":{"step_index":12,"state":"ACTIVE","step_type":"agent_response","text_delta":"BG-CANARY-7741-ZQ."}}',
+  '{"event":"result","result":{"conversation_id":"73961df0-0d11-40ed-9fe7-842abf43eb6a","status":"SUCCESS","response":"The distinctive ID is BG-CANARY-7741-ZQ.","usage":{"input_tokens":79004,"output_tokens":1501}}}',
+]);
+
+/** A CLI that says something, waits, and only then finishes — as a real one does. */
+function replayScript(lines: readonly string[], split: number): readonly string[] {
+  return Object.freeze([
+    "-e",
+    `process.stdout.write(${JSON.stringify(`${lines.slice(0, split).join("\n")}\n`)});`
+    + `setTimeout(() => process.stdout.write(${JSON.stringify(`${lines.slice(split).join("\n")}\n`)}), 150);`,
+  ]);
+}
+
+async function replayedDirectRun(plan: ShadowInvocationPlan, workspace: string, root: string): Promise<{ readonly text: string; readonly result: ShadowProcessResult }> {
+  let sawText: (text: string) => void = () => { /* replaced by the promise below */ };
+  const streamed = new Promise<string>((resolveText) => { sawText = resolveText; });
+  const pieces: string[] = [];
+  const run = new NodeShadowProcessExecutor().run({
+    project: { projectId: "s", name: "s", repositories: [workspace], storageDir: join(root, "state"), workspaceId: "s" } as never,
+    plan,
+    onText: (text) => { pieces.push(text); sawText(text); },
+  });
+  // The whole claim of this phase, written as a race: the terminal has words before the run is over.
+  const winner = await Promise.race([streamed.then(() => "text" as const), run.then(() => "run" as const)]);
+  assert.equal(winner, "text", "the answer must reach the terminal before the process closes");
+  const result = await run;
+  return { text: pieces.join(""), result };
+}
+
+test("a DIRECT Codex read streams its words and still yields its answer and session id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-direct-stream-"));
+  const workspace = join(root, "repo");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const planned = planShadowInvocation({
+      snapshot: snapshot("openai", ["openai-model"]), model: modelFor("openai"), cwd: workspace,
+      nativeHarness: true, payload, now: new Date("2026-09-19T01:00:00Z"),
+    });
+    assert.equal(planned.streamDialect, "openai");
+    const { text, result } = await replayedDirectRun(
+      { ...planned, executable: process.execPath, args: replayScript(CODEX_STREAM, 3), stdin: "" },
+      workspace, root,
+    );
+    assert.match(text, /I will read canary\.txt/, "the narration is shown while the run is still working");
+    assert.match(text, /The distinctive ID is BG-CANARY-7741-ZQ\./, "and the contract's prose is unwrapped rather than printed as JSON");
+    assert.doesNotMatch(text, /"kind"/, "the operator is never shown the contract's braces");
+    // What the run is judged on afterwards, out of what survived the thinning.
+    assert.equal(extractCodexAgentMessage(result.stdout), '{"kind":"work","output":"The distinctive ID is BG-CANARY-7741-ZQ."}');
+    assert.equal(reportedSessionIdOf("openai", result.stdout), "01a0ba7c-5dce-7fd2-a002-953a9aa9d711");
+    assert.doesNotMatch(result.stdout, /project name is Rehla/, "a command's output is not an answer, and it is the whole file");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});
+
+test("a DIRECT Antigravity read streams its deltas and still yields its answer and conversation id", async () => {
+  const root = mkdtempSync(join(tmpdir(), "braingate-direct-stream-agy-"));
+  const workspace = join(root, "repo");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const planned = planShadowInvocation({
+      snapshot: snapshot("google", ["google-model"]), model: modelFor("google"), cwd: workspace,
+      nativeHarness: true, payload, measured: antigravityMeasured({ reads: true, shell: true }),
+      now: new Date("2026-09-19T01:00:00Z"),
+    });
+    assert.equal(planned.streamDialect, "google");
+    const { text, result } = await replayedDirectRun(
+      { ...planned, executable: process.execPath, args: replayScript(AGY_STREAM, 3), stdin: "" },
+      workspace, root,
+    );
+    assert.equal(text, "The distinctive ID is BG-CANARY-7741-ZQ.");
+    assert.equal(extractAntigravityResult(result.stdout), "The distinctive ID is BG-CANARY-7741-ZQ.");
+    assert.equal(reportedSessionIdOf("google", result.stdout), "73961df0-0d11-40ed-9fe7-842abf43eb6a");
+    assert.equal(providerTokenUsage("google", result.stdout)?.output, 1501, "the run's own accounting survives the thinning");
+    assert.doesNotMatch(result.stdout, /project name is Rehla/, "a tool step carries whole files and nothing reads them back");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });

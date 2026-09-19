@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { COLOURED_PROGRESS, PLAIN_PROGRESS, progressFrame, startProgress } from "./progress.js";
+import { COLOURED_PROGRESS, PLAIN_PROGRESS, elapsedLabel, progressFrame, startProgress } from "./progress.js";
 
 /** A controllable clock and timer, so the tests never wait on a real one. */
 function harness() {
@@ -26,6 +26,16 @@ test("a frame shows the gate, the moving mark, and elapsed whole seconds", () =>
   assert.match(frame, /◈/);
   assert.match(frame, /▸/);
   assert.match(frame, /working · 7s/);
+});
+
+test("past a minute the wait is read as a duration, not as a three-digit number", () => {
+  assert.equal(elapsedLabel(0), "0s");
+  assert.equal(elapsedLabel(59_900), "59s");
+  assert.equal(elapsedLabel(60_000), "1m00s");
+  // The example a DIRECT read on a subscription actually produces.
+  assert.equal(elapsedLabel(100_000), "1m40s");
+  assert.equal(elapsedLabel(3_661_000), "61m01s");
+  assert.match(progressFrame("working · antigravity · gemini-3.8-flash-medium", 1, 100_000), /working · antigravity · gemini-3\.8-flash-medium · 1m40s/);
 });
 
 test("the mark moves and the gate never does", () => {

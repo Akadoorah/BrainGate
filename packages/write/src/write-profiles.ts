@@ -5,6 +5,7 @@ import type { MeasuredCapabilities } from "@braingate/shadow";
 import {
   GROK_SANDBOX_PROFILE,
   GROK_WRITE_SANDBOX,
+  antigravityEffortArgs,
   jsonSchemaFor,
   resolveToolGrant,
   validCodexIsolationAttestation,
@@ -429,7 +430,11 @@ function planDirectWrite(input: WriteInvocationInput): WriteProviderPlan {
   const args = Object.freeze([
     "--output-format", "json",
     "--model", input.model.modelId,
-    "--effort", "medium",
+    // The tier the model id already names, never a fixed one: measured 2026-09-19 on agy 1.2.7 a
+    // mismatched `--effort` aborts the run before a single token is spent (see
+    // `antigravityEffortArgs`). The hard-coded `medium` here refused every write on a model whose
+    // id ends in `-low` or `-high`.
+    ...antigravityEffortArgs(input.model.modelId),
     "--mode", "accept-edits",
     ...(resumedId === null ? [] : ["--conversation", resumedId]),
     `-p=${WRITE_INSTRUCTION}\n\n${body}`,

@@ -152,14 +152,39 @@ export function withoutStreamedAnswer(text: string): string {
 }
 
 /**
- * How a working role reads in the indicator: what it is doing, on which model.
+ * The CLI an operator knows a provider by, which is rarely the vendor's name.
  *
- * The quota pool rather than the provider id, because that is the thing being spent, and two
- * models from one subscription share it.
+ * Display only, and deliberately not the binary either: nobody waiting on a run recognises `agy`
+ * as the thing they signed into as Antigravity. An unknown provider keeps its own id rather than
+ * being renamed into something invented.
  */
-export function activityLabel(activity: { readonly role: string; readonly model: string; readonly quotaPool: string }): string {
+const PROVIDER_CLI_NAMES: Readonly<Record<string, string>> = Object.freeze({
+  anthropic: "claude",
+  openai: "codex",
+  google: "antigravity",
+  xai: "grok",
+  "github-copilot": "copilot",
+});
+
+export function providerCliName(providerId: string): string {
+  return PROVIDER_CLI_NAMES[providerId] ?? providerId;
+}
+
+/**
+ * How a working role reads in the indicator: what it is doing, whose CLI is doing it, on which
+ * model.
+ *
+ * The provider is there because that is the question a silent minute actually raises — which
+ * subscription is this waiting on — and the model alone does not answer it for anyone who has not
+ * memorised which family belongs to whom. The quota pool still follows when it says something the
+ * provider's name does not: "antigravity · antigravity-subscription" is one fact printed twice,
+ * while "codex · chatgpt-subscription" names the subscription the run is actually spending.
+ */
+export function activityLabel(activity: { readonly role: string; readonly model: string; readonly quotaPool: string; readonly provider?: string }): string {
   const verb = activity.role === "planner" ? "planning" : activity.role === "reviewer" ? "reviewing" : activity.role === "judge" ? "judging" : "working";
-  return `${verb} · ${activity.model} · ${activity.quotaPool}`;
+  const cli = activity.provider === undefined ? null : providerCliName(activity.provider);
+  const pool = cli !== null && (activity.quotaPool.includes(cli) || activity.quotaPool.includes(activity.provider!)) ? "" : ` · ${activity.quotaPool}`;
+  return `${verb}${cli === null ? "" : ` · ${cli}`} · ${activity.model}${pool}`;
 }
 
 /** The per-role capability lines the plan prints under its summary. */

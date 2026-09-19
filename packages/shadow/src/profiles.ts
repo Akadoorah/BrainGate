@@ -97,6 +97,32 @@ function sessionFlags(session: PlannedNativeSession): readonly string[] {
 /** Where a staged response schema is written for a CLI that takes it as a path. */
 export const STAGED_SCHEMA_FILE = "braingate-response-schema.json";
 
+/**
+ * The reasoning effort for an Antigravity run, which is the model's own and not BrainGate's to pick.
+ *
+ * Measured 2026-09-19 on agy 1.2.7: the effort tier is part of the model id — `agy models` lists
+ * `gemini-3.8-flash-{low,medium,high}`, `gemini-3.1-pro-{low,high}` — and `--effort` has to agree
+ * with it or the run never starts:
+ *
+ *     --model gemini-3.8-flash-medium --effort low
+ *       → invalid model selection: --model gemini-3.8-flash-medium conflicts with --effort=low
+ *     --model gemini-3.8-flash-low --effort medium
+ *       → invalid model selection: --model gemini-3.8-flash-low conflicts with --effort=medium
+ *
+ * So the hard-coded `--effort medium` that used to sit here refused every Antigravity model the
+ * operator might choose whose id does not end in `-medium`, including the `gemini-3.1-pro-high`
+ * in their own catalogue — an instant ERROR envelope, zero tokens spent, no answer. What is passed
+ * now is the tier the chosen model already names, and nothing at all when it names none, which
+ * leaves the CLI's own default rather than contradicting it.
+ *
+ * This is also why M23's "run T0/T1 reads at `--effort low`" is not implementable on this build:
+ * effort is a property of the model the operator scored, not a per-task knob.
+ */
+export function antigravityEffortArgs(modelId: string): readonly string[] {
+  const tier = /-(low|medium|high)$/.exec(modelId)?.[1];
+  return tier === undefined ? Object.freeze([]) : Object.freeze(["--effort", tier]);
+}
+
 const GENERIC_PROMPT = [
   "You receive one JSON request object (appended below this instruction, or supplied as the attached file).",
   "Use its `task` field as the request and its `context` field as supporting data.",
@@ -685,7 +711,10 @@ export function planShadowInvocation(input: {
         envOverrides: Object.freeze({}),
         grant: directGrant,
         nativeSession: session,
-        streamDialect: null,
+        // Measured 2026-09-19 on codex-cli 0.153.4: `--json` is whole JSONL events, not deltas, so
+        // this streams at message granularity — the narration item reaches the terminal while the
+        // run is still working, and the final `agent_message` is still the answer of record.
+        streamDialect: "openai",
         guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false })),
         nativeHarness: true,
         ...(input.schemaPath === undefined ? {} : { externalFiles: Object.freeze({ [input.schemaPath]: schema }) }),
@@ -743,9 +772,13 @@ export function planShadowInvocation(input: {
     // by an option landing between the flag and the prompt. No permission flag of any kind: the
     // run's tool policy is the operator's own settings file, which the gate above has already read.
     const args = Object.freeze([
-      "--output-format", "json",
+      // NDJSON rather than one envelope, measured 2026-09-19 on agy 1.2.7: this build streams
+      // `agent_response` text deltas as the model writes them, and its final `result` event still
+      // carries `conversation_id`, `response` and `usage` — which is what makes the switch safe,
+      // since goal continuity resumes on that id.
+      "--output-format", "stream-json",
       "--model", input.model.modelId,
-      "--effort", "medium",
+      ...antigravityEffortArgs(input.model.modelId),
       ...(session.kind === "resumed" && session.sessionId !== null ? ["--conversation", session.sessionId] : []),
       // Prose, like Grok: no schema flag is passed here either, and measured 2026-09-19 on agy 1.2.7
       // the model answers a DIRECT read in markdown. The invoker accepts that prose as the answer.
@@ -774,7 +807,9 @@ export function planShadowInvocation(input: {
       envOverrides: Object.freeze({}),
       grant: directGrant,
       nativeSession: session,
-      streamDialect: null,
+      // Measured 2026-09-19 on agy 1.2.7: token-level `text_delta` events, and the answer of record
+      // still arrives in the retained `result` envelope.
+      streamDialect: "google",
       guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: !headlessShell, noNetworkTools: false, noMcp: false })),
       nativeHarness: true,
       minimumVersion: profile.minimumVersion,
@@ -956,8 +991,11 @@ export function planShadowInvocation(input: {
       allowedEnvKeys: Object.freeze([]),
       envOverrides: Object.freeze({}),
       grant,
-      // agy streams too, but its partial-event shape has not been watched on this build, and a
-      // dialect is added when someone has seen it rather than because the format shares a name.
+      // The DIRECT read's `google` dialect was measured on the print route (`-p=`) on 2026-09-19;
+      // this staged run drives the CLI the other way, through `--input-format stream-json` and an
+      // enforced schema, and that route's event stream has not been watched. A dialect is added
+      // when someone has seen the shape, not because the flag shares a name — and a staged
+      // reviewer has nobody watching a terminal anyway.
       streamDialect: null,
       // Deliberately the weakest guarantee set BrainGate publishes. The staged workspace holds
       // nothing but the run, and headless agy auto-denies any tool it lacks permission for —
