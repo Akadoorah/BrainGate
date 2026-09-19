@@ -6,6 +6,7 @@ import { findManifest } from "./manifest-path.js";
 import { runCli } from "./cli.js";
 import { runDogfoodCli } from "./dogfood-cli.js";
 import { runMemoryCli } from "./memory-cli.js";
+import { SLASH_COMMANDS, slashSuggestions } from "./slash-commands.js";
 import { ProviderSnapshotCache } from "./provider-cache.js";
 import { SessionContext, sessionThreadPath } from "./session-context.js";
 import {
@@ -671,7 +672,10 @@ export function answerOf(data: unknown): string | null {
 
 async function runSlash(line: string, deps: ReplDeps, session: SessionContext, goals: GoalStore | null, ledger: TaskLedger | null, worker: WorkerLoopState, workspaceScope: ExecutionScope | null): Promise<"continue" | "exit"> {
   const [command, ...rest] = line.slice(1).trim().split(/\s+/);
-  const io = { cwd: deps.cwd, stdout: deps.stdout, stderr: deps.stderr };
+  // The session's own environment, not the process's: `/remember` under a BRAINGATE_HOME the session
+  // was given wrote its proposal into the default home, where `memory promote` in that session
+  // could not find it — found by a real memory check whose proposal "did not exist".
+  const io = { cwd: deps.cwd, ...(deps.env === undefined ? {} : { env: deps.env }), stdout: deps.stdout, stderr: deps.stderr };
 
   switch (command) {
     case "exit": case "quit": case "q":
@@ -687,26 +691,13 @@ async function runSlash(line: string, deps: ReplDeps, session: SessionContext, g
         "  is given the goal's established findings, what has changed and what is unresolved, so",
         "  switching models continues the work instead of restarting it.",
         "",
-        "  /remember <text>  record something about this project, for later sessions",
-        "  /goal       the current goal, its established findings and its open questions",
-        "  /new        set the current goal aside and start a different one",
-        "",
         "  Which worker does the work. A switch keeps the goal: the next worker is handed the",
         "  established findings, and a worker whose own session can be resumed is given only what",
         "  changed while it was away.",
         "",
-        "  /use <provider>/<model> [--fresh]   send the next work to this worker",
-        "  /auto       let BrainGate choose again",
-        "  /worker     who is selected, what the goal is, and what the next run would resume",
-        "  /project    which checkout this session is bound to, and where it is registered",
-        "  /memory     what is remembered, and what is waiting for your evidence",
-        "  /status     recent tasks in this project",
-        "  /models     configured models and reviewer independence",
-        "  /providers  which CLIs are installed, and which role each may take here",
-        "  /doctor     validate project, models and reviewer isolation",
-        "  /forget     drop this session's thread (project memory is untouched)",
-        "  /feedback <task-id> <T0-T4> <success|partial|failure>",
-        "  /exit",
+        "  Type / to see these as you type; Tab completes.",
+        "",
+        ...SLASH_COMMANDS.map((command) => `  ${(`/${command.name}${command.args === undefined ? "" : ` ${command.args}`}`).padEnd(44)} ${command.hint}`),
         "",
       ].join("\n"));
       return "continue";
@@ -1116,6 +1107,8 @@ export async function runReplOnTerminal(cwd: string): Promise<number> {
     input: process.stdin,
     write: (text) => { process.stdout.write(text); },
     terminal: !dumb && process.stdin.isTTY === true,
+    // `/` opens the command list under the draft, and Tab completes it — from the same table /help prints.
+    suggest: slashSuggestions,
   });
   try {
     // A dumb terminal gets no escape sequences: no bracketed paste, no raw mode. Typing still works,
