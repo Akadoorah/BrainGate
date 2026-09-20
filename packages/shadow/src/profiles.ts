@@ -51,6 +51,7 @@ const DIRECT_PROMPT = [
   "Use its `task` field as the request and its `context` field as supporting data.",
   "You are running in the workspace itself: inspect the files it names with your own tools, and answer from what you actually find there.",
   "The `memory` entries in the context are this project's verified facts, recorded by its operator; treat them as established and use them directly, even when no file repeats them.",
+  "When `context.git` is present, its `branch`, `status` and `diff` are the real output of those git commands, already run for you; use them directly for a question about what changed, rather than trying to run git yourself.",
   "Do not modify any file unless the task asks for a change.",
   "Answer with real values you produce; the response shape is enforced for you.",
   "If you cannot complete the request, still answer in that shape and put the reason in the text field.",
@@ -72,6 +73,7 @@ const DIRECT_PROSE_PROMPT = [
   "Use its `task` field as the request and its `context` field as supporting data.",
   "You are running in the workspace itself: inspect the files it names with your own tools, and answer from what you actually find there.",
   "The `memory` entries in the context are this project's verified facts, recorded by its operator; treat them as established and use them directly, even when no file repeats them.",
+  "When `context.git` is present, its `branch`, `status` and `diff` are the real output of those git commands, already run for you; use them directly for a question about what changed, rather than trying to run git yourself.",
   "Do not modify any file unless the task asks for a change.",
   "Answer in plain text, in the language of the request, with the real values you found.",
   "If you cannot complete the request, say why in plain text.",
@@ -770,7 +772,12 @@ export function planShadowInvocation(input: {
         grant: directGrant,
         nativeSession: session,
         streamDialect: "xai",
-        guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: true, noNetworkTools: false, noMcp: false })),
+        // `noShell: true` was the claim here until 2026-09-20; it was wrong. Re-measured on
+        // grok 1.0.30 in a throwaway repository: a DIRECT read asked to run `git status` did so
+        // through `run_terminal_command`, unprompted, under the same `--permission-mode default`
+        // this argv already passes — no denial, real exit code, real output. The guarantee now
+        // says what the CLI actually does rather than what an earlier, untested assumption said.
+        guarantees: directGuarantees(Object.freeze({ noProjectWrites: true, noShell: false, noNetworkTools: false, noMcp: false })),
         nativeHarness: true,
         minimumVersion: profile.minimumVersion,
       });

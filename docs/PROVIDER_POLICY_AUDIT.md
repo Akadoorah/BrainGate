@@ -38,6 +38,13 @@ under the credentials it is already signed in with.
   ships weekly, and a flag's behavior is not guaranteed to be stable across releases.
 - Re-verify that DIRECT still leaves an attended run's own approval prompts intact rather than
   silently suppressing them.
+- **Re-measure the headless tool list** (2026-09-20 finding, ADR [0022](adr/0022-git-facts-are-computed-not-shelled-out-for.md)):
+  the operator's installed `claude` 2.1.278 offers no `Bash` tool at all to a headless `-p` run —
+  confirmed with every Claude-Code session-identity environment variable stripped, so it is not an
+  artifact of one Claude process being spawned from inside another. `--permission-mode` cannot grant
+  a tool the build never provisioned. BrainGate now computes git status/diff itself and hands it to
+  every DIRECT read as `context.git` rather than depending on any worker's shell; re-check whether a
+  future build changes this before assuming the workaround is still load-bearing.
 
 ## Codex (`codex`)
 
@@ -99,6 +106,11 @@ grant includes it.
   as Grok's own config surface changes.
 - Re-confirm `restrict_network` remains a real seccomp control on Linux and a documented no-op on
   macOS; a platform change here would need the attestation and the README both updated.
+- **`noShell` was corrected 2026-09-20** (ADR [0022](adr/0022-git-facts-are-computed-not-shelled-out-for.md)):
+  a DIRECT read's guarantee claimed `noShell: true`, but a live `git status` under this same
+  `--permission-mode default` ran through `run_terminal_command` with no prompt and no denial —
+  the claim was stale, not a live restriction. Re-verify this on any Grok upgrade that touches its
+  headless permission model.
 
 ## Antigravity (`agy`)
 

@@ -55,6 +55,7 @@ import {
 import { acceptedSubscriptions, codexIsolationStatusFor, configuredProvider, grokIsolationStatus, isolationCacheFor, loadAcceptances, type IsolationStatus } from "./provider-proof.js";
 import { taskTitleFor } from "@braingate/security";
 import { collectTaskMemory } from "./task-memory.js";
+import { readGitContext } from "@braingate/dogfood";
 import { WriteDogfoodRunner, assertWriteEligible, bigWrite, buildWriteTaskPlan, directWriteCapable, type WriteProviderExecutor } from "@braingate/write";
 import { applyInheritedFloor } from "@braingate/goals";
 import { isUsableOutcome, projectFinalizer, recordedOutcomeOf, type RecordedOutcome } from "./finalization.js";
@@ -846,6 +847,11 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
     const budget = budgetFor(effective, { writeRequested: false });
     const requiredContextTokens = contextTokens(task);
     const memory = collectTaskMemory(project, task, budget.maxContextTokens);
+    // Read once by BrainGate, not asked of the worker: a build with no local shell tool (measured
+    // 2026-09-20 on the operator's own `claude`) cannot answer "what changed" itself, and a build
+    // that does have one should not have to be trusted to run git correctly. Every worker gets the
+    // same figures. Absent when the workspace is not a git repository.
+    const git = readGitContext(project.repositories[0] ?? cwd);
     const context = Object.freeze({
       projectId: project.projectId,
       scope: "dogfood-project-read-only",
@@ -859,6 +865,7 @@ async function runAsk(args: string[], deps: DogfoodCliDependencies, cwd: string,
       // M20 layer 2 and 3: the goal this request continues, and where its detail lives. Absent for
       // the flag interface, which continues nothing.
       ...(deps.goalContext === undefined ? {} : { goal: deps.goalContext }),
+      ...(git === null ? {} : { git }),
     });
     const needsReview = budget.reviewerPolicy === "required" || (budget.reviewerPolicy === "optional" && optionalReview);
     // A review needs Codex's proof, and so does a read primary on a project copy: one self-test

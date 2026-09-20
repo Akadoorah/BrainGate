@@ -158,6 +158,10 @@ test("Grok DIRECT reads in the workspace with the runtime's own read posture", (
   for (const flag of SUBSTITUTED_HARNESS_FLAGS) assert.equal(args.includes(flag), false, `${flag} is BrainGate's harness, not Grok's`);
   assertNoForeignSandbox(args, "xai");
   assert.equal(plan.guarantees.noProjectWrites, true, "a headless Grok refuses what it would have prompted for");
+  // Re-measured 2026-09-20 on grok 1.0.30: a DIRECT read asked to run `git status` did so through
+  // `run_terminal_command`, unprompted, under this same `--permission-mode default`. The plan must
+  // not claim a boundary the CLI does not actually hold.
+  assert.equal(plan.guarantees.noShell, false, "Grok's shell already runs under DIRECT; the plan says so");
   // Measured 2026-09-19 on grok 1.0.30: under an enforced schema the model answers in one turn
   // without a single tool call, promising to inspect and never doing so. A DIRECT read asks for
   // prose instead, and the prose is the answer.
