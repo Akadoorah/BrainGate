@@ -11,7 +11,9 @@ measured against.
 **Report privately, not through a public GitHub issue.** A public issue on a project that drives
 other people's AI coding CLIs and touches their source code is itself a disclosure.
 
-- **Contact:** sales@tec-ads.com
+- **Preferred:** [open a private security advisory](https://github.com/Akadoorah/BrainGate/security/advisories/new)
+  on this repository (GitHub's private vulnerability reporting). Only the maintainers can see it.
+- **By email, if you cannot use GitHub:** sales@tec-ads.com
 
 Please include:
 

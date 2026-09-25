@@ -1,5 +1,5 @@
 blank_issues_enabled: true
 contact_links:
   - name: Report a security issue privately
-    url: https://github.com/Akadoorah/BrainGate/blob/main/SECURITY.md
-    about: Do not open a public issue for a vulnerability. See SECURITY.md for how to report it.
+    url: https://github.com/Akadoorah/BrainGate/security/advisories/new
+    about: Do not open a public issue for a vulnerability. This opens a private advisory only the maintainers can see.
