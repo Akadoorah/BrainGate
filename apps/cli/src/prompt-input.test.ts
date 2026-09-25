@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
+import { PassThrough } from "node:stream";
 import { createPromptInput, type PromptInputOptions, displayWidth, fallbackLastGrapheme, lastGrapheme, PASTE_END, PASTE_START, type PromptInput } from "./prompt-input.js";
 import { classifyRequestIntent } from "./request-intent.js";
 
@@ -1517,4 +1518,18 @@ test("Ctrl+C at an empty prompt still ends the session when nothing is running",
   const pending = terminal.input.ask("> ");
   terminal.chunk("\u0003");
   assert.equal(await pending, null, "Ctrl+C at an idle prompt keeps its old meaning: it ends the session");
+});
+
+test("closing the composer lets go of stdin, so /exit ends the process", async () => {
+  // Found while recording the demo: `/exit` closed the session and the process stayed, because the
+  // composer's listener kept stdin flowing and a flowing stdin keeps Node's event loop alive.
+  const stdin = new PassThrough();
+  const input = createPromptInput({ input: stdin, write: () => {}, terminal: false, columns: 80 });
+  const pending = input.ask("> ");
+  assert.equal(stdin.listenerCount("data"), 1, "the composer reads stdin while a question is open");
+  input.close();
+  assert.equal(await pending, null, "the open question ends with the session");
+  assert.equal(stdin.listenerCount("data"), 0, "and nothing is left reading stdin");
+  assert.equal(stdin.listenerCount("end") + stdin.listenerCount("close"), 0);
+  assert.equal(stdin.isPaused(), true, "which is paused, so it no longer holds the process open");
 });
