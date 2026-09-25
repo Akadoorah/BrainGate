@@ -6,7 +6,7 @@ BrainGate ist ein Projekt im Pre-Alpha-Stadium, das die offiziellen KI-Coding-CL
 Softwareprojekte hinweg koordiniert: Es hält den Kontext jedes Projekts getrennt, kontrolliert
 den Kontingentverbrauch und protokolliert, was jeder Agent getan hat.
 
-> Maßgeblich ist die englische Fassung: [`README.md`](../../README.md). Diese Übersetzung deckt
+> Maßgeblich ist die englische Fassung: [`README.md`](../../README.md) · [`docs/GUIDE.md`](../GUIDE.md). Diese Übersetzung deckt
 > Installation und erste Nutzung ab; die übrige Dokumentation unter `docs/` ist englisch.
 
 **Weitere Sprachen:**
