@@ -1,6 +1,6 @@
 {
   "name": "braingate",
-  "version": "0.1.0-preview",
+  "version": "0.1.1-preview",
   "type": "module",
   "description": "One local control plane for the AI coding subscriptions you already use.",
   "license": "Apache-2.0",

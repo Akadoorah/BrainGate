@@ -4,6 +4,17 @@ Notable changes to BrainGate. The format follows [Keep a Changelog](https://keep
 versions follow [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may change
 behaviour, the CLI's flags, or the layout of `~/.braingate`, and the entry here says so.
 
+## [0.1.1-preview] — unreleased
+
+### Fixed
+
+- `/exit` ended the session but not the process: the composer kept listening on stdin, which kept
+  Node running until the terminal was closed or Ctrl+C was pressed. The process now exits at once.
+
+### Added
+
+- `docs/demo/`: a VHS tape that records the README's demo GIF from a real session.
+
 ## [0.1.0-preview] — 2026-09-25
 
 The first technical preview.
@@ -37,4 +48,5 @@ The first technical preview.
 - A provider CLI that exited before reading its request crashed BrainGate with an uncaught `EPIPE`.
   The run is now recorded as failed, with the CLI's own exit code and message.
 
+[0.1.1-preview]: https://www.npmjs.com/package/braingate/v/0.1.1-preview
 [0.1.0-preview]: https://www.npmjs.com/package/braingate/v/0.1.0-preview

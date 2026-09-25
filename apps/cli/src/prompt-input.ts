@@ -193,6 +193,8 @@ export interface PromptInputSource {
   on(event: "data", listener: (chunk: Buffer | string) => void): unknown;
   on(event: "end" | "close", listener: () => void): unknown;
   off?(event: "data", listener: (chunk: Buffer | string) => void): unknown;
+  off?(event: "end" | "close", listener: () => void): unknown;
+  pause?(): unknown;
   setRawMode?(mode: boolean): unknown;
   readonly isTTY?: boolean;
 }
@@ -452,6 +454,12 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
   const endSession = (): void => {
     if (closed) return;
     closed = true;
+    // A listener on stdin keeps it flowing, and a flowing stdin keeps Node alive: without this the
+    // session ended on `/exit` and the process stayed, waiting for input nobody would read.
+    options.input.off?.("data", onData);
+    options.input.off?.("end", endSession);
+    options.input.off?.("close", endSession);
+    options.input.pause?.();
     const resolve = waiter;
     waiter = null;
     prompt = null;
@@ -900,6 +908,12 @@ export function createPromptInput(options: PromptInputOptions): PromptInput {
     }
     if (closed) return;
     closed = true;
+    // A listener on stdin keeps it flowing, and a flowing stdin keeps Node alive: without this the
+    // session ended on `/exit` and the process stayed, waiting for input nobody would read.
+    options.input.off?.("data", onData);
+    options.input.off?.("end", endSession);
+    options.input.off?.("close", endSession);
+    options.input.pause?.();
     const resolve = waiter;
     waiter = null;
     prompt = null;
