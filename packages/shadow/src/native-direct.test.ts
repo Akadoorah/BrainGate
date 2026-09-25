@@ -469,3 +469,25 @@ test("a DIRECT Antigravity read streams its deltas and still yields its answer a
     assert.doesNotMatch(result.stdout, /project name is Rehla/, "a tool step carries whole files and nothing reads them back");
   } finally { rmSync(root, { recursive: true, force: true }); }
 });
+
+test("a CLI that exits without reading its request is a failed run, not a crashed BrainGate", async () => {
+  // Found as an uncaught `write EPIPE`: a process that exits before reading stdin closes the pipe
+  // under BrainGate's write, and with no handler on the stream that error ended the whole process.
+  // A request larger than the pipe buffer makes the write outlive the child every time.
+  const root = mkdtempSync(join(tmpdir(), "braingate-early-exit-"));
+  const workspace = join(root, "repo");
+  mkdirSync(workspace, { recursive: true });
+  try {
+    const planned = planShadowInvocation({
+      snapshot: snapshot("anthropic", ["anthropic-model"]), model: modelFor("anthropic"), cwd: workspace,
+      nativeHarness: true, payload, now: new Date("2026-09-25T01:00:00Z"),
+    });
+    const result = await new NodeShadowProcessExecutor().run({
+      project: { projectId: "early-exit", name: "Early Exit", repositories: [workspace], storageDir: join(root, "state"), workspaceId: "early-exit" } as never,
+      plan: { ...planned, executable: process.execPath, args: ["-e", "process.stderr.write('unknown flag'); process.exit(2)"], stdin: "x".repeat(4 * 1024 * 1024) },
+    });
+    assert.equal(result.spawned, true);
+    assert.equal(result.exitCode, 2, "the CLI's own exit code is what the run reports");
+    assert.match(result.stderr, /unknown flag/, "and its own words are kept for the diagnosis");
+  } finally { rmSync(root, { recursive: true, force: true }); }
+});

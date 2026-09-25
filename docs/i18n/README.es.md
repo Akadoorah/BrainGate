@@ -6,7 +6,7 @@ BrainGate es un proyecto en fase pre-alfa que coordina las CLI oficiales de IA p
 entre varios proyectos de software, manteniendo aislado el contexto de cada proyecto,
 controlando el consumo de cuota y registrando lo que hizo cada agente.
 
-> El inglés es la fuente de verdad: [`README.md`](../../README.md). Esta traducción cubre la
+> El inglés es la fuente de verdad: [`README.md`](../../README.md) · [`docs/GUIDE.md`](../GUIDE.md). Esta traducción cubre la
 > instalación y el primer uso; el resto de la documentación en `docs/` está en inglés.
 
 **Otros idiomas:**

@@ -6,7 +6,7 @@ BrainGate est un projet en phase pré-alpha qui coordonne les CLI officielles d'
 développement sur plusieurs projets logiciels, en isolant le contexte de chaque projet, en
 maîtrisant la consommation de quota et en consignant ce qu'a fait chaque agent.
 
-> L'anglais fait foi : [`README.md`](../../README.md). Cette traduction couvre l'installation et
+> L'anglais fait foi : [`README.md`](../../README.md) · [`docs/GUIDE.md`](../GUIDE.md). Cette traduction couvre l'installation et
 > la première utilisation ; le reste de la documentation dans `docs/` est en anglais.
 
 **Autres langues :**

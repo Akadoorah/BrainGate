@@ -9,7 +9,7 @@ legal reading of any provider's terms of service. It states what BrainGate does 
 when it drives each CLI, cites the exact flags at the time of writing, and lists what to re-measure
 before treating any of it as still true. Whether a particular pattern of use is permitted under a
 subscription's terms is a question for that provider's terms and the person running BrainGate, per
-the [Responsible use](../README.md#responsible-use) section of the README — this document does not
+the [Responsible use](GUIDE.md#responsible-use) section of the guide — this document does not
 answer it on their behalf.
 
 Every section below is true of every role BrainGate can route to that provider today, staged or

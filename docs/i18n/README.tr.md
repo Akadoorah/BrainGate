@@ -6,7 +6,7 @@ BrainGate, resmî yapay zekâ kodlama CLI'larını birden çok yazılım projesi
 koordine eden, alfa öncesi bir projedir: her projenin bağlamını yalıtır, kota kullanımını
 denetler ve her ajanın ne yaptığını kaydeder.
 
-> Kaynak metin İngilizcedir: [`README.md`](../../README.md). Bu çeviri yalnızca kurulum ve
+> Kaynak metin İngilizcedir: [`README.md`](../../README.md) · [`docs/GUIDE.md`](../GUIDE.md). Bu çeviri yalnızca kurulum ve
 > ilk kullanımı kapsar; `docs/` altındaki geri kalan belgeler İngilizcedir.
 
 **Diğer diller:**
