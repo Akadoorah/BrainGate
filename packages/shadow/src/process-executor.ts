@@ -326,6 +326,12 @@ export class NodeShadowProcessExecutor implements ShadowProcessExecutor {
         child.stderr?.on("data", (chunk: Buffer) => append("stderr", chunk));
         child.on("error", (error) => { stderr += `\n${error.message}`; finish(null); });
         child.on("close", (exitCode) => finish(exitCode));
+        // A CLI that exits before reading its request — a flag an update removed, a refused login —
+        // closes the pipe under the write. Unhandled, that EPIPE ends BrainGate itself; handled, the
+        // exit code and stderr say what happened, and the task is recorded failed like any other.
+        child.stdin?.on("error", (error: NodeJS.ErrnoException) => {
+          if (error.code !== "EPIPE") stderr += `\n${error.message}`;
+        });
         if (input.plan.stdin !== null) child.stdin?.end(input.plan.stdin); else child.stdin?.end();
       });
     } finally {
