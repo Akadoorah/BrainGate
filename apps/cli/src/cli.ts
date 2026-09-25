@@ -373,6 +373,22 @@ function snapshotProvider(state: OperatorStatePaths, scope: ExecutionScope): () 
   };
 }
 
+/**
+ * The version of the package this file was loaded from.
+ *
+ * Read at run time rather than compiled in: `src/cli.ts` in the monorepo and `dist/main.js` in an
+ * installed package both sit one directory below their `package.json`, so the same relative read
+ * answers for either.
+ */
+export function packageVersion(): string {
+  try {
+    const manifest = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version?: unknown };
+    return typeof manifest.version === "string" ? manifest.version : "unknown";
+  } catch {
+    return "unknown";
+  }
+}
+
 export async function runCli(argv: readonly string[], deps: CliDependencies = {}): Promise<CliResult> {
   const args = [...argv];
   const json = removeFlag(args, "--json");
@@ -381,6 +397,14 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
   const stdout = deps.stdout ?? ((text: string) => process.stdout.write(text));
   const stderr = deps.stderr ?? ((text: string) => process.stderr.write(text));
   let data: unknown = null;
+
+  // Answered before the operator state is resolved, so a bug report can always include it —
+  // including the one about a state directory BrainGate cannot open.
+  if (args[0] === "--version" || args[0] === "version") {
+    data = { version: packageVersion() };
+    emit(json, data, `braingate ${packageVersion()}`, stdout);
+    return Object.freeze({ exitCode: 0, data });
+  }
 
   try {
     const state = resolveOperatorState(env);
@@ -425,6 +449,7 @@ export async function runCli(argv: readonly string[], deps: CliDependencies = {}
           "  write        worktree-only change outside the dogfood flow",
           "  status       recent tasks for a project",
           "  dashboard    local read-only web view",
+          "  --version    the installed BrainGate version",
           "",
           "plan and run without --execute make no provider model calls.",
         ].join("\n"),

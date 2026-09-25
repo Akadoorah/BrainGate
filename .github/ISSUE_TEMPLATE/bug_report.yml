@@ -1,0 +1,53 @@
+name: Bug report
+description: Something BrainGate did that it should not have, or did not do that it should have.
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. **Do not paste tokens, API keys, `.env` contents, or private source code.**
+        A security issue — a task reaching another project, a write escaping its worktree, operator data
+        being read without your action — belongs in a private report: see SECURITY.md.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: What you ran or asked, what BrainGate showed, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. braingate
+        2. > …
+        3. …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: BrainGate version
+      description: Output of `braingate --version`, or the commit you are running from.
+    validations:
+      required: true
+  - type: textarea
+    id: providers
+    attributes:
+      label: Provider CLIs involved
+      description: Which CLI(s) and their versions, e.g. `claude --version`, `codex --version`. Output of `braingate discover` helps.
+      render: text
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options: [macOS, Linux, WSL, Windows, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: The plan line, the error, or `--json` output. Redact anything private.
+      render: text

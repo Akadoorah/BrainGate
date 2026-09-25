@@ -62,7 +62,8 @@ infrastructure (CI matrices, a package registry) this milestone did not stand up
 
 - [x] Add `CONTRIBUTING.md`. — 2026-09-19 (M23-F): how to run the project, the real-run rule for
       provider-facing changes, and when a change needs an ADR.
-- [ ] Add a Code of Conduct.
+- [x] Add a Code of Conduct. — 2026-09-25: `CODE_OF_CONDUCT.md` adopts the Contributor Covenant 2.1,
+      with reports going to the contact in `SECURITY.md`.
 - [ ] Define maintainer/decision model.
 - [ ] Add `CODEOWNERS`, especially for security/provider/execution boundaries.
 - [ ] Document ADR expectations for architectural changes.
@@ -76,7 +77,8 @@ infrastructure (CI matrices, a package registry) this milestone did not stand up
       `SECURITY.md` added, pointing to `docs/SECURITY.md` for the threat model. **The disclosure
       contact is a placeholder** (`SECURITY.md` has a `TODO(operator)` marker) — the operator needs
       to pick a real channel (a GitHub private security advisory or a contact mailbox) before this
-      is actually usable by an outside reporter.
+      is actually usable by an outside reporter. — Resolved: `a4b4e1a` replaced the placeholder with
+      a real contact address.
 - [ ] Publish supported release/security-update windows.
 - [ ] Document how to report a provider integration that becomes unsafe after a CLI update.
 - [x] Review repository Git history for secrets, credentials, private exports, internal URLs, personal data, and test artifacts. — 2026-09-19 (M23-F): ran
@@ -187,8 +189,11 @@ For every provider claimed as supported:
 
 ## Release engineering
 
-- [ ] Choose versioning scheme (SemVer unless a stronger reason exists).
-- [ ] Add changelog/release-note process.
+- [x] Choose versioning scheme (SemVer unless a stronger reason exists). — 2026-09-25: SemVer,
+      stated in `CHANGELOG.md`; before 1.0 a minor version may break, and its entry says so.
+- [x] Add changelog/release-note process. — 2026-09-25: `CHANGELOG.md` (Keep a Changelog) and
+      `docs/RELEASING.md`, whose checklist moves the entry to the release date and makes it the
+      GitHub release notes.
 - [ ] Decide release cadence and support window.
 - [ ] Automate reproducible builds/package publishing.
 - [ ] Sign releases/artifacts where practical.

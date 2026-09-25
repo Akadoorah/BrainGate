@@ -12,3 +12,5 @@ package.json.prepack-backup
 *.sqlite
 *.sqlite3
 *.db
+dev-readme.prepack-backup
+apps/cli/LICENSE
