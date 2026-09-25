@@ -137,6 +137,8 @@ BrainGate is a **technical preview**. CI runs on Linux and macOS; Windows is not
 | [Architecture decisions](docs/adr) | 22 ADRs: the reasoning behind each design choice |
 | [Provider policy audit](docs/PROVIDER_POLICY_AUDIT.md) | exactly how each CLI is invoked |
 | [Contributing](CONTRIBUTING.md) | running the tests, and when a change needs an ADR |
+| [Changelog](CHANGELOG.md) | what changed in each release |
+| [Code of Conduct](CODE_OF_CONDUCT.md) | how we treat each other here |
 
 To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
