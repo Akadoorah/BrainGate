@@ -1,10 +1,35 @@
 {
   "name": "braingate",
   "version": "0.1.0-preview",
-  "private": true,
   "type": "module",
   "description": "One local control plane for the AI coding subscriptions you already use.",
   "license": "Apache-2.0",
+  "keywords": [
+    "ai",
+    "cli",
+    "claude-code",
+    "codex",
+    "grok",
+    "antigravity",
+    "copilot",
+    "orchestration",
+    "coding-agents",
+    "developer-tools"
+  ],
+  "homepage": "https://github.com/Akadoorah/BrainGate#readme",
+  "bugs": {
+    "url": "https://github.com/Akadoorah/BrainGate/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Akadoorah/BrainGate.git"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "bin": {
     "braingate": "./bin/braingate.mjs"
   },
@@ -18,7 +43,7 @@
     "test": "tsx --test src/*.test.ts",
     "test:integration": "BRAINGATE_INTEGRATION=1 tsx --test src/integration.test.ts",
     "build": "node scripts/build.mjs",
-    "prepack": "node scripts/prepack.mjs",
+    "prepack": "node scripts/build.mjs && node scripts/prepack.mjs",
     "postpack": "node scripts/postpack.mjs"
   },
   "dependencies": {

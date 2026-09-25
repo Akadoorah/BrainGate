@@ -460,3 +460,15 @@ test("accepting a provider that needs no acceptance is refused rather than recor
   }
   assert.equal((await runCli(["providers", "accept", "not-a-provider"], deps)).exitCode, 1);
 });
+
+test("--version names the package version, before anything reads the operator's state", async () => {
+  // A bug report asks for the version first, and the report that most needs it is the one about a
+  // state directory BrainGate cannot open — so the answer must not depend on that directory.
+  const expected = (JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }).version;
+  const output = io();
+  const deps = { env: { BRAINGATE_HOME: "\u0000not-a-path" }, stdout: output.stdout, stderr: output.stderr };
+  assert.equal((await runCli(["--version"], deps)).exitCode, 0);
+  assert.equal(output.out().trim(), `braingate ${expected}`);
+  const json = await runCli(["--version", "--json"], deps);
+  assert.deepEqual(json.data, { version: expected });
+});

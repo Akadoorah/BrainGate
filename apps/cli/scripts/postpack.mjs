@@ -1,6 +1,6 @@
-// Restores the development `package.json` that `prepack.mjs` set aside, so a `pnpm pack` never
-// leaves the workspace deps and toolchain stripped out of the working tree.
-import { renameSync, existsSync } from "node:fs";
+// Restores the development `package.json` and README that `prepack.mjs` set aside, and removes the
+// LICENSE copy it staged, so a `pnpm pack` never leaves the working tree changed.
+import { renameSync, existsSync, rmSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 
@@ -13,3 +13,7 @@ if (!existsSync(backupPath)) {
 }
 
 renameSync(backupPath, pkgPath);
+
+const readmeBackupPath = path.join(cliDir, "dev-readme.prepack-backup");
+if (existsSync(readmeBackupPath)) renameSync(readmeBackupPath, path.join(cliDir, "README.md"));
+rmSync(path.join(cliDir, "LICENSE"), { force: true });
