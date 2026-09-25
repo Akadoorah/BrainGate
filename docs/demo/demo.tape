@@ -24,9 +24,25 @@ Set WaitPattern />\s*$/
 
 # Off camera: a short prompt, and the demo project back at its starting state.
 Hide
-Type "export PS1='$ ' && bash docs/demo/setup.sh >/dev/null && cd ~/bg-demo && clear"
+Type "export PS1='$ ' && bash docs/demo/setup.sh >/dev/null && cd ~/bg-demo"
 Enter
 Wait+Line /\$\s*$/
+# Drop the previous recording's thread and goal, so this one starts from nothing.
+Type "braingate"
+Enter
+Wait
+Type "/forget"
+Enter
+Wait
+Type "/new"
+Enter
+Wait
+Type "/exit"
+Enter
+Sleep 2s
+Type "reset"
+Enter
+Sleep 1s
 Show
 
 Type "braingate"
@@ -67,8 +83,9 @@ Enter
 Wait
 Sleep 2s
 
-# 4. Back to Claude, which resumes its own session and applies the fix in the workspace.
-Type "/use claude"
+# 4. Back to automatic routing: BrainGate picks whoever can do the write now, and it lands in the
+#    workspace. (/auto rather than /use claude, so a provider at its limit does not stop the take.)
+Type "/auto"
 Enter
 Wait
 Sleep 1s
