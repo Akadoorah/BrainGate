@@ -461,6 +461,12 @@ and [`docs/adr/0009-grok-sandbox-is-provable.md`](adr/0009-grok-sandbox-is-prova
 ## Install
 
 ```bash
+npm install -g braingate
+```
+
+Or from source:
+
+```bash
 git clone https://github.com/Akadoorah/BrainGate.git
 cd BrainGate
 corepack enable

@@ -4,7 +4,7 @@ Notable changes to BrainGate. The format follows [Keep a Changelog](https://keep
 versions follow [Semantic Versioning](https://semver.org/). Before 1.0, a minor version may change
 behaviour, the CLI's flags, or the layout of `~/.braingate`, and the entry here says so.
 
-## [0.1.0-preview] — unreleased
+## [0.1.0-preview] — 2026-09-25
 
 The first technical preview.
 
@@ -29,11 +29,12 @@ The first technical preview.
 - **Quota honesty**: usage is labelled `native`, `measured`, `estimated` or `unknown`, and a refusal
   backoff is shown as BrainGate's own decision.
 - `braingate --version`.
-- An npm-installable package (`apps/cli`) that bundles the CLI and depends only on `better-sqlite3`.
+- The `braingate` package on npm (`npm install -g braingate`), which bundles the CLI and depends
+  only on `better-sqlite3`.
 
 ### Fixed
 
 - A provider CLI that exited before reading its request crashed BrainGate with an uncaught `EPIPE`.
   The run is now recorded as failed, with the CLI's own exit code and message.
 
-[0.1.0-preview]: https://github.com/Akadoorah/BrainGate/commits/main
+[0.1.0-preview]: https://www.npmjs.com/package/braingate/v/0.1.0-preview

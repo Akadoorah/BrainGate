@@ -5,6 +5,7 @@
 [![CI](https://github.com/Akadoorah/BrainGate/actions/workflows/ci.yml/badge.svg)](https://github.com/Akadoorah/BrainGate/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue.svg)](LICENSE)
 ![Status: technical preview](https://img.shields.io/badge/status-technical%20preview-orange.svg)
+[![npm](https://img.shields.io/npm/v/braingate/preview.svg)](https://www.npmjs.com/package/braingate)
 ![Node 22+](https://img.shields.io/badge/node-%3E%3D22-brightgreen.svg)
 
 You pay for Claude Code, Codex, Antigravity, Grok or Copilot. Each one starts every session from
@@ -76,10 +77,7 @@ You need Node.js 22+, Git, and at least one provider CLI already signed in to a 
 control.
 
 ```bash
-git clone https://github.com/Akadoorah/BrainGate.git
-cd BrainGate
-corepack enable && pnpm install
-ln -s "$PWD/apps/cli/bin/braingate.mjs" ~/.local/bin/braingate
+npm install -g braingate
 ```
 
 Then, inside any project:
@@ -92,6 +90,22 @@ braingate
 The first run asks at most four questions: register this directory, adopt the models your
 subscriptions expose, and whether to accept Antigravity or require a reviewer. It prints everything
 it assumed, and every answer can be changed later.
+
+<details>
+<summary>Running from source instead</summary>
+
+```bash
+git clone https://github.com/Akadoorah/BrainGate.git
+cd BrainGate
+corepack enable && pnpm install
+ln -s "$PWD/apps/cli/bin/braingate.mjs" ~/.local/bin/braingate
+```
+
+If you later switch to the npm package, remove that link first (`rm ~/.local/bin/braingate`, then
+`rehash` in zsh). Otherwise your shell keeps running the source checkout. `which -a braingate`
+shows every copy on your `PATH`.
+
+</details>
 
 ## Everyday commands
 
